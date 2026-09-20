@@ -50,8 +50,12 @@ it can safely call the pinned `lego` binary (see
   under `stateDir/accounts.d/` that `stateDir/accounts` (a symbolic link)
   is atomically re-pointed to (`persistAccounts`). A directory cannot be
   replaced atomically with `rename(2)`, but a symbolic link can, so there
-  is no window in which the account state is absent; the files are fsynced
-  before the swap and the parent directory after it. ACME account
+  is no window in which the account state is absent; the files, the
+  version directory, `accounts.d` and `stateDir` are fsynced in that
+  order, so the same holds across a power loss. Publishing holds an
+  exclusive `flock` on `stateDir/.lock` (the copy-in at run start holds
+  it shared), so two Runners sharing a `stateDir` cannot prune each
+  other's freshly referenced version: the last publisher wins. ACME account
   continuity across runs therefore does not depend on this run's private
   key, which is destroyed with the work directory either way. Losing the
   account would mean registering a new one (rate-limited, and with EAB

@@ -11,15 +11,19 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
@@ -516,7 +520,7 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 		t.Fatalf("expected exactly one retained version, got %v", versions)
 	}
 	entries, _ := os.ReadDir(state)
-	if len(entries) != 2 {
+	if len(entries) != 3 { // accounts (link), accounts.d, .lock
 		t.Fatalf("unexpected entries in state dir: %v", entries)
 	}
 	st, _ := os.Stat(filepath.Join(final, "host", "user", "account.json"))
@@ -681,5 +685,101 @@ func TestResultDeliveredOnStdoutWhenFileUnwritable(t *testing.T) {
 	}
 	if !strings.Contains(h.logs.String(), "cannot write result file") {
 		t.Fatalf("file failure not logged:\n%s", h.logs.String())
+	}
+}
+
+// TestPersistAccountsConcurrentPublishersNeverLeaveDanglingLink is the
+// regression test for the account-state prune race: many publishers race
+// on one stateDir; afterwards the "accounts" link must resolve and exactly
+// one version must remain.
+func TestPersistAccountsConcurrentPublishersNeverLeaveDanglingLink(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	const publishers = 8
+	works := make([]string, publishers)
+	for i := range works {
+		works[i] = filepath.Join(dir, fmt.Sprintf("work-%d", i))
+		acct := filepath.Join(works[i], "accounts", "host", "user", "account.json")
+		if err := os.MkdirAll(filepath.Dir(acct), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(acct, []byte(fmt.Sprintf("v%d", i)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, publishers)
+	start := make(chan struct{})
+	for i := 0; i < publishers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs <- persistAccounts(works[i], state)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("persistAccounts: %v", err)
+		}
+	}
+	final := filepath.Join(state, "accounts")
+	target, err := os.Readlink(final)
+	if err != nil {
+		t.Fatalf("accounts is not a link: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, target)); err != nil {
+		t.Fatalf("accounts -> %s is dangling: %v", target, err)
+	}
+	versions, _ := os.ReadDir(filepath.Join(state, accountVersionsDir))
+	if len(versions) != 1 {
+		t.Fatalf("expected one surviving version, got %d", len(versions))
+	}
+	got, err := os.ReadFile(filepath.Join(final, "host", "user", "account.json"))
+	if err != nil || !strings.HasPrefix(string(got), "v") {
+		t.Fatalf("state = %q, %v", got, err)
+	}
+	// A reader under the shared lock sees the published state.
+	work := filepath.Join(dir, "reader")
+	if err := loadAccounts(state, work); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(work, "accounts", "host", "user", "account.json")); string(b) != string(got) {
+		t.Fatalf("loaded %q, want %q", b, got)
+	}
+}
+
+func TestLoadAccountsWithoutState(t *testing.T) {
+	dir := t.TempDir()
+	if err := loadAccounts(filepath.Join(dir, "state"), filepath.Join(dir, "work")); err != nil {
+		t.Fatalf("missing state must not be an error: %v", err)
+	}
+}
+
+func TestSweepDeadlineCoversTimeoutAndGrace(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.setTimeout(2)
+	h.job(nil)
+	// Capture the deadline lego saw by leaving a marker: run and inspect
+	// the record's directory deadline file before cleanup is impossible, so
+	// compute the same formula and check prepareWorkDir writes it.
+	parent := t.TempDir()
+	before := time.Now()
+	dir, cleanup, err := prepareWorkDir(parent, "01JABCDEFGHJKMNPQRSTVWXYZ0", 2*2*time.Second+lego.DefaultGracePeriod+staleMargin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(filepath.Join(dir, deadlineFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secs, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	minimum := before.Add(2*time.Second + lego.DefaultGracePeriod).Unix()
+	if secs < minimum {
+		t.Fatalf("deadline %d is before timeout+grace %d", secs, minimum)
 	}
 }

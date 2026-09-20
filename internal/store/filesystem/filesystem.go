@@ -5,14 +5,16 @@
 //	<root>/<object>/versions/<fingerprint-prefix>-<unix-nanos>/{cert.pem,chain.pem,fullchain.pem,privkey.pem}
 //	<root>/<object>/current -> versions/<...>   (symbolic link)
 //
-// A Put writes a complete new version directory (0700, files 0600, fsynced)
-// and then replaces the "current" symlink with a single rename, so a reader
-// always sees either the previous complete version or the new one. Puts on
-// the same object are serialized with an exclusive advisory lock
-// (<root>/<object>/.lock) held for the whole operation, so pruning of older
-// versions after the swap can never remove the version a concurrent writer
-// just published: the last writer to acquire the lock wins and its version
-// is the only one left.
+// A Put writes a complete new version directory (0700, files 0600, fsynced),
+// fsyncs the versions directory, and then replaces the "current" symlink
+// with a single rename followed by an fsync of the object directory, so
+// both a process crash and a power loss leave either the previous complete
+// version or the new one referenced. Puts on the same object are serialized
+// with an exclusive advisory lock (<root>/<object>/.lock) held for the whole
+// operation, so pruning of older versions after the swap can never remove
+// the version a concurrent writer just published: the last writer to
+// acquire the lock wins and its version is the only one left. Current holds
+// the same lock shared, so a reader never straddles a swap.
 //
 // Current verifies that the stored private key exists and matches the
 // certificate, so a bundle that is present but unusable is reported as an
@@ -31,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -87,27 +90,46 @@ func (s *Store) objectDir(object string) (string, error) {
 	return dir, nil
 }
 
-// Current implements store.Store. It returns ErrNotFound when no version
-// has been published, and an error (never ErrNotFound) when the published
-// version is incomplete or inconsistent, so a corrupted store fails closed
-// instead of being reported as a healthy certificate.
+// Current implements store.Store. It returns ErrNotFound only when no
+// version has ever been published (no "current" link). A link whose target
+// or files are missing, unreadable or inconsistent yields an error that is
+// not ErrNotFound, so a corrupted store fails closed instead of being
+// reported as empty or healthy. A shared lock is held while reading so a
+// concurrent Put cannot swap and prune between the reads; the link is
+// resolved once and both files are read from that one version.
 func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
 	dir, err := s.objectDir(object)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(dir, currentLink, certFile))
-	if err != nil {
+	if _, err := os.Lstat(filepath.Join(dir, currentLink)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, store.ErrNotFound
 		}
-		return nil, fmt.Errorf("read current certificate: %w", err)
+		return nil, fmt.Errorf("stat current link: %w", err)
+	}
+	lock, err := fslock.Shared(filepath.Join(dir, lockFile))
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Unlock()
+	target, err := os.Readlink(filepath.Join(dir, currentLink))
+	if err != nil {
+		return nil, fmt.Errorf("current is not a link for %q: %w", object, err)
+	}
+	version := filepath.Join(dir, target)
+	if !strings.HasPrefix(filepath.Clean(version), filepath.Clean(dir)+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("current link for %q points outside the object directory", object)
+	}
+	data, err := os.ReadFile(filepath.Join(version, certFile))
+	if err != nil {
+		return nil, fmt.Errorf("stored certificate for %q is unreadable (current -> %s): %w", object, target, err)
 	}
 	leaf, err := store.ParseLeaf(data)
 	if err != nil {
 		return nil, fmt.Errorf("stored certificate for %q is unreadable: %w", object, err)
 	}
-	key, err := os.ReadFile(filepath.Join(dir, currentLink, keyFile))
+	key, err := os.ReadFile(filepath.Join(version, keyFile))
 	if err != nil {
 		return nil, fmt.Errorf("stored private key for %q is unreadable: %w", object, err)
 	}
@@ -137,11 +159,11 @@ func (s *Store) Put(_ context.Context, object string, b store.Bundle) (err error
 	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
 	}
-	unlock, err := lockObject(dir)
+	lock, err := fslock.Exclusive(filepath.Join(dir, lockFile))
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer lock.Unlock()
 	var nonce [4]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("random nonce: %w", err)
@@ -168,6 +190,12 @@ func (s *Store) Put(_ context.Context, object string, b store.Bundle) (err error
 	finalPath := filepath.Join(versions, final)
 	if err := os.Rename(tmp, finalPath); err != nil {
 		return fmt.Errorf("commit version directory: %w", err)
+	}
+	// The rename is a metadata change of the versions directory; make it
+	// durable before anything points at the new entry.
+	if err := fsyncDir(versions); err != nil {
+		os.RemoveAll(finalPath)
+		return err
 	}
 	// Swap the "current" link atomically: create a temporary link, then
 	// rename it over the existing one.

@@ -306,11 +306,21 @@ one, never a partial write. `Put` holds an exclusive advisory lock
 (`<object>/.lock`, `flock`) for the whole operation, so writers on the
 same object are serialized: the last writer to take the lock wins, and
 the pruning of older version directories that follows the swap can never
-remove a version a concurrent writer has just published. `Current`
-verifies that `privkey.pem` exists and matches `cert.pem`; a published
-version that is incomplete or inconsistent is reported as an error, not
-as a healthy certificate, and `Put` refuses a bundle whose key does not
-match its certificate.
+remove a version a concurrent writer has just published. `Current` holds
+the same lock shared, resolves the `current` link once and reads both
+files from that one version, so a reader never straddles a swap or
+observes a half-pruned version. `Current` returns `ErrNotFound` only when
+no `current` link exists; a link whose target or files are missing, a
+link pointing outside the object directory, or a `privkey.pem` that is
+missing or does not match `cert.pem` is reported as an error, not as an
+empty or healthy store. `Put` refuses a bundle whose key does not match
+its certificate.
+
+Durability: file data is fsynced, then the version directory, then the
+`versions` directory after the rename that publishes the version, then
+the object directory after the `current` swap. On a filesystem that
+honours fsync this means a power loss, like a process crash, leaves either
+the previous complete version or the new one referenced.
 
 `<object>` is derived from the target FQDN by `store.ObjectName`: a
 human-readable prefix (`wiki.example.ac.jp`, or `wildcard.example.ac.jp`
@@ -461,7 +471,8 @@ across the rest of the codebase's log statements is still Phase 2+ work
   normal exit path. A Runner killed with an uncatchable signal (SIGKILL,
   OOM) cannot run it, so every start also sweeps `run-*` directories under
   `workDir` that are past their deadline. Each run records its own
-  deadline (now + 2 × its `lego.timeoutSeconds`) in a `.sweep-after` file
+  deadline (now + 2 × `lego.timeoutSeconds` + the termination grace
+  period + a 5-minute margin) in a `.sweep-after` file
   inside the directory when it is created, and the sweep honours that
   file, so Runners with different timeouts sharing one `workDir` never
   sweep each other's live runs; a directory without the file falls back
@@ -470,10 +481,14 @@ across the rest of the codebase's log statements is still Phase 2+ work
   nothing survives at all.
 - ACME account state is published as a versioned directory under
   `stateDir/accounts.d/` and `stateDir/accounts` is a symbolic link that
-  is swapped with one `rename` (then `stateDir` is fsynced); older
-  versions are pruned afterwards. There is no moment at which `accounts`
-  is absent, so a crash at any point leaves either the previous or the
-  new state referenced. The persisted files are fsynced before the swap.
+  is swapped with one `rename`; older versions are pruned afterwards. The
+  files, the version directory, `accounts.d` and finally `stateDir` are
+  fsynced in that order, so neither a process crash nor a power loss
+  leaves `accounts` absent or pointing at an incomplete version. Publishing
+  runs under an exclusive lock on `stateDir/.lock` and the copy-in at run
+  start holds it shared, so concurrent Runners sharing a `stateDir` are
+  serialized on the state itself (last publisher wins) and a reader never
+  copies a version that is being pruned.
 - The filesystem store refuses to write through a symbolic link at the
   object or `versions` level, serializes `Put` per object with an
   advisory lock, and prunes only under that lock, so concurrent writers

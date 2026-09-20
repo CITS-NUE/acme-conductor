@@ -26,7 +26,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,6 +36,11 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
+
+// staleMargin is added to a run's sweep deadline on top of the lego
+// timeout and the termination grace period, to cover the store and state
+// work around the lego invocation.
+const staleMargin = 5 * time.Minute
 
 // clockSkewTolerance is how far in the future a certificate's NotBefore may
 // lie and still be treated as valid now. CAs backdate NotBefore by about an
@@ -247,15 +251,21 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 		return nil, fail(v1alpha1.ErrorCodeCancelled, "run was cancelled before lego started", ctx.Err())
 	}
 
-	// A live run never outlasts twice the lego timeout; older per-run
-	// directories are leftovers of a killed process.
-	staleAfter := 2 * time.Duration(cfg.Lego.TimeoutSeconds) * time.Second
+	grace := opts.GracePeriod
+	if grace <= 0 {
+		grace = lego.DefaultGracePeriod
+	}
+	// A live run never outlasts the lego timeout plus the grace period
+	// plus the surrounding store work; the sweep deadline adds a wide
+	// margin on top of that (see staleMargin), so a directory past it is a
+	// leftover of a killed process, never a live run.
+	staleAfter := 2*time.Duration(cfg.Lego.TimeoutSeconds)*time.Second + grace + staleMargin
 	work, cleanup, err := prepareWorkDir(cfg.Lego.WorkDir, spec.RunID, staleAfter)
 	if err != nil {
 		return nil, fail(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)
 	}
 	defer cleanup()
-	if err := copyTree(filepath.Join(cfg.Lego.StateDir, lego.AccountsDir), filepath.Join(work, lego.AccountsDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := loadAccounts(cfg.Lego.StateDir, work); err != nil {
 		return nil, fail(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err)
 	}
 

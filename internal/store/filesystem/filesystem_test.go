@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
 )
 
@@ -469,10 +470,14 @@ func TestPutBlocksWhileObjectLockIsHeld(t *testing.T) {
 	root := t.TempDir()
 	object := "wiki.example.ac.jp-deadbeef"
 	dir := filepath.Join(root, object)
-	unlock, err := lockObject(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	held, err := fslock.Exclusive(filepath.Join(dir, lockFile))
 	if err != nil {
 		t.Fatal(err)
 	}
+	unlock := held.Unlock
 	st, _ := New(root)
 	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
 	done := make(chan error, 1)
@@ -522,5 +527,86 @@ func TestCurrentRequiresMatchingPrivateKey(t *testing.T) {
 	// Put refuses a mismatched bundle up front.
 	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: otherKey}); err == nil {
 		t.Fatal("Put accepted a mismatched key")
+	}
+}
+
+func TestCurrentDistinguishesEmptyFromCorrupt(t *testing.T) {
+	root := t.TempDir()
+	st, _ := New(root)
+	object := "wiki.example.ac.jp-deadbeef"
+	// Empty store.
+	if _, err := st.Current(context.Background(), object); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("empty store: %v, want ErrNotFound", err)
+	}
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	// Dangling current link.
+	target, _ := os.Readlink(filepath.Join(root, object, "current"))
+	if err := os.RemoveAll(filepath.Join(root, object, target)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Current(context.Background(), object); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("dangling link: %v, want a corruption error", err)
+	}
+	// Version present but cert.pem missing.
+	if err := os.MkdirAll(filepath.Join(root, object, target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Current(context.Background(), object); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing cert.pem: %v, want a corruption error", err)
+	}
+	// Link pointing outside the object directory.
+	os.Remove(filepath.Join(root, object, "current"))
+	os.Symlink("../../etc", filepath.Join(root, object, "current"))
+	if _, err := st.Current(context.Background(), object); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("escaping link: %v, want an error", err)
+	}
+}
+
+// TestCurrentIsConsistentDuringConcurrentPuts: readers must never observe
+// a mixed or half-pruned version while writers keep swapping.
+func TestCurrentIsConsistentDuringConcurrentPuts(t *testing.T) {
+	root := t.TempDir()
+	object := "wiki.example.ac.jp-deadbeef"
+	st, _ := New(root)
+	var bundles []store.Bundle
+	for i := 0; i < 4; i++ {
+		c, k, _ := genCert(t, "wiki.example.ac.jp")
+		bundles = append(bundles, store.Bundle{Certificate: c, PrivateKey: k})
+	}
+	if err := st.Put(context.Background(), object, bundles[0]); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := st.Put(context.Background(), object, bundles[i%len(bundles)]); err != nil {
+				t.Errorf("Put: %v", err)
+				return
+			}
+		}
+	}()
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	reads := 0
+	for time.Now().Before(deadline) {
+		if _, err := st.Current(context.Background(), object); err != nil {
+			t.Fatalf("Current during concurrent Put: %v", err)
+		}
+		reads++
+	}
+	close(stop)
+	wg.Wait()
+	if reads == 0 {
+		t.Fatal("no reads performed")
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 )
 
@@ -162,6 +163,29 @@ func copyFile(src, dst string) error {
 // <stateDir>/accounts is a symbolic link to the current one.
 const accountVersionsDir = "accounts.d"
 
+// stateLockFile serializes publishers of the account state and keeps a
+// reader (loadAccounts) consistent with them.
+const stateLockFile = ".lock"
+
+// loadAccounts copies the current ACME account state from stateDir into
+// the work directory under a shared lock, so a concurrent publisher cannot
+// prune the version being read. A missing state is not an error.
+func loadAccounts(stateDir, work string) error {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	lock, err := fslock.Shared(filepath.Join(stateDir, stateLockFile))
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
+	err = copyTree(filepath.Join(stateDir, lego.AccountsDir), filepath.Join(work, lego.AccountsDir))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // persistAccounts publishes the "accounts" subtree of the work directory as
 // the current ACME account state:
 //
@@ -174,7 +198,12 @@ const accountVersionsDir = "accounts.d"
 //
 // There is no moment at which "accounts" is absent: a crash before step 2
 // leaves the previous pointer intact, a crash after it leaves the new one.
-// A pre-existing plain "accounts" directory (not a link) is moved into
+// Every directory whose entries change (the version, accounts.d, stateDir)
+// is fsynced in order, so the same holds for a power loss. The whole
+// operation runs under an exclusive lock on stateDir, so two publishers
+// are serialized and step 3 can never prune the version a concurrent
+// publisher just referenced: the last one to take the lock wins. A
+// pre-existing plain "accounts" directory (not a link) is moved into
 // accounts.d before the swap so nothing is lost.
 func persistAccounts(work, stateDir string) error {
 	src := filepath.Join(work, lego.AccountsDir)
@@ -184,6 +213,14 @@ func persistAccounts(work, stateDir string) error {
 		}
 		return err
 	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	lock, err := fslock.Exclusive(filepath.Join(stateDir, stateLockFile))
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
 	versions := filepath.Join(stateDir, accountVersionsDir)
 	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return err
@@ -199,6 +236,10 @@ func persistAccounts(work, stateDir string) error {
 		return err
 	}
 	if err := fsyncDir(fresh); err != nil {
+		os.RemoveAll(fresh)
+		return err
+	}
+	if err := fsyncDir(versions); err != nil {
 		os.RemoveAll(fresh)
 		return err
 	}

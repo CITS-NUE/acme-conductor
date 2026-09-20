@@ -146,6 +146,11 @@ type Outcome struct {
 	Duration  time.Duration
 }
 
+// DefaultGracePeriod is how long Run waits after SIGTERM (and after the
+// process exits with its pipes still held) before forcing termination when
+// Executor.GracePeriod is zero.
+const DefaultGracePeriod = 10 * time.Second
+
 // Executor runs invocations.
 type Executor struct {
 	Timeout time.Duration
@@ -175,7 +180,7 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	}
 	grace := e.GracePeriod
 	if grace <= 0 {
-		grace = 10 * time.Second
+		grace = DefaultGracePeriod
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

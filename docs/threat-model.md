@@ -174,9 +174,10 @@ it does not, and what closes the gap.
 - Removal of secrets from all log output across the codebase (the
   `lego`-output redactor covers only `lego`'s own stdout/stderr).
 - Mutual exclusion between two Runner *runs* for the same target: both
-  can issue. (The filesystem store serializes writes per object with an
-  advisory lock and the account state is swapped atomically, so neither
-  is corrupted by it, but the double issuance itself is not prevented.)
+  can issue. (The filesystem store and the account state are each
+  protected by an advisory lock held by writers and readers, so neither
+  is corrupted or observed half-swapped by it, but the double issuance
+  itself is not prevented.)
 
 **Planned:**
 
@@ -217,10 +218,10 @@ about what remains open:
   A Phase 1 Runner runtime now exists, which sharpens this specific
   residual risk rather than removing it: two Runner processes for the
   same target both talk to the CA (double issuance, rate-limit cost) and
-  both register or refresh account state. The account state swap is
-  atomic (last writer wins) and the filesystem store serializes `Put`
-  per object, so neither is corrupted, but the duplicate work is not
-  prevented. Per-target mutual exclusion across runs is Phase 2 work
+  both register or refresh account state. Publishing account state and
+  writing the filesystem store are serialized by advisory locks (last
+  writer wins; readers hold the lock shared), so neither is corrupted,
+  but the duplicate work is not prevented. Per-target mutual exclusion across runs is Phase 2 work
   (the Conductor's run registry/scheduler).
 - **The filesystem Certificate Store is dev/test only.** The only Store
   implementation shipped so far (`internal/store/filesystem`) has no
