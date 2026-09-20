@@ -102,8 +102,11 @@ catches it:
   Conductor core.
 - Azure (and any future cloud) resources are declared in Bicep, never
   created ad hoc from application code.
-- FQDN policy is validated by both the Conductor and, independently, the
-  Runner.
+- FQDN policy is validated by the Conductor when it accepts a `Target`/
+  `CertificatePolicy`, and the Runner both validates the `JobSpec`
+  document it receives (self-consistency) and authorizes it against its
+  own trusted policy (`policy.RunnerAuthorizationPolicy`) before acting —
+  see `docs/architecture.md`'s "Validation vs. authorization".
 - `JobSpec`/`Result` documents are strictly decoded: unknown fields,
   duplicate keys, and trailing data are always rejected.
 - Production ACME certificate authorities are never called from automated

@@ -16,8 +16,9 @@ The system is split into two binaries with a hard boundary between them:
   that starts Runner executions on whatever execution platform is
   configured. It never touches ACME, DNS or certificate material directly.
 - **`acme-runner`** is the data plane: a one-shot OCI job. It strictly
-  validates the `JobSpec` it receives, re-validates FQDN policy
-  independently of the Conductor, invokes `lego` exactly once, normalizes
+  validates the `JobSpec` it receives, authorizes the request against its
+  own trusted, Runner-side policy (`policy.RunnerAuthorizationPolicy`,
+  Phase 1), invokes `lego` exactly once, normalizes
   the result, writes the certificate directly into an external
   **Certificate Store** (filesystem for local development; Azure Key Vault
   and others in later phases), and exits. It runs no server and no
@@ -83,9 +84,12 @@ below).
 
 ### acme-runner (data plane)
 
-- **JobSpec validation** — strict decoding (see
-  [contract](#jobspecresult-contract)) plus full semantic validation,
-  including an independent FQDN policy re-check.
+- **JobSpec validation and authorization** — strict decoding (see
+  [contract](#jobspecresult-contract)) plus full semantic validation
+  (`JobSpec.Validate`, a self-consistency check of the document itself),
+  followed by authorization against the Runner's own trusted
+  `policy.RunnerAuthorizationPolicy` (Phase 1) — see
+  [Validation vs. authorization](#validation-vs-authorization) below.
 - **lego invocation** — a single subprocess call to the pinned `lego`
   binary with an explicit argument vector built from the validated
   `JobSpec`. No shell is ever invoked to build or run this command.
@@ -214,10 +218,12 @@ Produced by the Conductor, consumed exactly once by a Runner.
 }
 ```
 
-`policy` is a **snapshot**, not a reference: it is the exact policy the
-Runner must re-validate against, copied by value, so that a Runner can be
-fully audited from the `JobSpec` alone without calling back to the
-Conductor.
+`policy` is a **snapshot**, not a reference: it is the policy the Conductor
+applied when it created the job, copied by value so that a run can be fully
+audited from the `JobSpec` alone without calling back to the Conductor. It
+is untrusted input to the Runner, exactly like every other field in the
+document — see
+[Validation vs. authorization](#validation-vs-authorization) below.
 
 Forbidden in a `JobSpec`, by construction of the schema (there is simply no
 field for these, and strict decoding rejects any attempt to add one): a
@@ -226,6 +232,57 @@ container image reference, a client secret / access key / private key, an
 arbitrary cloud resource ID, or an arbitrary output path. Only opaque
 identifiers, a normalized FQDN, policy values, and logical binding names
 ever appear.
+
+### Validation vs. authorization
+
+`pkg/api/v1alpha1/validate.go` and `internal/policy` deliberately separate
+two different questions, and the docs (and code comments) never use the
+word "authorize" for the first one:
+
+- **Validation** — what `JobSpec.Validate` does. It checks that a document
+  is well-formed and **internally self-consistent**: constants and syntax,
+  ranges, that `target.fqdn` and every entry of `policy.allowedDnsSuffixes`
+  are already in canonical form, and that `target.fqdn` lies under one of
+  the suffixes in the `policy` snapshot **embedded in the same document**,
+  on a label boundary, with wildcard use only when that same snapshot
+  allows it. Every value this check compares comes from the document
+  itself. Whoever can produce or alter a `JobSpec` — including a
+  compromised Conductor — can change `target.fqdn` and the `policy`
+  snapshot together and still pass this check, or point a binding name at
+  a different, equally well-formed, registered binding. Passing `Validate`
+  means "this document is coherent," never "this issuance is permitted."
+  See `TestJobSpecValidateIsSelfConsistencyNotAuthorization` in
+  `pkg/api/v1alpha1/validate_test.go`.
+- **Authorization** — what the Runner must do, with its own trusted
+  configuration, before acting on a validated document. This is
+  `policy.RunnerAuthorizationPolicy` and its `Authorize` method
+  (`internal/policy/authorize.go`): a deny-by-default decision evaluated
+  against configuration loaded on the execution platform, never against
+  the `JobSpec`'s own `policy` snapshot. Its fields are:
+  - `AllowedDnsSuffixes` — the DNS suffixes this Runner may issue for.
+  - `AllowWildcard` — whether wildcard names under those suffixes are
+    permitted.
+  - `AllowedACMEBindings`, `AllowedDNSBindings`, `AllowedStoreBindings` —
+    allow-lists of the logical binding names this Runner may select; a
+    binding name that is well-formed but not listed is rejected even if
+    the Runner has configuration for it. Because a `JobSpec`'s binding
+    names are only selectors into this Runner-side configuration, a
+    document whose binding names have been swapped for other registered
+    names is not caught by `Validate` and is caught here instead.
+
+  `Authorize` requires an already-normalized FQDN (it does not normalize on
+  the caller's behalf) and matches suffixes on the same label-boundary
+  rule as validation. Phase 0 defines the policy type and the decision
+  function, with tests; loading the configuration and calling `Authorize`
+  from the Runner before it acts is Phase 1 work. Until Phase 1 ships,
+  nothing independently bounds a `JobSpec`'s content beyond the
+  self-consistency check above (see `docs/threat-model.md`, T1/T2/T5 and
+  "Assurance levels").
+- **Signing's scope.** A signed/authenticated `JobSpec` envelope (planned,
+  Phase 4) protects the document against tampering in transit; it does not
+  by itself address a compromised Conductor that legitimately produces a
+  bad `JobSpec`. Only the Runner-side trusted authorization policy above
+  bounds that case.
 
 ### `CertificateReconcileResult` (`Result`)
 
@@ -269,18 +326,29 @@ Failure:
 }
 ```
 
-`storeObjectRef` is a logical, versionless reference to the stored object
-(for example a Key Vault certificate name) — never a URL with credentials,
-a file system path outside the store, or the object itself. `error.summary`
-is a short, machine-checked, secret-free string: `validate.go` rejects PEM
-headers, bearer tokens, `AKIA`/`ghp_`/`github_pat_` prefixes, JWT-shaped
-base64 (`eyJ`), and any non-printable character (control characters,
-Unicode line/paragraph separators, bidi/format characters), so a `Result`
-can never carry a
-command line, an environment dump, or a credential fragment. `error.code`
-is one of a fixed, append-only set (`InvalidJobSpec`, `PolicyViolation`,
-`BindingNotFound`, `AcmeFailure`, `DnsFailure`, `StoreFailure`, `Timeout`,
-`Cancelled`, `Internal`).
+`storeObjectRef` is a **strict logical name**
+(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, at most 128 characters
+— sized to cover Azure Key Vault certificate names, 1..127 characters — and
+`..` rejected). None of `/ \ : ? # @ % & =` or whitespace can appear, so it
+is never a URL, a URI, a path, or a query string, with or without
+credentials, by construction of the pattern, not just by convention.
+
+`error.summary` is a short, bounded, printable-only string additionally
+checked against the secret-marker heuristic described in
+`pkg/api/v1alpha1/validate.go` (`secretMarkers`) — markers whose meaning
+does not depend on case (`bearer `, `basic `, `authorization:`,
+`password=`, `secret=`, `token=`, `sig=`, `key=`, and similar) are matched
+case-insensitively. That check is defense-in-depth, not a secret detector:
+it cannot recognize an arbitrary secret or an unknown format. The rule that
+actually keeps a `Result` free of raw external output is a Runner
+responsibility (Phase 1): the Runner never copies a raw external
+command/SDK error, stdout, or stderr into a `Result`; `error.summary` is
+generated only from Runner-owned safe templates, and full external details
+go to redacted internal logs only. `error.code` — one of a fixed,
+append-only set (`InvalidJobSpec`, `PolicyViolation`, `BindingNotFound`,
+`AcmeFailure`, `DnsFailure`, `StoreFailure`, `Timeout`, `Cancelled`,
+`Internal`) — is the primary machine-readable signal for API consumers;
+`error.summary` is for humans and is never meant to be parsed.
 
 ### Decoding rules
 
@@ -400,9 +468,13 @@ These hold across every phase and are traced to concrete mitigations in
    credentials, or provider configuration — only the logical names of
    administrator-registered bindings (see
    [binding model](#binding-model)).
-7. FQDN policy is validated by the Conductor **and independently
-   re-validated by the Runner**; the Runner never trusts that the Conductor
-   already did the check.
+7. FQDN policy is validated by the Conductor when it accepts a `Target`/
+   `CertificatePolicy`; the Runner does not trust that the Conductor
+   already did the check. The Runner both **validates** the `JobSpec`
+   document it receives (self-consistency; see
+   [Validation vs. authorization](#validation-vs-authorization)) and
+   **authorizes** it against its own trusted, Runner-side policy — the
+   validation step is not itself authorization.
 8. Production ACME certificate authorities are never called from automated
    tests.
 

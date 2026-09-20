@@ -9,8 +9,10 @@ a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
 **Status: Phase 0 (contracts and skeleton); not usable for issuing
-certificates yet.** See the [roadmap](docs/architecture.md#roadmap) for
-what each phase adds.
+certificates yet.** Phase 0 provides `JobSpec` validation and the
+`policy.RunnerAuthorizationPolicy` authorization decision function, but no
+Runner wiring of that policy yet. See the
+[roadmap](docs/architecture.md#roadmap) for what each phase adds.
 
 ## Architecture
 
@@ -85,8 +87,10 @@ docs/                 architecture, threat model, ADRs
 - API input can only name administrator-registered logical bindings —
   never a command, image, resource ID, credential, or provider
   configuration.
-- FQDN policy is validated by the Conductor **and** independently
-  re-validated by the Runner.
+- FQDN policy is validated by the Conductor; the Runner validates the
+  `JobSpec` document it receives and authorizes it against its own
+  trusted policy (Phase 1) — validating the document is not itself
+  authorization.
 - Production ACME certificate authorities are never called from automated
   tests.
 

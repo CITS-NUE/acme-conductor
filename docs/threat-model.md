@@ -42,8 +42,8 @@ about that gap.
                                                     - NO private key, ever
                                                           |
                                                           | JobSpec (v1alpha1, strictly
-                                                          | decoded, policy re-checked
-                                                          | on the far side)
+                                                          | decoded, self-consistency
+                                                          | checked on the far side)
                                                           v
                                                     [ acme-runner ]
                                                     data plane, one-shot job
@@ -102,12 +102,12 @@ Boundaries that matter:
 
 | # | Threat | Description | Impact | Mitigation (existing / planned) | Phase |
 |---|---|---|---|---|---|
-| T1 | Conductor compromise | An attacker gains code execution or database access on the Conductor. | Attacker can create/modify `Target`s and `CertificatePolicy`, submit arbitrary jobs, or read audit data — but **cannot** obtain private keys, DNS credentials, or Store credentials, because the Conductor never holds them. Worst case is unauthorized issuance requests for FQDNs the Conductor's own policy still constrains, and Runner-side re-validation still applies. | Principle 1/2/5 (no secrets, no DNS/Store credential, separate identity from Runner); FQDN policy re-validated independently by the Runner (T5); append-only audit log for detection; SQLite behind a `Registry` interface so a compromise is contained to one process/host (no multi-replica blast radius in the MVP). | Existing (principles, contract); registry/audit implementation Phase 2 |
-| T2 | JobSpec tampering in transit or at rest | A `JobSpec` is modified between production by the Conductor and consumption by the Runner (e.g. a compromised launcher, a tampered queue message, a modified file). | A tampered `JobSpec` could redirect issuance to an unauthorized FQDN, point at a different binding, or otherwise escape the policy the Conductor intended. | Strict decoding (`pkg/api/v1alpha1/decode.go`: unknown fields, duplicate keys, trailing data, 64 KiB cap all rejected) narrows what a tampered document can even express; the Runner independently re-validates FQDN policy against the `policy` snapshot embedded in the document (T5), so a tampered `policy` block cannot widen what is allowed beyond what the Runner itself would enforce anyway once it re-derives policy from the target's real, server-side state in Phase 2+; bindings resolve to Runner-side configuration, not to attacker-controlled values, so tampering a binding name at worst causes `BindingNotFound`, not privilege escalation. | Existing (decoding, re-validation); signed/authenticated transport for the Launcher-to-Runner path is planned alongside T3 |
+| T1 | Conductor compromise | An attacker gains code execution or database access on the Conductor. | Attacker can create/modify `Target`s and `CertificatePolicy`, submit arbitrary jobs, or read audit data — but **cannot** obtain private keys, DNS credentials, or Store credentials, because the Conductor never holds them. `JobSpec.Validate` only checks that a document is internally self-consistent (T5), so a compromised Conductor can produce a self-consistent `JobSpec` for any FQDN and any registered binding name; nothing on the Runner side bounds that today beyond the document's shape. | Principle 1/2/5 (no secrets, no DNS/Store credential, separate identity from Runner); closed schema, strict decoding and well-formed logical binding names only (T2/T5) constrain what a compromised Conductor can even express, not what it may cause to be issued; append-only audit log for detection; SQLite behind a `Registry` interface so a compromise is contained to one process/host (no multi-replica blast radius in the MVP). **Planned**: a Runner-side `policy.RunnerAuthorizationPolicy`, loaded from trusted administrator configuration and never from the JobSpec, bounds issuance regardless of JobSpec content (Phase 1); an authenticated `JobSpec` with expiry/nonce narrows the window further (Phase 4). | Existing (principles, contract, shape-only limits); Runner authorization Phase 1; registry/audit implementation Phase 2 |
+| T2 | JobSpec tampering in transit or at rest | A `JobSpec` is modified between production by the Conductor and consumption by the Runner (e.g. a compromised launcher, a tampered queue message, a modified file). | A tampered `JobSpec` could redirect issuance to an unauthorized FQDN, point at a different binding, or otherwise escape the policy the Conductor intended. | Strict decoding (`pkg/api/v1alpha1/decode.go`: unknown fields, duplicate keys, trailing data, 64 KiB cap all rejected) limits the *shape* of a tampered document only. A tampered document that remains self-consistent — `target.fqdn` and the embedded `policy` snapshot changed together, or one registered binding name swapped for another well-formed registered binding name — passes `Validate` unchanged (T5); `Validate` cannot detect that kind of tampering by itself, so today's mitigation is shape-only. **Planned**: a Runner-side `RunnerAuthorizationPolicy`, evaluated against trusted configuration that is not part of the document, bounds issuance independently of anything a tampered `JobSpec` claims (Phase 1); a signed/authenticated `JobSpec` envelope with expiry (Phase 4) detects tampering in transit — but signing addresses tampering, not a compromised producer legitimately emitting a bad document in the first place (see T1). | Existing (decoding limits shape only); Runner authorization Phase 1; signed envelope Phase 4 |
 | T3 | JobSpec replay and expiry | An old, previously-valid `JobSpec` is re-submitted (e.g. replayed from a log, a retried queue message, or a captured artifact) after the `Target` it names has since changed or been disabled. | Certificate issuance or renewal against stale policy or a disabled target; potential double execution when combined with T7. | **Planned**: a signed envelope around the `JobSpec` carrying `issuedAt`/`expiresAt` and a `nonce`, checked by the Runner against the run registry before it does anything (a `runId` that is not `queued`/`starting` in the registry, or whose `expiresAt` has passed, is refused). The `target.revision` field already lets a `Result` be matched to the exact target state a job was produced for, which is the building block this check is layered on. | Planned, Phase 4 |
 | T4 | DNS permission abuse | The Runner's DNS credential/workload identity is used (by a compromised Runner, or by DNS-provider-side misconfiguration) to write records outside the one zone the current run needs. | Ability to complete ACME challenges for FQDNs outside the intended scope, or to otherwise tamper with DNS beyond the TXT challenge record. | The Runner's DNS-side workload identity is provisioned per `DnsBinding` and is expected to be scoped by the administrator who registers that binding to the challenge zone and TXT records only — never zone-wide or account-wide DNS write. This scoping is an operational requirement on how each `DnsBinding` is provisioned, not something the JobSpec contract can enforce by itself. | Binding model exists (Phase 0); real DNS credentials wired Phase 1+ |
-| T5 | FQDN policy bypass | An attacker crafts an FQDN or suffix list to slip past the intended policy: mismatched label boundaries, case differences, a trailing dot, an IDNA/punycode label, an unintended wildcard, or a duplicate JSON key that causes two validators to disagree on which value "wins". | Certificate issued for a domain the operator did not intend to authorize (e.g. `evil-example.ac.jp` treated as under `example.ac.jp`). | `internal/policy/fqdn.go` normalizes before comparing (lower-case, single trailing dot stripped, ASCII-only) and matches suffixes on whole label boundaries only (`MatchesSuffix`), so `evil-example.ac.jp` is correctly rejected against the suffix `example.ac.jp`. `xn--` (IDNA A-label) input is rejected outright rather than silently accepted (see ADR 0006) so there is no IDNA confusion to exploit yet. Wildcards are accepted only as the whole left-most label. `pkg/api/v1alpha1/decode.go` rejects duplicate JSON keys before any validator sees the document, closing the classic "two parsers disagree" bypass. The check runs **twice**: once when the Conductor accepts a `Target`/`CertificatePolicy`, and again, independently, when the Runner validates the `JobSpec` it received (Principle 7). | Existing (`internal/policy`, decode/validate) |
-| T6 | Secret leakage into logs/results/errors | A credential, private key, EAB HMAC, access token, or temporary PFX password ends up in a log line, a `Result.error.summary`, or an exception message. | Credential compromise even without direct access to the Conductor or Runner process — e.g. via log aggregation, error trackers, or a leaked `Result` document. | `validate.go`'s `validateOpaqueText` rejects non-printable characters (control characters, Unicode line/paragraph separators, bidi/format characters) and a set of secret markers (`-----BEGIN`, `PRIVATE KEY`, `eyJ` JWT/JWS/EAB-shaped base64, `AKIA`, `ghp_`, `github_pat_`, `Bearer `, `password=`, `secret=`, `token=`) in any `Result` free-text field, so a `Result` cannot carry these even if the Runner's own code tried to put them there. `ResultError` is a fixed machine code plus a short summary — never a raw error, command line, or environment dump. Structured JSON logging rules require `runId`/`targetId` on every line and forbid credentials, private keys, and the ACME EAB HMAC by policy. | Existing (Result validation); logging rules documented (`docs/architecture.md`), enforced by review until a Phase 2+ log-scrubbing test exists |
+| T5 | FQDN policy bypass | An attacker crafts an FQDN or suffix list to slip past the intended policy: mismatched label boundaries, case differences, a trailing dot, an IDNA/punycode label, an unintended wildcard, or a duplicate JSON key that causes two validators to disagree on which value "wins". | Certificate issued for a domain the operator did not intend to authorize (e.g. `evil-example.ac.jp` treated as under `example.ac.jp`). | **Validation** (implemented, both sides of the boundary): `internal/policy/fqdn.go` normalizes before comparing (lower-case, single trailing dot stripped, ASCII-only) and matches suffixes on whole label boundaries only (`MatchesSuffix`), so `evil-example.ac.jp` is correctly rejected against the suffix `example.ac.jp`. `xn--` (IDNA A-label) input is rejected outright rather than silently accepted (see ADR 0006). Wildcards are accepted only as the whole left-most label. `pkg/api/v1alpha1/decode.go` rejects duplicate JSON keys before any validator sees the document, closing the classic "two parsers disagree" bypass. `JobSpec.Validate` checks that `target.fqdn` is consistent with the `policy` snapshot embedded in the same document — this is a self-consistency check of untrusted input, never authorization (see the doc comment on `JobSpec.Validate` and `TestJobSpecValidateIsSelfConsistencyNotAuthorization`). **Authorization** (decision function implemented; not yet wired): `internal/policy.RunnerAuthorizationPolicy.Authorize` decides, against a trusted allowed-suffix/wildcard/binding-name configuration that is loaded on the execution platform and never taken from the JobSpec, whether the Runner may act at all. Loading that configuration and calling it from the Runner is Phase 1 work; until it lands, nothing independently bounds a JobSpec beyond the self-consistency check above (see T1, T2). | Validation existing (`internal/policy`, decode/validate); authorization decision function existing (`internal/policy/authorize.go`), Runner wiring Phase 1 |
+| T6 | Secret leakage into logs/results/errors | A credential, private key, EAB HMAC, access token, or temporary PFX password ends up in a log line, a `Result.error.summary`, or an exception message. | Credential compromise even without direct access to the Conductor or Runner process — e.g. via log aggregation, error trackers, or a leaked `Result` document. | `validate.go`'s `validateOpaqueText` rejects non-printable characters (control characters, Unicode line/paragraph separators, bidi/format characters) and a case-insensitive-where-meaningful set of secret markers (`-----BEGIN`, `private key`, `eyJ` JWT/JWS/EAB-shaped base64, `AKIA`, `ghp_`, `github_pat_`, `bearer `, `basic `, `authorization:`, `password=`, `secret=`, `token=`, `sig=`, `key=`, and similar) in any `Result` free-text field. This is a **defense-in-depth heuristic, not a secret detector**: it catches common accidental leaks by known shape but cannot recognize an arbitrary secret or an unknown format. `storeObjectRef` is now a strict logical name (`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, max 128, `..` rejected) — never a URL, path, query string, or credential-bearing value. `ResultError` is a fixed machine code plus a short summary — never a raw error, command line, or environment dump, by field shape alone. **Planned real control** (Phase 1): the Runner never copies raw external command/SDK errors, stdout, or stderr into a `Result`; `error.summary` is generated only from Runner-owned safe templates; raw external details go to redacted internal logs only; `error.code` is the primary machine-readable signal for API consumers. Structured JSON logging rules require `runId`/`targetId` on every line and forbid credentials, private keys, and the ACME EAB HMAC by policy. | Existing (Result field validation, marker heuristic); template-based safe error translation Phase 1; log redaction tests Phase 2+ |
 | T7 | Double execution / concurrent reconcile of the same target | Two `Run`s for the same `Target` execute concurrently (e.g. a retried scheduler tick, a re-delivered queue message, or an operator manually triggering a run while one is already in flight). | Wasted ACME rate-limit budget, racing writes to the Certificate Store, or two Runners fighting over the same DNS TXT record. | **Planned**: per-target mutual exclusion in the scheduler/launcher, an idempotency key derived from `(targetId, targetRevision)`, and optimistic locking on `Target.revision` so a stale `JobSpec` cannot be actioned against a target that has since moved on. | Planned, Phase 2 |
 | T8 | Supply chain | A malicious or vulnerable dependency, base image, GitHub Action, or `lego` release is pulled into a build. | Compromised build output; a vulnerable component shipped in a released image. | `lego` is pinned to a specific, version-checked release (Phase 1) rather than "latest". Both Dockerfiles build from `golang:1.24-bookworm`, and are documented to switch to a digest-pinned base image at release time; runtime images are `gcr.io/distroless/static-debian12:nonroot` (minimal attack surface, no shell). CI runs `govulncheck` on every push/PR (`.github/workflows/ci.yml`). Deployments are required to pin images by commit SHA or digest, never `latest`. SBOM and provenance generation land in Phase 5. | Partial now (govulncheck, distroless, CGO disabled); digest pinning and SBOM/provenance Phase 5 |
 | T9 | Denial of service via oversized/hostile documents | A very large or deeply-nested `JobSpec`/`Result` document is submitted to exhaust memory or CPU during decoding. | Resource exhaustion on the Conductor or Runner. | `decodeStrict` reads through an `io.LimitReader` capped at `MaxDocumentSize` (64 KiB) and rejects anything larger before decoding. The size cap alone does not bound CPU: a 64 KiB document of nothing but nested brackets can make a naive recursive walker superlinear. The duplicate-key walker therefore also enforces `MaxNestingDepth` (8 levels; the contract needs 3) and renders diagnostic paths only on error, so the cost of any accepted-size document is linear in its length (`TestDecodeRejectsDeepNestingQuickly`). | Existing (`pkg/api/v1alpha1/decode.go`) |
@@ -115,18 +115,71 @@ Boundaries that matter:
 | T11 | Disable vs purge confusion | An operator (or a bug) treats "disable" as if it deletes data, or conversely expects "disable" to also revoke/destroy the certificate. | Either a false sense that sensitive history has been removed, or an unexpected loss of audit trail / certificate availability. | There is no purge operation in the MVP at all (see [ADR 0008](adr/0008-no-purge-in-mvp.md)): `Target.enabled = false` stops future issuance/renewal but leaves the `Target`, its `Run` history, and its `AuditEvent`s intact. A future purge is scoped to be a separate, explicitly audited operation, never a side effect of disable. | Existing as a design decision; `enabled` field implemented Phase 2 |
 | T12 | Production CA misuse from tests | An automated test accidentally issues a real certificate against a production ACME CA (e.g. Let's Encrypt production), burning rate limits or leaving orphaned certificates. | Rate-limit exhaustion affecting real issuance; unintended public certificates for test domains. | Principle 8: production ACME CAs are never called from automated tests. Test fixtures and CI use a local/staging ACME server (`pebble` or the ACME staging directory) exclusively; this is a per-PR review checklist item (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)). | Principle established now; enforced by test-harness setup from Phase 1 |
 
+## Assurance levels
+
+A single "is it secure" question does not fit this system; these three
+lists say precisely what today's Phase 0 code guarantees, what it does not,
+and what closes the gap.
+
+**Guaranteed today:**
+
+- A closed schema: unknown fields, duplicate JSON keys, trailing data,
+  oversized documents (> 64 KiB), and over-deep documents (> 8 levels) are
+  all rejected before a validator ever sees them.
+- `target.fqdn` and the embedded `policy` snapshot are internally
+  consistent within a `JobSpec` — `Validate` rejects a document where they
+  disagree.
+- ACME/DNS/Store bindings are accepted only as restricted-form logical
+  names (`bindingNameRe`), never as a URL, path, command, or credential.
+- `Result` free text (`error.summary`) is bounded in size, restricted to
+  printable characters, and checked against a known-marker heuristic.
+- `storeObjectRef` is a restricted logical name
+  (`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, max 128, `..`
+  rejected) — never a URL or a path.
+
+**Not guaranteed today:**
+
+- That the entity that produced a `JobSpec` is legitimate.
+- That the `policy` snapshot embedded in a `JobSpec` is trustworthy.
+- That issuance scope is bounded when the Conductor itself is compromised.
+- Replay prevention (an old, previously-valid `JobSpec` being rejected).
+- Complete detection of arbitrary secrets by the `error.summary` marker
+  check — it is a heuristic for known shapes, not a secret detector.
+- Removal of secrets from all log output across the codebase.
+
+**Planned:**
+
+- Runner-side trusted authorization policy
+  (`policy.RunnerAuthorizationPolicy`, Phase 1).
+- ACME/DNS/Store binding allow-lists enforced from trusted configuration
+  (Phase 1, part of the same policy).
+- Safe error translation that never forwards raw external errors, stdout,
+  or stderr into a `Result` (Phase 1).
+- `JobSpec` authentication, integrity, and expiry (Phase 4).
+- Log redaction tests (Phase 2+).
+
 ## Residual risks / not yet mitigated
 
 Phase 0 has shipped the contract, the FQDN policy engine, and CI — no
 runtime exists yet. Being explicit about what that means:
 
-- **No signing or authentication of the `JobSpec` itself yet.** T2's
-  mitigation today is "a tampered document can't express more than the
-  schema allows, and the Runner re-checks policy anyway" — there is no
-  cryptographic integrity check on the document in transit. This is
-  acceptable while the only transport is "the same local process passes a
-  Go struct" (Phase 0/1) but must land before the Conductor and Runner run
-  on separate hosts trusting an untrusted transport.
+- **No Runner-side authorization wired yet (T1, T2, T5).** The decision
+  function (`policy.RunnerAuthorizationPolicy.Authorize`) exists and is
+  tested, but nothing loads trusted configuration or calls it from a
+  Runner yet — there is no Runner runtime in Phase 0. Until Phase 1 wires
+  it in, the only control on a `JobSpec`'s content is `Validate`'s
+  self-consistency check, which a compromised or malicious producer of the
+  document can satisfy for any FQDN or registered binding name.
+- **No signing or authentication of the `JobSpec` itself yet (T2, T3).**
+  Today's mitigation is shape-only: strict decoding limits what a tampered
+  document can express, but a self-consistent tampered document (fqdn and
+  policy changed together, or a binding name swapped) still passes
+  `Validate`. There is no cryptographic integrity check on the document in
+  transit. This is acceptable while the only transport is "the same local
+  process passes a Go struct" (Phase 0/1) but must land before the
+  Conductor and Runner run on separate hosts trusting an untrusted
+  transport — and even then, signing only addresses tampering, not a
+  compromised Conductor legitimately producing a bad `JobSpec` (see T1).
 - **No replay/expiry enforcement yet (T3).** `RunID` and `target.revision`
   exist in the contract, but nothing currently checks them against a run
   registry — there is no run registry yet.
@@ -137,6 +190,10 @@ runtime exists yet. Being explicit about what that means:
   currently design commitments, not enforced permissions, because no
   binding is wired to a real credential or workload identity until Phase
   1/3/4.
+- **The secret-marker heuristic is not a secret detector (T6).** It cannot
+  detect an arbitrary or unknown-format secret; it is defense-in-depth on
+  top of the Phase 1 plan of never copying raw external output into a
+  `Result` at all.
 - **No log-scrubbing test.** T6's mitigation covers the `Result` document
   (code-enforced) but not arbitrary log statements elsewhere in the
   codebase; that relies on code review and the per-PR checklist until a

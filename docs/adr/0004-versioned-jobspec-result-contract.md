@@ -34,8 +34,10 @@ JSON shape.
   cloud resource ID. Bindings are resolved to real configuration only on
   the Runner side, from Runner-side administrator configuration.
 - A `Result` carries a fixed, append-only `ErrorCode` enum plus a
-  length-bounded, secret-scanned `error.summary` — never a raw error,
-  stack trace, command line, or environment dump.
+  length-bounded `error.summary` checked against a defense-in-depth
+  secret-marker heuristic (not a secret detector — see "Validation vs
+  authorization" below) — never a raw error, stack trace, command line, or
+  environment dump.
 - The Go validation in `pkg/api/v1alpha1` is authoritative. JSON Schemas
   under `schemas/v1alpha1/` mirror it for external tooling and human
   reference, and a test (`pkg/api/v1alpha1/schema_test.go` and its
@@ -50,6 +52,55 @@ JSON shape.
   anything that would reject a previously valid document requires a new
   `apiVersion`/`kind` pair and a new schema file (e.g. `v1alpha2`), never an
   in-place edit of a shipped schema.
+
+### Validation vs authorization
+
+The contract deliberately separates two things, and this ADR states the
+split explicitly because it is easy to conflate them:
+
+- **`JobSpec.Validate`** (`pkg/api/v1alpha1/validate.go`) checks
+  **structure, normalization, and self-consistency**: constants and
+  syntax, ranges, that `target.fqdn` and the `policy` snapshot's suffixes
+  are already in canonical form, and that `target.fqdn` is consistent with
+  the `policy` snapshot embedded in the same document. Every value it
+  compares comes from the document itself, so a party that can produce or
+  alter the whole document — including a compromised Conductor — can
+  change `target.fqdn` and the `policy` snapshot together, or swap a
+  binding name for another well-formed, registered one, and still pass
+  `Validate`. This method is never called authorization, in code comments
+  or here.
+- **Authorization** is `policy.RunnerAuthorizationPolicy.Authorize`
+  (`internal/policy/authorize.go`), evaluated by the Runner against
+  configuration it trusts, not against anything carried in the `JobSpec`.
+  Its five fields: `AllowedDnsSuffixes`, `AllowWildcard`,
+  `AllowedACMEBindings`, `AllowedDNSBindings`, `AllowedStoreBindings`.
+  Every list is deny-by-default. Phase 0 ships the type and the decision
+  function with tests; loading the configuration and wiring `Authorize`
+  into the Runner's execution path is Phase 1 work.
+- **Signing's scope.** A future signed/authenticated `JobSpec` envelope
+  (Phase 4) protects the document against tampering in transit between
+  production and consumption. It does not address a compromised Conductor
+  that legitimately produces a self-consistent but wrongful `JobSpec` —
+  only the Runner-side `RunnerAuthorizationPolicy` bounds that case,
+  because it never trusts anything from the document itself.
+- **`storeObjectRef`** is a strict logical name
+  (`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, at most 128
+  characters — covering Azure Key Vault certificate names, 1..127
+  characters — with `..` rejected), never a URL, URI, path, or query
+  string.
+- **`error.summary`** is bounded in length and printable-character class,
+  and checked against a defense-in-depth secret-marker heuristic
+  (`secretMarkers`, case-insensitive where the marker's meaning does not
+  depend on case) — not a secret detector. The control that actually keeps
+  raw external output out of a `Result` is a Runner responsibility (Phase
+  1): the Runner never copies a raw external command/SDK error, stdout, or
+  stderr into `error.summary`; summaries come only from Runner-owned safe
+  templates, and `error.code` is the primary machine-readable signal for
+  API consumers.
+
+See `docs/threat-model.md` (T1, T2, T5, "Assurance levels") and
+`docs/architecture.md` ("Validation vs. authorization") for the full
+reasoning.
 
 ## Consequences
 

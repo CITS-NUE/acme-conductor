@@ -97,6 +97,9 @@ it does not apply):
 - [ ] Are migration/backup/restore/rollback steps documented for this
       change?
 - [ ] Do any tests call a production ACME CA? (They must not.)
+- [ ] Is validation (self-consistency) kept distinct from authorization
+      (trusted Runner policy) in code comments and docs?
+- [ ] Does the Runner copy raw external output into a `Result`?
 
 See [`docs/threat-model.md`](docs/threat-model.md) for the reasoning behind
 each of these.
