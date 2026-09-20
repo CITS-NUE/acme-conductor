@@ -72,7 +72,17 @@ func ObjectName(fqdn string) string {
 	if len(readable) > max {
 		readable = strings.TrimRight(readable[:max], ".-")
 	}
+	// A normalized FQDN always starts with a letter, digit or "*." and is
+	// non-empty; anything else (defensive path only) gets a fixed prefix so
+	// the result still satisfies the contract.
+	if readable == "" || !isAlnum(readable[0]) {
+		readable = "target-" + readable
+	}
 	return readable + suffix
+}
+
+func isAlnum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 // ParseLeaf parses the first CERTIFICATE block of pemData.
