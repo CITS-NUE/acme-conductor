@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -260,15 +261,20 @@ var (
 	pemEndRe   = regexp.MustCompile(`-----END [A-Z0-9 ]+-----`)
 )
 
-// NewRedactor returns a redactor for the given secret values. Empty and
-// very short values are ignored: masking every "a" would destroy the log.
+// NewRedactor returns a redactor for the given secret values. Every
+// non-empty value is masked regardless of its length: the invariant is that
+// a passthrough or EAB value never appears in a log line, and a short value
+// that happens to be a common substring only costs readability of the
+// debug-level lego output, never a leak. Longer values are masked first so
+// that a value which contains another one is not left partially visible.
 func NewRedactor(secrets []string) *Redactor {
 	r := &Redactor{}
 	for _, s := range secrets {
-		if len(s) >= 4 {
+		if s != "" {
 			r.secrets = append(r.secrets, s)
 		}
 	}
+	sort.Slice(r.secrets, func(i, j int) bool { return len(r.secrets[i]) > len(r.secrets[j]) })
 	return r
 }
 

@@ -284,14 +284,26 @@ directories sort and are unique. A `Put` writes a complete new version
 directory (mode `0700`, files mode `0600`, all fsynced) and only then
 swaps the `current` symlink into place with a single `rename`, so a reader
 always observes either the complete previous version or the complete new
-one, never a partial write. Older version directories are pruned after
-the swap.
+one, never a partial write. `Put` holds an exclusive advisory lock
+(`<object>/.lock`, `flock`) for the whole operation, so writers on the
+same object are serialized: the last writer to take the lock wins, and
+the pruning of older version directories that follows the swap can never
+remove a version a concurrent writer has just published. `Current`
+verifies that `privkey.pem` exists and matches `cert.pem`; a published
+version that is incomplete or inconsistent is reported as an error, not
+as a healthy certificate, and `Put` refuses a bundle whose key does not
+match its certificate.
 
 `<object>` is derived from the target FQDN by `store.ObjectName`: a
 human-readable prefix (`wiki.example.ac.jp`, or `wildcard.example.ac.jp`
-for a wildcard name) plus an 8-hex-character suffix that is the first 4
-bytes of the SHA-256 of the exact FQDN, so a wildcard object name can
-never collide with a literal host happening to be called `wildcard`.
+for a wildcard name) plus a 16-hex-character suffix that is the first 8
+bytes (64 bits) of the SHA-256 of the exact FQDN. The suffix is what keeps
+a wildcard name apart from a host literally called `wildcard`, and two
+long names that truncate to the same readable prefix apart from each
+other; a collision between two registered names is not a practical
+concern at 64 bits, but it is not impossible, and its effect would be two
+targets sharing one store object (an availability fault, never a key
+disclosure).
 
 ## Directories and container usage
 
@@ -368,8 +380,10 @@ Logs are structured JSON on stderr, always UTC, and carry `runId` /
 **debug** level, per stream, after redaction:
 
 - Any value the Runner considers a secret (a resolved `passthroughEnv`
-  value or an EAB `kid`/`hmac` value, when at least 4 characters long) is
-  replaced with `[REDACTED]` wherever it appears in the line.
+  value or an EAB `kid`/`hmac` value, whatever its length) is replaced
+  with `[REDACTED]` wherever it appears in the line; longer values are
+  masked before shorter ones they contain. A very short value costs
+  readability of the debug-level lego output, never a leak.
 - PEM blocks are suppressed statefully, per stream: the `-----BEGIN ...-----`
   line is replaced with `[REDACTED PEM]`, and every following line up to and
   including the `-----END ...-----` line is dropped, so the base64 body of a
@@ -425,21 +439,29 @@ across the rest of the codebase's log statements is still Phase 2+ work
   OOM) cannot run it, so every start also sweeps `run-*` directories under
   `workDir` older than twice `lego.timeoutSeconds`. Mount `workDir` as a
   tmpfs/emptyDir that dies with the container so nothing survives at all.
-- ACME account state is swapped into `stateDir/accounts` with renames;
-  a crash leaves either the previous or the new state.
+- ACME account state is published as a versioned directory under
+  `stateDir/accounts.d/` and `stateDir/accounts` is a symbolic link that
+  is swapped with one `rename` (then `stateDir` is fsynced); older
+  versions are pruned afterwards. There is no moment at which `accounts`
+  is absent, so a crash at any point leaves either the previous or the
+  new state referenced. The persisted files are fsynced before the swap.
 - The filesystem store refuses to write through a symbolic link at the
-  object or `versions` level, and pruning only removes versions older
-  than the one just written, so a concurrent writer that won the
-  `current` swap keeps its files. Two Runners writing the same object
-  concurrently are still not coordinated (see Limitations).
+  object or `versions` level, serializes `Put` per object with an
+  advisory lock, and prunes only under that lock, so concurrent writers
+  cannot leave `current` dangling (see Certificate Store above).
+- A certificate whose `NotBefore` lies more than 5 minutes in the future
+  is rejected when lego produces it (`AcmeFailure`) and, when found in
+  the store, is treated as unusable and reissued.
 
 ## Limitations in Phase 1
 
 - The filesystem Certificate Store is for **local development and tests
   only** — it has no access control of its own beyond filesystem
   permissions and is not a substitute for a real secrets store.
-- No concurrency control: two Runner processes sharing a `stateDir` (or
-  targeting the same store object) can race; this is deferred to Phase 2.
+- No run-level concurrency control: two Runner processes for the same
+  target can both issue (double issuance, ACME rate-limit cost). The
+  filesystem store and the account state survive that (last writer wins),
+  but nothing prevents it; per-target exclusion is Phase 2.
 - Only one store backend (`filesystem`) and one execution shape (a single
   local process per run) exist; Azure Key Vault (Phase 3) and an Azure
   Container Apps Job launcher (Phase 4) are not implemented yet.

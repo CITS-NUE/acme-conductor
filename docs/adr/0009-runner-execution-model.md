@@ -45,11 +45,18 @@ it can safely call the pinned `lego` binary (see
   private key**, in `lego.stateDir` (an explicitly different, persistent
   directory — `config.Lego.validate` rejects a configuration where
   `stateDir` equals `workDir`). Only the `accounts` subtree lego writes
-  under `--path` is copied in before the run and copied back with a
-  rename-swap (`persistAccounts`) after — regardless of whether the run
-  succeeded — so ACME account continuity across runs does not depend on
-  this run's private key, which is destroyed with the work directory
-  either way.
+  under `--path` is copied in before the run and published back after —
+  regardless of whether the run succeeded — as a new versioned directory
+  under `stateDir/accounts.d/` that `stateDir/accounts` (a symbolic link)
+  is atomically re-pointed to (`persistAccounts`). A directory cannot be
+  replaced atomically with `rename(2)`, but a symbolic link can, so there
+  is no window in which the account state is absent; the files are fsynced
+  before the swap and the parent directory after it. ACME account
+  continuity across runs therefore does not depend on this run's private
+  key, which is destroyed with the work directory either way. Losing the
+  account would mean registering a new one (rate-limited, and with EAB
+  possibly impossible without a new credential), which is why this is
+  treated as durable state rather than a cache.
 - **The Runner always invokes `lego run`, never `lego renew`.** Because
   the work directory is fresh on every run and never carries a previous
   `certificates` resource across runs (only `accounts` is persisted), a

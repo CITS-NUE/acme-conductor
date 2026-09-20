@@ -35,6 +35,12 @@ const (
 	EnvMode = "FAKE_LEGO_MODE"
 	// EnvDays sets the certificate validity in days (default 90).
 	EnvDays = "FAKE_LEGO_DAYS"
+	// EnvNotBeforeHours shifts the certificate's NotBefore by this many
+	// hours from now (default -1; a positive value yields a not-yet-valid
+	// certificate).
+	EnvNotBeforeHours = "FAKE_LEGO_NOTBEFORE_HOURS"
+	// EnvExtraSAN adds a second subject alternative name to the certificate.
+	EnvExtraSAN = "FAKE_LEGO_EXTRA_SAN"
 	// EnvRecord names a file to which argv and environment are written as
 	// JSON so tests can characterize the exact invocation.
 	EnvRecord = "FAKE_LEGO_RECORD"
@@ -128,7 +134,17 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	if mode == "wrongdomain" {
 		certDomain = "other.example.net"
 	}
-	certPEM, keyPEM, issuerPEM, err := selfSigned(certDomain, flags["key-type"], days)
+	notBefore := -1
+	if v := getenv(EnvNotBeforeHours); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			notBefore = n
+		}
+	}
+	names := []string{certDomain}
+	if extra := getenv(EnvExtraSAN); extra != "" {
+		names = append(names, extra)
+	}
+	certPEM, keyPEM, issuerPEM, err := selfSigned(names, flags["key-type"], days, notBefore)
 	if err != nil {
 		fmt.Fprintln(stderr, "fake lego:", err)
 		return 1
@@ -192,7 +208,8 @@ func hostOf(server string) string {
 	return strings.ReplaceAll(s, ":", "_")
 }
 
-func selfSigned(domain, keyType string, days int) (certPEM, keyPEM, issuerPEM []byte, err error) {
+func selfSigned(names []string, keyType string, days, notBeforeHours int) (certPEM, keyPEM, issuerPEM []byte, err error) {
+	domain := names[0]
 	var pub any
 	switch keyType {
 	case "rsa2048", "rsa3072", "rsa4096":
@@ -235,8 +252,8 @@ func selfSigned(domain, keyType string, days int) (certPEM, keyPEM, issuerPEM []
 	leafTmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: domain},
-		DNSNames:     []string{domain},
-		NotBefore:    now.Add(-time.Hour),
+		DNSNames:     names,
+		NotBefore:    now.Add(time.Duration(notBeforeHours) * time.Hour),
 		NotAfter:     now.Add(time.Duration(days) * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

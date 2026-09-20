@@ -76,13 +76,20 @@ func sweepStaleWorkDirs(parent string, staleAfter time.Duration, now time.Time) 
 // creating dst. Symbolic links and special files are skipped. Directories
 // are created 0700 and files 0600 regardless of their source mode.
 func copyTree(src, dst string) error {
-	info, err := os.Lstat(src)
+	// The root may be a symbolic link (the state directory's "accounts"
+	// pointer); it is resolved once here. Links below the root are skipped.
+	resolved, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return err
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", src)
 	}
+	src = resolved
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -131,9 +138,24 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// persistAccounts copies the "accounts" subtree of the work directory back
-// into stateDir, replacing the previous copy with a rename so a crash in
-// the middle leaves either the old or the new state.
+// accountVersionsDir holds the versioned copies of the ACME account state;
+// <stateDir>/accounts is a symbolic link to the current one.
+const accountVersionsDir = "accounts.d"
+
+// persistAccounts publishes the "accounts" subtree of the work directory as
+// the current ACME account state:
+//
+//  1. copy it to <stateDir>/accounts.d/<unix-nanos>-<nonce>/ (files 0600,
+//     fsynced), fsync that directory;
+//  2. point <stateDir>/accounts at it by creating a temporary symbolic
+//     link and renaming it over "accounts" (one atomic step), fsync
+//     stateDir;
+//  3. remove older versions.
+//
+// There is no moment at which "accounts" is absent: a crash before step 2
+// leaves the previous pointer intact, a crash after it leaves the new one.
+// A pre-existing plain "accounts" directory (not a link) is moved into
+// accounts.d before the swap so nothing is lost.
 func persistAccounts(work, stateDir string) error {
 	src := filepath.Join(work, lego.AccountsDir)
 	if _, err := os.Lstat(src); err != nil {
@@ -142,31 +164,66 @@ func persistAccounts(work, stateDir string) error {
 		}
 		return err
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	versions := filepath.Join(stateDir, accountVersionsDir)
+	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return err
 	}
 	var nonce [4]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return err
 	}
-	suffix := hex.EncodeToString(nonce[:])
-	fresh := filepath.Join(stateDir, ".accounts-new-"+suffix)
+	version := fmt.Sprintf("%d-%s", time.Now().UnixNano(), hex.EncodeToString(nonce[:]))
+	fresh := filepath.Join(versions, version)
 	if err := copyTree(src, fresh); err != nil {
 		os.RemoveAll(fresh)
 		return err
 	}
+	if err := fsyncDir(fresh); err != nil {
+		os.RemoveAll(fresh)
+		return err
+	}
 	final := filepath.Join(stateDir, lego.AccountsDir)
-	old := filepath.Join(stateDir, ".accounts-old-"+suffix)
-	if err := os.Rename(final, old); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if info, err := os.Lstat(final); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		// Legacy layout: keep the directory as an unreferenced version.
+		if err := os.Rename(final, filepath.Join(versions, "legacy-"+version)); err != nil {
+			os.RemoveAll(fresh)
+			return err
+		}
+	}
+	linkTmp := filepath.Join(stateDir, ".accounts-"+hex.EncodeToString(nonce[:]))
+	if err := os.Symlink(filepath.Join(accountVersionsDir, version), linkTmp); err != nil {
 		os.RemoveAll(fresh)
 		return err
 	}
-	if err := os.Rename(fresh, final); err != nil {
-		// Try to put the old state back.
-		_ = os.Rename(old, final)
+	if err := os.Rename(linkTmp, final); err != nil {
+		os.Remove(linkTmp)
 		os.RemoveAll(fresh)
 		return err
 	}
-	_ = os.RemoveAll(old)
+	if err := fsyncDir(stateDir); err != nil {
+		return err
+	}
+	// Prune every version except the one now referenced.
+	entries, err := os.ReadDir(versions)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if e.Name() != version && e.IsDir() {
+			_ = os.RemoveAll(filepath.Join(versions, e.Name()))
+		}
+	}
+	return nil
+}
+
+func fsyncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open directory for sync: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync directory: %w", err)
+	}
 	return nil
 }

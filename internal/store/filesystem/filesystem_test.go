@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -364,7 +365,7 @@ func TestPutRejectsSymlinkedObjectDirectory(t *testing.T) {
 	}
 }
 
-func TestPruneKeepsNewerVersionsAndForeignDirectories(t *testing.T) {
+func TestPruneRemovesOtherStoreVersionsButNotForeignDirectories(t *testing.T) {
 	root := t.TempDir()
 	st, err := New(root)
 	if err != nil {
@@ -381,21 +382,145 @@ func TestPruneKeepsNewerVersionsAndForeignDirectories(t *testing.T) {
 		t.Fatalf("expected one version, got %v", entries)
 	}
 	mine := entries[0].Name()
-	newer := strings.Repeat("0", 16) + "-99999999999999999999"
+	other := strings.Repeat("0", 16) + "-99999999999999999999"
 	foreign := "not-mine-but-has-a-dash"
 	tmp := ".tmp-abandoned"
-	for _, d := range []string{newer, foreign, tmp} {
+	for _, d := range []string{other, foreign, tmp} {
 		if err := os.Mkdir(filepath.Join(versions, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	st.prune(versions, mine)
-	for _, d := range []string{mine, newer, foreign} {
+	for _, d := range []string{mine, foreign} {
 		if _, err := os.Stat(filepath.Join(versions, d)); err != nil {
 			t.Fatalf("%s must survive prune: %v", d, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(versions, tmp)); err == nil {
-		t.Fatalf("abandoned temporary directory must be pruned")
+	for _, d := range []string{other, tmp} {
+		if _, err := os.Stat(filepath.Join(versions, d)); err == nil {
+			t.Fatalf("%s must be pruned", d)
+		}
+	}
+}
+
+// TestConcurrentPutsNeverLeaveCurrentDangling is the regression test for
+// the prune race: many writers with deliberately inverted timestamps race
+// on one object; afterwards "current" must resolve to an existing,
+// complete version and it must be the only version left.
+func TestConcurrentPutsNeverLeaveCurrentDangling(t *testing.T) {
+	root := t.TempDir()
+	object := "wiki.example.ac.jp-deadbeef"
+	const writers = 8
+	type bundle struct {
+		b  store.Bundle
+		fp string
+	}
+	bundles := make([]bundle, writers)
+	for i := range bundles {
+		c, k, cert := genCert(t, "wiki.example.ac.jp")
+		bundles[i] = bundle{store.Bundle{Certificate: c, PrivateKey: k}, store.Fingerprint(cert)}
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	start := make(chan struct{})
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Inverted clocks: later writers see older timestamps.
+			st := &Store{Root: root, Now: func() time.Time { return time.Unix(0, int64(writers-i)) }}
+			<-start
+			errs <- st.Put(context.Background(), object, bundles[i].b)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	st, _ := New(root)
+	info, err := st.Current(context.Background(), object)
+	if err != nil {
+		t.Fatalf("Current after concurrent puts: %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(root, object, "current"))
+	if _, err := os.Stat(filepath.Join(root, object, target)); err != nil {
+		t.Fatalf("current -> %s is dangling: %v", target, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(root, object, "versions"))
+	if len(entries) != 1 {
+		t.Fatalf("expected one surviving version, got %d", len(entries))
+	}
+	found := false
+	for _, b := range bundles {
+		if b.fp == info.FingerprintSHA256 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("current certificate is none of the written bundles")
+	}
+}
+
+func TestPutBlocksWhileObjectLockIsHeld(t *testing.T) {
+	root := t.TempDir()
+	object := "wiki.example.ac.jp-deadbeef"
+	dir := filepath.Join(root, object)
+	unlock, err := lockObject(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := New(root)
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	done := make(chan error, 1)
+	go func() {
+		done <- st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Put completed while the lock was held: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Put did not complete after unlock")
+	}
+}
+
+func TestCurrentRequiresMatchingPrivateKey(t *testing.T) {
+	root := t.TempDir()
+	st, _ := New(root)
+	object := "wiki.example.ac.jp-deadbeef"
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(root, object, "current", "privkey.pem")
+	// Missing key.
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Current(context.Background(), object); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Current must fail (not NotFound) without a key: %v", err)
+	}
+	// Key of another certificate.
+	_, otherKey, _ := genCert(t, "wiki.example.ac.jp")
+	if err := os.WriteFile(keyPath, otherKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Current(context.Background(), object); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Current must fail with a mismatched key: %v", err)
+	}
+	// Put refuses a mismatched bundle up front.
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: otherKey}); err == nil {
+		t.Fatal("Put accepted a mismatched key")
 	}
 }

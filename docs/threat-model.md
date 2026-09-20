@@ -173,8 +173,10 @@ it does not, and what closes the gap.
   shapes/values, not general secret detectors.
 - Removal of secrets from all log output across the codebase (the
   `lego`-output redactor covers only `lego`'s own stdout/stderr).
-- Mutual exclusion between two Runner processes sharing the same
-  `stateDir` or targeting the same store object.
+- Mutual exclusion between two Runner *runs* for the same target: both
+  can issue. (The filesystem store serializes writes per object with an
+  advisory lock and the account state is swapped atomically, so neither
+  is corrupted by it, but the double issuance itself is not prevented.)
 
 **Planned:**
 
@@ -206,12 +208,13 @@ about what remains open:
   launcher, or run registry: nothing outside the Runner itself prevents
   two `reconcile` invocations for the same target from running at once.
   A Phase 1 Runner runtime now exists, which sharpens this specific
-  residual risk rather than removing it: **`stateDir` concurrency** — two
-  Runner processes given the same `lego.stateDir` race on the
-  rename-swap that persists ACME account state
-  (`internal/runner/workdir.go`'s `persistAccounts`); nothing in the
-  Runner serializes that. Per-target mutual exclusion across runs is
-  Phase 2 work (the Conductor's run registry/scheduler).
+  residual risk rather than removing it: two Runner processes for the
+  same target both talk to the CA (double issuance, rate-limit cost) and
+  both register or refresh account state. The account state swap is
+  atomic (last writer wins) and the filesystem store serializes `Put`
+  per object, so neither is corrupted, but the duplicate work is not
+  prevented. Per-target mutual exclusion across runs is Phase 2 work
+  (the Conductor's run registry/scheduler).
 - **The filesystem Certificate Store is dev/test only.** The only Store
   implementation shipped so far (`internal/store/filesystem`) has no
   access control beyond filesystem permissions and is not a production

@@ -7,8 +7,16 @@
 //
 // A Put writes a complete new version directory (0700, files 0600, fsynced)
 // and then replaces the "current" symlink with a single rename, so a reader
-// always sees either the previous complete version or the new one. Older
-// versions are pruned after the swap.
+// always sees either the previous complete version or the new one. Puts on
+// the same object are serialized with an exclusive advisory lock
+// (<root>/<object>/.lock) held for the whole operation, so pruning of older
+// versions after the swap can never remove the version a concurrent writer
+// just published: the last writer to acquire the lock wins and its version
+// is the only one left.
+//
+// Current verifies that the stored private key exists and matches the
+// certificate, so a bundle that is present but unusable is reported as an
+// error rather than as a valid current certificate.
 package filesystem
 
 import (
@@ -20,7 +28,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +41,7 @@ const Type = "filesystem"
 const (
 	currentLink = "current"
 	versionsDir = "versions"
+	lockFile    = ".lock"
 	certFile    = "cert.pem"
 	chainFile   = "chain.pem"
 	fullFile    = "fullchain.pem"
@@ -62,7 +70,7 @@ func New(root string) (*Store, error) {
 func (s *Store) Type() string { return Type }
 
 // versionRe matches the version directories this store creates.
-var versionRe = regexp.MustCompile(`^[0-9a-f]{16}-([0-9]+)$`)
+var versionRe = regexp.MustCompile(`^[0-9a-f]{16}-[0-9]+$`)
 
 func (s *Store) objectDir(object string) (string, error) {
 	if !v1alpha1.IsStoreObjectRef(object) {
@@ -79,7 +87,10 @@ func (s *Store) objectDir(object string) (string, error) {
 	return dir, nil
 }
 
-// Current implements store.Store.
+// Current implements store.Store. It returns ErrNotFound when no version
+// has been published, and an error (never ErrNotFound) when the published
+// version is incomplete or inconsistent, so a corrupted store fails closed
+// instead of being reported as a healthy certificate.
 func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
 	dir, err := s.objectDir(object)
 	if err != nil {
@@ -95,6 +106,13 @@ func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
 	leaf, err := store.ParseLeaf(data)
 	if err != nil {
 		return nil, fmt.Errorf("stored certificate for %q is unreadable: %w", object, err)
+	}
+	key, err := os.ReadFile(filepath.Join(dir, currentLink, keyFile))
+	if err != nil {
+		return nil, fmt.Errorf("stored private key for %q is unreadable: %w", object, err)
+	}
+	if err := store.PrivateKeyMatches(leaf, key); err != nil {
+		return nil, fmt.Errorf("stored private key for %q is unusable: %w", object, err)
 	}
 	return store.InfoOf(leaf), nil
 }
@@ -112,10 +130,18 @@ func (s *Store) Put(_ context.Context, object string, b store.Bundle) (err error
 	if len(b.PrivateKey) == 0 {
 		return errors.New("bundle has no private key")
 	}
+	if err := store.PrivateKeyMatches(leaf, b.PrivateKey); err != nil {
+		return fmt.Errorf("bundle: %w", err)
+	}
 	versions := filepath.Join(dir, versionsDir)
 	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
 	}
+	unlock, err := lockObject(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var nonce [4]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("random nonce: %w", err)
@@ -169,36 +195,23 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
-// prune removes version directories this store created that are older
-// than keep, plus abandoned temporary directories. Newer versions are left
-// alone: if a concurrent Put won the "current" swap, its version must
-// survive. Failures are ignored: a leftover old version is harmless.
+// prune removes every version directory this store created except keep,
+// plus abandoned temporary directories. It runs under the object lock, so
+// keep is by construction the version that "current" points to and no
+// concurrent writer can be publishing another one.
 func (s *Store) prune(versions, keep string) {
 	entries, err := os.ReadDir(versions)
 	if err != nil {
 		return
 	}
-	keepStamp := versionStamp(keep)
 	for _, e := range entries {
 		if e.Name() == keep || !e.IsDir() {
 			continue
 		}
-		switch {
-		case strings.HasPrefix(e.Name(), ".tmp-"):
-			os.RemoveAll(filepath.Join(versions, e.Name()))
-		case versionRe.MatchString(e.Name()) && versionStamp(e.Name()) < keepStamp:
+		if strings.HasPrefix(e.Name(), ".tmp-") || versionRe.MatchString(e.Name()) {
 			os.RemoveAll(filepath.Join(versions, e.Name()))
 		}
 	}
-}
-
-func versionStamp(name string) int64 {
-	m := versionRe.FindStringSubmatch(name)
-	if m == nil {
-		return 0
-	}
-	n, _ := strconv.ParseInt(m[1], 10, 64)
-	return n
 }
 
 func writeFile(path string, content []byte) error {

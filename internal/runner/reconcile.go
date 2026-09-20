@@ -38,6 +38,11 @@ import (
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
+// clockSkewTolerance is how far in the future a certificate's NotBefore may
+// lie and still be treated as valid now. CAs backdate NotBefore by about an
+// hour; a larger offset indicates a wrong clock or a malformed certificate.
+const clockSkewTolerance = 5 * time.Minute
+
 // Exit codes of a reconcile.
 const (
 	// ExitSucceeded: a Result with status "succeeded" was written.
@@ -217,13 +222,17 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	default:
 		renewBefore := time.Duration(spec.Policy.RenewBeforeDays) * 24 * time.Hour
 		covers := containsFold(current.DNSNames, spec.Target.FQDN)
-		if covers && current.NotAfter.After(now.Add(renewBefore)) {
+		valid := !current.NotBefore.After(now.Add(clockSkewTolerance))
+		if covers && valid && current.NotAfter.After(now.Add(renewBefore)) {
 			log.Info("certificate is current; nothing to do", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 			return &outcome{action: v1alpha1.ActionNoop, info: current, objectRef: object, storeType: st.Type()}, nil
 		}
-		if !covers {
+		switch {
+		case !covers:
 			log.Warn("stored certificate does not cover the target; reissuing", "fingerprintSha256", current.FingerprintSHA256)
-		} else {
+		case !valid:
+			log.Warn("stored certificate is not yet valid; reissuing", "fingerprintSha256", current.FingerprintSHA256, "notBefore", current.NotBefore.Format(time.RFC3339))
+		default:
 			log.Info("certificate is due for renewal", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 		}
 	}
@@ -309,6 +318,12 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	}
 	if !leaf.NotAfter.After(now) {
 		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate is already expired", nil)
+	}
+	if leaf.NotBefore.After(now.Add(clockSkewTolerance)) {
+		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate is not yet valid", nil)
+	}
+	if len(leaf.DNSNames) != 1 {
+		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not contain exactly one subject alternative name", nil)
 	}
 	info := store.InfoOf(leaf)
 	if err := st.Put(ctx, object, store.Bundle{Certificate: leafPEM, Chain: chainPEM, PrivateKey: keyPEM}); err != nil {

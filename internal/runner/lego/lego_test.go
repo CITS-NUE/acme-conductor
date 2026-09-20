@@ -280,11 +280,21 @@ func TestRedactor_Line(t *testing.T) {
 	}
 	r := NewRedactor([]string{"abcd1234", "xyz"})
 
-	t.Run("masks secrets >= 4 chars, ignores shorter ones", func(t *testing.T) {
+	t.Run("masks every secret regardless of length", func(t *testing.T) {
 		got := line(r, "token=abcd1234 other=xyz")
-		want := "token=[REDACTED] other=xyz"
+		want := "token=[REDACTED] other=[REDACTED]"
 		if got != want {
 			t.Errorf("Line() = %q, want %q", got, want)
+		}
+		if got := line(NewRedactor([]string{"a", ""}), "banana"); got != "b[REDACTED]n[REDACTED]n[REDACTED]" {
+			t.Errorf("single-char secret: %q", got)
+		}
+	})
+
+	t.Run("longer secrets are masked before shorter ones they contain", func(t *testing.T) {
+		r := NewRedactor([]string{"kid", "kid-and-more"})
+		if got := line(r, "x kid-and-more y"); got != "x [REDACTED] y" {
+			t.Errorf("Line() = %q", got)
 		}
 	})
 

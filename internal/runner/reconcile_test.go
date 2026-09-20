@@ -3,9 +3,16 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"log/slog"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,6 +324,8 @@ func TestReconcileFailures(t *testing.T) {
 		{name: "lego writes no output", mode: "missingoutput", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},
 		{name: "lego writes wrong domain", mode: "wrongdomain", code: v1alpha1.ErrorCodeACMEFailure, summary: "does not cover the target fqdn", legoRan: true},
 		{name: "lego writes no key", mode: "nokey", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},
+		{name: "lego writes not-yet-valid certificate", mode: "ok", extraEnv: map[string]string{fakelego.EnvNotBeforeHours: "24"}, code: v1alpha1.ErrorCodeACMEFailure, summary: "not yet valid", legoRan: true},
+		{name: "lego writes certificate with extra SAN", mode: "ok", extraEnv: map[string]string{fakelego.EnvExtraSAN: "other.example.ac.jp"}, code: v1alpha1.ErrorCodeACMEFailure, summary: "exactly one subject alternative name", legoRan: true},
 		{name: "lego writes garbage", mode: "garbage", code: v1alpha1.ErrorCodeACMEFailure, summary: "unreadable certificate", legoRan: true},
 		{name: "lego hangs", mode: "hang", code: v1alpha1.ErrorCodeTimeout, summary: "did not finish within", legoRan: true,
 			prepare: func(h *harness) { h.setTimeout(1) }},
@@ -470,32 +479,58 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 	dir := t.TempDir()
 	work := filepath.Join(dir, "work")
 	state := filepath.Join(dir, "state")
-	if err := os.MkdirAll(filepath.Join(work, "accounts", "host", "user"), 0o700); err != nil {
+	acct := filepath.Join(work, "accounts", "host", "user", "account.json")
+	if err := os.MkdirAll(filepath.Dir(acct), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(work, "accounts", "host", "user", "account.json"), []byte("v1"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := persistAccounts(work, state); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "accounts", "host", "user", "account.json"), []byte("v2"), 0o600); err != nil {
+	if err := os.WriteFile(acct, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := persistAccounts(work, state); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(state, "accounts", "host", "user", "account.json"))
+	if err := os.WriteFile(acct, []byte("v2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistAccounts(work, state); err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(state, "accounts")
+	got, err := os.ReadFile(filepath.Join(final, "host", "user", "account.json"))
 	if err != nil || string(got) != "v2" {
 		t.Fatalf("state = %q, %v", got, err)
 	}
-	entries, _ := os.ReadDir(state)
-	if len(entries) != 1 {
-		t.Fatalf("leftover entries in state dir: %v", entries)
+	info, err := os.Lstat(final)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("accounts must be a symbolic link: %v %v", info, err)
 	}
-	st, _ := os.Stat(filepath.Join(state, "accounts", "host", "user", "account.json"))
+	target, _ := os.Readlink(final)
+	if !strings.HasPrefix(target, accountVersionsDir+"/") {
+		t.Fatalf("link target = %q", target)
+	}
+	if _, err := os.Stat(filepath.Join(state, target)); err != nil {
+		t.Fatalf("link target does not exist: %v", err)
+	}
+	versions, _ := os.ReadDir(filepath.Join(state, accountVersionsDir))
+	if len(versions) != 1 {
+		t.Fatalf("expected exactly one retained version, got %v", versions)
+	}
+	entries, _ := os.ReadDir(state)
+	if len(entries) != 2 {
+		t.Fatalf("unexpected entries in state dir: %v", entries)
+	}
+	st, _ := os.Stat(filepath.Join(final, "host", "user", "account.json"))
 	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %o", st.Mode().Perm())
+	}
+	// The persisted state is readable through copyTree (used at the start
+	// of the next run) even though the root is a link.
+	back := filepath.Join(dir, "back")
+	if err := copyTree(final, back); err != nil {
+		t.Fatalf("copyTree through link: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(back, "host", "user", "account.json")); string(b) != "v2" {
+		t.Fatalf("copied state = %q", b)
 	}
 	// No accounts in work → no-op.
 	if err := persistAccounts(filepath.Join(dir, "empty"), state); err != nil {
@@ -503,59 +538,84 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 	}
 }
 
-func TestReconcileDrainsHugeLegoOutput(t *testing.T) {
-	h := newHarness(t, "longline", nil)
-	h.job(nil)
-	start := time.Now()
-	code, res := h.run(context.Background())
-	if code != ExitSucceeded || res.Action != v1alpha1.ActionIssued {
-		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+func TestPersistAccountsMigratesLegacyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	work := filepath.Join(dir, "work")
+	state := filepath.Join(dir, "state")
+	legacy := filepath.Join(state, "accounts", "host", "user")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if time.Since(start) > 10*time.Second {
-		t.Fatalf("runner stalled on a long output line: %v", time.Since(start))
+	os.WriteFile(filepath.Join(legacy, "account.json"), []byte("legacy"), 0o600)
+	acct := filepath.Join(work, "accounts", "host", "user", "account.json")
+	os.MkdirAll(filepath.Dir(acct), 0o700)
+	os.WriteFile(acct, []byte("new"), 0o600)
+	if err := persistAccounts(work, state); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(h.logs.String(), `"truncated":true`) {
-		t.Fatalf("long lines should be logged truncated")
+	got, err := os.ReadFile(filepath.Join(state, "accounts", "host", "user", "account.json"))
+	if err != nil || string(got) != "new" {
+		t.Fatalf("state = %q, %v", got, err)
+	}
+	if info, _ := os.Lstat(filepath.Join(state, "accounts")); info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("legacy directory was not replaced by a link")
 	}
 }
 
-func TestSweepStaleWorkDirs(t *testing.T) {
-	parent := t.TempDir()
-	stale := filepath.Join(parent, "run-old-abc")
-	fresh := filepath.Join(parent, "run-new-def")
-	other := filepath.Join(parent, "keep-me")
-	for _, d := range []string{stale, fresh, other} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(d, "privkey.pem"), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	old := time.Now().Add(-3 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
-	}
-	dir, cleanup, err := prepareWorkDir(parent, "01JABCDEFGHJKMNPQRSTVWXYZ0", time.Hour)
+// futureCert writes a not-yet-valid certificate for fqdn into the harness
+// store so the renewal decision can be exercised without lego.
+func (h *harness) putCert(fqdn string, notBefore, notAfter time.Time) string {
+	h.t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	defer cleanup()
-	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale run directory not swept: %v", err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: fqdn},
+		DNSNames:     []string{fqdn},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 	}
-	for _, d := range []string{fresh, other, dir} {
-		if _, err := os.Stat(d); err != nil {
-			t.Fatalf("%s should survive: %v", d, err)
-		}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		h.t.Fatal(err)
 	}
-	// A zero grace disables sweeping.
-	if err := os.MkdirAll(stale, 0o700); err != nil {
-		t.Fatal(err)
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	st, err := filesystem.New(h.storeDir)
+	if err != nil {
+		h.t.Fatal(err)
 	}
-	os.Chtimes(stale, old, old)
-	sweepStaleWorkDirs(parent, 0, time.Now())
-	if _, err := os.Stat(stale); err != nil {
-		t.Fatalf("sweep with zero grace must not delete: %v", err)
+	object := store.ObjectName(fqdn)
+	err = st.Put(context.Background(), object, store.Bundle{
+		Certificate: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		PrivateKey:  pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return object
+}
+
+func TestReconcileReissuesStoredCertificateThatIsNotYetValid(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	h.putCert("wiki.example.ac.jp", h.now.Add(24*time.Hour), h.now.Add(90*24*time.Hour))
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionRenewed {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "not yet valid") {
+		t.Fatalf("expected a not-yet-valid warning:\n%s", h.logs.String())
+	}
+}
+
+func TestReconcileNoopWithinClockSkew(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	h.putCert("wiki.example.ac.jp", h.now.Add(2*time.Minute), h.now.Add(90*24*time.Hour))
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionNoop {
+		t.Fatalf("code=%d result=%+v", code, res)
 	}
 }

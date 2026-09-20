@@ -327,7 +327,7 @@ func TestObjectName(t *testing.T) {
 
 	t.Run("host name format", func(t *testing.T) {
 		name := ObjectName("wiki.example.ac.jp")
-		re := regexp.MustCompile(`^wiki\.example\.ac\.jp-[0-9a-f]{8}$`)
+		re := regexp.MustCompile(`^wiki\.example\.ac\.jp-[0-9a-f]{16}$`)
 		if !re.MatchString(name) {
 			t.Errorf("ObjectName(%q) = %q, want to match %s", "wiki.example.ac.jp", name, re)
 		}
@@ -335,7 +335,7 @@ func TestObjectName(t *testing.T) {
 
 	t.Run("wildcard name format", func(t *testing.T) {
 		name := ObjectName("*.example.ac.jp")
-		re := regexp.MustCompile(`^wildcard\.example\.ac\.jp-[0-9a-f]{8}$`)
+		re := regexp.MustCompile(`^wildcard\.example\.ac\.jp-[0-9a-f]{16}$`)
 		if !re.MatchString(name) {
 			t.Errorf("ObjectName(%q) = %q, want to match %s", "*.example.ac.jp", name, re)
 		}

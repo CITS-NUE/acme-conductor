@@ -59,14 +59,25 @@ type Store interface {
 	Put(ctx context.Context, object string, b Bundle) error
 }
 
+// ObjectNameHashBytes is the length of the SHA-256 prefix appended to an
+// object name (64 bits, rendered as 16 hex characters). The prefix is what
+// keeps two different FQDNs with the same readable part apart (a wildcard
+// "*.x" and a host literally named "wildcard.x", or two long names that
+// truncate to the same prefix); with 64 bits an accidental collision
+// between two names an operator actually registers is not a practical
+// concern, but it is not mathematically impossible, and a collision would
+// make two targets share one store object (an availability fault, never a
+// key disclosure).
+const ObjectNameHashBytes = 8
+
 // ObjectName derives the logical store object name of a target FQDN. The
-// name is readable ("wiki.example.ac.jp") and made unambiguous by a short
-// hash of the exact FQDN, so a wildcard name ("wildcard.example.ac.jp-…")
-// can never collide with a host that happens to be called "wildcard". The
-// result always satisfies v1alpha1.IsStoreObjectRef.
+// name is readable ("wiki.example.ac.jp") followed by "-" and the first
+// ObjectNameHashBytes of the SHA-256 of the exact FQDN. The result always
+// satisfies v1alpha1.IsStoreObjectRef and is at most
+// v1alpha1.MaxStoreObjectRefLength characters long.
 func ObjectName(fqdn string) string {
 	sum := sha256.Sum256([]byte(fqdn))
-	suffix := "-" + hex.EncodeToString(sum[:4])
+	suffix := "-" + hex.EncodeToString(sum[:ObjectNameHashBytes])
 	readable := strings.Replace(fqdn, "*.", "wildcard.", 1)
 	max := v1alpha1.MaxStoreObjectRefLength - len(suffix)
 	if len(readable) > max {
