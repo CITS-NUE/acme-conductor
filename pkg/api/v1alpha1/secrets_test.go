@@ -64,8 +64,8 @@ func TestResultJSONNeverContainsSecretMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, m := range secretMarkers {
-		if strings.Contains(string(data), m) {
-			t.Fatalf("serialized result contains %q: %s", m, data)
+		if strings.Contains(strings.ToLower(string(data)), strings.ToLower(m.text)) {
+			t.Fatalf("serialized result contains %q: %s", m.text, data)
 		}
 	}
 	for _, m := range []string{"privateKey", "certificatePem", "pfx", "password", "clientSecret"} {
@@ -75,10 +75,20 @@ func TestResultJSONNeverContainsSecretMarkers(t *testing.T) {
 	}
 }
 
-func TestSecretMarkersAreDetectedCaseSensitivelyWherePrefixesAreCaseSensitive(t *testing.T) {
+func TestSecretMarkersAreDetected(t *testing.T) {
 	for _, m := range secretMarkers {
-		if err := validateOpaqueText("f", "prefix "+m+" suffix", MaxErrorSummaryLength); err == nil {
-			t.Errorf("marker %q not detected", m)
+		if err := validateOpaqueText("f", "prefix "+m.text+" suffix", MaxErrorSummaryLength); err == nil {
+			t.Errorf("marker %q not detected", m.text)
 		}
+		upper := strings.ToUpper(m.text)
+		err := validateOpaqueText("f", "prefix "+upper+" suffix", MaxErrorSummaryLength)
+		if m.ignoreCase && err == nil {
+			t.Errorf("case-insensitive marker %q not detected as %q", m.text, upper)
+		}
+	}
+	// Exact-case token prefixes stay exact: "EYJ" is not a JWT header and
+	// must not cause false positives on ordinary text.
+	if err := validateOpaqueText("f", "EYJ is fine", MaxErrorSummaryLength); err != nil {
+		t.Errorf("false positive: %v", err)
 	}
 }

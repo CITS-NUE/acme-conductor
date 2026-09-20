@@ -32,9 +32,12 @@ type TargetRef struct {
 	Revision int64  `json:"revision"`
 }
 
-// PolicySpec is the snapshot of the certificate policy the Runner must
-// re-validate before doing anything. It is a copy, not a reference, so that a
-// Runner can be audited from the JobSpec alone.
+// PolicySpec is the snapshot of the certificate policy the Conductor
+// applied when it created the job. It is a copy, not a reference, so that a
+// run can be audited from the JobSpec alone. It is untrusted input to the
+// Runner: Validate checks the document is consistent with it, but the
+// Runner authorizes against its own policy.RunnerAuthorizationPolicy, never
+// against this snapshot.
 type PolicySpec struct {
 	AllowedDnsSuffixes []string `json:"allowedDnsSuffixes"`
 	AllowWildcard      bool     `json:"allowWildcard"`

@@ -49,8 +49,9 @@
     },
     "storeObjectRef": {
       "type": "string",
-      "maxLength": 512,
-      "description": "Logical, versionless reference to the stored object (for example a Key Vault certificate name). Never a URL with credentials, a file system path outside the store, or the object itself. Go validation additionally rejects control characters and known secret markers (e.g. PEM headers, bearer tokens), which is not expressible in JSON Schema."
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$",
+      "description": "Provider-independent logical object name (for example a Key Vault certificate name). Never a URL, URI, path, query string or credential. Go validation additionally rejects any value containing \"..\", which is not expressible in this pattern. The 128-character bound is chosen to cover Azure Key Vault certificate names, which are 1..127 characters."
     },
     "startedAt": {
       "type": "string",
@@ -125,7 +126,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 1024,
-          "description": "Short human-readable summary. MUST NOT contain command lines, environment dumps, credentials, key material or certificate bodies. Go validation additionally rejects control characters, blank-after-trim text and known secret markers (e.g. PEM headers, bearer tokens), which is not expressible in JSON Schema."
+          "description": "Short human-readable summary. MUST NOT contain command lines, environment dumps, credentials, key material or certificate bodies: summaries MUST come from Runner-owned templates, never copied from raw external output. Go validation additionally rejects control characters, blank-after-trim text and known secret markers (e.g. PEM headers, bearer tokens; header and key=value markers are matched case-insensitively). That marker check is a best-effort defense-in-depth heuristic, not a secret detector, and is not expressible in JSON Schema."
         }
       }
     }

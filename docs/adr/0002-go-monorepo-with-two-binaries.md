@@ -11,9 +11,9 @@ credentials, or a deploy lifecycle (see
 [`docs/architecture.md`](../architecture.md#control-plane-vs-data-plane)).
 They do, however, need to share a versioned wire contract
 (`pkg/api/v1alpha1`) and FQDN policy logic (`internal/policy`) byte-for-byte
-— the whole point of the Runner re-validating policy independently is that
-it runs the *same* validation code, not a reimplementation of it that could
-drift.
+— the Runner validates the document and authorizes it against its own
+trusted policy with the *same* normalization and suffix-matching code the
+Conductor uses, not a reimplementation of it that could drift.
 
 ## Decision
 

@@ -179,6 +179,14 @@ func TestResultValidateOK(t *testing.T) {
 	if err := r.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// Legitimate logical object names are accepted.
+	for _, ref := range []string{"vault-cert-prod", "wiki-example-ac-jp", "a", "A1", "wiki.example.ac.jp", "cert_v2", strings.Repeat("a", MaxStoreObjectRefLength)} {
+		v := validResult()
+		v.StoreObjectRef = ref
+		if err := v.Validate(); err != nil {
+			t.Fatalf("storeObjectRef %q rejected: %v", ref, err)
+		}
+	}
 	// Printable non-ASCII text is fine in a summary.
 	u := failedResult()
 	u.Error.Summary = "ACME 認可に失敗しました (dns-01)"
@@ -221,7 +229,21 @@ func TestResultValidateRejects(t *testing.T) {
 		{"fingerprint colon form", validResult, func(r *Result) { r.FingerprintSha256 = strings.Repeat("ab:", 31) + "ab" }, "fingerprintSha256"},
 		{"store ref too long", validResult, func(r *Result) { r.StoreObjectRef = strings.Repeat("a", MaxStoreObjectRefLength+1) }, "storeObjectRef"},
 		{"store ref newline", validResult, func(r *Result) { r.StoreObjectRef = "a\nb" }, "storeObjectRef"},
-		{"store ref with token", validResult, func(r *Result) { r.StoreObjectRef = "https://vault/x?token=abc" }, "storeObjectRef"},
+		{"store ref url", validResult, func(r *Result) { r.StoreObjectRef = "https://vault.example.net/certificates/wiki" }, "storeObjectRef"},
+		{"store ref url with token", validResult, func(r *Result) { r.StoreObjectRef = "https://vault/x?token=abc" }, "storeObjectRef"},
+		{"store ref azure sas", validResult, func(r *Result) { r.StoreObjectRef = "wiki?sv=2024-01-01&se=2026-01-01&sig=abc123" }, "storeObjectRef"},
+		{"store ref absolute path", validResult, func(r *Result) { r.StoreObjectRef = "/tmp/certificate.pfx" }, "storeObjectRef"},
+		{"store ref parent traversal", validResult, func(r *Result) { r.StoreObjectRef = "../certificate" }, "storeObjectRef"},
+		{"store ref dotdot inside", validResult, func(r *Result) { r.StoreObjectRef = "a..b" }, "storeObjectRef"},
+		{"store ref backslash", validResult, func(r *Result) { r.StoreObjectRef = "certs\\wiki" }, "storeObjectRef"},
+		{"store ref colon", validResult, func(r *Result) { r.StoreObjectRef = "vault:wiki" }, "storeObjectRef"},
+		{"store ref fragment", validResult, func(r *Result) { r.StoreObjectRef = "wiki#v1" }, "storeObjectRef"},
+		{"store ref at", validResult, func(r *Result) { r.StoreObjectRef = "user@wiki" }, "storeObjectRef"},
+		{"store ref percent", validResult, func(r *Result) { r.StoreObjectRef = "wiki%2f" }, "storeObjectRef"},
+		{"store ref space", validResult, func(r *Result) { r.StoreObjectRef = "wiki cert" }, "storeObjectRef"},
+		{"store ref leading dot", validResult, func(r *Result) { r.StoreObjectRef = ".wiki" }, "storeObjectRef"},
+		{"store ref trailing dash", validResult, func(r *Result) { r.StoreObjectRef = "wiki-" }, "storeObjectRef"},
+		{"store ref non-ascii", validResult, func(r *Result) { r.StoreObjectRef = "証明書" }, "storeObjectRef"},
 		{"zero startedAt", validResult, func(r *Result) { r.StartedAt = zero }, "startedAt"},
 		{"zero finishedAt", validResult, func(r *Result) { r.FinishedAt = zero }, "finishedAt"},
 		{"finished before started", validResult, func(r *Result) { r.FinishedAt = r.StartedAt.Add(-time.Second) }, "finishedAt"},
@@ -242,6 +264,13 @@ func TestResultValidateRejects(t *testing.T) {
 		{"failed summary jwt", failedResult, func(r *Result) { r.Error.Summary = "eab: eyJhbGciOi..." }, "error.summary"},
 		{"failed summary bearer", failedResult, func(r *Result) { r.Error.Summary = "Authorization: Bearer abc" }, "error.summary"},
 		{"failed summary env dump", failedResult, func(r *Result) { r.Error.Summary = "AZURE_CLIENT_SECRET=hunter2 secret=x" }, "error.summary"},
+		{"failed summary Password=", failedResult, func(r *Result) { r.Error.Summary = "login failed: Password=secret" }, "error.summary"},
+		{"failed summary PASSWORD=", failedResult, func(r *Result) { r.Error.Summary = "PASSWORD=secret" }, "error.summary"},
+		{"failed summary BEARER", failedResult, func(r *Result) { r.Error.Summary = "Authorization: BEARER abc" }, "error.summary"},
+		{"failed summary bearer lower", failedResult, func(r *Result) { r.Error.Summary = "got bearer abc" }, "error.summary"},
+		{"failed summary basic auth", failedResult, func(r *Result) { r.Error.Summary = "Authorization: Basic dXNlcjpwYXNz" }, "error.summary"},
+		{"failed summary sas sig", failedResult, func(r *Result) { r.Error.Summary = "blob url ...&sig=abc" }, "error.summary"},
+		{"failed summary key=", failedResult, func(r *Result) { r.Error.Summary = "AccountKey=abc" }, "error.summary"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -259,5 +288,61 @@ func TestResultValidateRejects(t *testing.T) {
 				t.Fatalf("field = %q, want %q (%v)", ve.Field, c.field, err)
 			}
 		})
+	}
+}
+
+// TestJobSpecValidateIsSelfConsistencyNotAuthorization documents the limit
+// of Validate: a forger who controls the whole document can change the FQDN
+// and the embedded policy snapshot together, or swap a binding name for a
+// different well-formed one, and the document still validates. Rejecting
+// such a document is the job of policy.RunnerAuthorizationPolicy, which
+// compares against trusted configuration outside the JobSpec.
+func TestJobSpecValidateIsSelfConsistencyNotAuthorization(t *testing.T) {
+	// Only the fqdn is changed: the embedded snapshot no longer matches.
+	s := validJobSpec()
+	s.Target.FQDN = "wiki.evil.com"
+	if err := s.Validate(); err == nil {
+		t.Fatal("inconsistent document must fail")
+	}
+	// The fqdn AND the snapshot are changed together: self-consistent, so
+	// Validate passes even though nobody authorized evil.com.
+	s.Policy.AllowedDnsSuffixes = []string{"evil.com"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("self-consistent forged document unexpectedly rejected: %v", err)
+	}
+	// Wildcard permission is also just a field in the same document.
+	s.Target.FQDN = "*.evil.com"
+	s.Policy.AllowWildcard = true
+	if err := s.Validate(); err != nil {
+		t.Fatalf("self-consistent forged wildcard document unexpectedly rejected: %v", err)
+	}
+	// A binding name swapped for another syntactically valid name passes:
+	// Validate checks syntax, not membership in any allow-list.
+	b := validJobSpec()
+	b.ACME.Binding = "letsencrypt-production"
+	b.DNS.Binding = "azure-dns-production"
+	b.Store.Binding = "azure-keyvault-production"
+	if err := b.Validate(); err != nil {
+		t.Fatalf("swapped binding names unexpectedly rejected: %v", err)
+	}
+	// The trusted policy rejects exactly these documents.
+	trusted := policy.RunnerAuthorizationPolicy{
+		AllowedDnsSuffixes:   []string{"example.ac.jp"},
+		AllowedACMEBindings:  []string{"letsencrypt-staging"},
+		AllowedDNSBindings:   []string{"azure-dns-staging"},
+		AllowedStoreBindings: []string{"filesystem-dev"},
+	}
+	for _, spec := range []JobSpec{s, b} {
+		err := trusted.Authorize(policy.AuthorizationRequest{
+			FQDN: spec.Target.FQDN, ACMEBinding: spec.ACME.Binding, DNSBinding: spec.DNS.Binding, StoreBinding: spec.Store.Binding,
+		})
+		if err == nil {
+			t.Fatalf("trusted policy must reject %+v", spec.Target)
+		}
+	}
+	if err := trusted.Authorize(policy.AuthorizationRequest{
+		FQDN: "wiki.example.ac.jp", ACMEBinding: "letsencrypt-staging", DNSBinding: "azure-dns-staging", StoreBinding: "filesystem-dev",
+	}); err != nil {
+		t.Fatalf("legitimate request rejected: %v", err)
 	}
 }

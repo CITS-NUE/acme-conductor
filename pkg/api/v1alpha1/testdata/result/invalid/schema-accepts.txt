@@ -22,3 +22,18 @@ finishedat-before-startedat.json
 # rejected by validateOpaqueText in Go only; the schema bounds length only.
 error-summary-line-separator.json
 error-summary-bidi-override.json
+
+# The secret-marker heuristic in error.summary is matched case-insensitively
+# for header/key=value-shaped markers (password=, bearer , basic ,
+# authorization:, sig=, etc.) by validateOpaqueText in Go only; the schema
+# only bounds length.
+error-summary-password-mixed-case.json
+error-summary-password-upper.json
+error-summary-bearer-upper.json
+error-summary-basic-auth.json
+error-summary-sas-sig.json
+
+# storeObjectRef additionally rejects any value containing ".." in Go
+# (validateStoreObjectRef), even when the surrounding characters otherwise
+# match the schema pattern.
+storeobjectref-dotdot-inside.json

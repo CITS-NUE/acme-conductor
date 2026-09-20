@@ -23,8 +23,10 @@ const (
 	MaxRenewBeforeDays = 365
 	// MaxErrorSummaryLength bounds a Result error summary.
 	MaxErrorSummaryLength = 1024
-	// MaxStoreObjectRefLength bounds a Result store reference.
-	MaxStoreObjectRefLength = 512
+	// MaxStoreObjectRefLength bounds a Result store reference. 128 covers
+	// Azure Key Vault certificate names (1..127 characters) and leaves room
+	// for filesystem-store base names without ever admitting a path.
+	MaxStoreObjectRefLength = 128
 )
 
 var (
@@ -36,6 +38,11 @@ var (
 	bindingNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	// fingerprintRe: lower-case hex SHA-256.
 	fingerprintRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	// storeObjectRefRe: a provider-independent logical object name. It is
+	// deliberately not a URL, URI, path or query string: no '/', '\\', ':',
+	// '?', '#', '@', '%', '&', '=' or whitespace, and it must start and end
+	// with an alphanumeric character. ".." is rejected separately.
+	storeObjectRefRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`)
 )
 
 // ErrValidation is wrapped by every validation failure.
@@ -72,13 +79,24 @@ func invalidErr(field, msg string, err error) error {
 	return &ValidationError{Field: field, Msg: msg, Err: err}
 }
 
-// Validate checks structural and semantic rules. It also re-evaluates the
-// FQDN policy against the target, so a Runner calling Validate has already
-// applied the policy check the Conductor was supposed to apply.
+// Validate checks that a JobSpec is well-formed:
 //
-// Validate does not modify the spec: the FQDN and suffixes must already be in
-// normalized form. This keeps the document that was validated byte-identical
-// to the document that is acted upon.
+//   - structural rules (constants, identifier and binding-name syntax, ranges);
+//   - the FQDN and every suffix are already in canonical form, so the
+//     document that was validated is byte-identical to the one acted upon;
+//   - internal self-consistency: target.fqdn lies under one of the
+//     policy.allowedDnsSuffixes embedded in the same document, on a label
+//     boundary, and is a wildcard only if the embedded policy allows it.
+//
+// Validate is NOT authorization. Every value it compares comes from the same
+// document, so anyone who can produce or alter a JobSpec (including a
+// compromised Conductor) can change target.fqdn and the policy snapshot
+// together, or point a binding name at a different, equally well-formed,
+// registered binding. Passing Validate therefore means "this document is
+// coherent", never "this issuance is permitted". A Runner must additionally
+// authorize the request against trusted configuration that is not carried
+// in the JobSpec; see policy.RunnerAuthorizationPolicy and
+// docs/adr/0004-versioned-jobspec-result-contract.md.
 func (s *JobSpec) Validate() error {
 	if s == nil {
 		return invalid("$", "nil JobSpec")
@@ -113,12 +131,14 @@ func (s *JobSpec) Validate() error {
 	if err := validateBindingName("store.binding", s.Store.Binding); err != nil {
 		return err
 	}
-	// Policy re-validation: this is the check that must never be skipped.
+	// Self-consistency of the embedded policy snapshot. This catches a
+	// Conductor bug or a partial edit; it cannot catch a document whose fqdn
+	// and policy were changed together (see the doc comment above).
 	if _, err := policy.Evaluate(s.Target.FQDN, policy.Policy{
 		AllowedDnsSuffixes: s.Policy.AllowedDnsSuffixes,
 		AllowWildcard:      s.Policy.AllowWildcard,
 	}); err != nil {
-		return invalidErr("target.fqdn", "rejected by policy", err)
+		return invalidErr("target.fqdn", "inconsistent with embedded policy snapshot", err)
 	}
 	return nil
 }
@@ -230,7 +250,7 @@ func (r *Result) Validate() error {
 	if r.FingerprintSha256 != "" && !fingerprintRe.MatchString(r.FingerprintSha256) {
 		return invalid("fingerprintSha256", "must be 64 lower-case hex characters")
 	}
-	if err := validateOpaqueText("storeObjectRef", r.StoreObjectRef, MaxStoreObjectRefLength); err != nil {
+	if err := validateStoreObjectRef("storeObjectRef", r.StoreObjectRef); err != nil {
 		return err
 	}
 	if r.StartedAt.IsZero() {
@@ -292,27 +312,70 @@ func validateNormalizedFQDN(field, v string) error {
 	return nil
 }
 
-// secretMarkers are substrings that must never appear in free text fields of
-// a Result. They catch the most common accidental leaks: PEM blocks and the
-// prefixes of well-known token formats.
-var secretMarkers = []string{
-	"-----BEGIN",
-	"PRIVATE KEY",
-	"eyJ", // base64url JSON header: JWT / JWS / ACME EAB
-	"AKIA",
-	"ghp_",
-	"github_pat_",
-	"Bearer ",
-	"password=",
-	"secret=",
-	"token=",
+// secretMarker is a substring that must never appear in a Result free-text
+// field. Markers whose meaning does not depend on case (HTTP header names,
+// key=value names) are compared case-insensitively; token prefixes whose
+// case is part of the format are compared exactly.
+type secretMarker struct {
+	text       string
+	ignoreCase bool
 }
 
-// validateOpaqueText applies the common rules for short, single-line,
-// non-secret text: bounded length, printable characters only (no control
-// characters, no Unicode line/paragraph separators, no format or bidi
-// override characters, so a summary can never inject or visually spoof log
-// lines), valid UTF-8, and none of the secret markers above.
+// secretMarkers is a defense-in-depth heuristic, not a secret detector. It
+// catches the most common accidental leaks (PEM blocks, well-known token
+// prefixes, credential-shaped key=value pairs, authorization headers and
+// signed-URL parameters). It cannot recognize an arbitrary secret, a
+// provider-specific format it does not know, or a random value with no
+// prefix. The real control is that a Runner never copies raw external
+// output into a Result at all: error.summary is produced from Runner-owned
+// templates and raw details stay in redacted internal logs.
+var secretMarkers = []secretMarker{
+	{"-----BEGIN", false},
+	{"private key", true},
+	{"eyJ", false}, // base64url JSON header: JWT / JWS / ACME EAB
+	{"AKIA", false},
+	{"ghp_", false},
+	{"github_pat_", false},
+	{"bearer ", true},
+	{"basic ", true},
+	{"authorization:", true},
+	{"password=", true},
+	{"passwd=", true},
+	{"pwd=", true},
+	{"secret=", true},
+	{"token=", true},
+	{"sig=", true}, // Azure SAS / signed URL parameter
+	{"signature=", true},
+	{"key=", true},
+	{"credential=", true},
+}
+
+// validateStoreObjectRef requires a logical object name: no URL, URI, path,
+// query string or credential can satisfy storeObjectRefRe, and ".." is
+// rejected so the value can never be used for traversal even by a careless
+// filesystem store.
+func validateStoreObjectRef(field, v string) error {
+	if v == "" {
+		return nil // presence is decided by status in Result.Validate
+	}
+	if len(v) > MaxStoreObjectRefLength {
+		return invalid(field, fmt.Sprintf("must be at most %d bytes", MaxStoreObjectRefLength))
+	}
+	if strings.Contains(v, "..") {
+		return invalid(field, "must not contain \"..\"")
+	}
+	if !storeObjectRefRe.MatchString(v) {
+		return invalid(field, "must be a logical object name matching "+storeObjectRefRe.String())
+	}
+	return nil
+}
+
+// validateOpaqueText applies the common rules for short, single-line text:
+// bounded length, printable characters only (no control characters, no
+// Unicode line/paragraph separators, no format or bidi override characters,
+// so a summary can never inject or visually spoof log lines), valid UTF-8,
+// and none of the secret markers above. The marker check is best-effort; it
+// does not make a free-text field safe to fill with raw external output.
 func validateOpaqueText(field, v string, maxLen int) error {
 	if len(v) > maxLen {
 		return invalid(field, fmt.Sprintf("must be at most %d bytes", maxLen))
@@ -322,9 +385,14 @@ func validateOpaqueText(field, v string, maxLen int) error {
 			return invalid(field, "must contain only printable characters and valid UTF-8")
 		}
 	}
+	lower := strings.ToLower(v)
 	for _, m := range secretMarkers {
-		if strings.Contains(v, m) {
-			return invalid(field, fmt.Sprintf("must not contain %q", m))
+		hay, needle := v, m.text
+		if m.ignoreCase {
+			hay = lower
+		}
+		if strings.Contains(hay, needle) {
+			return invalid(field, fmt.Sprintf("must not contain %q", m.text))
 		}
 	}
 	return nil

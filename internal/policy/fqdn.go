@@ -1,8 +1,14 @@
-// Package policy implements FQDN normalization and the certificate policy
-// checks that both the Conductor and the Runner apply.
+// Package policy implements FQDN normalization, label-boundary suffix
+// matching, and the Runner-side authorization policy.
 //
-// The Runner MUST re-run these checks on the JobSpec it receives; it never
-// trusts that the Conductor already did (see docs/threat-model.md).
+// Two different callers use the same primitives for two different purposes:
+//
+//   - v1alpha1.JobSpec.Validate checks that a document is self-consistent
+//     (target.fqdn lies under the policy snapshot embedded in the same
+//     document). That is validation of untrusted input, not authorization.
+//   - RunnerAuthorizationPolicy.Authorize decides, against trusted
+//     configuration that is not part of the JobSpec, whether the Runner may
+//     act at all. See docs/threat-model.md.
 //
 // v1alpha1 accepts ASCII host names only. Internationalized domain names
 // (Unicode input and "xn--" A-labels) are rejected until IDNA handling and
