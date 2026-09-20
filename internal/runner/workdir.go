@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -167,21 +168,56 @@ const accountVersionsDir = "accounts.d"
 // reader (loadAccounts) consistent with them.
 const stateLockFile = ".lock"
 
+// ErrLegacyAccountsLayout is returned when <stateDir>/accounts is a plain
+// directory rather than the link this Runner maintains. There is no
+// crash-safe way to migrate it in place, and no released layout ever used
+// it, so it is refused and left for the operator to move aside.
+var ErrLegacyAccountsLayout = errors.New("stateDir/accounts is a plain directory, not a link to a version under accounts.d; unsupported layout")
+
+// ErrAccountsCorrupt is returned when the account state link exists but
+// what it points at cannot be read. It is deliberately distinct from "no
+// state yet": a corrupted state must never look like a first run, which
+// would silently register a new ACME account.
+var ErrAccountsCorrupt = errors.New("stateDir/accounts exists but its target is unreadable")
+
+// accountsLinkState classifies <stateDir>/accounts: absent, a link, or
+// something else.
+func accountsLinkState(stateDir string) (exists bool, err error) {
+	info, err := os.Lstat(filepath.Join(stateDir, lego.AccountsDir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return true, ErrLegacyAccountsLayout
+	}
+	return true, nil
+}
+
 // loadAccounts copies the current ACME account state from stateDir into
 // the work directory under a shared lock, so a concurrent publisher cannot
-// prune the version being read. A missing state is not an error.
-func loadAccounts(stateDir, work string) error {
+// prune the version being read. A missing state is not an error; a state
+// link whose target is missing or unreadable is (ErrAccountsCorrupt).
+func loadAccounts(ctx context.Context, stateDir, work string) error {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return err
 	}
-	lock, err := fslock.Shared(filepath.Join(stateDir, stateLockFile))
+	lock, err := fslock.Shared(ctx, filepath.Join(stateDir, stateLockFile))
 	if err != nil {
 		return err
 	}
 	defer lock.Unlock()
-	err = copyTree(filepath.Join(stateDir, lego.AccountsDir), filepath.Join(work, lego.AccountsDir))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	exists, err := accountsLinkState(stateDir)
+	if err != nil {
 		return err
+	}
+	if !exists {
+		return nil
+	}
+	if err := copyTree(filepath.Join(stateDir, lego.AccountsDir), filepath.Join(work, lego.AccountsDir)); err != nil {
+		return fmt.Errorf("%w: %v", ErrAccountsCorrupt, err)
 	}
 	return nil
 }
@@ -203,9 +239,10 @@ func loadAccounts(stateDir, work string) error {
 // operation runs under an exclusive lock on stateDir, so two publishers
 // are serialized and step 3 can never prune the version a concurrent
 // publisher just referenced: the last one to take the lock wins. A
-// pre-existing plain "accounts" directory (not a link) is moved into
-// accounts.d before the swap so nothing is lost.
-func persistAccounts(work, stateDir string) error {
+// pre-existing plain "accounts" directory (not a link) is refused
+// (ErrLegacyAccountsLayout): replacing a directory cannot be made
+// crash-safe with rename alone, and no released layout ever used one.
+func persistAccounts(ctx context.Context, work, stateDir string) error {
 	src := filepath.Join(work, lego.AccountsDir)
 	if _, err := os.Lstat(src); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -216,11 +253,14 @@ func persistAccounts(work, stateDir string) error {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return err
 	}
-	lock, err := fslock.Exclusive(filepath.Join(stateDir, stateLockFile))
+	lock, err := fslock.Exclusive(ctx, filepath.Join(stateDir, stateLockFile))
 	if err != nil {
 		return err
 	}
 	defer lock.Unlock()
+	if _, err := accountsLinkState(stateDir); err != nil {
+		return err
+	}
 	versions := filepath.Join(stateDir, accountVersionsDir)
 	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return err
@@ -244,13 +284,6 @@ func persistAccounts(work, stateDir string) error {
 		return err
 	}
 	final := filepath.Join(stateDir, lego.AccountsDir)
-	if info, err := os.Lstat(final); err == nil && info.Mode()&os.ModeSymlink == 0 {
-		// Legacy layout: keep the directory as an unreferenced version.
-		if err := os.Rename(final, filepath.Join(versions, "legacy-"+version)); err != nil {
-			os.RemoveAll(fresh)
-			return err
-		}
-	}
 	linkTmp := filepath.Join(stateDir, ".accounts-"+hex.EncodeToString(nonce[:]))
 	if err := os.Symlink(filepath.Join(accountVersionsDir, version), linkTmp); err != nil {
 		os.RemoveAll(fresh)

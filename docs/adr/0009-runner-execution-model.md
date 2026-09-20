@@ -132,10 +132,17 @@ it can safely call the pinned `lego` binary (see
   and a destroyed-after-use work directory, a leaked or backed-up
   `stateDir` contains no certificate private key material — only the ACME
   account key.
-- Two Runner processes sharing the same `stateDir` race on
-  `persistAccounts`'s rename-swap; nothing in the Runner itself serializes
-  that. Per-target mutual exclusion across runs is Phase 2 work (see
+- Two Runner processes sharing the same `stateDir` are serialized on the
+  state itself by an advisory `flock` (`internal/fslock`; publisher
+  exclusive, reader shared; lock waits honour the run's context so a
+  signal still ends the run). What remains unserialized is the run
+  itself: both processes can still execute `lego` and place two ACME
+  orders. Per-target mutual exclusion across runs is Phase 2 work (see
   `docs/threat-model.md`, T7) and is a residual risk until then.
+- `stateDir/accounts` is strictly either absent or a symbolic link into
+  `accounts.d/`; a plain directory is refused rather than migrated, since
+  no released layout ever used one and an in-place migration cannot be
+  made crash-safe with `rename` alone.
 - `Result.action` correctness depends entirely on the Store's `Current`
   read being accurate and on `store.ObjectName` being a stable, collision-
   resistant function of the FQDN; both already hold by construction (see

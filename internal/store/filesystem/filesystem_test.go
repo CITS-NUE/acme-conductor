@@ -473,7 +473,7 @@ func TestPutBlocksWhileObjectLockIsHeld(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	held, err := fslock.Exclusive(filepath.Join(dir, lockFile))
+	held, err := fslock.Exclusive(context.Background(), filepath.Join(dir, lockFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,5 +608,32 @@ func TestCurrentIsConsistentDuringConcurrentPuts(t *testing.T) {
 	wg.Wait()
 	if reads == 0 {
 		t.Fatal("no reads performed")
+	}
+}
+
+func TestPutAndCurrentHonourContextWhileWaitingForLock(t *testing.T) {
+	root := t.TempDir()
+	st, _ := New(root)
+	object := "wiki.example.ac.jp-deadbeef"
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := fslock.Exclusive(context.Background(), filepath.Join(root, object, lockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := st.Current(ctx, object); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Current: %v, want context error", err)
+	}
+	if err := st.Put(ctx, object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Put: %v, want context error", err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("lock waits ignored the context: %v", d)
 	}
 }

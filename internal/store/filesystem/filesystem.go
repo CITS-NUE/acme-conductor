@@ -97,7 +97,7 @@ func (s *Store) objectDir(object string) (string, error) {
 // reported as empty or healthy. A shared lock is held while reading so a
 // concurrent Put cannot swap and prune between the reads; the link is
 // resolved once and both files are read from that one version.
-func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
+func (s *Store) Current(ctx context.Context, object string) (*store.Info, error) {
 	dir, err := s.objectDir(object)
 	if err != nil {
 		return nil, err
@@ -108,7 +108,7 @@ func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
 		}
 		return nil, fmt.Errorf("stat current link: %w", err)
 	}
-	lock, err := fslock.Shared(filepath.Join(dir, lockFile))
+	lock, err := fslock.Shared(ctx, filepath.Join(dir, lockFile))
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +140,7 @@ func (s *Store) Current(_ context.Context, object string) (*store.Info, error) {
 }
 
 // Put implements store.Store.
-func (s *Store) Put(_ context.Context, object string, b store.Bundle) (err error) {
+func (s *Store) Put(ctx context.Context, object string, b store.Bundle) (err error) {
 	dir, err := s.objectDir(object)
 	if err != nil {
 		return err
@@ -159,7 +159,7 @@ func (s *Store) Put(_ context.Context, object string, b store.Bundle) (err error
 	if err := os.MkdirAll(versions, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
 	}
-	lock, err := fslock.Exclusive(filepath.Join(dir, lockFile))
+	lock, err := fslock.Exclusive(ctx, filepath.Join(dir, lockFile))
 	if err != nil {
 		return err
 	}

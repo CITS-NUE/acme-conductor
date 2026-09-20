@@ -398,7 +398,7 @@ generic, code-specific summary so a `Result` is always produced.
 | `AcmeFailure` | The issued certificate is already expired. | `issued certificate is already expired` |
 | `StoreFailure` | The Certificate Store could not be opened, read (`Current`) or written (`Put`). | `certificate store could not be opened` / `... read failed` / `... write failed` |
 | `Timeout` | `lego` did not finish within `lego.timeoutSeconds`. | `lego did not finish within <n> seconds` |
-| `Cancelled` | The run was cancelled by signal before or during the `lego` invocation. | `run was cancelled before lego started` / `... while lego was running` |
+| `Cancelled` | The run was cancelled by signal before or during the `lego` invocation, or while waiting for a store/state lock. | `run was cancelled before lego started` / `... while lego was running` / `run was cancelled by signal while waiting for …` |
 | `Internal` | Configuration could not be loaded, the work directory could not be prepared, ACME account state could not be read, the `lego` invocation could not be built for a reason other than a missing env var, or `lego` could not even be started. | e.g. `runner configuration could not be loaded` |
 
 ## Logging and redaction
@@ -460,10 +460,39 @@ across the rest of the codebase's log statements is still Phase 2+ work
   run against `internal/runner/fakelego`, a test double that imitates
   `lego`'s observable file/exit-code behavior without any network access
   (Phase 1 enforces principle 8 in [`docs/architecture.md`](architecture.md#security-principles)).
-- **`stateDir` must not be shared by concurrently-running Runner
-  processes.** Per-target mutual exclusion across runs is Phase 2 work
-  (the Conductor's run registry/scheduler); nothing in the Runner itself
-  serializes two processes writing to the same `stateDir`.
+- **Concurrency, precisely.** The two on-disk stores are
+  concurrency-safe on one host: account state publication and the
+  copy-in at run start are serialized by an advisory `flock` on
+  `stateDir/.lock` (publisher exclusive, reader shared), and the
+  filesystem Certificate Store does the same per object. What is *not*
+  provided is run-level exclusion: two Runner processes for the same
+  target can still both execute `lego`, place two ACME orders and race on
+  the DNS challenge. That is Phase 2 work (the Conductor's run
+  registry/scheduler), not a property of these stores.
+- **Locks and cancellation.** Lock acquisition never blocks in the
+  kernel: it retries non-blocking `flock` with a 10–100 ms backoff while
+  honouring the run's context, so a SIGTERM/SIGINT received while
+  another Runner holds a lock ends the run promptly with a `Cancelled`
+  Result (or `Timeout`, if the caller's deadline passed) rather than
+  hanging or reporting `Internal`/`StoreFailure`. Account state is still
+  published after a cancelled run, under its own 30-second bound, so an
+  account that the killed `lego` registered is not lost.
+- **Lock semantics** (`internal/fslock`): advisory, host-local, held on a
+  0600 lock file opened with `O_NOFOLLOW` (a pre-planted symbolic link is
+  refused); released by the kernel when the holder exits or closes the
+  descriptor, so a crashed holder leaves no stale lock; one lock per open
+  file description; a shared lock is never upgraded to exclusive. `flock`
+  behaviour on network filesystems (NFS, SMB) varies, so these stores are
+  for local filesystems; a deployment that places `stateDir` on a network
+  mount must verify `flock` semantics there first.
+- **Account state layout is strict.** `stateDir/accounts` is either
+  absent (first run) or a symbolic link into `accounts.d/`. A plain
+  directory there is refused (`ErrLegacyAccountsLayout`, no in-place
+  migration is attempted because none can be made crash-safe with
+  `rename` alone), and a link whose target is missing or unreadable is
+  reported as corruption (`ErrAccountsCorrupt`) and fails the run with
+  `Internal` before `lego` starts; a corrupted state never looks like a
+  first run, which would silently register a new ACME account.
 
 ## Crash safety
 

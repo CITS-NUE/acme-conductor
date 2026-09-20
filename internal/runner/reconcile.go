@@ -42,6 +42,24 @@ import (
 // work around the lego invocation.
 const staleMargin = 5 * time.Minute
 
+// persistTimeout bounds the publication of ACME account state after lego
+// has finished; it is independent of the run's own cancellation.
+const persistTimeout = 30 * time.Second
+
+// classifyCtx turns a failure whose cause is the run's own context ending
+// into the contract's Cancelled or Timeout code, so a lock or store wait
+// interrupted by SIGTERM is reported as a cancellation rather than as an
+// internal or store failure.
+func classifyCtx(ctx context.Context, f *failure) *failure {
+	switch {
+	case errors.Is(f.err, context.Canceled) && ctx.Err() != nil:
+		return fail(v1alpha1.ErrorCodeCancelled, "run was cancelled by signal while waiting for "+f.summary, f.err)
+	case errors.Is(f.err, context.DeadlineExceeded) && ctx.Err() != nil:
+		return fail(v1alpha1.ErrorCodeTimeout, "run deadline passed while waiting for "+f.summary, f.err)
+	}
+	return f
+}
+
 // clockSkewTolerance is how far in the future a certificate's NotBefore may
 // lie and still be treated as valid now. CAs backdate NotBefore by about an
 // hour; a larger offset indicates a wrong clock or a malformed certificate.
@@ -229,7 +247,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 		current = nil
 		log.Info("no certificate in store; issuing")
 	case err != nil:
-		return nil, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store read failed", err)
+		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store read failed", err))
 	default:
 		renewBefore := time.Duration(spec.Policy.RenewBeforeDays) * 24 * time.Hour
 		covers := containsFold(current.DNSNames, spec.Target.FQDN)
@@ -265,8 +283,8 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 		return nil, fail(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)
 	}
 	defer cleanup()
-	if err := loadAccounts(cfg.Lego.StateDir, work); err != nil {
-		return nil, fail(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err)
+	if err := loadAccounts(ctx, cfg.Lego.StateDir, work); err != nil {
+		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err))
 	}
 
 	inv, err := lego.Build(lego.Params{
@@ -295,10 +313,14 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	}
 	res, err := exec.Run(ctx, inv)
 	// Whatever happened, keep the account state lego may have created or
-	// updated, so the next run reuses the same ACME account.
-	if perr := persistAccounts(work, cfg.Lego.StateDir); perr != nil {
+	// updated, so the next run reuses the same ACME account. This runs even
+	// after a cancellation (an account registered by the killed lego must
+	// not be lost), but with its own bound so it cannot hang.
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	if perr := persistAccounts(persistCtx, work, cfg.Lego.StateDir); perr != nil {
 		log.Warn("ACME account state could not be persisted", "error", perr.Error())
 	}
+	cancelPersist()
 	if err != nil {
 		return nil, fail(v1alpha1.ErrorCodeInternal, "lego could not be executed", err)
 	}
@@ -347,7 +369,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	}
 	info := store.InfoOf(leaf)
 	if err := st.Put(ctx, object, store.Bundle{Certificate: leafPEM, Chain: chainPEM, PrivateKey: keyPEM}); err != nil {
-		return nil, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store write failed", err)
+		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store write failed", err))
 	}
 	action := v1alpha1.ActionIssued
 	if current != nil {

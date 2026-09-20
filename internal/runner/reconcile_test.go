@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
@@ -490,13 +491,13 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 	if err := os.WriteFile(acct, []byte("v1"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistAccounts(work, state); err != nil {
+	if err := persistAccounts(context.Background(), work, state); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(acct, []byte("v2"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistAccounts(work, state); err != nil {
+	if err := persistAccounts(context.Background(), work, state); err != nil {
 		t.Fatal(err)
 	}
 	final := filepath.Join(state, "accounts")
@@ -537,12 +538,12 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 		t.Fatalf("copied state = %q", b)
 	}
 	// No accounts in work → no-op.
-	if err := persistAccounts(filepath.Join(dir, "empty"), state); err != nil {
+	if err := persistAccounts(context.Background(), filepath.Join(dir, "empty"), state); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestPersistAccountsMigratesLegacyDirectory(t *testing.T) {
+func TestLegacyAccountsDirectoryIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	work := filepath.Join(dir, "work")
 	state := filepath.Join(dir, "state")
@@ -554,15 +555,97 @@ func TestPersistAccountsMigratesLegacyDirectory(t *testing.T) {
 	acct := filepath.Join(work, "accounts", "host", "user", "account.json")
 	os.MkdirAll(filepath.Dir(acct), 0o700)
 	os.WriteFile(acct, []byte("new"), 0o600)
-	if err := persistAccounts(work, state); err != nil {
+	if err := persistAccounts(context.Background(), work, state); !errors.Is(err, ErrLegacyAccountsLayout) {
+		t.Fatalf("persistAccounts = %v, want ErrLegacyAccountsLayout", err)
+	}
+	if err := loadAccounts(context.Background(), state, filepath.Join(dir, "reader")); !errors.Is(err, ErrLegacyAccountsLayout) {
+		t.Fatalf("loadAccounts = %v, want ErrLegacyAccountsLayout", err)
+	}
+	// The legacy directory is untouched.
+	if b, err := os.ReadFile(filepath.Join(legacy, "account.json")); err != nil || string(b) != "legacy" {
+		t.Fatalf("legacy state modified: %q %v", b, err)
+	}
+}
+
+func TestLoadAccountsDanglingLinkIsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	if err := os.MkdirAll(filepath.Join(state, accountVersionsDir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(state, "accounts", "host", "user", "account.json"))
-	if err != nil || string(got) != "new" {
-		t.Fatalf("state = %q, %v", got, err)
+	if err := os.Symlink(filepath.Join(accountVersionsDir, "nonexistent"), filepath.Join(state, "accounts")); err != nil {
+		t.Fatal(err)
 	}
-	if info, _ := os.Lstat(filepath.Join(state, "accounts")); info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("legacy directory was not replaced by a link")
+	err := loadAccounts(context.Background(), state, filepath.Join(dir, "work"))
+	if !errors.Is(err, ErrAccountsCorrupt) {
+		t.Fatalf("loadAccounts = %v, want ErrAccountsCorrupt", err)
+	}
+	// And the runner reports it as Internal, not as a first run.
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	os.MkdirAll(filepath.Join(h.stateDir, accountVersionsDir), 0o700)
+	os.Symlink(filepath.Join(accountVersionsDir, "nonexistent"), filepath.Join(h.stateDir, "accounts"))
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInternal || !strings.Contains(res.Error.Summary, "account state") {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run on a corrupted account state")
+	}
+}
+
+// TestCancelWhileWaitingForStateLock: a SIGTERM (context cancellation)
+// while another Runner holds the state lock must end the run promptly with
+// a Cancelled Result, not block in flock or report Internal.
+func TestCancelWhileWaitingForStateLock(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	if err := os.MkdirAll(h.stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := fslock.Exclusive(context.Background(), filepath.Join(h.stateDir, stateLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	code, res := h.run(ctx)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("run blocked on the lock for %v", d)
+	}
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeTimeout && res.Error.Code != v1alpha1.ErrorCodeCancelled {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run when the state could not be read")
+	}
+}
+
+func TestCancelWhileWaitingForStoreLock(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	object := store.ObjectName("wiki.example.ac.jp")
+	if err := os.MkdirAll(filepath.Join(h.storeDir, object), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Publish a certificate first so Current has to take the lock.
+	h.putCert("wiki.example.ac.jp", h.now.Add(-time.Hour), h.now.Add(90*24*time.Hour))
+	holder, err := fslock.Exclusive(context.Background(), filepath.Join(h.storeDir, object, ".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(400 * time.Millisecond); cancel() }()
+	start := time.Now()
+	code, res := h.run(ctx)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("run blocked on the store lock for %v", d)
+	}
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeCancelled {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
 	}
 }
 
@@ -715,7 +798,7 @@ func TestPersistAccountsConcurrentPublishersNeverLeaveDanglingLink(t *testing.T)
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			errs <- persistAccounts(works[i], state)
+			errs <- persistAccounts(context.Background(), works[i], state)
 		}(i)
 	}
 	close(start)
@@ -744,7 +827,7 @@ func TestPersistAccountsConcurrentPublishersNeverLeaveDanglingLink(t *testing.T)
 	}
 	// A reader under the shared lock sees the published state.
 	work := filepath.Join(dir, "reader")
-	if err := loadAccounts(state, work); err != nil {
+	if err := loadAccounts(context.Background(), state, work); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(work, "accounts", "host", "user", "account.json")); string(b) != string(got) {
@@ -754,7 +837,7 @@ func TestPersistAccountsConcurrentPublishersNeverLeaveDanglingLink(t *testing.T)
 
 func TestLoadAccountsWithoutState(t *testing.T) {
 	dir := t.TempDir()
-	if err := loadAccounts(filepath.Join(dir, "state"), filepath.Join(dir, "work")); err != nil {
+	if err := loadAccounts(context.Background(), filepath.Join(dir, "state"), filepath.Join(dir, "work")); err != nil {
 		t.Fatalf("missing state must not be an error: %v", err)
 	}
 }

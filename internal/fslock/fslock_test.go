@@ -1,6 +1,9 @@
 package fslock
 
 import (
+	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -8,14 +11,15 @@ import (
 
 func TestExclusiveBlocksExclusiveAndShared(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".lock")
-	l, err := Exclusive(path)
+	ctx := context.Background()
+	l, err := Exclusive(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, take := range []func(string) (*Lock, error){Exclusive, Shared} {
+	for _, take := range []func(context.Context, string) (*Lock, error){Exclusive, Shared} {
 		done := make(chan struct{})
 		go func() {
-			l2, err := take(path)
+			l2, err := take(ctx, path)
 			if err == nil {
 				l2.Unlock()
 			}
@@ -32,7 +36,7 @@ func TestExclusiveBlocksExclusiveAndShared(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("second lock never acquired after unlock")
 		}
-		l, err = Exclusive(path)
+		l, err = Exclusive(ctx, path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,25 +47,76 @@ func TestExclusiveBlocksExclusiveAndShared(t *testing.T) {
 
 func TestSharedLocksCoexist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".lock")
-	a, err := Shared(path)
+	a, err := Shared(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Unlock()
-	done := make(chan error, 1)
-	go func() {
-		b, err := Shared(path)
-		if err == nil {
-			b.Unlock()
+	b, err := Shared(context.Background(), path)
+	if err != nil {
+		t.Fatalf("shared lock blocked by another shared lock: %v", err)
+	}
+	b.Unlock()
+}
+
+func TestAcquisitionHonoursContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".lock")
+	holder, err := Exclusive(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	for _, take := range []func(context.Context, string) (*Lock, error){Exclusive, Shared} {
+		_, err := take(ctx, path)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want context deadline", err)
 		}
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("shared lock blocked by another shared lock")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("cancellation took %v", d)
+	}
+	// A pre-cancelled context still fails fast even if the lock is free.
+	holder.Unlock()
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	if l, err := Exclusive(cctx, path); err == nil {
+		l.Unlock()
+		// Acquiring an uncontended lock with a cancelled context is
+		// acceptable (the first non-blocking attempt succeeds).
+	}
+}
+
+func TestLockFileRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".lock")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := Exclusive(context.Background(), path); err == nil {
+		l.Unlock()
+		t.Fatal("lock followed a symbolic link")
+	}
+}
+
+func TestLockFileMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".lock")
+	l, err := Exclusive(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Unlock()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o", st.Mode().Perm())
 	}
 }
