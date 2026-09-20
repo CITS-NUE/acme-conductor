@@ -9,6 +9,12 @@ VERSION     := $(shell git describe --tags --always --dirty 2>/dev/null || echo 
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# lego CLI bundled into the runner image (Dockerfile.runner). The version
+# here must match the LEGO_SHA256_AMD64 / LEGO_SHA256_ARM64 checksum
+# defaults declared in Dockerfile.runner, which remain the single source
+# of truth for those checksums.
+LEGO_VERSION ?= 4.35.2
+
 LDFLAGS := -s -w \
 	-X $(MODULE)/internal/version.Version=$(VERSION) \
 	-X $(MODULE)/internal/version.Commit=$(COMMIT) \
@@ -68,6 +74,7 @@ image-runner:
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_DATE=$(BUILD_DATE) \
+		--build-arg LEGO_VERSION=$(LEGO_VERSION) \
 		-t $(IMAGE_REGISTRY)/acme-runner:$(IMAGE_TAG) .
 
 ## images: build both container images.

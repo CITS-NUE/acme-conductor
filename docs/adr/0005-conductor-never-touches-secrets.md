@@ -50,7 +50,7 @@ private keys or any long-lived cloud/DNS/Key Vault credential:
   "can request issuance jobs," not "can exfiltrate every certificate the
   system manages." Requesting a job is not itself bounded by this ADR: a
   compromised Conductor can produce any self-consistent `JobSpec`, and it
-  is the Runner-side trusted authorization policy (Phase 1; see
+  is the Runner-side trusted authorization policy (wired in Phase 1; see
   `docs/threat-model.md`, T1) — not this identity-and-secrets separation —
   that is meant to bound what such a job can actually cause to be issued.
 - This rules out several conveniences a simpler design might have: the

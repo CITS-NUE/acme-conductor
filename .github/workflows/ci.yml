@@ -119,3 +119,18 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Smoke test bundled lego --version
+        if: matrix.component == 'runner'
+        run: |
+          out="$(docker run --rm --read-only --user 65532:65532 \
+            --entrypoint /usr/local/bin/lego \
+            ghcr.io/cits-nue/acme-runner:ci --version)"
+          echo "$out"
+          case "$out" in
+            *"lego version 4.35.2"*) ;;
+            *)
+              echo "unexpected lego --version output: $out" >&2
+              exit 1
+              ;;
+          esac

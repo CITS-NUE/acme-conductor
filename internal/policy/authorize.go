@@ -12,9 +12,9 @@ import (
 // by a compromised Conductor) cannot widen it.
 //
 // This is the authorization boundary; v1alpha1.JobSpec.Validate is only a
-// self-consistency check of the document. Phase 0 defines the policy and the
-// decision function; loading it from configuration and wiring it into the
-// Runner is Phase 1 work.
+// self-consistency check of the document. The Runner loads the policy from
+// its configuration (internal/runner/config) and calls Authorize before it
+// resolves any binding or starts lego (internal/runner).
 //
 // Every list is deny-by-default: an empty list authorizes nothing.
 type RunnerAuthorizationPolicy struct {

@@ -76,7 +76,9 @@ split explicitly because it is easy to conflate them:
   `AllowedACMEBindings`, `AllowedDNSBindings`, `AllowedStoreBindings`.
   Every list is deny-by-default. Phase 0 ships the type and the decision
   function with tests; loading the configuration and wiring `Authorize`
-  into the Runner's execution path is Phase 1 work.
+  into the Runner's execution path happened in Phase 1
+  (`internal/runner/config` loads it; `internal/runner` calls `Authorize`
+  before any binding is resolved).
 - **Signing's scope.** A future signed/authenticated `JobSpec` envelope
   (Phase 4) protects the document against tampering in transit between
   production and consumption. It does not address a compromised Conductor
