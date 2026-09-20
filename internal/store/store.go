@@ -72,11 +72,22 @@ func ObjectName(fqdn string) string {
 	if len(readable) > max {
 		readable = strings.TrimRight(readable[:max], ".-")
 	}
-	// A normalized FQDN always starts with a letter, digit or "*." and is
-	// non-empty; anything else (defensive path only) gets a fixed prefix so
-	// the result still satisfies the contract.
-	if readable == "" || !isAlnum(readable[0]) {
-		readable = "target-" + readable
+	// A normalized FQDN only contains [a-z0-9.-] after the wildcard
+	// replacement. Anything else (defensive path only) is mapped onto the
+	// contract's alphabet so the result is always a valid object name.
+	readable = strings.Map(func(r rune) rune {
+		if r < 0x80 && (isAlnum(byte(r)) || r == '.' || r == '-' || r == '_') {
+			return r
+		}
+		return '-'
+	}, readable)
+	readable = strings.TrimLeft(readable, ".-_")
+	readable = strings.TrimRight(readable, ".-_")
+	if readable == "" {
+		readable = "target"
+	}
+	for strings.Contains(readable, "..") {
+		readable = strings.ReplaceAll(readable, "..", ".")
 	}
 	return readable + suffix
 }
