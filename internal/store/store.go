@@ -12,6 +12,9 @@ package store
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -179,6 +182,33 @@ func Covers(c *x509.Certificate, fqdn string) bool {
 		}
 	}
 	return false
+}
+
+// KeyMatchesType reports whether the certificate's public key is of the
+// algorithm and size that keyType denotes (lego --key-type names).
+func KeyMatchesType(c *x509.Certificate, keyType v1alpha1.KeyType) error {
+	switch pub := c.PublicKey.(type) {
+	case *ecdsa.PublicKey:
+		want := map[v1alpha1.KeyType]elliptic.Curve{v1alpha1.KeyTypeEC256: elliptic.P256(), v1alpha1.KeyTypeEC384: elliptic.P384()}[keyType]
+		if want == nil {
+			return fmt.Errorf("certificate has an ECDSA key but %q was requested", keyType)
+		}
+		if pub.Curve != want {
+			return fmt.Errorf("certificate has an ECDSA %s key but %q was requested", pub.Curve.Params().Name, keyType)
+		}
+		return nil
+	case *rsa.PublicKey:
+		want := map[v1alpha1.KeyType]int{v1alpha1.KeyTypeRSA2048: 2048, v1alpha1.KeyTypeRSA3072: 3072, v1alpha1.KeyTypeRSA4096: 4096}[keyType]
+		if want == 0 {
+			return fmt.Errorf("certificate has an RSA key but %q was requested", keyType)
+		}
+		if pub.N.BitLen() != want {
+			return fmt.Errorf("certificate has an RSA-%d key but %q was requested", pub.N.BitLen(), keyType)
+		}
+		return nil
+	default:
+		return fmt.Errorf("certificate has an unsupported key type %T", c.PublicKey)
+	}
 }
 
 // PrivateKeyMatches reports whether keyPEM is the private key of c.

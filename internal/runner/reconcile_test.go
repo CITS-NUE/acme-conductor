@@ -89,7 +89,7 @@ func newHarness(t *testing.T, mode string, extraEnv map[string]string) *harness 
 		},
 		"lego": map[string]any{"binary": self, "stateDir": h.stateDir, "workDir": h.workDir, "timeoutSeconds": 20},
 		"acmeBindings": map[string]any{
-			"fake-ca": map[string]any{"directoryURL": "https://acme.invalid/directory", "email": "certs@example.ac.jp"},
+			"fake-ca": map[string]any{"directoryURL": "https://acme.test.invalid/directory", "email": "certs@example.ac.jp"},
 		},
 		"dnsBindings": map[string]any{
 			"fake-dns": map[string]any{"provider": "fakedns", "env": env, "passthroughEnv": []string{"FAKE_TOKEN"}},
@@ -211,7 +211,7 @@ func TestReconcileIssued(t *testing.T) {
 	if len(h.workEntries()) != 0 {
 		t.Fatalf("work directory not cleaned up")
 	}
-	if _, err := os.Stat(filepath.Join(h.stateDir, "accounts", "acme.invalid", "certs@example.ac.jp", "account.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(h.stateDir, "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json")); err != nil {
 		t.Fatalf("account state not persisted: %v", err)
 	}
 	// Private key exists in the store only.
@@ -228,7 +228,7 @@ func TestReconcileIssued(t *testing.T) {
 	if err := json.Unmarshal(data, &rec); err != nil {
 		t.Fatal(err)
 	}
-	wantArgv := []string{"--accept-tos", "--email", "certs@example.ac.jp", "--server", "https://acme.invalid/directory", "--dns", "fakedns", "--domains", "wiki.example.ac.jp", "--key-type", "ec256", "--path", rec.Dir, "run"}
+	wantArgv := []string{"--accept-tos", "--email", "certs@example.ac.jp", "--server", "https://acme.test.invalid/directory", "--dns", "fakedns", "--domains", "wiki.example.ac.jp", "--key-type", "ec256", "--path", rec.Dir, "run"}
 	if strings.Join(rec.Argv, " ") != strings.Join(wantArgv, " ") {
 		t.Fatalf("argv = %q\nwant %q", rec.Argv, wantArgv)
 	}
@@ -617,5 +617,69 @@ func TestReconcileNoopWithinClockSkew(t *testing.T) {
 	code, res := h.run(context.Background())
 	if code != ExitSucceeded || res.Action != v1alpha1.ActionNoop {
 		t.Fatalf("code=%d result=%+v", code, res)
+	}
+}
+
+func TestSweepHonoursCreatorDeadline(t *testing.T) {
+	parent := t.TempDir()
+	// Runner A with a long timeout creates a directory whose mtime is old
+	// but whose recorded deadline is far in the future.
+	live, cleanup, err := prepareWorkDir(parent, "01JABCDEFGHJKMNPQRSTVWXYZ0", 2*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(live, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// Runner B with a short timeout sweeps: must not touch A's live run.
+	sweepStaleWorkDirs(parent, 2*time.Minute, time.Now())
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live run directory of another runner was swept: %v", err)
+	}
+	// Past its own deadline it is swept even by a runner with a longer
+	// threshold.
+	os.WriteFile(filepath.Join(live, deadlineFile), []byte("1\n"), 0o600)
+	sweepStaleWorkDirs(parent, 24*time.Hour, time.Now())
+	if _, err := os.Stat(live); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired run directory not swept: %v", err)
+	}
+}
+
+func TestReconcileRejectsWrongKeyType(t *testing.T) {
+	h := newHarness(t, "ok", map[string]string{fakelego.EnvKeyTypeOverride: "rsa2048"})
+	h.job(nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeACMEFailure || !strings.Contains(res.Error.Summary, "key type") {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	h2 := newHarness(t, "ok", nil)
+	h2.job(func(m map[string]any) { m["policy"].(map[string]any)["keyType"] = "rsa2048" })
+	if code, res := h2.run(context.Background()); code != ExitSucceeded || res.Action != v1alpha1.ActionIssued {
+		t.Fatalf("rsa2048 issuance: code=%d result=%+v\n%s", code, res, h2.logs.String())
+	}
+}
+
+func TestResultDeliveredOnStdoutWhenFileUnwritable(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	// --result points at a directory: the file cannot be committed.
+	if err := os.MkdirAll(h.resPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewJSONHandler(&h.logs, nil))
+	code := Reconcile(context.Background(), Options{
+		ConfigPath: h.cfgPath, JobPath: h.jobPath, ResultPath: h.resPath, Stdout: &h.stdout, Logger: logger,
+		Now: func() time.Time { return h.now }, LookupEnv: func(k string) (string, bool) { v, ok := h.env[k]; return v, ok },
+	})
+	if code != ExitSucceeded {
+		t.Fatalf("exit code = %d, want %d (Result was delivered on stdout)", code, ExitSucceeded)
+	}
+	if _, err := v1alpha1.DecodeResult(strings.NewReader(h.stdout.String())); err != nil {
+		t.Fatalf("stdout Result invalid: %v", err)
+	}
+	if !strings.Contains(h.logs.String(), "cannot write result file") {
+		t.Fatalf("file failure not logged:\n%s", h.logs.String())
 	}
 }

@@ -19,10 +19,10 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
+	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
@@ -72,15 +73,33 @@ var (
 	deniedEnvNames    = map[string]struct{}{"PATH": {}, "HOME": {}, "TMPDIR": {}}
 )
 
-// productionDirectories lists well-known production ACME directories. A
-// binding may only use one of them when AllowProductionCA is set, so that a
-// test or development configuration can never reach a production CA by
-// accident (security principle 8).
-var productionDirectories = map[string]string{
-	"https://acme-v02.api.letsencrypt.org/directory": "Let's Encrypt production",
-	"https://acme.zerossl.com/v2/DV90":               "ZeroSSL production",
-	"https://dv.acme-v02.api.pki.goog/directory":     "Google Trust Services production",
-	"https://api.buypass.com/acme/directory":         "Buypass production",
+// nonProductionHostTokens are host-name labels (split on "." and "-") that
+// identify a staging, test or local ACME server. Any other directory is
+// treated as production and requires AllowProductionCA (security
+// principle 8: a test or development configuration must never reach a
+// production CA by accident). A private CA whose host name carries none
+// of these tokens must set AllowProductionCA explicitly; that is the
+// intended fail-closed behaviour. Tokens are matched whole so that
+// "attestation" or "devices" do not count as "test" or "dev".
+var nonProductionHostTokens = map[string]struct{}{
+	"staging": {}, "stage": {}, "test": {}, "testing": {}, "sandbox": {},
+	"pebble": {}, "localhost": {}, "dev": {}, "local": {}, "internal": {},
+}
+
+// IsNonProductionDirectory reports whether u is recognized as a
+// staging/test/local ACME directory: a loopback, private or link-local IP
+// literal, or a host name one of whose labels is a non-production token.
+func IsNonProductionDirectory(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	for _, label := range strings.FieldsFunc(host, func(r rune) bool { return r == '.' || r == '-' }) {
+		if _, ok := nonProductionHostTokens[label]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Config is the whole runner configuration document.
@@ -125,8 +144,8 @@ type ACMEBinding struct {
 	// EAB names the environment variables holding External Account Binding
 	// credentials. The values themselves are never in this file.
 	EAB *EAB `json:"eab,omitempty"`
-	// AllowProductionCA must be set explicitly to use a well-known
-	// production directory.
+	// AllowProductionCA must be set explicitly to use a directory that is
+	// not recognized as staging/test/local (see IsNonProductionDirectory).
 	AllowProductionCA bool `json:"allowProductionCA,omitempty"`
 }
 
@@ -186,14 +205,9 @@ func Read(r io.Reader) (*Config, error) {
 	if len(data) > MaxConfigSize {
 		return nil, ErrTooLarge
 	}
-	dec := json.NewDecoder(strings.NewReader(string(data)))
-	dec.DisallowUnknownFields()
 	var c Config
-	if err := dec.Decode(&c); err != nil {
+	if err := strictjson.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return nil, fmt.Errorf("%w: trailing data after document", ErrInvalid)
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -275,8 +289,8 @@ func (b *ACMEBinding) validate(field string) error {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return invalid("%s.directoryURL must be an https URL without credentials or fragment", field)
 	}
-	if desc, prod := productionDirectories[b.DirectoryURL]; prod && !b.AllowProductionCA {
-		return invalid("%s.directoryURL is %s; set allowProductionCA to use it", field, desc)
+	if !b.AllowProductionCA && !IsNonProductionDirectory(u) {
+		return invalid("%s.directoryURL %q is not recognized as a staging/test directory; set allowProductionCA to use it", field, b.DirectoryURL)
 	}
 	if b.Email == "" || strings.ContainsAny(b.Email, " \t\r\n\"'\\/") || strings.Count(b.Email, "@") != 1 || strings.HasPrefix(b.Email, "@") || strings.HasSuffix(b.Email, "@") {
 		return invalid("%s.email must be a single mailbox address", field)
@@ -339,7 +353,7 @@ func splitHostPort(s string) (string, string, error) {
 		return "", "", errors.New("missing port")
 	}
 	host, port := s[:i], s[i+1:]
-	if strings.ContainsAny(host, " /\\") || strings.ContainsAny(port, " /\\") {
+	if strings.ContainsAny(host, " \t,/\\") || strings.ContainsAny(port, " \t,/\\") {
 		return "", "", errors.New("invalid characters")
 	}
 	for _, c := range port {

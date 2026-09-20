@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,12 @@ const maxStateFileSize = 1 << 20
 
 // workDirPrefix is the name prefix of per-run work directories.
 const workDirPrefix = "run-"
+
+// deadlineFile, inside a per-run directory, records the Unix time after
+// which the directory may be swept by any Runner, so that Runners with
+// different timeouts sharing one workDir never sweep each other's live
+// runs.
+const deadlineFile = ".sweep-after"
 
 // prepareWorkDir creates a private per-run directory under parent and
 // returns it with a cleanup function that removes it entirely. The
@@ -34,7 +41,8 @@ func prepareWorkDir(parent, runID string, staleAfter time.Duration) (string, fun
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create work parent: %w", err)
 	}
-	sweepStaleWorkDirs(parent, staleAfter, time.Now())
+	now := time.Now()
+	sweepStaleWorkDirs(parent, staleAfter, now)
 	dir, err := os.MkdirTemp(parent, workDirPrefix+runID+"-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create work directory: %w", err)
@@ -43,13 +51,20 @@ func prepareWorkDir(parent, runID string, staleAfter time.Duration) (string, fun
 		os.RemoveAll(dir)
 		return "", nil, fmt.Errorf("restrict work directory: %w", err)
 	}
+	if staleAfter > 0 {
+		deadline := strconv.FormatInt(now.Add(staleAfter).Unix(), 10)
+		if err := os.WriteFile(filepath.Join(dir, deadlineFile), []byte(deadline+"\n"), 0o600); err != nil {
+			os.RemoveAll(dir)
+			return "", nil, fmt.Errorf("record work directory deadline: %w", err)
+		}
+	}
 	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }
 
-// sweepStaleWorkDirs removes per-run directories under parent whose
-// modification time is older than staleAfter. A live run never exceeds
-// the lego timeout, so callers pass a multiple of it. Failures are logged
-// by omission only: sweeping is best effort.
+// sweepStaleWorkDirs removes per-run directories under parent that are
+// past their recorded deadline (deadlineFile written by the creator). A
+// directory without a readable deadline falls back to its modification
+// time plus staleAfter. Sweeping is best effort.
 func sweepStaleWorkDirs(parent string, staleAfter time.Duration, now time.Time) {
 	if staleAfter <= 0 {
 		return
@@ -62,12 +77,17 @@ func sweepStaleWorkDirs(parent string, staleAfter time.Duration, now time.Time) 
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), workDirPrefix) {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
+		dir := filepath.Join(parent, e.Name())
+		expired := false
+		if data, err := os.ReadFile(filepath.Join(dir, deadlineFile)); err == nil {
+			if secs, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				expired = now.Unix() > secs
+			}
+		} else if info, err := e.Info(); err == nil {
+			expired = now.Sub(info.ModTime()) > staleAfter
 		}
-		if now.Sub(info.ModTime()) > staleAfter {
-			_ = os.RemoveAll(filepath.Join(parent, e.Name()))
+		if expired {
+			_ = os.RemoveAll(dir)
 		}
 	}
 }

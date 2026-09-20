@@ -9,7 +9,6 @@
 package lego
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -158,8 +157,13 @@ type Executor struct {
 }
 
 // Run executes inv once. It returns a non-nil error only when the process
-// could not be started or was killed; a non-zero exit is reported through
-// Outcome.ExitCode with a nil error.
+// could not be started or waited for; a non-zero exit, a timeout and a
+// cancellation are reported through Outcome with a nil error.
+//
+// Output is consumed through io.Writer sinks that os/exec drives with its
+// own goroutines, so exec.Cmd.WaitDelay bounds how long a descendant that
+// inherited the pipes (a detached helper process) can delay the return:
+// after the grace period the pipes are closed forcibly and Wait returns.
 func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	logger := e.Logger
 	if logger == nil {
@@ -189,56 +193,124 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	cmd.WaitDelay = grace
 
 	secrets := inv.Secrets()
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
+	// One sink per stream: PEM suppression is stateful.
+	stdout := newLineSink(logger, "stdout", NewRedactor(secrets))
+	stderr := newLineSink(logger, "stderr", NewRedactor(secrets))
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start lego: %w", err)
 	}
 	// Whatever way Wait returns, make sure no process from the group
-	// survives this function.
+	// survives this function. A descendant that left the group (setsid)
+	// is out of reach; only a PID namespace can contain that.
 	defer func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }()
-	var wg sync.WaitGroup
-	for name, r := range map[string]io.Reader{"stdout": stdout, "stderr": stderr} {
-		wg.Add(1)
-		go func(name string, r io.Reader) {
-			defer wg.Done()
-			// One redactor per stream: PEM suppression is stateful.
-			redact := NewRedactor(secrets)
-			readLines(r, func(line string, truncated bool) {
-				out, keep := redact.Line(line)
-				if !keep {
-					return
-				}
-				logger.Debug("lego output", "stream", name, "line", out, "truncated", truncated)
-			})
-		}(name, r)
-	}
-	wg.Wait()
 	waitErr := cmd.Wait()
+	stdout.Flush()
+	stderr.Flush()
+
 	out := &Outcome{Duration: time.Since(start)}
-	if waitErr != nil {
+	switch {
+	case waitErr == nil:
+		out.ExitCode = 0
+	case errors.Is(waitErr, exec.ErrWaitDelay):
+		// The process exited but something kept its output pipes open past
+		// the grace period; the exit status itself is known.
+		out.ExitCode = cmd.ProcessState.ExitCode()
+		logger.Warn("lego output pipes were held open after exit; closed forcibly", "exitCode", out.ExitCode)
+	default:
 		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			out.ExitCode = exitErr.ExitCode()
-		} else {
+		if !errors.As(waitErr, &exitErr) {
 			return nil, fmt.Errorf("wait for lego: %w", waitErr)
 		}
+		out.ExitCode = exitErr.ExitCode()
 	}
+	// A process that finished successfully right at the deadline is a
+	// success, not a timeout: only a killed process is classified.
+	killed := out.ExitCode != 0
 	switch {
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil:
+	case killed && errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil:
 		out.TimedOut = true
-	case ctx.Err() != nil:
+	case killed && ctx.Err() != nil:
 		out.Cancelled = true
 	}
 	logger.Info("lego finished", "exitCode", out.ExitCode, "durationMs", out.Duration.Milliseconds(), "timedOut", out.TimedOut, "cancelled", out.Cancelled)
 	return out, nil
+}
+
+// maxLogLine bounds one logged output line. Longer lines are truncated,
+// never dropped, and the remainder is discarded, so the child can never
+// block on a full pipe.
+const maxLogLine = 8 * 1024
+
+// lineSink is an io.Writer that splits a stream into lines, redacts them
+// and logs them. os/exec writes to it from its own goroutine, so no
+// locking is needed beyond what Write's caller provides.
+type lineSink struct {
+	logger    *slog.Logger
+	stream    string
+	redact    *Redactor
+	buf       []byte
+	truncated bool
+	mu        sync.Mutex
+}
+
+func newLineSink(logger *slog.Logger, stream string, r *Redactor) *lineSink {
+	return &lineSink{logger: logger, stream: stream, redact: r}
+}
+
+func (s *lineSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(p)
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			s.append(p)
+			break
+		}
+		s.append(p[:i])
+		s.emit()
+		p = p[i+1:]
+	}
+	return n, nil
+}
+
+func (s *lineSink) append(b []byte) {
+	if len(s.buf) >= maxLogLine {
+		if len(b) > 0 {
+			s.truncated = true
+		}
+		return
+	}
+	room := maxLogLine - len(s.buf)
+	if len(b) > room {
+		s.buf = append(s.buf, b[:room]...)
+		s.truncated = true
+		return
+	}
+	s.buf = append(s.buf, b...)
+}
+
+func (s *lineSink) emit() {
+	line := strings.TrimRight(string(s.buf), "\r")
+	out, keep := s.redact.Line(line)
+	if keep {
+		s.logger.Debug("lego output", "stream", s.stream, "line", out, "truncated", s.truncated)
+	}
+	s.buf = s.buf[:0]
+	s.truncated = false
+}
+
+// Flush logs a trailing line without a newline.
+func (s *lineSink) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.buf) > 0 {
+		s.emit()
+	}
 }
 
 // Redactor masks secret values and PEM blocks in text before it is logged.
@@ -313,46 +385,6 @@ func (r *Redactor) Line(s string) (string, bool) {
 		}
 	}
 	return b.String(), true
-}
-
-// maxLogLine bounds one logged output line. Longer lines are truncated,
-// never dropped, and reading always continues so the child can never block
-// on a full pipe.
-const maxLogLine = 8 * 1024
-
-// readLines calls fn for every line of r until EOF. Lines longer than
-// maxLogLine are delivered truncated with truncated=true; the remainder is
-// drained and discarded.
-func readLines(r io.Reader, fn func(line string, truncated bool)) {
-	br := bufio.NewReaderSize(r, 64*1024)
-	for {
-		var line []byte
-		truncated := false
-		for {
-			chunk, err := br.ReadSlice('\n')
-			if len(line) < maxLogLine {
-				line = append(line, chunk...)
-				if len(line) > maxLogLine {
-					line = line[:maxLogLine]
-					truncated = true
-				}
-			} else {
-				truncated = true
-			}
-			if err == nil {
-				break
-			}
-			if errors.Is(err, bufio.ErrBufferFull) {
-				continue
-			}
-			// EOF or read error: deliver what we have and stop.
-			if len(line) > 0 {
-				fn(strings.TrimRight(string(line), "\r\n"), truncated)
-			}
-			return
-		}
-		fn(strings.TrimRight(string(line), "\r\n"), truncated)
-	}
 }
 
 // ReadOutputs reads the certificate, private key and issuer chain lego wrote

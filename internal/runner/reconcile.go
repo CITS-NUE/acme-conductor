@@ -144,9 +144,16 @@ func Reconcile(ctx context.Context, opts Options) int {
 				return ExitNoResult
 			}
 		}
-		if err := WriteResult(res, opts.ResultPath, opts.Stdout); err != nil {
-			log.Error("cannot write result", "error", err.Error())
-			return ExitNoResult
+		delivered, err := WriteResult(res, opts.ResultPath, opts.Stdout)
+		if err != nil {
+			// The Result could not be written to the file. If it reached
+			// stdout the run's outcome is still reported and the exit code
+			// reflects it; only when nothing was delivered is there no
+			// Result at all.
+			log.Error("cannot write result file", "error", err.Error(), "deliveredOnStdout", delivered)
+			if !delivered {
+				return ExitNoResult
+			}
 		}
 		if f != nil {
 			log.Error("reconcile failed", "code", string(f.code), "summary", f.summary, "cause", causeText(f.err))
@@ -324,6 +331,9 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	}
 	if len(leaf.DNSNames) != 1 {
 		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not contain exactly one subject alternative name", nil)
+	}
+	if err := store.KeyMatchesType(leaf, spec.Policy.KeyType); err != nil {
+		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate key does not match the requested key type", err)
 	}
 	info := store.InfoOf(leaf)
 	if err := st.Put(ctx, object, store.Bundle{Certificate: leafPEM, Chain: chainPEM, PrivateKey: keyPEM}); err != nil {

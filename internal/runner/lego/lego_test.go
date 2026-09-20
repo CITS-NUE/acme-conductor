@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -366,20 +367,26 @@ func TestRedactor_Line(t *testing.T) {
 	})
 }
 
-func TestReadLinesTruncatesButKeepsDraining(t *testing.T) {
+func TestLineSinkTruncatesAndFlushes(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	sink := newLineSink(logger, "stdout", NewRedactor(nil))
 	long := strings.Repeat("x", 300*1024)
-	input := "short\n" + long + "\nlast"
-	var lines []string
-	var truncs []bool
-	readLines(strings.NewReader(input), func(l string, truncated bool) {
-		lines = append(lines, l)
-		truncs = append(truncs, truncated)
-	})
-	if len(lines) != 3 || lines[0] != "short" || lines[2] != "last" {
-		t.Fatalf("lines = %d %q...", len(lines), lines[0])
+	for _, chunk := range []string{"sho", "rt\n" + long[:1000], long[1000:] + "\nla", "st"} {
+		if _, err := sink.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if len(lines[1]) != maxLogLine || !truncs[1] || truncs[0] || truncs[2] {
-		t.Fatalf("long line len=%d truncated=%v", len(lines[1]), truncs)
+	sink.Flush()
+	out := logs.String()
+	if strings.Count(out, `"msg":"lego output"`) != 3 {
+		t.Fatalf("expected 3 lines, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"line":"short","truncated":false`) || !strings.Contains(out, `"line":"last","truncated":false`) {
+		t.Fatalf("short/last lines missing:\n%s", out[:200])
+	}
+	if !strings.Contains(out, `"truncated":true`) || strings.Contains(out, strings.Repeat("x", maxLogLine+1)) {
+		t.Fatalf("long line not truncated")
 	}
 }
 
@@ -560,4 +567,60 @@ func TestExecutor_Run_HangCancelled(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("Run took %v, want it to return promptly after cancellation", elapsed)
 	}
+}
+
+// TestRunReturnsWhenDetachedChildHoldsPipes covers the orphan case: lego
+// exits but a detached helper keeps stdout open. Run must return after the
+// grace period with the real exit status, not block until the helper dies.
+func TestRunReturnsWhenDetachedChildHoldsPipes(t *testing.T) {
+	inv := fakeInvocation(t, "orphan", nil)
+	e := &Executor{Timeout: 10 * time.Second, GracePeriod: 500 * time.Millisecond, Logger: testLogger(t)}
+	start := time.Now()
+	out, err := e.Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("Run blocked on the orphan's pipe for %v", d)
+	}
+	if out.ExitCode != 0 || out.TimedOut || out.Cancelled {
+		t.Fatalf("outcome = %+v", out)
+	}
+	if _, _, _, err := ReadOutputs(inv.Dir, "wiki.example.ac.jp"); err != nil {
+		t.Fatalf("outputs missing: %v", err)
+	}
+}
+
+func TestRunTimesOutEvenWithDetachedChild(t *testing.T) {
+	inv := fakeInvocation(t, "orphanhang", nil)
+	e := &Executor{Timeout: 1 * time.Second, GracePeriod: 500 * time.Millisecond, Logger: testLogger(t)}
+	start := time.Now()
+	out, err := e.Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if d := time.Since(start); d > 6*time.Second {
+		t.Fatalf("Run took %v", d)
+	}
+	if !out.TimedOut {
+		t.Fatalf("outcome = %+v, want TimedOut", out)
+	}
+}
+
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+func fakeInvocation(t *testing.T, mode string, extra map[string]string) *Invocation {
+	t.Helper()
+	env := map[string]string{"FAKE_LEGO_MODE": mode}
+	for k, v := range extra {
+		env[k] = v
+	}
+	inv, err := Build(fakeParams(t, t.TempDir(), env))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return inv
 }

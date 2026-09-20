@@ -41,6 +41,9 @@ const (
 	EnvNotBeforeHours = "FAKE_LEGO_NOTBEFORE_HOURS"
 	// EnvExtraSAN adds a second subject alternative name to the certificate.
 	EnvExtraSAN = "FAKE_LEGO_EXTRA_SAN"
+	// EnvKeyTypeOverride generates the certificate key with this lego key
+	// type instead of the one requested on the command line.
+	EnvKeyTypeOverride = "FAKE_LEGO_KEYTYPE_OVERRIDE"
 	// EnvRecord names a file to which argv and environment are written as
 	// JSON so tests can characterize the exact invocation.
 	EnvRecord = "FAKE_LEGO_RECORD"
@@ -114,6 +117,24 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		ignoreTerm()
 		time.Sleep(10 * time.Minute)
 		return 0
+	case "orphan", "orphanhang":
+		// Start a detached child (new session, outside our process group)
+		// that inherits stdout and keeps it open for a long time, the way a
+		// daemonizing helper would. "orphan" then succeeds normally;
+		// "orphanhang" hangs like the hang mode.
+		if err := spawnOrphan(); err != nil {
+			fmt.Fprintln(stderr, "fake lego: orphan:", err)
+			return 1
+		}
+		if mode == "orphanhang" {
+			ignoreTerm()
+			time.Sleep(10 * time.Minute)
+			return 0
+		}
+	case "sleep":
+		// Used as the orphan child: hold stdout open quietly.
+		time.Sleep(20 * time.Second)
+		return 0
 	case "longline":
 		// A single 1 MiB line without newline, then success: the Runner
 		// must keep draining the pipe or the fake blocks forever.
@@ -144,7 +165,11 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	if extra := getenv(EnvExtraSAN); extra != "" {
 		names = append(names, extra)
 	}
-	certPEM, keyPEM, issuerPEM, err := selfSigned(names, flags["key-type"], days, notBefore)
+	keyType := flags["key-type"]
+	if o := getenv(EnvKeyTypeOverride); o != "" {
+		keyType = o
+	}
+	certPEM, keyPEM, issuerPEM, err := selfSigned(names, keyType, days, notBefore)
 	if err != nil {
 		fmt.Fprintln(stderr, "fake lego:", err)
 		return 1
@@ -213,7 +238,8 @@ func selfSigned(names []string, keyType string, days, notBeforeHours int) (certP
 	var pub any
 	switch keyType {
 	case "rsa2048", "rsa3072", "rsa4096":
-		k, err := rsa.GenerateKey(rand.Reader, 2048)
+		bits := map[string]int{"rsa2048": 2048, "rsa3072": 3072, "rsa4096": 4096}[keyType]
+		k, err := rsa.GenerateKey(rand.Reader, bits)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -221,7 +247,11 @@ func selfSigned(names []string, keyType string, days, notBeforeHours int) (certP
 		der := x509.MarshalPKCS1PrivateKey(k)
 		keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
 	default:
-		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		curve := elliptic.P256()
+		if keyType == "ec384" {
+			curve = elliptic.P384()
+		}
+		k, err := ecdsa.GenerateKey(curve, rand.Reader)
 		if err != nil {
 			return nil, nil, nil, err
 		}

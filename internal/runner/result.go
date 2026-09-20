@@ -14,47 +14,50 @@ import (
 
 // WriteResult prints res as one JSON line to stdout and, when path is not
 // empty, writes the same document atomically to path (temporary file in
-// the same directory, fsync, rename).
-func WriteResult(res *v1alpha1.Result, path string, stdout io.Writer) error {
+// the same directory, fsync, rename). It reports whether the Result
+// reached stdout; a file error after that is returned but the Result has
+// still been delivered.
+func WriteResult(res *v1alpha1.Result, path string, stdout io.Writer) (delivered bool, err error) {
 	line, err := json.Marshal(res)
 	if err != nil {
-		return fmt.Errorf("encode result: %w", err)
+		return false, fmt.Errorf("encode result: %w", err)
 	}
 	if stdout != nil {
 		if _, err := stdout.Write(append(line, '\n')); err != nil {
-			return fmt.Errorf("write result to stdout: %w", err)
+			return false, fmt.Errorf("write result to stdout: %w", err)
 		}
+		delivered = true
 	}
 	if path == "" {
-		return nil
+		return delivered, nil
 	}
 	dir := filepath.Dir(path)
 	var nonce [4]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
+		return delivered, err
 	}
 	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp-"+hex.EncodeToString(nonce[:]))
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return fmt.Errorf("create result file: %w", err)
+		return delivered, fmt.Errorf("create result file: %w", err)
 	}
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return fmt.Errorf("write result file: %w", err)
+		return delivered, fmt.Errorf("write result file: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return fmt.Errorf("sync result file: %w", err)
+		return delivered, fmt.Errorf("sync result file: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return err
+		return delivered, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("commit result file: %w", err)
+		return delivered, fmt.Errorf("commit result file: %w", err)
 	}
-	return nil
+	return delivered, nil
 }

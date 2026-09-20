@@ -78,8 +78,15 @@ it can safely call the pinned `lego` binary (see
   `cmd.Cancel` sends `SIGTERM` to the whole process group; `cmd.WaitDelay`
   (a configurable grace period, 10s by default) bounds how long the Runner
   waits after that before the process is force-killed, and the Runner
-  additionally sends `SIGKILL` to the whole group after `Wait` returns so
-  no helper process `lego` spawned can survive the run.
+  additionally sends `SIGKILL` to the whole group when the run ends so
+  helper processes that stay in the group cannot survive it. `lego`'s
+  output is consumed through `io.Writer` sinks that `os/exec` drives with
+  its own goroutines rather than through `StdoutPipe`, because only then
+  does `WaitDelay` also bound the case where a descendant inherited the
+  pipes and keeps them open after `lego` exits (otherwise the Runner would
+  wait for that descendant, not for `lego`). A descendant that leaves the
+  group (`setsid`) cannot be killed by a group signal; that is contained
+  by running one job per container (PID namespace), not by this code.
 
 ## Alternatives considered
 

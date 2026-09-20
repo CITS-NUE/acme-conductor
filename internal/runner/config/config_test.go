@@ -458,7 +458,7 @@ func TestRead_TrailingData(t *testing.T) {
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Read: expected ErrInvalid, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "trailing data") {
+	if !strings.Contains(err.Error(), "after JSON document") {
 		t.Fatalf("Read: error %q does not mention trailing data", err.Error())
 	}
 }
@@ -535,5 +535,72 @@ func TestDNSBinding_SortedEnv_Empty(t *testing.T) {
 	got := b.SortedEnv()
 	if len(got) != 0 {
 		t.Fatalf("SortedEnv() on empty binding = %v, want empty", got)
+	}
+}
+
+func TestProductionDirectoryRule(t *testing.T) {
+	accepted := []string{
+		"https://acme-staging-v02.api.letsencrypt.org/directory",
+		"https://pebble.internal:14000/dir",
+		"https://localhost:14000/dir",
+		"https://127.0.0.1:14000/dir",
+		"https://10.0.0.5/acme/directory",
+		"https://[::1]:14000/dir",
+		"https://ca-test.example.ac.jp/acme/directory",
+		"https://acme.sandbox.example.net/directory",
+		"https://step-ca.dev.example.org/acme/acme/directory",
+	}
+	rejected := []string{
+		"https://acme-v02.api.letsencrypt.org/directory",
+		"https://acme.zerossl.com/v2/DV90",
+		"https://dv.acme-v02.api.pki.goog/directory",
+		"https://api.buypass.com/acme/directory",
+		"https://acme.ssl.com/sslcom-dv-rsa",
+		"https://acme.ssl.com/sslcom-dv-ecc",
+		"https://acme.sectigo.com/v2/DV",
+		"https://acme.upki.example.ac.jp/directory",
+		"https://attestation.example.net/directory", // "test" is not a whole label
+		"https://devices.example.net/directory",     // "dev" is not a whole label
+		"https://8.8.8.8/directory",
+	}
+	for _, u := range accepted {
+		doc := validDoc()
+		doc["acmeBindings"].(map[string]any)["letsencrypt-staging"].(map[string]any)["directoryURL"] = u
+		if _, err := Read(strings.NewReader(marshalDoc(t, doc))); err != nil {
+			t.Errorf("%s should be accepted without allowProductionCA: %v", u, err)
+		}
+	}
+	for _, u := range rejected {
+		doc := validDoc()
+		b := doc["acmeBindings"].(map[string]any)["letsencrypt-staging"].(map[string]any)
+		b["directoryURL"] = u
+		if _, err := Read(strings.NewReader(marshalDoc(t, doc))); err == nil || !strings.Contains(err.Error(), "allowProductionCA") {
+			t.Errorf("%s should require allowProductionCA, got %v", u, err)
+		}
+		b["allowProductionCA"] = true
+		if _, err := Read(strings.NewReader(marshalDoc(t, doc))); err != nil {
+			t.Errorf("%s with allowProductionCA should be accepted: %v", u, err)
+		}
+	}
+}
+
+func TestReadRejectsDuplicateKeys(t *testing.T) {
+	doc := marshalDoc(t, validDoc())
+	// Inject a second "authorization" block that would silently win with
+	// plain encoding/json.
+	dup := `{"authorization":{"allowedDnsSuffixes":["evil.com"],"allowWildcard":true,"allowedAcmeBindings":["letsencrypt-staging"],"allowedDnsBindings":["fake-dns"],"allowedStoreBindings":["filesystem-dev"]},` + doc[1:]
+	_, err := Read(strings.NewReader(dup))
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate key accepted: %v", err)
+	}
+}
+
+func TestResolversRejectCommaAndWhitespace(t *testing.T) {
+	for _, bad := range []string{"a,b:53", "1.1.1.1:53,8.8.8.8:53", "1.1.1.1:5 3", "\t1.1.1.1:53"} {
+		doc := validDoc()
+		doc["dnsBindings"].(map[string]any)["fake-dns"].(map[string]any)["resolvers"] = []string{bad}
+		if _, err := Read(strings.NewReader(marshalDoc(t, doc))); err == nil {
+			t.Errorf("resolver %q accepted", bad)
+		}
 	}
 }

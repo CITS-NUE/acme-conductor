@@ -50,7 +50,13 @@ acme-runner --help
 |---|---|
 | `0` | A `Result` with `status: succeeded` was written (to stdout and, if given, `--result`). |
 | `1` | A `Result` with `status: failed` was written. |
-| `2` | No `Result` could be produced at all — the job file could not be read, or it failed strict validation and no run identity (`runId`/`target.id`) could be recovered even leniently. Details are on stderr only. |
+| `2` | No `Result` could be delivered at all — the job file could not be read, or it failed strict validation and no run identity (`runId`/`target.id`) could be recovered even leniently. Details are on stderr only. |
+
+The exit code follows the `Result` printed on stdout. If the `--result`
+file cannot be written (for example the path is a directory or its parent
+does not exist) the failure is logged at error level, but the exit code
+is still `0`/`1` because the `Result` was delivered on stdout; consumers
+that rely on the file must treat a missing file as "check stdout".
 
 ## Configuration reference
 
@@ -107,17 +113,21 @@ empty or missing required list authorizes nothing.
 | `directoryURL` | string | Must be an `https://` URL with no userinfo and no fragment. |
 | `email` | string | A single mailbox address (no whitespace/quotes/slashes, exactly one `@`, not leading/trailing `@`). |
 | `eab` | object, optional | `{ "kidEnv": "...", "hmacEnv": "..." }` — the **names** of the environment variables that carry the EAB key ID and HMAC at run time (never the values). `kidEnv` and `hmacEnv` must be valid env names and must differ. |
-| `allowProductionCA` | bool, default `false` | Must be set explicitly to use one of the well-known production ACME directories (see below). |
+| `allowProductionCA` | bool, default `false` | Must be set explicitly to use any directory that is not recognized as a staging/test/local one (see below). |
 
-Well-known production directories that require `allowProductionCA: true`:
-
-- `https://acme-v02.api.letsencrypt.org/directory` (Let's Encrypt production)
-- `https://acme.zerossl.com/v2/DV90` (ZeroSSL production)
-- `https://dv.acme-v02.api.pki.goog/directory` (Google Trust Services production)
-- `https://api.buypass.com/acme/directory` (Buypass production)
-
-This exists so a development or test configuration can never reach a
-production CA by accident.
+A directory is recognized as **non-production** when its host is a
+loopback, private or link-local IP literal, or when one of the host's
+labels (split on `.` and `-`) is one of `staging`, `stage`, `test`,
+`testing`, `sandbox`, `pebble`, `localhost`, `dev`, `local`, `internal`
+(for example `acme-staging-v02.api.letsencrypt.org`, `pebble.internal`,
+`ca-test.example.ac.jp`). **Every other directory is treated as
+production** and is refused unless `allowProductionCA: true`. This is
+deliberately an allow-rule for test-looking hosts rather than a denylist
+of known CAs, so an unknown production CA (SSL.com, Sectigo, a
+university's own ACME service, …) can never be reached by accident; a
+private CA whose host name carries none of these labels must set the flag
+explicitly. Labels are matched whole: `attestation.example` or
+`devices.example` do not count as test hosts.
 
 ### `dnsBindings.<name>`
 
@@ -167,8 +177,9 @@ One `reconcile` invocation:
    `JobSpec.Validate`) — unknown fields, duplicate keys and trailing data
    are all rejected; this is a self-consistency check of the document, not
    authorization.
-3. Load the Runner configuration (strict JSON, unknown fields rejected,
-   256 KiB cap).
+3. Load the Runner configuration (strict JSON: unknown fields, duplicate
+   keys, trailing data and over-deep nesting rejected, 256 KiB cap — the
+   same decoder as the JobSpec, `internal/strictjson`).
 4. Authorize the request with `RunnerAuthorizationPolicy` built from that
    configuration — deny by default, suffix matched on a label boundary,
    wildcard gated by `allowWildcard`, and all three binding names checked
@@ -193,15 +204,22 @@ One `reconcile` invocation:
     below).
 12. Run `lego` once, under a timeout, in its own process group; on
     timeout or cancellation `SIGTERM` is sent to the whole group, followed
-    by `SIGKILL` after a grace period if it has not exited.
-13. Copy the (possibly updated) `accounts` subtree back into `stateDir`
-    with a rename-swap, regardless of whether `lego` succeeded — so
-    account continuity across runs does not depend on this run's outcome.
-14. Verify what `lego` wrote: the certificate parses, its SAN list covers
-    the target FQDN **exactly** (no wildcard-aware matching — a job for
-    `*.example.ac.jp` must produce a certificate whose SAN is literally
-    `*.example.ac.jp`), the private key matches the certificate's public
-    key, and the certificate is not already expired.
+    by `SIGKILL` after a grace period if it has not exited. Output is
+    consumed through writer sinks driven by `os/exec`, so the same grace
+    period also bounds how long a descendant that inherited `lego`'s
+    output pipes (a detached helper) can delay the return: after it the
+    pipes are closed forcibly and the real exit status is used.
+13. Publish the (possibly updated) `accounts` subtree into `stateDir` as a
+    new version and re-point the `accounts` link (see Crash safety),
+    regardless of whether `lego` succeeded — so account continuity across
+    runs does not depend on this run's outcome.
+14. Verify what `lego` wrote: the certificate parses, it carries exactly
+    one subject alternative name and that name is the target FQDN (no
+    wildcard-aware matching — a job for `*.example.ac.jp` must produce a
+    certificate whose SAN is literally `*.example.ac.jp`), the private key
+    matches the certificate's public key, the key algorithm and size match
+    the requested `keyType`, the certificate is not already expired, and
+    its `NotBefore` is not more than 5 minutes in the future.
 15. `Put` the verified bundle (certificate, chain, private key) into the
     Certificate Store.
 16. Destroy the work directory (`defer`, so this always runs, on every
@@ -417,10 +435,15 @@ across the rest of the codebase's log statements is still Phase 2+ work
   Runner process except through a binding's declared `env`/`passthroughEnv`.
 - The `lego` subprocess runs in its own process group under a timeout;
   `SIGTERM` is sent to the whole group first, `SIGKILL` follows after a
-  grace period (10s by default) if needed, so no helper process `lego`
-  spawns can outlive the run.
-- Production ACME directories are refused unless the ACME binding sets
-  `allowProductionCA: true` (see the denylist above).
+  grace period (10s by default) if needed, and the group is killed again
+  when the run ends, so helper processes that stay in the group cannot
+  outlive the run. A descendant that leaves the group (`setsid`) is out
+  of reach of a process-group kill; the grace period still bounds how long
+  it can delay the Runner, but only a PID namespace (one container per
+  run) actually contains it.
+- Any ACME directory not recognized as staging/test/local is refused
+  unless the ACME binding sets `allowProductionCA: true` (see the rule
+  above).
 - `RunnerAuthorizationPolicy` is deny-by-default: an empty or unset
   allow-list authorizes nothing.
 - Automated tests never call a real ACME CA or a real DNS provider: they
@@ -437,8 +460,14 @@ across the rest of the codebase's log statements is still Phase 2+ work
 - The per-run work directory is removed by a deferred cleanup on every
   normal exit path. A Runner killed with an uncatchable signal (SIGKILL,
   OOM) cannot run it, so every start also sweeps `run-*` directories under
-  `workDir` older than twice `lego.timeoutSeconds`. Mount `workDir` as a
-  tmpfs/emptyDir that dies with the container so nothing survives at all.
+  `workDir` that are past their deadline. Each run records its own
+  deadline (now + 2 × its `lego.timeoutSeconds`) in a `.sweep-after` file
+  inside the directory when it is created, and the sweep honours that
+  file, so Runners with different timeouts sharing one `workDir` never
+  sweep each other's live runs; a directory without the file falls back
+  to its modification time plus the sweeping Runner's own threshold.
+  Mount `workDir` as a tmpfs/emptyDir that dies with the container so
+  nothing survives at all.
 - ACME account state is published as a versioned directory under
   `stateDir/accounts.d/` and `stateDir/accounts` is a symbolic link that
   is swapped with one `rename` (then `stateDir` is fsynced); older

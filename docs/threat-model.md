@@ -201,6 +201,13 @@ about what remains open:
   Conductor and Runner run on separate hosts trusting an untrusted
   transport — and even then, signing only addresses tampering, not a
   compromised Conductor legitimately producing a bad `JobSpec` (see T1).
+- **JobSpec-controlled cost levers.** `policy.renewBeforeDays` and
+  `policy.keyType` are taken from the `JobSpec` and are not bounded by the
+  Runner's trusted policy: a producer that is authorized for a name can
+  force a reissue on every run (`renewBeforeDays` near 365) or an
+  expensive key type. This is a cost/rate-limit lever within an already
+  authorized scope, not an escalation; bounding both in
+  `RunnerAuthorizationPolicy` is a candidate for Phase 2.
 - **No replay/expiry enforcement yet (T3).** `RunID` and `target.revision`
   exist in the contract, but nothing currently checks them against a run
   registry — there is no run registry yet.
