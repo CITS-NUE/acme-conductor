@@ -304,6 +304,17 @@ func TestRedactor_Line(t *testing.T) {
 		}
 	})
 
+	t.Run("unterminated PEM block stops suppressing after maxPEMLines", func(t *testing.T) {
+		r := NewRedactor(nil)
+		line(r, "-----BEGIN X-----")
+		for i := 0; i < maxPEMLines; i++ {
+			line(r, "body")
+		}
+		if got := line(r, "visible again"); got != "visible again" {
+			t.Errorf("after cap: %q", got)
+		}
+	})
+
 	t.Run("single-line PEM does not enter block state", func(t *testing.T) {
 		r := NewRedactor(nil)
 		if got := line(r, "-----BEGIN CERTIFICATE-----MIIB-----END CERTIFICATE-----"); got != "[REDACTED PEM]" {

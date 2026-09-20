@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 )
@@ -16,15 +18,24 @@ import (
 // directories. ACME account files are a few kilobytes.
 const maxStateFileSize = 1 << 20
 
+// workDirPrefix is the name prefix of per-run work directories.
+const workDirPrefix = "run-"
+
 // prepareWorkDir creates a private per-run directory under parent and
 // returns it with a cleanup function that removes it entirely. The
 // certificate private key only ever exists inside this directory (and in
 // the Store), so cleanup is what destroys it.
-func prepareWorkDir(parent, runID string) (string, func(), error) {
+//
+// Before creating the new directory, per-run directories older than
+// staleAfter are removed: a Runner that was killed with an uncatchable
+// signal cannot run its own cleanup, and a work directory on anything
+// other than a per-process tmpfs would otherwise keep key material.
+func prepareWorkDir(parent, runID string, staleAfter time.Duration) (string, func(), error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create work parent: %w", err)
 	}
-	dir, err := os.MkdirTemp(parent, "run-"+runID+"-")
+	sweepStaleWorkDirs(parent, staleAfter, time.Now())
+	dir, err := os.MkdirTemp(parent, workDirPrefix+runID+"-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create work directory: %w", err)
 	}
@@ -33,6 +44,32 @@ func prepareWorkDir(parent, runID string) (string, func(), error) {
 		return "", nil, fmt.Errorf("restrict work directory: %w", err)
 	}
 	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
+// sweepStaleWorkDirs removes per-run directories under parent whose
+// modification time is older than staleAfter. A live run never exceeds
+// the lego timeout, so callers pass a multiple of it. Failures are logged
+// by omission only: sweeping is best effort.
+func sweepStaleWorkDirs(parent string, staleAfter time.Duration, now time.Time) {
+	if staleAfter <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), workDirPrefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > staleAfter {
+			_ = os.RemoveAll(filepath.Join(parent, e.Name()))
+		}
+	}
 }
 
 // copyTree copies the regular files and directories under src to dst,

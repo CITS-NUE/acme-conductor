@@ -518,3 +518,44 @@ func TestReconcileDrainsHugeLegoOutput(t *testing.T) {
 		t.Fatalf("long lines should be logged truncated")
 	}
 }
+
+func TestSweepStaleWorkDirs(t *testing.T) {
+	parent := t.TempDir()
+	stale := filepath.Join(parent, "run-old-abc")
+	fresh := filepath.Join(parent, "run-new-def")
+	other := filepath.Join(parent, "keep-me")
+	for _, d := range []string{stale, fresh, other} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "privkey.pem"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	dir, cleanup, err := prepareWorkDir(parent, "01JABCDEFGHJKMNPQRSTVWXYZ0", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale run directory not swept: %v", err)
+	}
+	for _, d := range []string{fresh, other, dir} {
+		if _, err := os.Stat(d); err != nil {
+			t.Fatalf("%s should survive: %v", d, err)
+		}
+	}
+	// A zero grace disables sweeping.
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(stale, old, old)
+	sweepStaleWorkDirs(parent, 0, time.Now())
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("sweep with zero grace must not delete: %v", err)
+	}
+}

@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,11 +61,22 @@ func New(root string) (*Store, error) {
 // Type implements store.Store.
 func (s *Store) Type() string { return Type }
 
+// versionRe matches the version directories this store creates.
+var versionRe = regexp.MustCompile(`^[0-9a-f]{16}-([0-9]+)$`)
+
 func (s *Store) objectDir(object string) (string, error) {
 	if !v1alpha1.IsStoreObjectRef(object) {
 		return "", fmt.Errorf("invalid store object name %q", object)
 	}
-	return filepath.Join(s.Root, object), nil
+	dir := filepath.Join(s.Root, object)
+	// Never follow a pre-existing symbolic link at the object or versions
+	// level: writes must stay under the store root.
+	for _, p := range []string{dir, filepath.Join(dir, versionsDir)} {
+		if info, err := os.Lstat(p); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("store path %s is a symbolic link", p)
+		}
+	}
+	return dir, nil
 }
 
 // Current implements store.Store.
@@ -156,22 +169,36 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
-// prune removes every version directory except keep. Failures are ignored:
-// a leftover old version is harmless.
+// prune removes version directories this store created that are older
+// than keep, plus abandoned temporary directories. Newer versions are left
+// alone: if a concurrent Put won the "current" swap, its version must
+// survive. Failures are ignored: a leftover old version is harmless.
 func (s *Store) prune(versions, keep string) {
 	entries, err := os.ReadDir(versions)
 	if err != nil {
 		return
 	}
+	keepStamp := versionStamp(keep)
 	for _, e := range entries {
 		if e.Name() == keep || !e.IsDir() {
 			continue
 		}
-		// Only remove directories that follow our naming scheme.
-		if strings.HasPrefix(e.Name(), ".tmp-") || strings.Contains(e.Name(), "-") {
+		switch {
+		case strings.HasPrefix(e.Name(), ".tmp-"):
+			os.RemoveAll(filepath.Join(versions, e.Name()))
+		case versionRe.MatchString(e.Name()) && versionStamp(e.Name()) < keepStamp:
 			os.RemoveAll(filepath.Join(versions, e.Name()))
 		}
 	}
+}
+
+func versionStamp(name string) int64 {
+	m := versionRe.FindStringSubmatch(name)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(m[1], 10, 64)
+	return n
 }
 
 func writeFile(path string, content []byte) error {

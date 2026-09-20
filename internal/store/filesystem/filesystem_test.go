@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -335,5 +336,66 @@ func TestPut_ReadOnlyRoot(t *testing.T) {
 	err := s.Put(context.Background(), "wiki.example.ac.jp", store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
 	if err == nil {
 		t.Fatal("Put: expected error on a read-only root, got nil")
+	}
+}
+
+func TestPutRejectsSymlinkedObjectDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	st, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := "wiki.example.ac.jp-deadbeef"
+	if err := os.Symlink(outside, filepath.Join(root, object)); err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	err = st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("Put through a symlink must fail, got %v", err)
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 0 {
+		t.Fatalf("wrote through the symlink: %v", entries)
+	}
+	if _, err := st.Current(context.Background(), object); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("Current through a symlink must fail, got %v", err)
+	}
+}
+
+func TestPruneKeepsNewerVersionsAndForeignDirectories(t *testing.T) {
+	root := t.TempDir()
+	st, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := "wiki.example.ac.jp-deadbeef"
+	certPEM, keyPEM, _ := genCert(t, "wiki.example.ac.jp")
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	versions := filepath.Join(root, object, "versions")
+	entries, _ := os.ReadDir(versions)
+	if len(entries) != 1 {
+		t.Fatalf("expected one version, got %v", entries)
+	}
+	mine := entries[0].Name()
+	newer := strings.Repeat("0", 16) + "-99999999999999999999"
+	foreign := "not-mine-but-has-a-dash"
+	tmp := ".tmp-abandoned"
+	for _, d := range []string{newer, foreign, tmp} {
+		if err := os.Mkdir(filepath.Join(versions, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.prune(versions, mine)
+	for _, d := range []string{mine, newer, foreign} {
+		if _, err := os.Stat(filepath.Join(versions, d)); err != nil {
+			t.Fatalf("%s must survive prune: %v", d, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(versions, tmp)); err == nil {
+		t.Fatalf("abandoned temporary directory must be pruned")
 	}
 }

@@ -200,6 +200,9 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start lego: %w", err)
 	}
+	// Whatever way Wait returns, make sure no process from the group
+	// survives this function.
+	defer func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }()
 	var wg sync.WaitGroup
 	for name, r := range map[string]io.Reader{"stdout": stdout, "stderr": stderr} {
 		wg.Add(1)
@@ -227,8 +230,6 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 			return nil, fmt.Errorf("wait for lego: %w", waitErr)
 		}
 	}
-	// Make sure no process from the group survives.
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	switch {
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil:
 		out.TimedOut = true
@@ -244,9 +245,15 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 // including the END line is suppressed, so the base64 body of a key that a
 // tool prints can never reach the log. Use one Redactor per stream.
 type Redactor struct {
-	secrets []string
-	inPEM   bool
+	secrets  []string
+	inPEM    bool
+	pemLines int
 }
+
+// maxPEMLines bounds how many lines a PEM block may suppress. A BEGIN line
+// without a matching END would otherwise silence the rest of the stream;
+// real PEM bodies are far shorter than this.
+const maxPEMLines = 200
 
 var (
 	pemBeginRe = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+-----`)
@@ -270,7 +277,8 @@ func NewRedactor(secrets []string) *Redactor {
 // line is replaced by a marker).
 func (r *Redactor) Line(s string) (string, bool) {
 	if r.inPEM {
-		if pemEndRe.MatchString(s) {
+		r.pemLines++
+		if pemEndRe.MatchString(s) || r.pemLines >= maxPEMLines {
 			r.inPEM = false
 		}
 		return "", false
@@ -278,6 +286,7 @@ func (r *Redactor) Line(s string) (string, bool) {
 	if pemBeginRe.MatchString(s) {
 		if !pemEndRe.MatchString(s) {
 			r.inPEM = true
+			r.pemLines = 0
 		}
 		return "[REDACTED PEM]", true
 	}

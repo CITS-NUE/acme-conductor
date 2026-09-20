@@ -418,6 +418,21 @@ across the rest of the codebase's log statements is still Phase 2+ work
   (the Conductor's run registry/scheduler); nothing in the Runner itself
   serializes two processes writing to the same `stateDir`.
 
+## Crash safety
+
+- The per-run work directory is removed by a deferred cleanup on every
+  normal exit path. A Runner killed with an uncatchable signal (SIGKILL,
+  OOM) cannot run it, so every start also sweeps `run-*` directories under
+  `workDir` older than twice `lego.timeoutSeconds`. Mount `workDir` as a
+  tmpfs/emptyDir that dies with the container so nothing survives at all.
+- ACME account state is swapped into `stateDir/accounts` with renames;
+  a crash leaves either the previous or the new state.
+- The filesystem store refuses to write through a symbolic link at the
+  object or `versions` level, and pruning only removes versions older
+  than the one just written, so a concurrent writer that won the
+  `current` swap keeps its files. Two Runners writing the same object
+  concurrently are still not coordinated (see Limitations).
+
 ## Limitations in Phase 1
 
 - The filesystem Certificate Store is for **local development and tests

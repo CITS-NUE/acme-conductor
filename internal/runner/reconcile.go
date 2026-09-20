@@ -231,7 +231,10 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 		return nil, fail(v1alpha1.ErrorCodeCancelled, "run was cancelled before lego started", ctx.Err())
 	}
 
-	work, cleanup, err := prepareWorkDir(cfg.Lego.WorkDir, spec.RunID)
+	// A live run never outlasts twice the lego timeout; older per-run
+	// directories are leftovers of a killed process.
+	staleAfter := 2 * time.Duration(cfg.Lego.TimeoutSeconds) * time.Second
+	work, cleanup, err := prepareWorkDir(cfg.Lego.WorkDir, spec.RunID, staleAfter)
 	if err != nil {
 		return nil, fail(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)
 	}
