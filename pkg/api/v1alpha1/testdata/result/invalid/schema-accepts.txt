@@ -17,3 +17,8 @@ error-summary-newline.json
 # finishedAt >= startedAt is a Go-only cross-field ordering rule; the schema
 # validates each timestamp's format independently.
 finishedat-before-startedat.json
+
+# Unicode line/paragraph separators and format (bidi) characters are
+# rejected by validateOpaqueText in Go only; the schema bounds length only.
+error-summary-line-separator.json
+error-summary-bidi-override.json

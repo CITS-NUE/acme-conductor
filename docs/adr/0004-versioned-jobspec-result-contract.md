@@ -25,8 +25,9 @@ JSON shape.
   (`CertificateReconcileJob` / `CertificateReconcileResult`) on every
   document.
 - Documents are **strictly decoded**: unknown fields, duplicate JSON object
-  keys, and trailing data are all rejected, and any document over 64 KiB is
-  rejected before decoding is even attempted (`decode.go`).
+  keys, and trailing data are all rejected, any document over 64 KiB is
+  rejected before decoding is even attempted, and nesting deeper than
+  8 levels is rejected in linear time (`decode.go`).
 - A `JobSpec` carries only opaque identifiers, a normalized FQDN, a policy
   snapshot, and **logical binding names** (`ACMERef`, `DNSRef`, `StoreRef`)
   — never a command, an image, an environment variable, a credential, or a

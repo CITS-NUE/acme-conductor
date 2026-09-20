@@ -274,7 +274,9 @@ Failure:
 a file system path outside the store, or the object itself. `error.summary`
 is a short, machine-checked, secret-free string: `validate.go` rejects PEM
 headers, bearer tokens, `AKIA`/`ghp_`/`github_pat_` prefixes, JWT-shaped
-base64 (`eyJ`), and any control characters, so a `Result` can never carry a
+base64 (`eyJ`), and any non-printable character (control characters,
+Unicode line/paragraph separators, bidi/format characters), so a `Result`
+can never carry a
 command line, an environment dump, or a credential fragment. `error.code`
 is one of a fixed, append-only set (`InvalidJobSpec`, `PolicyViolation`,
 `BindingNotFound`, `AcmeFailure`, `DnsFailure`, `StoreFailure`, `Timeout`,
@@ -283,8 +285,9 @@ is one of a fixed, append-only set (`InvalidJobSpec`, `PolicyViolation`,
 ### Decoding rules
 
 Both documents are decoded **strictly**: unknown fields, duplicate JSON
-object keys, and trailing data after the document are all rejected, and any
-document over 64 KiB is rejected outright (`pkg/api/v1alpha1/decode.go`).
+object keys, and trailing data after the document are all rejected, any
+document over 64 KiB is rejected outright, and nesting deeper than 8 levels
+is rejected before the walker spends CPU on it (`pkg/api/v1alpha1/decode.go`).
 Duplicate-key rejection matters because `encoding/json` silently keeps the
 last value for a repeated key, which is a classic validation-bypass vector
 if left unchecked.

@@ -179,6 +179,12 @@ func TestResultValidateOK(t *testing.T) {
 	if err := r.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// Printable non-ASCII text is fine in a summary.
+	u := failedResult()
+	u.Error.Summary = "ACME 認可に失敗しました (dns-01)"
+	if err := u.Validate(); err != nil {
+		t.Fatal(err)
+	}
 	// A failed run may still report the pre-existing certificate.
 	f := failedResult()
 	exp := time.Date(2026, 12, 20, 0, 0, 0, 0, time.UTC)
@@ -226,6 +232,12 @@ func TestResultValidateRejects(t *testing.T) {
 		{"failed summary too long", failedResult, func(r *Result) { r.Error.Summary = strings.Repeat("x", MaxErrorSummaryLength+1) }, "error.summary"},
 		{"failed summary newline", failedResult, func(r *Result) { r.Error.Summary = "line1\nline2" }, "error.summary"},
 		{"failed summary invalid utf8", failedResult, func(r *Result) { r.Error.Summary = "bad\xffbyte" }, "error.summary"},
+		{"failed summary line separator", failedResult, func(r *Result) { r.Error.Summary = "line1\u2028line2" }, "error.summary"},
+		{"failed summary paragraph separator", failedResult, func(r *Result) { r.Error.Summary = "line1\u2029line2" }, "error.summary"},
+		{"failed summary bidi override", failedResult, func(r *Result) { r.Error.Summary = "safe\u202eevil" }, "error.summary"},
+		{"failed summary zero width space", failedResult, func(r *Result) { r.Error.Summary = "a\u200bb" }, "error.summary"},
+		{"failed summary escape", failedResult, func(r *Result) { r.Error.Summary = "\x1b[31mred" }, "error.summary"},
+		{"store ref bidi isolate", validResult, func(r *Result) { r.StoreObjectRef = "x\u2066y" }, "storeObjectRef"},
 		{"failed summary pem", failedResult, func(r *Result) { r.Error.Summary = "-----BEGIN EC PRIVATE KEY-----" }, "error.summary"},
 		{"failed summary jwt", failedResult, func(r *Result) { r.Error.Summary = "eab: eyJhbGciOi..." }, "error.summary"},
 		{"failed summary bearer", failedResult, func(r *Result) { r.Error.Summary = "Authorization: Bearer abc" }, "error.summary"},

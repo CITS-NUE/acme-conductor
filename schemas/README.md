@@ -34,7 +34,9 @@ only by Go, not by JSON Schema:
   duplicates that are already byte-identical strings).
 - The `finishedAt >= startedAt` ordering rule on `Result`.
 - Rejection of the zero `time.Time` value for `expiresAt`.
-- Rejection of control characters and known secret markers (PEM headers,
+- Rejection of non-printable characters (control characters, Unicode
+  line/paragraph separators, bidi/format characters) and known secret
+  markers (PEM headers,
   bearer tokens, etc.) in free-text fields such as `error.summary` and
   `storeObjectRef`.
 - Strict decoding: unknown fields, duplicate JSON object keys and trailing

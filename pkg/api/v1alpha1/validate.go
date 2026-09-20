@@ -309,16 +309,17 @@ var secretMarkers = []string{
 }
 
 // validateOpaqueText applies the common rules for short, single-line,
-// non-secret text: bounded length, printable characters only, no
-// control characters (so a summary can never inject log lines), and none of
-// the secret markers above.
+// non-secret text: bounded length, printable characters only (no control
+// characters, no Unicode line/paragraph separators, no format or bidi
+// override characters, so a summary can never inject or visually spoof log
+// lines), valid UTF-8, and none of the secret markers above.
 func validateOpaqueText(field, v string, maxLen int) error {
 	if len(v) > maxLen {
 		return invalid(field, fmt.Sprintf("must be at most %d bytes", maxLen))
 	}
 	for _, r := range v {
-		if r == unicode.ReplacementChar || unicode.IsControl(r) {
-			return invalid(field, "must not contain control characters or invalid UTF-8")
+		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
+			return invalid(field, "must contain only printable characters and valid UTF-8")
 		}
 	}
 	for _, m := range secretMarkers {

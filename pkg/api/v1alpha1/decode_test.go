@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDecodeJobSpecRoundTrip(t *testing.T) {
@@ -192,4 +193,62 @@ func truncate(b []byte) string {
 		return string(b[:200]) + "..."
 	}
 	return string(b)
+}
+
+func TestDecodeRejectsDeepNestingQuickly(t *testing.T) {
+	// A 64 KiB document of nothing but nested arrays must be rejected in
+	// linear time, well before the size cap is reached.
+	deep := append([]byte(`{"a":`), bytes.Repeat([]byte("["), MaxDocumentSize-6)...)
+	start := time.Now()
+	_, err := DecodeJobSpec(bytes.NewReader(deep))
+	if !errors.Is(err, ErrTooDeep) {
+		t.Fatalf("error = %v, want ErrTooDeep", err)
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("deep document took %v", d)
+	}
+	// Nested objects with duplicate keys hidden past the depth limit are
+	// also rejected (by depth) rather than walked.
+	var b strings.Builder
+	b.WriteString(`{"a":`)
+	for i := 0; i <= MaxNestingDepth; i++ {
+		b.WriteString(`{"k":`)
+	}
+	b.WriteString(`1`)
+	for i := 0; i <= MaxNestingDepth+1; i++ {
+		b.WriteString(`}`)
+	}
+	if _, err := DecodeJobSpec(strings.NewReader(b.String())); !errors.Is(err, ErrTooDeep) {
+		t.Fatalf("error = %v, want ErrTooDeep", err)
+	}
+}
+
+func TestDecodeAllowsContractDepth(t *testing.T) {
+	// The real contract is 3 levels deep ($ -> policy -> allowedDnsSuffixes[i]);
+	// make sure the limit leaves headroom for it and for a future level.
+	if MaxNestingDepth < 4 {
+		t.Fatalf("MaxNestingDepth = %d is too small for the contract", MaxNestingDepth)
+	}
+	var b strings.Builder
+	b.WriteString(`{"a":`)
+	for i := 0; i < MaxNestingDepth-1; i++ {
+		b.WriteString(`[`)
+	}
+	for i := 0; i < MaxNestingDepth-1; i++ {
+		b.WriteString(`]`)
+	}
+	b.WriteString(`}`)
+	// Depth is acceptable; rejection must come from the unknown field, not
+	// from the depth limit.
+	_, err := DecodeJobSpec(strings.NewReader(b.String()))
+	if err == nil || errors.Is(err, ErrTooDeep) {
+		t.Fatalf("error = %v, want unknown-field error", err)
+	}
+}
+
+func TestDuplicateKeyErrorReportsPath(t *testing.T) {
+	_, err := DecodeJobSpec(strings.NewReader(`{"policy":{"allowedDnsSuffixes":["a"],"allowedDnsSuffixes":["b"]}}`))
+	if !errors.Is(err, ErrDuplicateKey) || !strings.Contains(err.Error(), "$.policy") {
+		t.Fatalf("error = %v", err)
+	}
 }
