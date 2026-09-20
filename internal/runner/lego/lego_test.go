@@ -271,36 +271,57 @@ func TestOutputFiles(t *testing.T) {
 // --- Redactor ----------------------------------------------------------------
 
 func TestRedactor_Line(t *testing.T) {
+	line := func(r *Redactor, s string) string {
+		out, keep := r.Line(s)
+		if !keep {
+			return "<dropped>"
+		}
+		return out
+	}
 	r := NewRedactor([]string{"abcd1234", "xyz"})
 
 	t.Run("masks secrets >= 4 chars, ignores shorter ones", func(t *testing.T) {
-		got := r.Line("token=abcd1234 other=xyz")
+		got := line(r, "token=abcd1234 other=xyz")
 		want := "token=[REDACTED] other=xyz"
 		if got != want {
 			t.Errorf("Line() = %q, want %q", got, want)
 		}
 	})
 
-	t.Run("BEGIN PEM line fully redacted", func(t *testing.T) {
-		got := r.Line("-----BEGIN EC PRIVATE KEY-----")
-		if got != "[REDACTED PEM]" {
-			t.Errorf("Line() = %q, want [REDACTED PEM]", got)
+	t.Run("PEM block: BEGIN replaced, body dropped, END dropped, then normal", func(t *testing.T) {
+		r := NewRedactor(nil)
+		if got := line(r, "-----BEGIN EC PRIVATE KEY-----"); got != "[REDACTED PEM]" {
+			t.Errorf("BEGIN: %q", got)
+		}
+		if got := line(r, "MHcCAQEEIBase64BodyLineWithoutMarker"); got != "<dropped>" {
+			t.Errorf("body: %q", got)
+		}
+		if got := line(r, "-----END EC PRIVATE KEY-----"); got != "<dropped>" {
+			t.Errorf("END: %q", got)
+		}
+		if got := line(r, "after the key"); got != "after the key" {
+			t.Errorf("after: %q", got)
+		}
+	})
+
+	t.Run("single-line PEM does not enter block state", func(t *testing.T) {
+		r := NewRedactor(nil)
+		if got := line(r, "-----BEGIN CERTIFICATE-----MIIB-----END CERTIFICATE-----"); got != "[REDACTED PEM]" {
+			t.Errorf("single: %q", got)
+		}
+		if got := line(r, "next"); got != "next" {
+			t.Errorf("next: %q", got)
 		}
 	})
 
 	t.Run("line containing PRIVATE KEY fully redacted", func(t *testing.T) {
-		got := r.Line("-----END EC PRIVATE KEY-----")
-		if got != "[REDACTED PEM]" {
+		if got := line(r, "here is a PRIVATE KEY, beware"); got != "[REDACTED PEM]" {
 			t.Errorf("Line() = %q, want [REDACTED PEM]", got)
-		}
-		got2 := r.Line("here is a PRIVATE KEY, beware")
-		if got2 != "[REDACTED PEM]" {
-			t.Errorf("Line() = %q, want [REDACTED PEM]", got2)
 		}
 	})
 
 	t.Run("control characters replaced", func(t *testing.T) {
-		got := r.Line("a\x00b\x01c\x1fd\x7fe")
+		got := line(r, "a\x00b\x01c\x1fd\x7fe")
 		want := "a?b?c?d?e"
 		if got != want {
 			t.Errorf("Line() = %q, want %q", got, want)
@@ -308,7 +329,7 @@ func TestRedactor_Line(t *testing.T) {
 	})
 
 	t.Run("line/paragraph separators replaced", func(t *testing.T) {
-		got := r.Line("a b c")
+		got := line(r, "a\u2028b\u2029c")
 		want := "a?b?c"
 		if got != want {
 			t.Errorf("Line() = %q, want %q", got, want)
@@ -317,11 +338,28 @@ func TestRedactor_Line(t *testing.T) {
 
 	t.Run("tabs and printable unicode kept", func(t *testing.T) {
 		in := "a\tb café 日本語"
-		got := r.Line(in)
+		got := line(r, in)
 		if got != in {
 			t.Errorf("Line() = %q, want unchanged %q", got, in)
 		}
 	})
+}
+
+func TestReadLinesTruncatesButKeepsDraining(t *testing.T) {
+	long := strings.Repeat("x", 300*1024)
+	input := "short\n" + long + "\nlast"
+	var lines []string
+	var truncs []bool
+	readLines(strings.NewReader(input), func(l string, truncated bool) {
+		lines = append(lines, l)
+		truncs = append(truncs, truncated)
+	})
+	if len(lines) != 3 || lines[0] != "short" || lines[2] != "last" {
+		t.Fatalf("lines = %d %q...", len(lines), lines[0])
+	}
+	if len(lines[1]) != maxLogLine || !truncs[1] || truncs[0] || truncs[2] {
+		t.Fatalf("long line len=%d truncated=%v", len(lines[1]), truncs)
+	}
 }
 
 // --- Executor.Run, via a re-exec'd fake lego --------------------------------

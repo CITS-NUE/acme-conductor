@@ -159,7 +159,7 @@ func (h *harness) run(ctx context.Context) (int, *v1alpha1.Result) {
 
 func (h *harness) assertNoSecrets() {
 	h.t.Helper()
-	for _, forbidden := range []string{"PRIVATE KEY", "-----BEGIN", fakelego.LeakedSecret} {
+	for _, forbidden := range []string{"PRIVATE KEY", "-----BEGIN", "-----END", "ZmFrZS1sZWFrZWQta2V5", fakelego.LeakedSecret} {
 		if strings.Contains(h.stdout.String(), forbidden) {
 			h.t.Fatalf("result contains %q", forbidden)
 		}
@@ -500,5 +500,21 @@ func TestPersistAccountsReplacesPrevious(t *testing.T) {
 	// No accounts in work → no-op.
 	if err := persistAccounts(filepath.Join(dir, "empty"), state); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReconcileDrainsHugeLegoOutput(t *testing.T) {
+	h := newHarness(t, "longline", nil)
+	h.job(nil)
+	start := time.Now()
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionIssued {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("runner stalled on a long output line: %v", time.Since(start))
+	}
+	if !strings.Contains(h.logs.String(), `"truncated":true`) {
+		t.Fatalf("long lines should be logged truncated")
 	}
 }

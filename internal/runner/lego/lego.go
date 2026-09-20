@@ -187,7 +187,7 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	}
 	cmd.WaitDelay = grace
 
-	redact := NewRedactor(inv.Secrets())
+	secrets := inv.Secrets()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
@@ -205,11 +205,15 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 		wg.Add(1)
 		go func(name string, r io.Reader) {
 			defer wg.Done()
-			sc := bufio.NewScanner(r)
-			sc.Buffer(make([]byte, 64*1024), 64*1024)
-			for sc.Scan() {
-				logger.Debug("lego output", "stream", name, "line", redact.Line(sc.Text()))
-			}
+			// One redactor per stream: PEM suppression is stateful.
+			redact := NewRedactor(secrets)
+			readLines(r, func(line string, truncated bool) {
+				out, keep := redact.Line(line)
+				if !keep {
+					return
+				}
+				logger.Debug("lego output", "stream", name, "line", out, "truncated", truncated)
+			})
 		}(name, r)
 	}
 	wg.Wait()
@@ -236,11 +240,18 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 }
 
 // Redactor masks secret values and PEM blocks in text before it is logged.
+// It is stateful: once a PEM BEGIN line is seen, every line up to and
+// including the END line is suppressed, so the base64 body of a key that a
+// tool prints can never reach the log. Use one Redactor per stream.
 type Redactor struct {
 	secrets []string
+	inPEM   bool
 }
 
-var pemLineRe = regexp.MustCompile(`-----BEGIN [A-Z ]+-----.*`)
+var (
+	pemBeginRe = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+-----`)
+	pemEndRe   = regexp.MustCompile(`-----END [A-Z0-9 ]+-----`)
+)
 
 // NewRedactor returns a redactor for the given secret values. Empty and
 // very short values are ignored: masking every "a" would destroy the log.
@@ -254,13 +265,27 @@ func NewRedactor(secrets []string) *Redactor {
 	return r
 }
 
-// Line returns a redacted copy of one output line.
-func (r *Redactor) Line(s string) string {
+// Line returns a redacted copy of one output line and whether the line
+// should be logged at all (lines inside a PEM block are dropped; the BEGIN
+// line is replaced by a marker).
+func (r *Redactor) Line(s string) (string, bool) {
+	if r.inPEM {
+		if pemEndRe.MatchString(s) {
+			r.inPEM = false
+		}
+		return "", false
+	}
+	if pemBeginRe.MatchString(s) {
+		if !pemEndRe.MatchString(s) {
+			r.inPEM = true
+		}
+		return "[REDACTED PEM]", true
+	}
+	if strings.Contains(s, "PRIVATE KEY") {
+		return "[REDACTED PEM]", true
+	}
 	for _, sec := range r.secrets {
 		s = strings.ReplaceAll(s, sec, "[REDACTED]")
-	}
-	if pemLineRe.MatchString(s) || strings.Contains(s, "PRIVATE KEY") {
-		return "[REDACTED PEM]"
 	}
 	// Anything that is not printable is replaced so a hostile line cannot
 	// inject log records or terminal escapes.
@@ -272,7 +297,47 @@ func (r *Redactor) Line(s string) string {
 			b.WriteByte('?')
 		}
 	}
-	return b.String()
+	return b.String(), true
+}
+
+// maxLogLine bounds one logged output line. Longer lines are truncated,
+// never dropped, and reading always continues so the child can never block
+// on a full pipe.
+const maxLogLine = 8 * 1024
+
+// readLines calls fn for every line of r until EOF. Lines longer than
+// maxLogLine are delivered truncated with truncated=true; the remainder is
+// drained and discarded.
+func readLines(r io.Reader, fn func(line string, truncated bool)) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		var line []byte
+		truncated := false
+		for {
+			chunk, err := br.ReadSlice('\n')
+			if len(line) < maxLogLine {
+				line = append(line, chunk...)
+				if len(line) > maxLogLine {
+					line = line[:maxLogLine]
+					truncated = true
+				}
+			} else {
+				truncated = true
+			}
+			if err == nil {
+				break
+			}
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			// EOF or read error: deliver what we have and stop.
+			if len(line) > 0 {
+				fn(strings.TrimRight(string(line), "\r\n"), truncated)
+			}
+			return
+		}
+		fn(strings.TrimRight(string(line), "\r\n"), truncated)
+	}
 }
 
 // ReadOutputs reads the certificate, private key and issuer chain lego wrote

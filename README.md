@@ -8,11 +8,17 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 0 (contracts and skeleton); not usable for issuing
-certificates yet.** Phase 0 provides `JobSpec` validation and the
-`policy.RunnerAuthorizationPolicy` authorization decision function, but no
-Runner wiring of that policy yet. See the
-[roadmap](docs/architecture.md#roadmap) for what each phase adds.
+**Status: Phase 1 (Runner with bundled lego and filesystem store); the
+Conductor is still a skeleton.** The `acme-runner` data-plane binary
+validates and authorizes a `JobSpec` against its own trusted configuration,
+invokes the pinned `lego` CLI, and stores certificates in a filesystem
+Certificate Store (dev/test only). The `acme-conductor` control plane still
+implements only `--version`/`--help`; nothing yet schedules a `Target` or
+launches a Runner job automatically. See
+[`docs/runner.md`](docs/runner.md) for how to run and configure the Runner,
+and the [roadmap](docs/architecture.md#roadmap) for what each phase adds.
+Automated tests never call a real ACME CA or DNS provider — they run
+against a fake `lego` test double.
 
 ## Architecture
 
@@ -51,8 +57,11 @@ make build    # build ./bin/acme-conductor and ./bin/acme-runner
 make images   # build both container images (ghcr.io/cits-nue/acme-conductor, acme-runner)
 ```
 
-Phase 0 binaries implement only `--version` and `--help`; there are no
-functional subcommands yet.
+`acme-conductor` still implements only `--version` and `--help`.
+`acme-runner` additionally implements `reconcile`, which handles one
+`JobSpec` end to end — see [`docs/runner.md`](docs/runner.md) for the
+command line, the configuration file format, and an example config/job
+pair under [`deploy/examples/`](deploy/examples/).
 
 ## Repository layout
 
@@ -69,6 +78,7 @@ docs/                 architecture, threat model, ADRs
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Runner operator guide](docs/runner.md)
 - [Threat model](docs/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)
 

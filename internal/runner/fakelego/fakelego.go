@@ -31,7 +31,7 @@ import (
 // binding's non-secret env map in test configurations.
 const (
 	// EnvMode selects the behaviour: ok (default), fail, hang, wrongdomain,
-	// nokey, garbage, missingoutput.
+	// nokey, garbage, missingoutput, longline (1 MiB output lines, then ok).
 	EnvMode = "FAKE_LEGO_MODE"
 	// EnvDays sets the certificate validity in days (default 90).
 	EnvDays = "FAKE_LEGO_DAYS"
@@ -108,6 +108,12 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		ignoreTerm()
 		time.Sleep(10 * time.Minute)
 		return 0
+	case "longline":
+		// A single 1 MiB line without newline, then success: the Runner
+		// must keep draining the pipe or the fake blocks forever.
+		fmt.Fprint(stdout, strings.Repeat("x", 1<<20))
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stderr, strings.Repeat("y", 1<<20))
 	case "missingoutput":
 		fmt.Fprintln(stdout, "fake lego: pretending success without writing files")
 		return 0

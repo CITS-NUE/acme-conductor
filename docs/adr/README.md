@@ -14,6 +14,8 @@ Conductor, in the lightweight MADR-like format described in
 | [0006](0006-ascii-only-fqdn-in-v1alpha1.md) | ASCII-only FQDN in v1alpha1 |
 | [0007](0007-container-baseline.md) | Container baseline |
 | [0008](0008-no-purge-in-mvp.md) | No purge in the MVP |
+| [0009](0009-runner-execution-model.md) | Runner execution model |
+| [0010](0010-pinned-lego-binary.md) | Pinned lego binary |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).
