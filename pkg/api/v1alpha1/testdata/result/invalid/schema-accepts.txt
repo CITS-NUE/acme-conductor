@@ -32,8 +32,3 @@ error-summary-password-upper.json
 error-summary-bearer-upper.json
 error-summary-basic-auth.json
 error-summary-sas-sig.json
-
-# storeObjectRef additionally rejects any value containing ".." in Go
-# (validateStoreObjectRef), even when the surrounding characters otherwise
-# match the schema pattern.
-storeobjectref-dotdot-inside.json

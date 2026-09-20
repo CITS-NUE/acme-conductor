@@ -47,10 +47,6 @@ only by Go, not by JSON Schema:
   with raw external output. The real control is that a Runner never copies
   raw external output into a Result at all; `error.summary` must come from
   Runner-owned templates.
-- Rejection of any `storeObjectRef` containing `..`, on top of the
-  provider-independent logical-name pattern both the schema and Go enforce
-  (so it can never be used for traversal even by a careless filesystem
-  store).
 - Strict decoding: unknown fields, duplicate JSON object keys and trailing
   data after the document are always rejected by
   `pkg/api/v1alpha1/decode.go`, regardless of what a particular JSON Schema

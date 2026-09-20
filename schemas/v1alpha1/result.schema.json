@@ -51,7 +51,10 @@
       "type": "string",
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$",
-      "description": "Provider-independent logical object name (for example a Key Vault certificate name). Never a URL, URI, path, query string or credential. Go validation additionally rejects any value containing \"..\", which is not expressible in this pattern. The 128-character bound is chosen to cover Azure Key Vault certificate names, which are 1..127 characters."
+      "not": {
+        "pattern": "\\.\\."
+      },
+      "description": "Provider-independent logical object name (for example a Key Vault certificate name). Never a URL, URI, path, query string or credential; consecutive dots (\"..\") are rejected by both this schema and Go validation. The 128-character bound is chosen to cover Azure Key Vault certificate names, which are 1..127 characters."
     },
     "startedAt": {
       "type": "string",
