@@ -1,0 +1,14 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ8",
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZ9",
+  "status": "failed",
+  "action": "failed",
+  "startedAt": "2026-09-20T05:00:00Z",
+  "finishedAt": "2026-09-20T05:00:20Z",
+  "error": {
+    "code": "DnsFailure",
+    "summary": "DNS-01 challenge record did not propagate within the timeout"
+  }
+}

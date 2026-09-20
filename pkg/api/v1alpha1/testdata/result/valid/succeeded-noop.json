@@ -1,0 +1,14 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ4",
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZ5",
+  "status": "succeeded",
+  "action": "noop",
+  "expiresAt": "2026-11-01T00:00:00Z",
+  "fingerprintSha256": "314fbd95f7c315ad362206bf62932963754e02979eac98e7e0113ec83e8e95a8",
+  "storeObjectRef": "api-example-ac-jp",
+  "startedAt": "2026-09-20T03:00:00Z",
+  "finishedAt": "2026-09-20T03:00:01Z",
+  "error": null
+}

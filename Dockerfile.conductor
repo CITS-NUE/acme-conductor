@@ -1,0 +1,71 @@
+#
+# Dockerfile.conductor builds the ACME Conductor control-plane binary
+# (cmd/acme-conductor) as a minimal, non-root, distroless runtime image.
+#
+# Build:
+#   docker build -f Dockerfile.conductor \
+#     --build-arg VERSION=$(git describe --tags --always --dirty) \
+#     --build-arg COMMIT=$(git rev-parse --short HEAD) \
+#     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     -t ghcr.io/cits-nue/acme-conductor:dev .
+
+# --- builder -----------------------------------------------------------
+#
+# Pinned by tag for Phase 0. Release builds pin the base image by digest
+# (golang:1.24-bookworm@sha256:<digest>) instead of by mutable tag; that
+# pinning is done at release time, not here.
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /src
+
+# Copy go.mod (and go.sum, if present) first so the module download layer
+# is cached independently of source changes. go.sum may not exist yet on a
+# freshly initialized module, so the glob form is used rather than a plain
+# COPY go.mod go.sum which would fail if go.sum is missing.
+COPY go.mod go.su[m] ./
+RUN go mod download
+
+# Now copy the rest of the source tree and build.
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+ENV CGO_ENABLED=0
+
+RUN go build \
+    -trimpath \
+    -ldflags "-s -w \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Version=${VERSION} \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Commit=${COMMIT} \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Date=${BUILD_DATE}" \
+    -o /out/acme-conductor \
+    ./cmd/acme-conductor
+
+# --- runtime -------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.title="acme-conductor" \
+      org.opencontainers.image.description="ACME Conductor control plane (target registry, policy, audit, run scheduling)." \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=builder /out/acme-conductor /usr/local/bin/acme-conductor
+
+# distroless/static-debian12:nonroot already runs as uid/gid 65532
+# (nonroot:nonroot); set it explicitly for clarity and to survive any base
+# image change that alters the default user.
+USER nonroot:nonroot
+
+# No writes are performed at startup, so this image is safe to run with a
+# read-only root filesystem (docker run --read-only / Kubernetes
+# readOnlyRootFilesystem: true). No VOLUME is declared here since Phase 0
+# has no runtime state to persist.
+ENTRYPOINT ["/usr/local/bin/acme-conductor"]

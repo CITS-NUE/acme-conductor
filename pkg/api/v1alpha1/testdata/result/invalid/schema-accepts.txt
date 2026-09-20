@@ -1,0 +1,34 @@
+# Fixtures in this directory that are structurally valid per
+# schemas/v1alpha1/result.schema.json, but are rejected by
+# v1alpha1.DecodeResult because of a Go-only semantic rule that JSON Schema
+# cannot express. See schemas/README.md for the full list of such rules.
+#
+# One file name per line. Comments start with '#'.
+
+# The "no secret markers" rule (PEM headers, bearer tokens, etc.) in
+# error.summary is enforced only by validateOpaqueText in Go; the schema
+# only bounds length.
+error-summary-pem.json
+
+# Rejecting control characters (including newlines) in error.summary is a
+# Go-only rule (validateOpaqueText); the schema only bounds length.
+error-summary-newline.json
+
+# finishedAt >= startedAt is a Go-only cross-field ordering rule; the schema
+# validates each timestamp's format independently.
+finishedat-before-startedat.json
+
+# Unicode line/paragraph separators and format (bidi) characters are
+# rejected by validateOpaqueText in Go only; the schema bounds length only.
+error-summary-line-separator.json
+error-summary-bidi-override.json
+
+# The secret-marker heuristic in error.summary is matched case-insensitively
+# for header/key=value-shaped markers (password=, bearer , basic ,
+# authorization:, sig=, etc.) by validateOpaqueText in Go only; the schema
+# only bounds length.
+error-summary-password-mixed-case.json
+error-summary-password-upper.json
+error-summary-bearer-upper.json
+error-summary-basic-auth.json
+error-summary-sas-sig.json

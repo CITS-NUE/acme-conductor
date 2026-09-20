@@ -1,0 +1,33 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# CI / GitHub metadata
+.github
+
+# Docs — not needed inside the build context
+docs
+README.md
+CHANGELOG.md
+LICENSE
+
+# Editor / OS cruft
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Build outputs
+bin/
+dist/
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+test-results/
+
+# Local env / secrets
+.env
+.env.*
