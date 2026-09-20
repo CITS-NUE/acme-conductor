@@ -1,0 +1,85 @@
+#
+# Dockerfile.runner builds the ACME Runner data-plane binary
+# (cmd/acme-runner) as a minimal, non-root, distroless runtime image.
+#
+# Build:
+#   docker build -f Dockerfile.runner \
+#     --build-arg VERSION=$(git describe --tags --always --dirty) \
+#     --build-arg COMMIT=$(git rev-parse --short HEAD) \
+#     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     -t ghcr.io/cits-nue/acme-runner:dev .
+
+# --- builder -----------------------------------------------------------
+#
+# Pinned by tag for Phase 0. Release builds pin the base image by digest
+# (golang:1.24-bookworm@sha256:<digest>) instead of by mutable tag; that
+# pinning is done at release time, not here.
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /src
+
+# Copy go.mod (and go.sum, if present) first so the module download layer
+# is cached independently of source changes. go.sum may not exist yet on a
+# freshly initialized module, so the glob form is used rather than a plain
+# COPY go.mod go.sum which would fail if go.sum is missing.
+COPY go.mod go.su[m] ./
+RUN go mod download
+
+# Now copy the rest of the source tree and build.
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+ENV CGO_ENABLED=0
+
+RUN go build \
+    -trimpath \
+    -ldflags "-s -w \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Version=${VERSION} \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Commit=${COMMIT} \
+      -X github.com/CITS-NUE/acme-conductor/internal/version.Date=${BUILD_DATE}" \
+    -o /out/acme-runner \
+    ./cmd/acme-runner
+
+# --- lego (placeholder — not fetched in Phase 0) ------------------------
+#
+# Phase 1 adds a pinned, checksum-verified `lego` ACME client binary to
+# this image (fetched from an official release artifact, not built from
+# source here). LEGO_VERSION is declared now as a placeholder so the Phase
+# 1 diff is small and the pin point is obvious in review. Phase 0
+# performs NO network fetch of third-party binaries — this ARG is unused
+# until Phase 1 wires it into a download/verify step.
+ARG LEGO_VERSION=""
+
+# --- runtime -------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.title="acme-runner" \
+      org.opencontainers.image.description="ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate)." \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=builder /out/acme-runner /usr/local/bin/acme-runner
+
+# distroless/static-debian12:nonroot already runs as uid/gid 65532
+# (nonroot:nonroot); set it explicitly for clarity and to survive any base
+# image change that alters the default user.
+USER nonroot:nonroot
+
+# The runner will need a writable tmpfs/emptyDir mounted at /work (scratch
+# space for the ACME/lego exchange) and /state (certificate output) once
+# Phase 1+ adds the actual job logic. Those are supplied by the caller at
+# run time (docker run --tmpfs / Kubernetes emptyDir volumes), not baked
+# into the image — so no VOLUME is declared here; a VOLUME instruction
+# would create anonymous volumes on every `docker run` and is not wanted.
+# The root filesystem otherwise stays read-only friendly (no writes at
+# startup in Phase 0).
+ENTRYPOINT ["/usr/local/bin/acme-runner"]

@@ -1,0 +1,14 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+  "status": "failed",
+  "action": "failed",
+  "startedAt": "2026-09-20T04:00:00Z",
+  "finishedAt": "2026-09-20T04:00:30Z",
+  "error": {
+    "code": "SomeUnknownCode",
+    "summary": "unexpected failure"
+  }
+}

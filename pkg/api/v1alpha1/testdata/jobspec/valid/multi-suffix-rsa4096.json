@@ -1,0 +1,19 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileJob",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ6",
+  "target": {
+    "id": "01JABCDEFGHJKMNPQRSTVWXYZ7",
+    "fqdn": "portal.dept.example.ac.jp",
+    "revision": 7
+  },
+  "policy": {
+    "allowedDnsSuffixes": ["example.ac.jp", "example.co.jp", "dept.example.ac.jp"],
+    "allowWildcard": false,
+    "renewBeforeDays": 14,
+    "keyType": "rsa4096"
+  },
+  "acme": { "binding": "letsencrypt-staging" },
+  "dns": { "binding": "route53-staging" },
+  "store": { "binding": "keyvault-dev" }
+}

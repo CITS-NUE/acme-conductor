@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acme-conductor.cits-nue.github.io/schemas/v1alpha1/result.schema.json",
+  "title": "ACME Conductor CertificateReconcileResult v1alpha1",
+  "description": "Output of one acme-runner execution. The contract carries only logical references: ASCII FQDNs only (no internationalized domain names, not repeated here), no secrets, private keys or certificate bodies. storeObjectRef is a logical, versionless reference to the stored object, never a URL with credentials or a file system path. error.summary MUST NOT contain command lines, environment dumps, credentials, key material or certificate bodies. Go validation (pkg/api/v1alpha1) is authoritative and stricter than this schema; see schemas/README.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "runId",
+    "targetId",
+    "status",
+    "action",
+    "startedAt",
+    "finishedAt",
+    "error"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "acme-conductor.cits-nue.github.io/v1alpha1"
+    },
+    "kind": {
+      "const": "CertificateReconcileResult"
+    },
+    "runId": {
+      "$ref": "#/$defs/identifier"
+    },
+    "targetId": {
+      "$ref": "#/$defs/identifier"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["succeeded", "failed"]
+    },
+    "action": {
+      "type": "string",
+      "enum": ["issued", "renewed", "noop", "failed"]
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "NotAfter of the certificate currently in the store, if known. Omitted when the run failed before a certificate existed. Go validation additionally rejects the zero time value, which is not expressible as a JSON Schema format constraint."
+    },
+    "fingerprintSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lower-case hex SHA-256 of the DER certificate currently in the store, if known."
+    },
+    "storeObjectRef": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "Logical, versionless reference to the stored object (for example a Key Vault certificate name). Never a URL with credentials, a file system path outside the store, or the object itself. Go validation additionally rejects control characters and known secret markers (e.g. PEM headers, bearer tokens), which is not expressible in JSON Schema."
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finishedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Must not be before startedAt. This cross-field ordering rule is enforced only by Go validation, not by this schema."
+    },
+    "error": {
+      "description": "Null on success, required (non-null) on failure.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/resultError" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "succeeded" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "error": { "type": "null" },
+          "action": { "enum": ["issued", "renewed", "noop"] }
+        },
+        "required": ["expiresAt", "fingerprintSha256", "storeObjectRef"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "failed" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "action": { "const": "failed" },
+          "error": { "$ref": "#/$defs/resultError" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "resultError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "summary"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "InvalidJobSpec",
+            "PolicyViolation",
+            "BindingNotFound",
+            "AcmeFailure",
+            "DnsFailure",
+            "StoreFailure",
+            "Timeout",
+            "Cancelled",
+            "Internal"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Short human-readable summary. MUST NOT contain command lines, environment dumps, credentials, key material or certificate bodies. Go validation additionally rejects control characters, blank-after-trim text and known secret markers (e.g. PEM headers, bearer tokens), which is not expressible in JSON Schema."
+        }
+      }
+    }
+  }
+}

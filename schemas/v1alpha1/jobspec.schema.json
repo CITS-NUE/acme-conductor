@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acme-conductor.cits-nue.github.io/schemas/v1alpha1/jobspec.schema.json",
+  "title": "ACME Conductor CertificateReconcileJob v1alpha1",
+  "description": "Input to one acme-runner execution. The contract carries only logical references: ASCII FQDNs only (no internationalized domain names), no secrets, no commands, images, environment variables or cloud resource identifiers. acme/dns/store are logical binding names resolved from administrator-provided configuration on the Runner side, never inline credentials or connection details. Go validation (pkg/api/v1alpha1) is authoritative and stricter than this schema; see schemas/README.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "runId", "target", "policy", "acme", "dns", "store"],
+  "properties": {
+    "apiVersion": {
+      "const": "acme-conductor.cits-nue.github.io/v1alpha1"
+    },
+    "kind": {
+      "const": "CertificateReconcileJob"
+    },
+    "runId": {
+      "$ref": "#/$defs/identifier",
+      "description": "Opaque run identifier (e.g. a ULID or UUID). Letters, digits, '-' and '_' only."
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fqdn", "revision"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier",
+          "description": "Opaque target identifier."
+        },
+        "fqdn": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^(\\*\\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Normalized ASCII FQDN (lower-case, no trailing dot), optionally with a leading '*.' wildcard label. This pattern only expresses the surface syntax. Semantic checks the Go code additionally enforces are NOT expressible in JSON Schema and are the authoritative rules: label-boundary suffix matching (e.g. 'evil-example.ac.jp' is not under 'example.ac.jp'), rejection of an all-numeric top-level label, rejection of 'xn--' (IDNA) labels, and that the value is already in normalized form."
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optimistic-locking revision of the target at the time the job was created."
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedDnsSuffixes", "allowWildcard", "renewBeforeDays", "keyType"],
+      "properties": {
+        "allowedDnsSuffixes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "description": "Normalized ASCII DNS suffix (no wildcard, no trailing dot). See target.fqdn description for the semantic checks the schema cannot express."
+          },
+          "description": "Suffixes under which a certificate may be issued. Must be non-empty; duplicates are rejected by Go validation (JSON Schema's uniqueItems catches exact-string duplicates only)."
+        },
+        "allowWildcard": {
+          "type": "boolean",
+          "description": "Whether '*.name' targets are permitted. Go validation additionally cross-checks this against target.fqdn; the schema cannot express that cross-field rule."
+        },
+        "renewBeforeDays": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 365
+        },
+        "keyType": {
+          "type": "string",
+          "enum": ["ec256", "ec384", "rsa2048", "rsa3072", "rsa4096"]
+        }
+      }
+    },
+    "acme": {
+      "$ref": "#/$defs/bindingRef",
+      "description": "Administrator-registered ACME binding (directory URL, account and optional EAB reference live in Runner configuration)."
+    },
+    "dns": {
+      "$ref": "#/$defs/bindingRef",
+      "description": "Administrator-registered DNS provider binding."
+    },
+    "store": {
+      "$ref": "#/$defs/bindingRef",
+      "description": "Administrator-registered certificate store binding."
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "bindingRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding"],
+      "properties": {
+        "binding": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Logical name resolved from administrator-provided configuration on the Runner side. Never a credential, connection string or resource identifier."
+        }
+      }
+    }
+  }
+}

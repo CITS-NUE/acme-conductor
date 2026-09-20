@@ -1,0 +1,14 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZC",
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZD",
+  "status": "failed",
+  "action": "failed",
+  "startedAt": "2026-09-20T07:00:00Z",
+  "finishedAt": "2026-09-20T07:00:03Z",
+  "error": {
+    "code": "Timeout",
+    "summary": "run exceeded the maximum reconcile duration"
+  }
+}

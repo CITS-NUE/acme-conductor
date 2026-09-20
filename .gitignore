@@ -1,0 +1,23 @@
+# Build outputs
+/bin/
+/dist/
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+test-results/
+
+# Go tooling
+*.out
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*

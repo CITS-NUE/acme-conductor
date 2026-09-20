@@ -1,0 +1,36 @@
+# Fixtures in this directory that are structurally valid per
+# schemas/v1alpha1/jobspec.schema.json, but are rejected by
+# v1alpha1.DecodeJobSpec because of a Go-only semantic rule that JSON Schema
+# cannot express. See schemas/README.md for the full list of such rules.
+#
+# One file name per line. Comments start with '#'.
+
+# xn-- (IDNA) labels are syntactically valid per the fqdn pattern; only
+# internal/policy.NormalizeFQDN rejects them (ErrIDNALabel).
+fqdn-xn--label.json
+
+# The schema has no way to compare target.fqdn against
+# policy.allowedDnsSuffixes; suffix membership is a Go-only cross-field
+# check (internal/policy.Evaluate / MatchesSuffix).
+fqdn-outside-suffix.json
+
+# Label-boundary suffix matching ("evil-example.ac.jp" is not under
+# "example.ac.jp") is a Go-only rule (internal/policy.MatchesSuffix); the
+# schema only checks syntactic shape, not suffix membership.
+fqdn-label-boundary-attack.json
+
+# Whether a wildcard FQDN is allowed depends on policy.allowWildcard, a
+# cross-field rule the schema cannot express.
+wildcard-not-allowed.json
+
+# An all-numeric top-level label is syntactically valid per the fqdn/suffix
+# patterns (digits are in the allowed character class); only
+# internal/policy.NormalizeFQDN rejects it (ErrNumericTLD).
+fqdn-numeric-tld.json
+
+# Duplicate top-level JSON object keys are syntactically valid JSON (the
+# grammar does not forbid them) and are accepted by both json.Valid and the
+# jsonschema library's decoder, which follow the common last-value-wins
+# behavior. Only pkg/api/v1alpha1/decode.go's checkDuplicateKeys rejects
+# this document.
+duplicate-top-level-key.json

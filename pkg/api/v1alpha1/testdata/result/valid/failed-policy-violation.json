@@ -1,0 +1,14 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZA",
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZB",
+  "status": "failed",
+  "action": "failed",
+  "startedAt": "2026-09-20T06:00:00Z",
+  "finishedAt": "2026-09-20T06:00:02Z",
+  "error": {
+    "code": "PolicyViolation",
+    "summary": "target fqdn is not under any allowed DNS suffix"
+  }
+}
