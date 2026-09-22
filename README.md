@@ -13,10 +13,12 @@ jobs).** The `acme-conductor` control plane keeps targets, certificate
 policies, runs and an append-only audit log in a SQLite registry, exposes
 them over a REST API on the local host only (`localhost-dev`
 authentication), decides when a target is due, and launches the Runner —
-as a local child process for development, or since Phase 4 as an
-execution of an Azure Container Apps Job that runs under its own managed
-identity — at most one active run per target. Jobs can travel as signed,
-expiring envelopes that the Runner verifies and refuses to replay. The
+as a local child process for development, or since Phase 4 by offering
+the job to a scheduled Azure Container Apps Job that runs under its own
+managed identity (the Conductor cannot start executions) — at most one
+active run per target. Jobs travel as signed, expiring envelopes that the
+Runner verifies and refuses to replay, and Results come back signed by
+the Runner. The
 `acme-runner` data-plane binary validates and authorizes a `JobSpec`
 against its own trusted configuration, invokes the pinned `lego` CLI, and
 stores certificates either in a filesystem Certificate Store (dev/test
