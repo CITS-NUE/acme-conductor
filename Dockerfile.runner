@@ -43,15 +43,44 @@ RUN go build \
     -o /out/acme-runner \
     ./cmd/acme-runner
 
-# --- lego (placeholder — not fetched in Phase 0) ------------------------
+# --- lego ----------------------------------------------------------------
 #
-# Phase 1 adds a pinned, checksum-verified `lego` ACME client binary to
-# this image (fetched from an official release artifact, not built from
-# source here). LEGO_VERSION is declared now as a placeholder so the Phase
-# 1 diff is small and the pin point is obvious in review. Phase 0
-# performs NO network fetch of third-party binaries — this ARG is unused
-# until Phase 1 wires it into a download/verify step.
-ARG LEGO_VERSION=""
+# Fetches the official, pre-built `lego` ACME client binary from its
+# GitHub release artifact and verifies it against a pinned sha256 checksum
+# before it is ever extracted or run. It is not built from source here.
+#
+# Bumping the lego version means updating LEGO_VERSION *and* both
+# LEGO_SHA256_AMD64 / LEGO_SHA256_ARM64 below to match the new release's
+# published checksums — the download is refused if the checksum does not
+# match. CI (.github/workflows/ci.yml) builds this image on every push and
+# PR, so a stale/incorrect checksum here fails CI, not just a local build.
+#
+# Reuses the golang:1.24-bookworm image as the fetch environment (it
+# already has curl and tar) rather than pulling in another base image.
+FROM golang:1.24-bookworm AS lego
+
+ARG LEGO_VERSION=4.35.2
+ARG LEGO_SHA256_AMD64=ee5be4bf457de8e3efa86a51651c75c87f0ee0e4e9f3ae14f6034d68365770f3
+ARG LEGO_SHA256_ARM64=e1f153179098d27ce044aaaa168c0e323d50ae71b0f1a147aa8ae49ac6b14d89
+# BuildKit sets TARGETARCH automatically; default it for the legacy
+# (non-BuildKit) builder, which does not populate build-time platform ARGs.
+ARG TARGETARCH=amd64
+
+WORKDIR /out
+
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) lego_arch="amd64"; expected_sha256="$LEGO_SHA256_AMD64" ;; \
+      arm64) lego_arch="arm64"; expected_sha256="$LEGO_SHA256_ARM64" ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    archive="lego_v${LEGO_VERSION}_linux_${lego_arch}.tar.gz"; \
+    url="https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/${archive}"; \
+    curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$url"; \
+    echo "${expected_sha256}  ${archive}" | sha256sum -c -; \
+    tar -xzf "$archive" lego; \
+    chmod 0755 lego; \
+    rm -f "$archive"
 
 # --- runtime -------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
@@ -59,15 +88,18 @@ FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
+ARG LEGO_VERSION=4.35.2
 
 LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
       org.opencontainers.image.title="acme-runner" \
       org.opencontainers.image.description="ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate)." \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0" \
+      io.acme-conductor.lego.version="${LEGO_VERSION}"
 
 COPY --from=builder /out/acme-runner /usr/local/bin/acme-runner
+COPY --from=lego /out/lego /usr/local/bin/lego
 
 # distroless/static-debian12:nonroot already runs as uid/gid 65532
 # (nonroot:nonroot); set it explicitly for clarity and to survive any base

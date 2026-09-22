@@ -272,12 +272,13 @@ word "authorize" for the first one:
 
   `Authorize` requires an already-normalized FQDN (it does not normalize on
   the caller's behalf) and matches suffixes on the same label-boundary
-  rule as validation. Phase 0 defines the policy type and the decision
-  function, with tests; loading the configuration and calling `Authorize`
-  from the Runner before it acts is Phase 1 work. Until Phase 1 ships,
-  nothing independently bounds a `JobSpec`'s content beyond the
-  self-consistency check above (see `docs/threat-model.md`, T1/T2/T5 and
-  "Assurance levels").
+  rule as validation. Phase 0 defined the policy type and the decision
+  function, with tests; as of Phase 1, the Runner loads its trusted
+  configuration (`internal/runner/config`) and wires
+  `RunnerAuthorizationPolicy` from it (`Config.Policy()`) before it acts on
+  any `JobSpec` — see [`docs/runner.md`](runner.md#execution-flow) for the
+  exact sequence and `docs/threat-model.md` (T1/T2/T5 and
+  "Assurance levels") for what this does and does not close.
 - **Signing's scope.** A signed/authenticated `JobSpec` envelope (planned,
   Phase 4) protects the document against tampering in transit; it does not
   by itself address a compromised Conductor that legitimately produces a
@@ -411,10 +412,17 @@ cmd/
   acme-runner/      data-plane binary (main.go, --version/--help only in Phase 0)
 internal/
   policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
+  runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
+  runner/config/    Runner configuration loading and validation (Phase 1)
+  runner/lego/      lego argv/env construction, subprocess execution, output redaction (Phase 1)
+  runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
+  store/            Certificate Store adapter contract shared by store implementations (Phase 1)
+  store/filesystem/ filesystem-backed Certificate Store (dev/test only, Phase 1)
   version/          build metadata injected via -ldflags
 pkg/api/v1alpha1/   the versioned JobSpec/Result contract (types, validation, strict decoding)
 schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
-docs/               this document, the threat model, and ADRs
+deploy/examples/    example Runner configuration and JobSpec documents
+docs/               this document, the threat model, the Runner guide, and ADRs
 Dockerfile.conductor  distroless, non-root image for acme-conductor
 Dockerfile.runner     distroless, non-root image for acme-runner
 Makefile            build / verify / image targets
@@ -490,14 +498,14 @@ These hold across every phase and are traced to concrete mitigations in
 
 ## Roadmap
 
-Only **Phase 0** is implemented today. Phases are strictly sequential; a
+**Phases 0 and 1** are implemented today. Phases are strictly sequential; a
 given pull request implements one phase's scope and no more (see
 [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
 | Phase | Scope |
 |---|---|
 | 0 | Bootstrap: module layout, JobSpec/Result contract, CI. |
-| 1 | Runner + filesystem Certificate Store, with a pinned `lego` CLI. |
+| 1 | **Implemented.** Runner + filesystem Certificate Store, with a pinned `lego` CLI. See [`docs/runner.md`](runner.md), [ADR 0009](adr/0009-runner-execution-model.md) and [ADR 0010](adr/0010-pinned-lego-binary.md). |
 | 2 | Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. |
 | 3 | Azure Key Vault store adapter, authenticated via `DefaultAzureCredential`. |
 | 4 | Azure Container Apps Job launcher, provisioned via Bicep. |

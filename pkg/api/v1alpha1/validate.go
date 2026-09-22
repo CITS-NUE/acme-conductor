@@ -286,6 +286,19 @@ func validateIdentifier(field, v string) error {
 	return nil
 }
 
+// IsBindingName reports whether v is a well-formed logical binding name.
+// Runner configuration uses it to validate its own binding keys so that the
+// two sides of the contract agree on the syntax.
+func IsBindingName(v string) bool {
+	return v != "" && len(v) <= MaxBindingNameLength && bindingNameRe.MatchString(v)
+}
+
+// IsStoreObjectRef reports whether v is a well-formed logical store object
+// name (see validateStoreObjectRef).
+func IsStoreObjectRef(v string) bool {
+	return validateStoreObjectRef("storeObjectRef", v) == nil && v != ""
+}
+
 func validateBindingName(field, v string) error {
 	if v == "" {
 		return invalid(field, "required")
