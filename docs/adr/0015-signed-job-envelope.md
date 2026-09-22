@@ -93,9 +93,16 @@ private key squares with "the Conductor never touches secrets"
   id is unique and a Result for another run is refused by that check.
   As with jobs, the switch is fail-closed in both directions: a Runner
   told to sign does not report an unsigned success when its key cannot
-  be loaded (the run fails), and a Conductor with `resultSigning` treats
-  a bare Result as no Result. The Container Apps launcher requires both
-  keys; the local launcher may run with either, neither or both.
+  be loaded (the run fails), a Runner in claim mode takes no job at all
+  without a result-signing key, and a Conductor with `resultSigning`
+  treats a bare Result as no Result. The Container Apps launcher
+  requires both keys; the local launcher may run with either, neither
+  or both. The two envelope kinds share one construction and the
+  signature covers the header and payload, not the outer `kind`; what
+  keeps a job envelope from being read as a result envelope is that
+  the two sides trust disjoint key sets and that the payloads decode
+  under different strict schemas — so **never use one key pair for both
+  directions**.
 
 ## Alternatives considered
 

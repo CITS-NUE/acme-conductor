@@ -286,7 +286,12 @@ func (l *Launcher) awaitClaim(ctx context.Context, log *slog.Logger, runID strin
 			if ctx.Err() != nil || !time.Now().Before(claimDeadline) {
 				withdrawn, werr := exchange.Withdraw(root, runID)
 				if werr != nil {
-					log.Error("offered job could not be withdrawn", "error", werr.Error())
+					// A real failure of the share, not a lost race: the
+					// offer may still be pending, but waiting on a share
+					// that cannot be written would never end. The run
+					// fails; the pending directory is reported so an
+					// operator can remove it.
+					return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("offered job could not be withdrawn (pending/%s may remain): %w", exchange.RunDirName(runID), werr)}
 				}
 				if withdrawn {
 					if ctx.Err() != nil {
@@ -294,8 +299,9 @@ func (l *Launcher) awaitClaim(ctx context.Context, log *slog.Logger, runID strin
 					}
 					return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("no execution took the job within %s", l.cfg.ClaimTimeout)}
 				}
-				// Taken at the last moment: fall through to the claimed
-				// case on the next iteration.
+				// Taken at the last moment: the next iteration sees the
+				// claimed state and waits for the execution name.
+				continue
 			}
 		case exchange.StateClaimed:
 			if markerDeadline.IsZero() {

@@ -52,9 +52,13 @@ acme-runner --help
   next to the job. With nothing pending the process logs so and exits
   `0` without a Result. This is how a scheduled Container Apps Job
   execution finds its work ([Running as a Container Apps Job](#running-as-a-container-apps-job));
-  it cannot be combined with `--job`/`--result`. Without an execution
-  name the job is left taken with no Result and the process exits `2`,
-  because the Conductor could neither observe nor stop that execution.
+  it cannot be combined with `--job`/`--result`. Claim mode requires
+  [`resultSigning`](#resultsigning) in the configuration: without it the
+  process takes no job and exits `2`, since the Conductor on the other
+  side of a shared volume accepts signed Results only. Without an
+  execution name the job is left taken with no Result and the process
+  exits `2`, because the Conductor could neither observe nor stop that
+  execution.
 - `keygen` — generate the Ed25519 result-signing key pair
   ([`resultSigning`](#resultsigning)); the private key file is created
   `0600` and never overwritten, and the one-line public key for the

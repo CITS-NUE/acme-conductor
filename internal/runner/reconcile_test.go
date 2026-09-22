@@ -1354,6 +1354,14 @@ func TestReconcileClaimMode(t *testing.T) {
 			GracePeriod: 300 * time.Millisecond,
 		})
 	}
+	// Without resultSigning a Runner in claim mode takes nothing at all.
+	if code := run("acme-runner-abc1234"); code != ExitNoResult || !strings.Contains(h.logs.String(), "requires resultSigning") {
+		t.Fatalf("unsigned claim: code = %d\n%s", code, h.logs.String())
+	}
+	if st, _ := exchange.StateOf(root, "01JABCDEFGHJKMNPQRSTVWXYZ0"); st != exchange.StatePending {
+		t.Fatalf("job was taken without result signing: %s", st)
+	}
+	h.resultSigning()
 	if code := run("acme-runner-abc1234"); code != ExitSucceeded {
 		t.Fatalf("code = %d\n%s", code, h.logs.String())
 	}
@@ -1365,7 +1373,7 @@ func TestReconcileClaimMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("result next to the claimed job: %v", err)
 	}
-	res, err := v1alpha1.DecodeResult(bytes.NewReader(raw))
+	res, err := h.decodeResult(string(raw))
 	if err != nil || res.Status != v1alpha1.StatusSucceeded || res.RunID != "01JABCDEFGHJKMNPQRSTVWXYZ0" {
 		t.Fatalf("result = %+v, %v", res, err)
 	}

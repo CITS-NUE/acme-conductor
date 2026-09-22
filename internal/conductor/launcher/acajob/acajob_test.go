@@ -714,6 +714,45 @@ func TestCancelDuringClaimWithdrawsTheOffer(t *testing.T) {
 	}
 }
 
+// A withdrawal that fails for a real reason (not a lost race) ends the
+// start instead of retrying forever: the share is not writable, so
+// waiting longer would change nothing.
+func TestWithdrawFailureEndsTheStart(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.paused = true })
+	l, _, _ := newLauncher(t, f, func(c *Config) { c.ClaimTimeout = 200 * time.Millisecond })
+	// A file where the withdrawn run directory would go makes the
+	// withdrawal rename fail with something other than "not exist".
+	if err := os.MkdirAll(filepath.Join(f.exchangeLocal, exchange.DirWithdrawn), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.exchangeLocal, exchange.DirWithdrawn, exchange.RunDirName(spec().RunID)), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err := l.Start(context.Background(), spec())
+	if launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "could not be withdrawn") {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("start took %v", time.Since(start))
+	}
+	// The same with a cancelled context: no busy loop, a prompt return.
+	if err := os.WriteFile(filepath.Join(f.exchangeLocal, exchange.DirWithdrawn, exchange.RunDirName("01JRUN000000000000000000B2")), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start = time.Now()
+	_, err = l.Start(ctx, specFor("01JRUN000000000000000000B2"))
+	if launcher.ReasonOf(err) == launcher.ReasonCancelled {
+		t.Fatalf("withdrawal did not fail: %v", err)
+	}
+	if launcher.ReasonOf(err) != launcher.ReasonStart || time.Since(start) > 5*time.Second {
+		t.Fatalf("err = %v after %v", err, time.Since(start))
+	}
+}
+
 // An execution name the platform does not know (planted on the share, or
 // a Runner that is not running as an execution of this Job) is refused
 // and the run fails at start; the marker's content is never trusted.

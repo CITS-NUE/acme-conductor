@@ -105,10 +105,10 @@ param claimTimeoutSeconds int = 300
 @description('Cron schedule on which the platform starts Runner executions; each execution takes one offered job or exits at once. Every minute is the finest schedule Container Apps supports and bounds the start latency of a run.')
 param runnerCronExpression string = '* * * * *'
 
-@description('Runner executions the platform may run at once (each takes one job). Keep it equal to schedulerMaxConcurrentRuns.')
+@description('Runner executions the platform may run at once (each takes one job). Defaults to schedulerMaxConcurrentRuns, which it should equal.')
 @minValue(1)
 @maxValue(10)
-param runnerParallelism int = 2
+param runnerParallelism int = schedulerMaxConcurrentRuns
 
 @description('Optional image for an administration sidecar in the Conductor replica (a shell with curl reaches the loopback-only API through `az containerapp exec`). Empty deploys no sidecar. Pin by digest.')
 param adminSidecarImage string = ''

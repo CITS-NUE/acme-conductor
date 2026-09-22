@@ -158,6 +158,18 @@ func Reconcile(ctx context.Context, opts Options) int {
 	log := opts.Logger
 
 	if opts.ExchangeDir != "" {
+		// Claim mode is for a shared transport, on which the Conductor
+		// accepts signed Results only: a Runner that could not sign would
+		// take jobs and fail every one of them, so it refuses to take any.
+		cfg, err := config.Load(opts.ConfigPath)
+		if err != nil {
+			log.Error("runner configuration could not be loaded; taking no job", "error", err.Error())
+			return ExitNoResult
+		}
+		if cfg.ResultSigning == nil {
+			log.Error("claim mode requires resultSigning in the runner configuration; taking no job")
+			return ExitNoResult
+		}
 		claim, err := exchange.Take(opts.ExchangeDir)
 		if err != nil {
 			log.Error("cannot take a job from the exchange directory", "error", err.Error())
