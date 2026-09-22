@@ -78,9 +78,9 @@ below).
 - **Scheduler** — decides when a `Target` is due for issuance or renewal and
   produces a `JobSpec` for it.
 - **Job Launcher interface** — an abstraction over "start a Runner
-  execution somewhere" (a local process in Phase 2, an Azure Container Apps
-  Job from Phase 4). Cloud-specific launcher code lives behind this
-  interface, never in Conductor core.
+  execution somewhere" (`internal/conductor/launcher`: a local process in
+  Phase 2, an Azure Container Apps Job from Phase 4). Cloud-specific
+  launcher code lives behind this interface, never in Conductor core.
 
 ### acme-runner (data plane)
 
@@ -128,12 +128,20 @@ through a `StoreBinding`. The Conductor never reads from it.
 
 A Conductor outage must never prevent an already-launched Runner job from
 completing: the Runner does not call back into the Conductor to do its
-work, it only reports a `Result` once finished.
+work, it only reports a `Result` once finished. With the Phase 2
+local-process launcher the Runner is a child of the Conductor, so a
+graceful stop waits for it (up to `server.shutdownGraceSeconds`) and then
+cancels it; a run whose outcome the Conductor missed is recorded as
+failed with "outcome unknown" at the next start, never guessed (see
+[ADR 0011](adr/0011-conductor-storage-and-run-model.md)).
 
 ## Domain model
 
-Implemented from Phase 2 onward; documented here so the contract in Phase 0
-and the storage design in Phase 2 agree from the start.
+Implemented in Phase 2 (`internal/conductor/registry` defines the model
+and the `Registry` interface, `internal/conductor/sqlite` persists it —
+see [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and
+[`docs/conductor.md`](conductor.md)); documented here so the contract in
+Phase 0 and the storage design agree.
 
 - **`Target`** — `{id, fqdn (normalized ASCII, unique), enabled, owner,
   policyRef, executionBinding, dnsBinding, storeBinding, createdAt,
@@ -176,6 +184,10 @@ binding that an administrator registered ahead of time:
 
 In the MVP, all four binding types are loaded from Runner/Conductor startup
 configuration; there is no admin API to create or modify them at runtime.
+The Conductor's configuration (`internal/conductor/config`) defines
+`ExecutionBinding`s and lists the ACME/DNS/Store binding **names** a policy
+or target may select — names only; what a name resolves to is Runner
+configuration, and the Conductor never sees it.
 A `JobSpec` carries only the binding's name (a short DNS-label-like string,
 see `pkg/api/v1alpha1/validate.go`'s `bindingNameRe`); the Runner resolves
 that name to the actual directory URL, credential, or workload identity
@@ -408,9 +420,18 @@ gets matched against the suffix list.
 
 ```
 cmd/
-  acme-conductor/   control-plane binary (main.go, --version/--help only in Phase 0)
-  acme-runner/      data-plane binary (main.go, --version/--help only in Phase 0)
+  acme-conductor/   control-plane binary (serve, Phase 2)
+  acme-runner/      data-plane binary (reconcile, Phase 1)
 internal/
+  conductor/            Conductor wiring: config, registry, scheduler, launchers, API (Phase 2)
+  conductor/api/        REST API handlers and the localhost-dev authenticator
+  conductor/config/     Conductor configuration loading and validation
+  conductor/launcher/   Job Launcher interface and the local-process launcher
+  conductor/registry/   domain model (Target, CertificatePolicy, Run, AuditEvent) and Registry interface
+  conductor/scheduler/  due decision, per-target exclusion, run execution
+  conductor/sqlite/     SQLite implementation of Registry, with migrations
+  conductor/fakerunner/ test double for acme-runner used by Conductor tests; not compiled into shipped binaries
+  fslock/           advisory file locks shared by the Runner's on-disk stores
   policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
   runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
   runner/config/    Runner configuration loading and validation (Phase 1)
@@ -421,8 +442,8 @@ internal/
   version/          build metadata injected via -ldflags
 pkg/api/v1alpha1/   the versioned JobSpec/Result contract (types, validation, strict decoding)
 schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
-deploy/examples/    example Runner configuration and JobSpec documents
-docs/               this document, the threat model, the Runner guide, and ADRs
+deploy/examples/    example Conductor and Runner configurations and a JobSpec document
+docs/               this document, the threat model, the Conductor and Runner guides, and ADRs
 Dockerfile.conductor  distroless, non-root image for acme-conductor
 Dockerfile.runner     distroless, non-root image for acme-runner
 Makefile            build / verify / image targets
@@ -435,12 +456,14 @@ holds code private to this module.
 
 ## Technology choices
 
-- **Go**, using the standard `net/http` or a small router when the REST API
-  lands in Phase 2 — no large web framework.
-- **SQLite** behind a `Registry` interface with versioned, explicit
+- **Go**, using the standard `net/http` (method-and-pattern `ServeMux`)
+  for the REST API — no web framework (Phase 2).
+- **SQLite** (`modernc.org/sqlite`, pure Go, so `CGO_ENABLED=0` still
+  holds) behind a `Registry` interface with versioned, explicit
   migrations for the Conductor's state (Target, CertificatePolicy, Run,
-  AuditEvent). PostgreSQL and multi-replica Conductor are explicitly out of
-  scope for now (see [non-goals](#non-goals)).
+  AuditEvent) — see [ADR 0011](adr/0011-conductor-storage-and-run-model.md).
+  PostgreSQL and multi-replica Conductor are explicitly out of scope for
+  now (see [non-goals](#non-goals)).
 - **No SPA framework** before Phase 5; the initial UI is deliberately
   minimal.
 - **Runner image**: multi-stage build, pinned official `lego` binary
@@ -492,21 +515,20 @@ These hold across every phase and are traced to concrete mitigations in
 - Every log line for a run carries `runId` and `targetId`.
 - Logs never carry credentials, private keys, or the ACME External Account
   Binding (EAB) HMAC — see the threat model's secret-leakage entry.
-- `/healthz` and `/readyz` are added as the Conductor gains real state to
-  report on; a Prometheus `/metrics` endpoint follows. None of these exist
-  yet in Phase 0.
+- `/healthz` and `/readyz` exist since Phase 2 (`readyz` pings the
+  registry); a Prometheus `/metrics` endpoint follows in a later phase.
 
 ## Roadmap
 
-**Phases 0 and 1** are implemented today. Phases are strictly sequential; a
-given pull request implements one phase's scope and no more (see
-[`CONTRIBUTING.md`](../CONTRIBUTING.md)).
+**Phases 0, 1 and 2** are implemented today. Phases are strictly
+sequential; a given pull request implements one phase's scope and no more
+(see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
 | Phase | Scope |
 |---|---|
 | 0 | Bootstrap: module layout, JobSpec/Result contract, CI. |
 | 1 | **Implemented.** Runner + filesystem Certificate Store, with a pinned `lego` CLI. See [`docs/runner.md`](runner.md), [ADR 0009](adr/0009-runner-execution-model.md) and [ADR 0010](adr/0010-pinned-lego-binary.md). |
-| 2 | Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. |
+| 2 | **Implemented.** Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. See [`docs/conductor.md`](conductor.md), [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and [ADR 0012](adr/0012-localhost-only-dev-auth.md). |
 | 3 | Azure Key Vault store adapter, authenticated via `DefaultAzureCredential`. |
 | 4 | Azure Container Apps Job launcher, provisioned via Bicep. |
 | 5 | OIDC auth, a minimal GUI, GHCR releases with SBOM and provenance. |

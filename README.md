@@ -8,17 +8,20 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 1 (Runner with bundled lego and filesystem store); the
-Conductor is still a skeleton.** The `acme-runner` data-plane binary
+**Status: Phase 2 (Conductor MVP on top of the Phase 1 Runner).** The
+`acme-conductor` control plane keeps targets, certificate policies, runs
+and an append-only audit log in a SQLite registry, exposes them over a
+REST API on the local host only (`localhost-dev` authentication), decides
+when a target is due, and launches the Runner as a local child process —
+at most one active run per target. The `acme-runner` data-plane binary
 validates and authorizes a `JobSpec` against its own trusted configuration,
 invokes the pinned `lego` CLI, and stores certificates in a filesystem
-Certificate Store (dev/test only). The `acme-conductor` control plane still
-implements only `--version`/`--help`; nothing yet schedules a `Target` or
-launches a Runner job automatically. See
-[`docs/runner.md`](docs/runner.md) for how to run and configure the Runner,
-and the [roadmap](docs/architecture.md#roadmap) for what each phase adds.
-Automated tests never call a real ACME CA or DNS provider — they run
-against a fake `lego` test double.
+Certificate Store (dev/test only). See
+[`docs/conductor.md`](docs/conductor.md) and
+[`docs/runner.md`](docs/runner.md) for how to run and configure each
+binary, and the [roadmap](docs/architecture.md#roadmap) for what each
+phase adds. Automated tests never call a real ACME CA or DNS provider —
+they run against fake `lego`/`acme-runner` test doubles.
 
 ## Architecture
 
@@ -57,17 +60,22 @@ make build    # build ./bin/acme-conductor and ./bin/acme-runner
 make images   # build both container images (ghcr.io/cits-nue/acme-conductor, acme-runner)
 ```
 
-`acme-conductor` still implements only `--version` and `--help`.
-`acme-runner` additionally implements `reconcile`, which handles one
-`JobSpec` end to end — see [`docs/runner.md`](docs/runner.md) for the
-command line, the configuration file format, and an example config/job
-pair under [`deploy/examples/`](deploy/examples/).
+`acme-conductor serve --config FILE` runs the control plane (REST API on
+`127.0.0.1:8080` by default, scheduler, local-process launcher) — see
+[`docs/conductor.md`](docs/conductor.md) for the command line, the
+configuration file format and the API. `acme-runner reconcile` handles one
+`JobSpec` end to end — see [`docs/runner.md`](docs/runner.md). Example
+configurations for both, and an example job, are under
+[`deploy/examples/`](deploy/examples/).
 
 ## Repository layout
 
 ```
 cmd/acme-conductor/   control-plane binary
 cmd/acme-runner/      data-plane binary
+internal/conductor/   Conductor: config, registry (SQLite), scheduler, launchers, REST API
+internal/runner/      Runner: config, reconcile loop, lego invocation
+internal/store/       Certificate Store contract and the filesystem store
 internal/policy/      FQDN normalization and suffix-matching
 internal/version/     build metadata (injected via -ldflags)
 pkg/api/v1alpha1/     the versioned JobSpec/Result contract
@@ -78,6 +86,7 @@ docs/                 architecture, threat model, ADRs
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Conductor operator guide](docs/conductor.md)
 - [Runner operator guide](docs/runner.md)
 - [Threat model](docs/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)

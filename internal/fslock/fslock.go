@@ -10,8 +10,8 @@
 //   - The locks are advisory and host-local. They coordinate acme-runner
 //     processes on one host that use this package; they do not stop a
 //     foreign writer, and they are not a substitute for the Conductor's
-//     per-target run exclusion (Phase 2), which is what prevents duplicate
-//     ACME work.
+//     per-target run exclusion (internal/conductor/scheduler), which is
+//     what prevents duplicate ACME work.
 //   - Acquisition is non-blocking underneath (LOCK_NB) and polls with a
 //     small backoff while honouring the caller's context, because a
 //     goroutine blocked in flock(2) cannot be woken by context

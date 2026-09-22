@@ -16,6 +16,8 @@ Conductor, in the lightweight MADR-like format described in
 | [0008](0008-no-purge-in-mvp.md) | No purge in the MVP |
 | [0009](0009-runner-execution-model.md) | Runner execution model |
 | [0010](0010-pinned-lego-binary.md) | Pinned lego binary |
+| [0011](0011-conductor-storage-and-run-model.md) | Conductor storage and run model |
+| [0012](0012-localhost-only-dev-auth.md) | Localhost-only development authentication |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).

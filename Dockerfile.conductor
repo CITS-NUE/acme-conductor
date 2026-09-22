@@ -11,7 +11,7 @@
 
 # --- builder -----------------------------------------------------------
 #
-# Pinned by tag for Phase 0. Release builds pin the base image by digest
+# Pinned by tag for now. Release builds pin the base image by digest
 # (golang:1.24-bookworm@sha256:<digest>) instead of by mutable tag; that
 # pinning is done at release time, not here.
 FROM golang:1.24-bookworm AS builder
@@ -64,8 +64,18 @@ COPY --from=builder /out/acme-conductor /usr/local/bin/acme-conductor
 # image change that alters the default user.
 USER nonroot:nonroot
 
-# No writes are performed at startup, so this image is safe to run with a
-# read-only root filesystem (docker run --read-only / Kubernetes
-# readOnlyRootFilesystem: true). No VOLUME is declared here since Phase 0
-# has no runtime state to persist.
+# The image writes only to the paths its configuration names, so it is
+# safe to run with a read-only root filesystem (docker run --read-only /
+# Kubernetes readOnlyRootFilesystem: true) as long as the registry
+# directory (database.path, e.g. /var/lib/acme-conductor) is a writable,
+# persistent mount and the configuration is mounted read-only at
+# /etc/acme-conductor/config.json. No VOLUME is declared so that the
+# caller chooses the mount explicitly. The image contains neither
+# acme-runner nor lego: the Phase 2 local-process launcher needs both on
+# the same host (see docs/conductor.md).
+#
+#   docker run --rm --read-only -p 127.0.0.1:8080:8080 \
+#     -v $PWD/conductor-config.json:/etc/acme-conductor/config.json:ro \
+#     -v acme-conductor-state:/var/lib/acme-conductor \
+#     ghcr.io/cits-nue/acme-conductor:dev serve
 ENTRYPOINT ["/usr/local/bin/acme-conductor"]

@@ -11,6 +11,11 @@ test-results/
 # Go tooling
 *.out
 
+# Local Conductor state
+*.db
+*.db-wal
+*.db-shm
+
 # Editor / OS cruft
 .vscode/
 .idea/

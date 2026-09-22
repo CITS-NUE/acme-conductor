@@ -1,0 +1,32 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "ConductorConfig",
+  "server": {
+    "listen": "127.0.0.1:8080",
+    "auth": { "mode": "localhost-dev" },
+    "shutdownGraceSeconds": 900
+  },
+  "database": {
+    "path": "/var/lib/acme-conductor/conductor.db"
+  },
+  "scheduler": {
+    "tickSeconds": 60,
+    "maxConcurrentRuns": 2,
+    "retryBackoffSeconds": 300,
+    "maxRetryBackoffSeconds": 21600
+  },
+  "executionBindings": {
+    "local": {
+      "type": "local-process",
+      "localProcess": {
+        "runnerBinary": "/usr/local/bin/acme-runner",
+        "runnerConfig": "/etc/acme-runner/config.json",
+        "workDir": "/var/lib/acme-conductor/runs",
+        "timeoutSeconds": 1200
+      }
+    }
+  },
+  "acmeBindings": ["letsencrypt-staging"],
+  "dnsBindings": ["azure-dns-staging"],
+  "storeBindings": ["filesystem-dev"]
+}
