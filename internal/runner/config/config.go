@@ -54,6 +54,10 @@ const (
 	// jobSigning.clockSkewSeconds.
 	DefaultClockSkewSeconds = 300
 	MaxClockSkewSeconds     = 3600
+	// DefaultResultValiditySeconds and MaxResultValiditySeconds bound
+	// resultSigning.validitySeconds.
+	DefaultResultValiditySeconds = 3600
+	MaxResultValiditySeconds     = 86400
 )
 
 // Errors.
@@ -127,6 +131,36 @@ type Config struct {
 	// it has not executed before. When absent, only bare JobSpecs are
 	// accepted (the Phase 2 local launcher over a private directory).
 	JobSigning *JobSigning `json:"jobSigning,omitempty"`
+	// ResultSigning, when present, makes the Runner wrap every Result in a
+	// SignedCertificateReconcileResult signed with the named key, so a
+	// Conductor that reads Results over a shared transport can tell this
+	// Runner's Results from anything else written there (docs/adr/0015).
+	// When absent, bare Results are written.
+	ResultSigning *ResultSigning `json:"resultSigning,omitempty"`
+}
+
+// ResultSigning locates the Runner's result-signing key.
+type ResultSigning struct {
+	// PrivateKeyFile is the clean, absolute path of a PEM "PRIVATE KEY"
+	// (PKCS #8) file holding an Ed25519 key: the Runner's identity
+	// towards the Conductor, never a DNS, Store or cloud credential.
+	PrivateKeyFile string `json:"privateKeyFile"`
+	// ValiditySeconds is how long a signed Result stays acceptable to a
+	// Conductor after it is issued (default DefaultResultValiditySeconds).
+	ValiditySeconds int `json:"validitySeconds,omitempty"`
+}
+
+func (r *ResultSigning) validate() error {
+	if r.PrivateKeyFile == "" || !filepath.IsAbs(r.PrivateKeyFile) || filepath.Clean(r.PrivateKeyFile) != r.PrivateKeyFile {
+		return invalid("resultSigning.privateKeyFile must be a clean absolute path")
+	}
+	if r.ValiditySeconds == 0 {
+		r.ValiditySeconds = DefaultResultValiditySeconds
+	}
+	if r.ValiditySeconds < 1 || r.ValiditySeconds > MaxResultValiditySeconds {
+		return invalid("resultSigning.validitySeconds must be between 1 and %d", MaxResultValiditySeconds)
+	}
+	return nil
 }
 
 // JobSigning is the trust configuration for signed job envelopes. It holds
@@ -352,6 +386,11 @@ func (c *Config) Validate() error {
 	}
 	if c.JobSigning != nil {
 		if err := c.JobSigning.validate(); err != nil {
+			return err
+		}
+	}
+	if c.ResultSigning != nil {
+		if err := c.ResultSigning.validate(); err != nil {
 			return err
 		}
 	}

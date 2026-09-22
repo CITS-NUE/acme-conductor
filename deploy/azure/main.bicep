@@ -6,16 +6,20 @@
 //     environment: conductor-state (the SQLite registry), runner-state
 //     (ACME account state) and exchange (signed jobs in, results out);
 //   - two user-assigned identities, one per binary, with disjoint grants
-//     (docs/threat-model.md, T10): the Conductor's may start, observe and
-//     stop executions of the Runner Job and nothing else; the Runner's may
-//     write TXT records in one DNS zone and import certificates into one
-//     Key Vault, and nothing else;
-//   - the Runner as a manually triggered Container Apps Job (one execution
-//     per run, started by the Conductor);
+//     (docs/threat-model.md, T10): the Conductor's may observe and stop
+//     executions of the Runner Job and nothing else — never start one,
+//     since the start operation's execution template could replace the
+//     Runner's image (docs/adr/0014); the Runner's may write TXT records
+//     in one DNS zone and import certificates into one Key Vault, and
+//     nothing else;
+//   - the Runner as a scheduled Container Apps Job whose executions take
+//     the jobs the Conductor offers on the exchange share;
 //   - the Conductor as a single-replica Container App without ingress.
 //
-// Nothing here is a secret except the job-signing private key, which is a
-// secure parameter stored as a Container App secret and mounted as a file.
+// Nothing here is a secret except the two signing private keys (the
+// Conductor's job-signing key, the Runner's result-signing key), each a
+// secure parameter stored as a secret and mounted as a file for its own
+// binary.
 // No DNS or Key Vault credential exists anywhere: both are the Runner's
 // managed identity. See deploy/azure/README.md for what this template does
 // not verify and how to operate the result.
@@ -26,7 +30,7 @@ targetScope = 'resourceGroup'
 @description('Azure region for every resource.')
 param location string = resourceGroup().location
 
-@description('Name prefix for the resources created here (letters, digits, hyphens).')
+@description('Name prefix for the resources created here: lower-case letters, digits and hyphens. The storage account name is the first 11 characters of the prefix without hyphens plus a 13-character unique suffix, so it always fits the 24-character limit.')
 @minLength(3)
 @maxLength(20)
 param namePrefix string = 'acme'
@@ -50,6 +54,13 @@ param jobSigningPrivateKeyPem string
 @description('The matching public key (PEM or one-line base64), placed into the Runner configuration as jobSigning.publicKeys[0].')
 param jobSigningPublicKey string
 
+@description('The Ed25519 result-signing private key, PEM (PKCS #8), from `acme-runner keygen`. Stored as a Container Apps Job secret and mounted as a file for the Runner only.')
+@secure()
+param resultSigningPrivateKeyPem string
+
+@description('The matching public key (PEM or one-line base64), placed into the Conductor configuration as resultSigning.publicKeys[0].')
+param resultSigningPublicKey string
+
 @description('Logical ACME binding names the Conductor registers (must match the Runner configuration).')
 param acmeBindings array
 
@@ -62,20 +73,14 @@ param storeBindings array
 @description('Name of the DNS zone the Runner completes challenges in.')
 param dnsZoneName string
 
-@description('Resource group of the DNS zone.')
+@description('Resource group of the DNS zone. The zone must be in this subscription (the custom roles are assignable in this subscription only).')
 param dnsZoneResourceGroup string
-
-@description('Subscription of the DNS zone (defaults to this one).')
-param dnsZoneSubscriptionId string = subscription().subscriptionId
 
 @description('Name of the Key Vault the Runner stores certificates in (RBAC permission model).')
 param keyVaultName string
 
-@description('Resource group of the Key Vault.')
+@description('Resource group of the Key Vault. The vault must be in this subscription (the custom roles are assignable in this subscription only).')
 param keyVaultResourceGroup string
-
-@description('Subscription of the Key Vault (defaults to this one).')
-param keyVaultSubscriptionId string = subscription().subscriptionId
 
 @description('Maximum seconds one Runner execution may run before the platform stops it. Keep it above the Runner lego.timeoutSeconds and below the Conductor timeoutSeconds.')
 @minValue(60)
@@ -87,10 +92,23 @@ param runnerReplicaTimeoutSeconds int = 1500
 @maxValue(86400)
 param conductorLaunchTimeoutSeconds int = 1800
 
-@description('How long a signed job stays acceptable after issue (seconds). It only has to cover the platform start latency.')
+@description('How long a signed job stays acceptable after issue (seconds). It has to cover the schedule cadence plus the platform start latency, and must be at least claimTimeoutSeconds.')
 @minValue(60)
 @maxValue(86400)
 param jobSigningValiditySeconds int = 900
+
+@description('How long the Conductor waits for a scheduled execution to take an offered job before it withdraws it (seconds). At most jobSigningValiditySeconds.')
+@minValue(60)
+@maxValue(86400)
+param claimTimeoutSeconds int = 300
+
+@description('Cron schedule on which the platform starts Runner executions; each execution takes one offered job or exits at once. Every minute is the finest schedule Container Apps supports and bounds the start latency of a run.')
+param runnerCronExpression string = '* * * * *'
+
+@description('Runner executions the platform may run at once (each takes one job). Keep it equal to schedulerMaxConcurrentRuns.')
+@minValue(1)
+@maxValue(10)
+param runnerParallelism int = 2
 
 @description('Optional image for an administration sidecar in the Conductor replica (a shell with curl reaches the loopback-only API through `az containerapp exec`). Empty deploys no sidecar. Pin by digest.')
 param adminSidecarImage string = ''
@@ -107,7 +125,7 @@ param tags object = {}
 var environmentName = '${namePrefix}-cae'
 var workspaceName = '${namePrefix}-log'
 // Storage account names: 3-24 lower-case alphanumerics, globally unique.
-var storageAccountName = toLower(replace('${namePrefix}${uniqueString(resourceGroup().id)}', '-', ''))
+var storageAccountName = toLower('${take(replace(namePrefix, '-', ''), 11)}${uniqueString(resourceGroup().id)}')
 var conductorIdentityName = '${namePrefix}-id-conductor'
 var runnerIdentityName = '${namePrefix}-id-runner'
 var runnerJobName = '${namePrefix}-runner'
@@ -265,15 +283,19 @@ resource exchangeStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01'
   }
 }
 
-// --- the Runner: a manually triggered Job ------------------------------------
+// --- the Runner: a scheduled Job -------------------------------------------
 
-// The operator's Runner configuration plus the Conductor's public key, so
-// the Runner cannot be deployed without the key it needs to verify jobs.
+// The operator's Runner configuration plus the Conductor's public key (so
+// the Runner cannot be deployed without the key it needs to verify jobs)
+// and the path of its own result-signing key.
 var runnerConfig = union(json(runnerConfigJson), {
   jobSigning: {
     publicKeys: [
       jobSigningPublicKey
     ]
+  }
+  resultSigning: {
+    privateKeyFile: '/etc/acme-runner/result-signing.pem'
   }
 })
 
@@ -290,13 +312,19 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: environment.id
     configuration: {
-      triggerType: 'Manual'
+      // Scheduled, never started by the Conductor: the start operation's
+      // execution template could replace the image, so no identity of
+      // this deployment holds jobs/start/action (docs/adr/0014). Each
+      // execution takes the oldest job the Conductor offered on the
+      // exchange share, or exits at once when there is none.
+      triggerType: 'Schedule'
       replicaTimeout: runnerReplicaTimeoutSeconds
       // A retried replica would present the same signed job again; the
       // Runner refuses it (replay ledger) and the retry only burns time.
       replicaRetryLimit: 0
-      manualTriggerConfig: {
-        parallelism: 1
+      scheduleTriggerConfig: {
+        cronExpression: runnerCronExpression
+        parallelism: runnerParallelism
         replicaCompletionCount: 1
       }
       secrets: [
@@ -307,6 +335,10 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
           #disable-next-line use-secure-value-for-secure-inputs
           value: string(runnerConfig)
         }
+        {
+          name: 'result-signing-key'
+          value: resultSigningPrivateKeyPem
+        }
       ]
     }
     template: {
@@ -314,11 +346,13 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'runner'
           image: runnerImage
-          // The Conductor supplies the arguments of each execution
-          // (reconcile --job ... --result ...); these defaults make a
-          // stray manual start fail fast instead of doing anything.
+          // Claim mode: take one offered job from the exchange share
+          // (docs/runner.md). The arguments are fixed here; nothing about
+          // an execution is chosen by the Conductor.
           args: [
-            '--version'
+            'reconcile'
+            '--exchange'
+            '/exchange'
           ]
           env: [
             {
@@ -364,6 +398,10 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               secretRef: 'runner-config'
               path: 'config.json'
+            }
+            {
+              secretRef: 'result-signing-key'
+              path: 'result-signing.pem'
             }
           ]
         }
@@ -411,6 +449,11 @@ var conductorConfig = {
     privateKeyFile: '/etc/acme-conductor/job-signing.pem'
     validitySeconds: jobSigningValiditySeconds
   }
+  resultSigning: {
+    publicKeys: [
+      resultSigningPublicKey
+    ]
+  }
   executionBindings: {
     azure: {
       type: 'azure-container-apps-job'
@@ -420,9 +463,8 @@ var conductorConfig = {
         jobName: runnerJob.name
         credential: 'managed-identity'
         managedIdentityClientId: conductorIdentity.properties.clientId
-        containerName: 'runner'
         exchangeDir: '/mnt/exchange'
-        runnerExchangeDir: '/exchange'
+        claimTimeoutSeconds: claimTimeoutSeconds
         timeoutSeconds: conductorLaunchTimeoutSeconds
       }
     }
@@ -550,21 +592,22 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
 
 // --- grants ------------------------------------------------------------------
 
-// Conductor identity -> start/observe/stop executions of this Job only.
-resource conductorStartsRunner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(runnerJob.id, conductorIdentity.id, 'job-starter')
+// Conductor identity -> observe and stop executions of this Job only
+// (never start one; see modules/roles.bicep).
+resource conductorObservesRunner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(runnerJob.id, conductorIdentity.id, 'job-observer')
   scope: runnerJob
   properties: {
     principalId: conductorIdentity.properties.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: roles.outputs.conductorJobStarterRoleId
+    roleDefinitionId: roles.outputs.conductorJobObserverRoleId
   }
 }
 
 // Runner identity -> TXT records in the challenge zone.
 module runnerDns 'modules/dns-role-assignment.bicep' = {
   name: '${deployment().name}-dns'
-  scope: resourceGroup(dnsZoneSubscriptionId, dnsZoneResourceGroup)
+  scope: resourceGroup(dnsZoneResourceGroup)
   params: {
     dnsZoneName: dnsZoneName
     runnerPrincipalId: runnerIdentity.properties.principalId
@@ -575,7 +618,7 @@ module runnerDns 'modules/dns-role-assignment.bicep' = {
 // Runner identity -> import certificates into the vault.
 module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {
   name: '${deployment().name}-keyvault'
-  scope: resourceGroup(keyVaultSubscriptionId, keyVaultResourceGroup)
+  scope: resourceGroup(keyVaultResourceGroup)
   params: {
     keyVaultName: keyVaultName
     runnerPrincipalId: runnerIdentity.properties.principalId

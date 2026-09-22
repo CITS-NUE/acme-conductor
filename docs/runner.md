@@ -39,10 +39,26 @@ process per run.
 
 ```
 acme-runner reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]
+acme-runner reconcile --exchange DIR [--config FILE] [--log-level LEVEL]
+acme-runner keygen --private FILE --public FILE
 acme-runner --version
 acme-runner --help
 ```
 
+- `--exchange DIR` — *claim mode*, instead of `--job`/`--result`: take
+  the oldest job a Conductor has offered under `DIR/pending/`, move it
+  to `DIR/claimed/`, record this process's platform execution name
+  (`CONTAINER_APP_JOB_EXECUTION_NAME`) next to it, and write the Result
+  next to the job. With nothing pending the process logs so and exits
+  `0` without a Result. This is how a scheduled Container Apps Job
+  execution finds its work ([Running as a Container Apps Job](#running-as-a-container-apps-job));
+  it cannot be combined with `--job`/`--result`. Without an execution
+  name the job is left taken with no Result and the process exits `2`,
+  because the Conductor could neither observe nor stop that execution.
+- `keygen` — generate the Ed25519 result-signing key pair
+  ([`resultSigning`](#resultsigning)); the private key file is created
+  `0600` and never overwritten, and the one-line public key for the
+  Conductor's `resultSigning.publicKeys` is printed.
 - `--job FILE` (required) — path to the `CertificateReconcileJob` document.
 - `--result FILE` (required) — path the `CertificateReconcileResult` is
   written to atomically (temporary file in the same directory, `fsync`,
@@ -188,6 +204,26 @@ decision: the local launcher over a private directory on one host may
 run unsigned; anything that hands jobs over a shared volume or a
 platform must sign ([ADR 0015](adr/0015-signed-job-envelope.md)).
 
+### `resultSigning`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `privateKeyFile` | string | — (required) | Clean, absolute path of the PEM `PRIVATE KEY` (PKCS #8, Ed25519) file from `acme-runner keygen`. The Runner's identity towards the Conductor, never a DNS, Store or cloud credential. |
+| `validitySeconds` | int | `3600` | How long a signed Result stays acceptable to the Conductor after it is issued. `1`–`86400`. |
+
+With `resultSigning` present the Runner wraps every Result — success or
+failure — in a `SignedCertificateReconcileResult`
+([ADR 0015](adr/0015-signed-job-envelope.md)): the exact `Result` bytes
+under a strict signed header, on stdout and in the result file alike.
+A Conductor configured with the matching public key
+([`docs/conductor.md`](conductor.md#resultsigning)) accepts nothing
+else, which is what keeps another writer to a shared exchange volume
+from substituting or altering a Result. The Runner fails closed: when
+the key cannot be read, the run fails (`Internal`, "result signing key
+could not be loaded") and `lego` does not run, rather than a bare
+success being reported. The Phase 4 deployment requires it; the local
+launcher over a private directory may run without.
+
 ### Running as a Container Apps Job
 
 In the Phase 4 deployment ([`deploy/azure`](../deploy/azure/README.md))
@@ -217,9 +253,16 @@ those names:
 No credential value is in the file; `IDENTITY_HEADER` is the
 per-container token of the local identity endpoint and is redacted from
 the Runner's log like every passthrough value.
+
+The Job is **scheduled** (every minute) with the fixed command
+`reconcile --exchange /exchange`, never started by the Conductor
+([ADR 0014](adr/0014-azure-container-apps-job-launcher.md)): each
+execution takes at most one offered job or exits at once, records its
+execution name for the Conductor, and signs its Result with the
+result-signing key mounted at `/etc/acme-runner/result-signing.pem`.
 [`deploy/examples/runner-config.aca.example.json`](../deploy/examples/runner-config.aca.example.json)
 is the complete, validated example for that deployment (paths `/state`
-and `/work`, `jobSigning` required).
+and `/work`, `jobSigning` and `resultSigning` required).
 
 ### Example
 
@@ -792,6 +835,10 @@ across the rest of the codebase's log statements is still Phase 3+ work
   reads service-principal variables from the Runner's environment and may
   execute developer tooling from `PATH`; that is a development
   convenience, not a production posture — say `managed-identity`.
+- In claim mode the atomicity of taking a job rests on directory rename
+  being atomic on the exchange volume; on an SMB share that is expected
+  but verified only by a first real deployment
+  ([`deploy/azure/README.md`](../deploy/azure/README.md)).
 - No run-level concurrency control in the Runner itself: two Runner
   processes for the same target can both issue (double issuance, ACME
   rate-limit cost). The filesystem store and the account state survive

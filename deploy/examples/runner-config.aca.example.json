@@ -55,5 +55,8 @@
     "publicKeys": [
       "MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms="
     ]
+  },
+  "resultSigning": {
+    "privateKeyFile": "/etc/acme-runner/result-signing.pem"
   }
 }

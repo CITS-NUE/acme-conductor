@@ -2,7 +2,8 @@
 //
 //   az deployment group create --resource-group rg-acme \
 //     --template-file main.bicep --parameters main.bicepparam \
-//     --parameters jobSigningPrivateKeyPem=@job-signing.pem
+//     --parameters jobSigningPrivateKeyPem=@job-signing.pem \
+//     --parameters resultSigningPrivateKeyPem=@result-signing.pem
 //
 // The runner configuration below is deploy/examples/runner-config.aca.example.json
 // with the paths this template mounts (/state, /work, /usr/local/bin/lego).
@@ -25,5 +26,9 @@ param keyVaultResourceGroup = 'rg-acme'
 // (the "publicKey:" line of its output).
 param jobSigningPublicKey = 'MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms='
 param jobSigningPrivateKeyPem = readEnvironmentVariable('ACME_JOB_SIGNING_PRIVATE_KEY_PEM', '')
+
+// From `acme-runner keygen --private result-signing.pem --public result-signing.pub`.
+param resultSigningPublicKey = 'MCowBQYDK2VwAyEA65N/M3oDE8dU2aAKvMDf19gGaRxk3W3gRWTKAj2DPOM='
+param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_PRIVATE_KEY_PEM', '')
 
 param runnerConfigJson = loadTextContent('../examples/runner-config.aca.example.json')

@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -33,7 +34,7 @@ const (
 	// for SIGTERM, then reports Cancelled), hang-noresult (ignores SIGTERM
 	// and never reports), noresult (exit 2 without a Result), garbage
 	// (unparseable Result), mismatch (Result for another run), slow (sleeps
-	// EnvSleepMS then ok).
+	// EnvSleepMS then ok), unsigned (ok, but the Result is never signed).
 	EnvMode = "FAKE_RUNNER_MODE"
 	// EnvDays sets the reported certificate validity in days (default 90).
 	EnvDays = "FAKE_RUNNER_DAYS"
@@ -42,6 +43,10 @@ const (
 	// EnvRecord names a file to which argv and environment are written as
 	// JSON so tests can characterize the exact invocation.
 	EnvRecord = "FAKE_RUNNER_RECORD"
+	// EnvResultKey names a PEM private key file; when set, the Result is
+	// written as a SignedCertificateReconcileResult signed with it (as
+	// acme-runner does with resultSigning), except in mode "unsigned".
+	EnvResultKey = "FAKE_RUNNER_RESULT_KEY"
 )
 
 // LeakedSecret is printed on stderr in every mode so tests can prove that
@@ -64,18 +69,38 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "fake runner: expected reconcile")
 		return 2
 	}
-	var jobPath, resultPath string
+	var jobPath, resultPath, exchangeDir string
 	for i := 1; i+1 < len(args); i += 2 {
 		switch args[i] {
 		case "--job":
 			jobPath = args[i+1]
 		case "--result":
 			resultPath = args[i+1]
+		case "--exchange":
+			exchangeDir = args[i+1]
 		case "--config":
 		default:
 			fmt.Fprintln(stderr, "fake runner: unknown flag", args[i])
 			return 2
 		}
+	}
+	if exchangeDir != "" {
+		// Claim mode, as acme-runner does it: take the oldest pending job
+		// and record the execution name the platform gave this process.
+		claim, err := exchange.Take(exchangeDir)
+		if err != nil {
+			fmt.Fprintln(stderr, "fake runner:", err)
+			return 2
+		}
+		if claim == nil {
+			fmt.Fprintln(stderr, "fake runner: nothing pending")
+			return 0
+		}
+		if err := claim.MarkExecution(getenv("CONTAINER_APP_JOB_EXECUTION_NAME")); err != nil {
+			fmt.Fprintln(stderr, "fake runner:", err)
+			return 2
+		}
+		jobPath, resultPath = claim.JobPath, claim.ResultPath
 	}
 	raw, err := os.ReadFile(jobPath)
 	if err != nil {
@@ -138,8 +163,9 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		res.Action = v1alpha1.ActionFailed
 		res.Error = &v1alpha1.ResultError{Code: code, Summary: summary}
 	}
+	signed := getenv(EnvResultKey) != "" && mode != "unsigned"
 	switch mode {
-	case "ok":
+	case "ok", "unsigned":
 		succeed(v1alpha1.ActionIssued)
 	case "noop":
 		succeed(v1alpha1.ActionNoop)
@@ -175,7 +201,26 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "fake runner: unknown mode", mode)
 		return 2
 	}
-	line, err := json.Marshal(res)
+	var doc any = res
+	if signed {
+		pem, err := os.ReadFile(getenv(EnvResultKey))
+		if err != nil {
+			fmt.Fprintln(stderr, "fake runner:", err)
+			return 2
+		}
+		key, err := v1alpha1.ParseSigningPrivateKey(pem)
+		if err != nil {
+			fmt.Fprintln(stderr, "fake runner:", err)
+			return 2
+		}
+		sr, err := v1alpha1.SignResult(res, key, v1alpha1.SignOptions{Validity: time.Hour})
+		if err != nil {
+			fmt.Fprintln(stderr, "fake runner: sign result:", err)
+			return 2
+		}
+		doc = sr
+	}
+	line, err := json.Marshal(doc)
 	if err != nil {
 		return 2
 	}

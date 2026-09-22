@@ -1,28 +1,40 @@
-// Package acajob is the Azure Container Apps Job launcher (Phase 4). It
-// starts one execution of a pre-provisioned Container Apps Job per run,
-// hands the Runner a signed JobSpec over a file share both containers
-// mount, watches the execution until it ends, and reads the Result back
-// from the same share.
+// Package acajob is the Azure Container Apps Job launcher (Phase 4). The
+// Runner runs as a *scheduled* Container Apps Job whose executions start on
+// the platform's own cadence; the Conductor never starts one. For each run
+// the Conductor offers a signed JobSpec in an exchange directory both
+// containers mount, the next execution takes it (internal/exchange), the
+// Conductor learns which execution did from the marker the Runner leaves,
+// watches that execution until it ends, and reads the signed Result back
+// from the same directory.
+//
+// Why the Conductor does not start executions: the platform's start
+// operation accepts an execution template that can replace the image, the
+// command and the environment of the Job's containers, so an identity
+// holding Microsoft.App/jobs/start/action can run any image under the
+// Job's managed identity. Nothing this code refrains from doing would
+// protect against a compromise of the Conductor's identity; only not
+// holding that permission does (docs/adr/0014, threat model T1/T10). The
+// Conductor's identity therefore needs three permissions on the Job:
+// read an execution, list executions, stop an execution — none of which
+// lets it choose what runs — and nothing else, never a DNS, Key Vault or
+// storage data permission. The Runner's identity is attached to the Job
+// in infrastructure (deploy/azure), so no credential ever travels through
+// this launcher.
+//
+// Transport. Both documents cross a file share that other principals may
+// be able to write, so neither direction is trusted on its own: the job
+// is a SignedCertificateReconcileJob and the Result must be a
+// SignedCertificateReconcileResult that verifies against the Runners'
+// public keys (docs/adr/0015); the launcher refuses to be built without a
+// signer and a verifier. The execution name the Runner records is
+// validated and confirmed against the platform before it is used. The
+// directory holds nothing else and is removed when the execution ends.
 //
 // This is the only package of the Conductor binary that imports an Azure
-// SDK; the scheduler sees it through launcher.Launcher only. The
-// Conductor's identity needs four permissions on the Job resource (read
-// it, start an execution, read an execution, stop an execution) and
-// nothing else — never a DNS, Key Vault or storage data permission
-// (docs/threat-model.md, T10). The Runner's identity is attached to the
-// Job in infrastructure (deploy/azure), so no credential ever travels
-// through this launcher.
-//
-// Transport. The Conductor writes <exchangeDir>/run-<runId>/job.json — a
-// SignedCertificateReconcileJob, never a bare JobSpec, because a share is
-// not a transport the Conductor owns (docs/adr/0015) — and starts the
-// execution with the Runner's arguments pointing at the same path as the
-// Runner container sees it. The Runner writes result.json next to it. The
-// directory holds nothing else and is removed when the execution ends.
+// SDK; the scheduler sees it through launcher.Launcher only.
 package acajob
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,7 +42,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"sync"
 	"time"
@@ -44,6 +55,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
+	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
@@ -54,11 +66,18 @@ const Type = config.ExecutionAzureContainerAppsJob
 const (
 	DefaultPollInterval = 10 * time.Second
 	DefaultResultGrace  = 30 * time.Second
+	// DefaultClaimTimeout bounds how long Start waits for a scheduled
+	// execution to take the offered job.
+	DefaultClaimTimeout = 5 * time.Minute
+	// DefaultExecutionGrace bounds how long Start waits, once the job has
+	// been taken, for the Runner to record its execution name.
+	DefaultExecutionGrace = 60 * time.Second
 	// DefaultStopGrace bounds how long Wait keeps polling for a terminal
 	// status after it asked the platform to stop the execution.
 	DefaultStopGrace = 90 * time.Second
-	// maxConsecutivePollErrors ends a Wait whose status reads keep failing
-	// (the platform is unreachable) before the launcher timeout would.
+	// maxConsecutivePollErrors ends the polling of a Wait whose status
+	// reads keep failing (the platform is unreachable) before the launcher
+	// timeout would; the execution is then stopped like a timed-out one.
 	maxConsecutivePollErrors = 30
 )
 
@@ -70,9 +89,9 @@ type Config struct {
 	Cloud                   string
 	Credential              string
 	ManagedIdentityClientID string
-	ContainerName           string
 	ExchangeDir             string
-	RunnerExchangeDir       string
+	ClaimTimeout            time.Duration
+	ExecutionGrace          time.Duration
 	Timeout                 time.Duration
 	PollInterval            time.Duration
 	ResultGrace             time.Duration
@@ -90,11 +109,12 @@ type Options struct {
 
 // Launcher implements launcher.Launcher for Container Apps Jobs.
 type Launcher struct {
-	cfg    Config
-	signer *launcher.Signer
-	jobs   *armappcontainers.JobsClient
-	api    *armappcontainers.ContainerAppsAPIClient
-	log    *slog.Logger
+	cfg      Config
+	signer   *launcher.Signer
+	verifier *launcher.Verifier
+	jobs     *armappcontainers.JobsClient
+	api      *armappcontainers.ContainerAppsAPIClient
+	log      *slog.Logger
 }
 
 // CloudConfiguration maps a config cloud name to the SDK's configuration.
@@ -134,23 +154,33 @@ func newCredential(kind, clientID string, c cloud.Configuration) (azcore.TokenCr
 	return nil, fmt.Errorf("unknown credential kind %q", kind)
 }
 
-// New builds a Launcher. signer is mandatory: this launcher never hands a
-// Runner an unsigned job.
-func New(cfg Config, signer *launcher.Signer, opts *Options) (*Launcher, error) {
+// New builds a Launcher. signer and verifier are mandatory: this launcher
+// never hands a Runner an unsigned job and never accepts an unsigned
+// Result, because both travel over a shared volume.
+func New(cfg Config, signer *launcher.Signer, verifier *launcher.Verifier, opts *Options) (*Launcher, error) {
 	if opts == nil {
 		opts = &Options{}
 	}
 	if signer == nil {
 		return nil, errors.New("a job signer is required: jobs travel over a shared volume")
 	}
+	if verifier == nil {
+		return nil, errors.New("a result verifier is required: results travel over a shared volume")
+	}
 	if cfg.SubscriptionID == "" || cfg.ResourceGroup == "" || cfg.JobName == "" {
 		return nil, errors.New("subscription id, resource group and job name are required")
 	}
-	if !filepath.IsAbs(cfg.ExchangeDir) || !filepath.IsAbs(cfg.RunnerExchangeDir) {
-		return nil, errors.New("exchange directories must be absolute paths")
+	if !filepath.IsAbs(cfg.ExchangeDir) {
+		return nil, errors.New("exchange directory must be an absolute path")
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = DefaultPollInterval
+	}
+	if cfg.ClaimTimeout <= 0 {
+		cfg.ClaimTimeout = DefaultClaimTimeout
+	}
+	if cfg.ExecutionGrace <= 0 {
+		cfg.ExecutionGrace = DefaultExecutionGrace
 	}
 	if cfg.ResultGrace < 0 {
 		cfg.ResultGrace = DefaultResultGrace
@@ -185,121 +215,106 @@ func New(cfg Config, signer *launcher.Signer, opts *Options) (*Launcher, error) 
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
-	return &Launcher{cfg: cfg, signer: signer, jobs: jobs, api: api, log: logger}, nil
+	return &Launcher{cfg: cfg, signer: signer, verifier: verifier, jobs: jobs, api: api, log: logger}, nil
 }
 
 // Type implements launcher.Launcher.
 func (l *Launcher) Type() string { return Type }
 
-// Start implements launcher.Launcher.
+// Start implements launcher.Launcher: it offers the signed job in the
+// exchange directory and waits for a scheduled execution to take it and
+// record its execution name, which is then confirmed with the platform.
+// A cancelled context or an expired ClaimTimeout withdraws the offer.
 func (l *Launcher) Start(ctx context.Context, spec *v1alpha1.JobSpec) (launcher.Execution, error) {
 	data, err := launcher.JobDocument(spec, l.signer)
 	if err != nil {
 		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: err}
 	}
-	if err := os.MkdirAll(l.cfg.ExchangeDir, 0o700); err != nil {
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("create exchange directory: %w", err)}
+	root := l.cfg.ExchangeDir
+	if err := exchange.Publish(root, spec.RunID, data); err != nil {
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("offer job: %w", err)}
 	}
-	runDir := "run-" + spec.RunID
-	dir := filepath.Join(l.cfg.ExchangeDir, runDir)
-	// The run id is unique, so an existing directory is a leftover of an
-	// earlier attempt and is refused rather than reused.
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("create run directory: %w", err)}
-	}
-	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := os.WriteFile(filepath.Join(dir, launcher.JobFile), data, 0o600); err != nil {
-		cleanup()
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("write job: %w", err)}
-	}
-	// Paths as the Runner container sees them (always slash-separated).
-	runnerJob := path.Join(l.cfg.RunnerExchangeDir, runDir, launcher.JobFile)
-	runnerResult := path.Join(l.cfg.RunnerExchangeDir, runDir, launcher.ResultFile)
+	log := l.log.With("runId", spec.RunID, "targetId", spec.Target.ID)
+	log.Info("job offered to the runner job", "job", l.cfg.JobName)
 
-	template, err := l.executionTemplate(ctx, []string{"reconcile", "--job", runnerJob, "--result", runnerResult})
+	name, err := l.awaitClaim(ctx, log, spec.RunID)
 	if err != nil {
-		cleanup()
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: err}
+		return nil, err
 	}
-	poller, err := l.jobs.BeginStart(ctx, l.cfg.ResourceGroup, l.cfg.JobName, &armappcontainers.JobsClientBeginStartOptions{Template: template})
-	if err != nil {
-		cleanup()
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: describe("start execution", err)}
+	// The marker is untrusted content from the share: the name must be an
+	// execution of this Job as far as the platform is concerned.
+	if _, err := l.api.JobExecution(ctx, l.cfg.ResourceGroup, l.cfg.JobName, name, nil); err != nil {
+		_ = exchange.Remove(root, spec.RunID)
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: describe("confirm execution", err)}
 	}
-	resp, err := poller.PollUntilDone(ctx, &runtime.PollUntilDoneOptions{Frequency: l.cfg.PollInterval})
-	if err != nil {
-		cleanup()
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: describe("start execution", err)}
-	}
-	if resp.Name == nil || *resp.Name == "" {
-		cleanup()
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: errors.New("start execution: platform returned no execution name")}
-	}
-	name := *resp.Name
-	log := l.log.With("runId", spec.RunID, "targetId", spec.Target.ID, "execution", name)
-	log.Info("job execution started", "job", l.cfg.JobName)
+	log = log.With("execution", name)
+	log.Info("job taken by an execution")
+	dir := exchange.ClaimedDir(root, spec.RunID)
 	return &execution{
-		l: l, id: Type + ":" + name, name: name, parent: ctx, dir: dir, cleanup: cleanup, spec: spec, log: log,
+		l: l, id: Type + ":" + name, name: name, parent: ctx, dir: dir,
+		cleanup: func() { _ = exchange.Remove(root, spec.RunID) }, spec: spec, log: log,
 	}, nil
 }
 
-// executionTemplate reads the Job's template and returns the execution
-// template for one run: every container copied as configured in
-// infrastructure (name, image, command, environment, resources), with the
-// Runner container's arguments replaced by args. Nothing else about the
-// execution — identity, volumes, secrets — is expressible here, which is
-// the point: the Conductor can choose what run a Runner executes, not
-// what the Runner is.
-func (l *Launcher) executionTemplate(ctx context.Context, args []string) (*armappcontainers.JobExecutionTemplate, error) {
-	job, err := l.jobs.Get(ctx, l.cfg.ResourceGroup, l.cfg.JobName, nil)
-	if err != nil {
-		return nil, describe("read job", err)
-	}
-	if job.Properties == nil || job.Properties.Template == nil || len(job.Properties.Template.Containers) == 0 {
-		return nil, errors.New("read job: the job template has no containers")
-	}
-	containers := job.Properties.Template.Containers
-	target := -1
-	for i, c := range containers {
-		if c == nil || c.Name == nil {
-			continue
+// awaitClaim waits until an execution has taken the job and recorded its
+// name, and returns that name. Waiting ends with the claim timeout or the
+// context: the offer is then withdrawn — unless an execution took it in
+// the meantime, in which case its name is still awaited for a bounded
+// grace. Every exit without a name leaves nothing of the run in the
+// exchange directory.
+func (l *Launcher) awaitClaim(ctx context.Context, log *slog.Logger, runID string) (string, error) {
+	root := l.cfg.ExchangeDir
+	claimDeadline := time.Now().Add(l.cfg.ClaimTimeout)
+	var markerDeadline time.Time
+	for {
+		name, err := exchange.ReadExecution(root, runID)
+		if err == nil {
+			return name, nil
 		}
-		if l.cfg.ContainerName == "" || *c.Name == l.cfg.ContainerName {
-			if target >= 0 && l.cfg.ContainerName == "" {
-				return nil, errors.New("read job: the job template has several containers; set containerName")
+		if !errors.Is(err, os.ErrNotExist) {
+			_ = exchange.Remove(root, runID)
+			return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("execution marker: %w", err)}
+		}
+		state, serr := exchange.StateOf(root, runID)
+		if serr != nil {
+			return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("exchange directory: %w", serr)}
+		}
+		switch state {
+		case exchange.StateAbsent:
+			return "", &launcher.Error{Reason: launcher.ReasonStart, Err: errors.New("the offered job disappeared from the exchange directory")}
+		case exchange.StatePending:
+			if ctx.Err() != nil || !time.Now().Before(claimDeadline) {
+				withdrawn, werr := exchange.Withdraw(root, runID)
+				if werr != nil {
+					log.Error("offered job could not be withdrawn", "error", werr.Error())
+				}
+				if withdrawn {
+					if ctx.Err() != nil {
+						return "", &launcher.Error{Reason: launcher.ReasonCancelled, Err: errors.New("run was cancelled before a runner took the job")}
+					}
+					return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("no execution took the job within %s", l.cfg.ClaimTimeout)}
+				}
+				// Taken at the last moment: fall through to the claimed
+				// case on the next iteration.
 			}
-			target = i
-		}
-	}
-	if target < 0 {
-		return nil, fmt.Errorf("read job: container %q is not in the job template", l.cfg.ContainerName)
-	}
-	tmpl := &armappcontainers.JobExecutionTemplate{}
-	for i, c := range containers {
-		if c == nil {
-			continue
-		}
-		ec := &armappcontainers.JobExecutionContainer{
-			Name: c.Name, Image: c.Image, Command: c.Command, Args: c.Args, Env: c.Env, Resources: c.Resources,
-		}
-		if i == target {
-			ec.Args = make([]*string, len(args))
-			for j := range args {
-				a := args[j]
-				ec.Args[j] = &a
+		case exchange.StateClaimed:
+			if markerDeadline.IsZero() {
+				markerDeadline = time.Now().Add(l.cfg.ExecutionGrace)
+			} else if !time.Now().Before(markerDeadline) {
+				_ = exchange.Remove(root, runID)
+				return "", &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("an execution took the job but recorded no execution name within %s", l.cfg.ExecutionGrace)}
 			}
 		}
-		tmpl.Containers = append(tmpl.Containers, ec)
-	}
-	for _, c := range job.Properties.Template.InitContainers {
-		if c == nil {
-			continue
+		select {
+		case <-ctx.Done():
+			// Re-check once so a cancellation withdraws a pending offer.
+			if state == exchange.StateClaimed {
+				_ = exchange.Remove(root, runID)
+				return "", &launcher.Error{Reason: launcher.ReasonCancelled, Err: errors.New("run was cancelled while waiting for the execution name")}
+			}
+		case <-time.After(l.cfg.PollInterval):
 		}
-		tmpl.InitContainers = append(tmpl.InitContainers, &armappcontainers.JobExecutionContainer{
-			Name: c.Name, Image: c.Image, Command: c.Command, Args: c.Args, Env: c.Env, Resources: c.Resources,
-		})
 	}
-	return tmpl, nil
 }
 
 type execution struct {
@@ -348,17 +363,29 @@ func (e *execution) wait() (*v1alpha1.Result, error) {
 
 	status, pollErr := e.poll(runCtx)
 	stopped := false
-	if !terminal(status) && runCtx.Err() != nil {
-		// Cancelled or timed out: ask the platform to stop the execution,
-		// then give it a bounded while to reach a terminal status and
-		// report what the Runner managed to write (normally Cancelled).
+	if !terminal(status) {
+		// Cancelled, timed out, or the status could not be read any more:
+		// in every case the execution may still be running, so ask the
+		// platform to stop it before the run directory is removed, then
+		// give it a bounded while to reach a terminal status and report
+		// what the Runner managed to write (normally Cancelled).
 		stopped = true
+		cause := "status could not be read"
+		if runCtx.Err() != nil {
+			cause = runCtx.Err().Error()
+		} else if pollErr != nil {
+			cause = pollErr.Error()
+		}
 		stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(e.parent), l.cfg.StopGrace)
-		e.log.Warn("stopping job execution", "cause", runCtx.Err().Error())
+		e.log.Warn("stopping job execution", "cause", cause)
 		if err := e.stop(stopCtx); err != nil {
 			e.log.Error("job execution could not be stopped", "error", err.Error())
 		}
-		status, pollErr = e.poll(stopCtx)
+		var stopPollErr error
+		status, stopPollErr = e.poll(stopCtx)
+		if pollErr == nil {
+			pollErr = stopPollErr
+		}
 		cancelStop()
 	}
 	statusText := "unknown"
@@ -449,10 +476,10 @@ func (e *execution) stop(ctx context.Context) error {
 // share, so its absence is retried for ResultGrace; otherwise one read is
 // made.
 func (e *execution) readResult(ctx context.Context, ended bool) (*v1alpha1.Result, error) {
-	path := filepath.Join(e.dir, launcher.ResultFile)
+	path := filepath.Join(e.dir, exchange.ResultFile)
 	deadline := time.Now().Add(e.l.cfg.ResultGrace)
 	for {
-		res, err := readResultFile(path)
+		res, err := launcher.ReadResultFile(path, e.l.verifier)
 		if err == nil {
 			return res, nil
 		}
@@ -471,19 +498,6 @@ func (e *execution) readResult(ctx context.Context, ended bool) (*v1alpha1.Resul
 		case <-time.After(wait):
 		}
 	}
-}
-
-func readResultFile(path string) (*v1alpha1.Result, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, v1alpha1.MaxDocumentSize+1))
-	if err != nil {
-		return nil, err
-	}
-	return v1alpha1.DecodeResult(bytes.NewReader(data))
 }
 
 // describe reduces an SDK error to fixed wording: an ARM response becomes

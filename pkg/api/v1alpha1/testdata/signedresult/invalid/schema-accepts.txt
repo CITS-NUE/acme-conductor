@@ -1,0 +1,4 @@
+# Fixtures the JSON Schema accepts but Go rejects. The schema sees the
+# protected header only as an opaque base64url string; its decoded content
+# is checked by Go only.
+header-alg-none.json

@@ -142,11 +142,11 @@ func TestVerifyRejects(t *testing.T) {
 		{name: "padded base64", mut: func(sj *SignedJob) { sj.Signature += "=" }, want: ErrValidation},
 		{name: "payload not a job spec", mut: func(sj *SignedJob) {
 			sj.Payload = base64.RawURLEncoding.EncodeToString([]byte(`{"kind":"x"}`))
-			sj.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, sj.signingInput()))
+			sj.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, sj.envelope().signingInput()))
 		}, want: ErrValidation},
 		{name: "payload with unknown field", mut: func(sj *SignedJob) {
 			tamperPayload(sj, func(m map[string]any) { m["image"] = "evil" })
-			sj.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, sj.signingInput()))
+			sj.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, sj.envelope().signingInput()))
 		}, anyErr: true},
 	}
 	_ = otherPub

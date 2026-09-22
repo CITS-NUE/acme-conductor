@@ -4,7 +4,9 @@
 // of declaring them here rather than granting built-in roles is that the
 // exact grant is a reviewable, versioned artifact (docs/threat-model.md,
 // T10). Role definitions are subscription-level resources, so this module
-// is deployed at subscription scope by main.bicep.
+// is deployed at subscription scope by main.bicep; their assignable scope
+// is that subscription, which is why the DNS zone and the Key Vault must
+// live in the same subscription as the deployment (Phase 4).
 targetScope = 'subscription'
 
 @description('Prefix for the role names, so several deployments in one tenant do not collide (role names are tenant-unique).')
@@ -12,15 +14,19 @@ targetScope = 'subscription'
 @maxLength(40)
 param roleNamePrefix string
 
-// The Conductor's identity may read the Runner Job, start an execution of
-// it, read an execution's status and stop an execution. It may not change
-// the Job (image, identity, volumes, secrets) and holds no DNS, Key Vault
-// or storage data permission at all.
-resource conductorJobStarter 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(subscription().id, roleNamePrefix, 'acme-conductor-job-starter')
+// The Conductor's identity may read an execution of the Runner Job, list
+// its executions and stop an execution. It may NOT start one:
+// Microsoft.App/jobs/start/action accepts an execution template that
+// replaces the image, command and environment of the Job's containers, so
+// a holder of it can run any image under the Runner's managed identity
+// (docs/adr/0014, threat model T1/T10). Executions are started by the
+// Job's own schedule instead. It may not change the Job either, and it
+// holds no DNS, Key Vault or storage data permission at all.
+resource conductorJobObserver 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(subscription().id, roleNamePrefix, 'acme-conductor-job-observer')
   properties: {
-    roleName: '${roleNamePrefix} Conductor Job Starter'
-    description: 'Start, observe and stop executions of the ACME Runner Container Apps Job. No write access to the Job itself.'
+    roleName: '${roleNamePrefix} Conductor Job Execution Observer'
+    description: 'Read, list and stop executions of the ACME Runner Container Apps Job. No start (its execution template could replace the image) and no write access to the Job.'
     type: 'CustomRole'
     assignableScopes: [
       subscription().id
@@ -28,10 +34,9 @@ resource conductorJobStarter 'Microsoft.Authorization/roleDefinitions@2022-04-01
     permissions: [
       {
         actions: [
-          'Microsoft.App/jobs/read'
-          'Microsoft.App/jobs/start/action'
-          'Microsoft.App/jobs/stop/action'
+          'Microsoft.App/jobs/execution/read'
           'Microsoft.App/jobs/executions/read'
+          'Microsoft.App/jobs/stop/execution/action'
         ]
         notActions: []
         dataActions: []
@@ -95,6 +100,6 @@ resource runnerKeyVaultCertificateWriter 'Microsoft.Authorization/roleDefinition
   }
 }
 
-output conductorJobStarterRoleId string = conductorJobStarter.id
+output conductorJobObserverRoleId string = conductorJobObserver.id
 output runnerDnsTxtWriterRoleId string = runnerDnsTxtWriter.id
 output runnerKeyVaultCertificateWriterRoleId string = runnerKeyVaultCertificateWriter.id

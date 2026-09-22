@@ -3,7 +3,9 @@
   "kind": "ConductorConfig",
   "server": {
     "listen": "127.0.0.1:8080",
-    "auth": { "mode": "localhost-dev" },
+    "auth": {
+      "mode": "localhost-dev"
+    },
     "shutdownGraceSeconds": 1800
   },
   "database": {
@@ -19,6 +21,11 @@
     "privateKeyFile": "/etc/acme-conductor/job-signing.pem",
     "validitySeconds": 900
   },
+  "resultSigning": {
+    "publicKeys": [
+      "MCowBQYDK2VwAyEA65N/M3oDE8dU2aAKvMDf19gGaRxk3W3gRWTKAj2DPOM="
+    ]
+  },
   "executionBindings": {
     "azure": {
       "type": "azure-container-apps-job",
@@ -29,16 +36,21 @@
         "cloud": "public",
         "credential": "managed-identity",
         "managedIdentityClientId": "11111111-1111-1111-1111-111111111111",
-        "containerName": "runner",
         "exchangeDir": "/mnt/exchange",
-        "runnerExchangeDir": "/exchange",
+        "claimTimeoutSeconds": 300,
         "timeoutSeconds": 1800,
         "pollIntervalSeconds": 10,
         "resultGraceSeconds": 30
       }
     }
   },
-  "acmeBindings": ["letsencrypt-staging"],
-  "dnsBindings": ["azure-dns-staging"],
-  "storeBindings": ["keyvault-staging"]
+  "acmeBindings": [
+    "letsencrypt-staging"
+  ],
+  "dnsBindings": [
+    "azure-dns-staging"
+  ],
+  "storeBindings": [
+    "keyvault-staging"
+  ]
 }

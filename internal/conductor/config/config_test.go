@@ -196,13 +196,18 @@ func TestShippedExampleAgreesWithRunnerExample(t *testing.T) {
 const acaBinding = `"aca": {"type": "azure-container-apps-job", "azureContainerAppsJob": {
   "subscriptionId": "0f8fad5b-d9cb-469f-a165-70867728950e", "resourceGroup": "rg-acme", "jobName": "acme-runner",
   "credential": "managed-identity", "managedIdentityClientId": "1f8fad5b-d9cb-469f-a165-70867728950e",
-  "exchangeDir": "/mnt/exchange", "runnerExchangeDir": "/exchange"}}`
+  "exchangeDir": "/mnt/exchange"}}`
 
 const signing = `"jobSigning": {"privateKeyFile": "/etc/acme-conductor/keys/job-signing.pem"},`
 
+// examplePublicKey is an Ed25519 public key (one-line PEM body).
+const examplePublicKey = "MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms="
+
+const resultSigning = `"resultSigning": {"publicKeys": ["` + examplePublicKey + `"]},`
+
 func withACA(s string) string {
 	s = strings.Replace(s, `"executionBindings": {`, `"executionBindings": {`+acaBinding+`, `, 1)
-	return strings.Replace(s, `"database"`, signing+` "database"`, 1)
+	return strings.Replace(s, `"database"`, signing+resultSigning+` "database"`, 1)
 }
 
 func TestAzureContainerAppsJobBinding(t *testing.T) {
@@ -211,14 +216,17 @@ func TestAzureContainerAppsJobBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := c.ExecutionBindings["aca"].AzureContainerAppsJob
-	if a == nil || a.Cloud != CloudPublic || a.TimeoutSeconds != DefaultLaunchTimeoutSeconds || a.PollIntervalSeconds != DefaultPollIntervalSeconds || a.ResultGraceSeconds != DefaultResultGraceSeconds || a.Credential != CredentialManagedIdentity {
+	if a == nil || a.Cloud != CloudPublic || a.TimeoutSeconds != DefaultLaunchTimeoutSeconds || a.PollIntervalSeconds != DefaultPollIntervalSeconds || a.ResultGraceSeconds != DefaultResultGraceSeconds || a.ClaimTimeoutSeconds != DefaultClaimTimeoutSeconds || a.Credential != CredentialManagedIdentity {
 		t.Fatalf("binding = %+v", a)
 	}
 	if c.JobSigning == nil || c.JobSigning.ValiditySeconds != DefaultSigningValiditySeconds {
 		t.Fatalf("jobSigning = %+v", c.JobSigning)
 	}
+	if c.ResultSigning == nil || len(c.ResultSigning.Keys()) != 1 || c.ResultSigning.ClockSkewSeconds != DefaultClockSkewSeconds {
+		t.Fatalf("resultSigning = %+v", c.ResultSigning)
+	}
 	// Signing alone is fine with the local launcher too.
-	if _, err := Read(strings.NewReader(strings.Replace(minimal, `"database"`, signing+` "database"`, 1))); err != nil {
+	if _, err := Read(strings.NewReader(strings.Replace(minimal, `"database"`, signing+resultSigning+` "database"`, 1))); err != nil {
 		t.Fatal(err)
 	}
 	// The default credential is "default" with no client id.
@@ -228,7 +236,23 @@ func TestAzureContainerAppsJobBinding(t *testing.T) {
 	}
 
 	rejects := map[string]func(string) string{
-		"aca without signing": func(s string) string { return strings.Replace(s, signing, "", 1) },
+		"aca without signing":        func(s string) string { return strings.Replace(s, signing, "", 1) },
+		"aca without result signing": func(s string) string { return strings.Replace(s, resultSigning, "", 1) },
+		"result signing without keys": func(s string) string {
+			return strings.Replace(s, resultSigning, `"resultSigning": {"publicKeys": []},`, 1)
+		},
+		"result signing bad key": func(s string) string {
+			return strings.Replace(s, examplePublicKey, "bm90LWEta2V5", 1)
+		},
+		"result signing duplicate key": func(s string) string {
+			return strings.Replace(s, resultSigning, `"resultSigning": {"publicKeys": ["`+examplePublicKey+`", "`+examplePublicKey+`"]},`, 1)
+		},
+		"claim timeout beyond validity": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"claimTimeoutSeconds": 901, "jobName"`, 1)
+		},
+		"claim timeout zero-negative": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"claimTimeoutSeconds": -1, "jobName"`, 1)
+		},
 		"signing relative path": func(s string) string {
 			return strings.Replace(s, "/etc/acme-conductor/keys/job-signing.pem", "keys/job-signing.pem", 1)
 		},
@@ -255,12 +279,15 @@ func TestAzureContainerAppsJobBinding(t *testing.T) {
 		"relative exchange dir": func(s string) string {
 			return strings.Replace(s, `"exchangeDir": "/mnt/exchange"`, `"exchangeDir": "exchange"`, 1)
 		},
-		"unclean runner dir": func(s string) string {
-			return strings.Replace(s, `"runnerExchangeDir": "/exchange"`, `"runnerExchangeDir": "/exchange/"`, 1)
+		"unclean exchange dir": func(s string) string {
+			return strings.Replace(s, `"exchangeDir": "/mnt/exchange"`, `"exchangeDir": "/mnt/exchange/"`, 1)
 		},
 		"missing sub-object": func(s string) string { return strings.Replace(s, `"azureContainerAppsJob": {`, `"localProcess": {`, 1) },
-		"bad container name": func(s string) string {
-			return strings.Replace(s, `"jobName"`, `"containerName": "Runner", "jobName"`, 1)
+		"removed field runnerExchangeDir": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"runnerExchangeDir": "/exchange", "jobName"`, 1)
+		},
+		"removed field containerName": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"containerName": "runner", "jobName"`, 1)
 		},
 		"poll interval too large": func(s string) string {
 			return strings.Replace(s, `"jobName"`, `"pollIntervalSeconds": 1000, "jobName"`, 1)
@@ -317,14 +344,20 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 		}
 	}
 	a := c.ExecutionBindings["azure"].AzureContainerAppsJob
-	if a == nil || a.Credential != CredentialManagedIdentity || a.ExchangeDir != "/mnt/exchange" || a.RunnerExchangeDir != "/exchange" || a.ContainerName != "runner" {
+	if a == nil || a.Credential != CredentialManagedIdentity || a.ExchangeDir != "/mnt/exchange" || a.ClaimTimeoutSeconds > c.JobSigning.ValiditySeconds {
 		t.Fatalf("example azure launcher: %+v", a)
 	}
 	if c.JobSigning == nil || c.JobSigning.PrivateKeyFile != "/etc/acme-conductor/job-signing.pem" {
 		t.Fatalf("example signing: %+v", c.JobSigning)
 	}
+	if c.ResultSigning == nil || len(c.ResultSigning.Keys()) != 1 {
+		t.Fatalf("conductor example must require signed results: %+v", c.ResultSigning)
+	}
 	if r.JobSigning == nil || len(r.JobSigning.Keys()) != 1 {
 		t.Fatalf("runner example must require signed jobs: %+v", r.JobSigning)
+	}
+	if r.ResultSigning == nil || r.ResultSigning.PrivateKeyFile != "/etc/acme-runner/result-signing.pem" {
+		t.Fatalf("runner example must sign results: %+v", r.ResultSigning)
 	}
 	if r.Lego.StateDir != "/state" || r.Lego.WorkDir != "/work" {
 		t.Fatalf("runner example paths: %+v", r.Lego)

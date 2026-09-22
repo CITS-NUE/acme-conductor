@@ -2,9 +2,11 @@
 
 `main.bicep` provisions a complete ACME Conductor deployment on Azure
 Container Apps: the Conductor as a single-replica Container App, the
-Runner as a manually triggered Container Apps Job that the Conductor
-starts once per run, two managed identities with disjoint grants, and
-the storage the two exchange documents over. It is the reviewable,
+Runner as a *scheduled* Container Apps Job whose executions take the
+jobs the Conductor offers (the Conductor cannot start executions: the
+start operation could replace the Runner's image), two managed
+identities with disjoint grants, and the storage the two signed exchange
+documents travel over. It is the reviewable,
 versioned form of the IAM the threat model requires
 ([`docs/threat-model.md`](../../docs/threat-model.md), T10): every grant
 is a custom role with the smallest set of actions, assigned at the
@@ -23,9 +25,9 @@ verified against is listed at the end; read that before relying on it.**
 | `<prefix>-log` (Log Analytics) | Container logs of both binaries. The Runner's own log is redacted before it is written; the Conductor's carries no secret. |
 | `<prefix>-cae` (Container Apps environment) | Hosts the app and the job. Consumption plan, no VNet integration. |
 | `<prefix><hash>` (storage account) | Three Azure Files shares, mounted into the environment: `conductor-state` (the SQLite registry, mounted with `nobrl`), `runner-state` (ACME account state, `/state`), `exchange` (signed jobs in, results out). |
-| `<prefix>-id-conductor` (user-assigned identity) | The Conductor's identity. Granted the **Conductor Job Starter** custom role on the Runner Job only. |
+| `<prefix>-id-conductor` (user-assigned identity) | The Conductor's identity. Granted the **Conductor Job Execution Observer** custom role (read, list and stop executions; no start) on the Runner Job only. |
 | `<prefix>-id-runner` (user-assigned identity) | The Runner's identity. Granted the **Runner DNS TXT Writer** custom role on the challenge zone and the **Runner Key Vault Certificate Writer** custom role on the vault. |
-| `<prefix>-runner` (Container Apps Job) | The Runner image with the Runner configuration mounted at `/etc/acme-runner/config.json`, `/exchange`, `/state`, and an ephemeral `/work`. Manual trigger, one replica, no retries. |
+| `<prefix>-runner` (Container Apps Job) | The Runner image with the Runner configuration and its result-signing private key mounted under `/etc/acme-runner/`, `/exchange`, `/state`, and an ephemeral `/work`. Schedule trigger (`runnerCronExpression`, every minute), `runnerParallelism` replicas at most, no retries, fixed command `reconcile --exchange /exchange`. |
 | `<prefix>-conductor` (Container App) | The Conductor image with its configuration and the job-signing private key mounted under `/etc/acme-conductor/`, `/var/lib/acme-conductor` and `/mnt/exchange`. One replica, no ingress, optional admin sidecar. |
 | Three custom role definitions (subscription scope) | See `modules/roles.bicep`. |
 
@@ -40,22 +42,34 @@ never enters either container.
 - A resource group for this deployment, a DNS zone the Runner may write
   TXT records in, and a Key Vault with the **RBAC** permission model
   (`enableRbacAuthorization: true`). Both may live in other resource
-  groups or subscriptions; the deployer needs the right to create role
-  assignments there (Owner or User Access Administrator), and to create
-  role definitions at subscription scope.
+  groups but **must be in the same subscription** as the deployment: the
+  custom roles are defined with that subscription as their only
+  assignable scope, and a role cannot be assigned outside its assignable
+  scopes. The deployer needs the right to create role assignments there
+  (Owner or User Access Administrator), and to create role definitions
+  at subscription scope. Cross-subscription placement is a later
+  extension (role definitions per subscription), not a parameter.
+- `namePrefix` of 3–20 lower-case letters, digits and hyphens. The
+  storage account is named from its first 11 characters without hyphens
+  plus a 13-character unique suffix, so any accepted prefix yields a
+  valid 24-character-bounded name.
 - Container images for both binaries, pinned by digest. Phase 4 has no
   release workflow; build them with `make images` and push them to a
   registry the environment can pull from (GHCR public images need no
   registry credential).
-- A job-signing key pair:
+- Two signing key pairs, one per direction of the exchange share:
 
   ```sh
   acme-conductor keygen --private job-signing.pem --public job-signing.pub
+  acme-runner keygen --private result-signing.pem --public result-signing.pub
   ```
 
-  The command prints `keyId:` and `publicKey:` (the one-line form of the
-  public key). The private key file goes in as a secure parameter; the
-  public key goes into the Runner configuration.
+  Each command prints `keyId:` and `publicKey:` (the one-line form of the
+  public key). The private key files go in as secure parameters
+  (`jobSigningPrivateKeyPem`, mounted for the Conductor;
+  `resultSigningPrivateKeyPem`, mounted for the Runner); the public keys
+  go to the other side (`jobSigningPublicKey` into the Runner
+  configuration, `resultSigningPublicKey` into the Conductor's).
 
 ## Deploy
 
@@ -136,10 +150,18 @@ and parameters, or set the previous image digests. A newer Conductor
 schema is not read by an older binary; restore the matching
 `conductor.db` as well ([`docs/conductor.md`](../../docs/conductor.md#backup-restore-rollback)).
 
-**Rotating the signing key.** Add the new public key to the Runner
-configuration first (`jobSigning.publicKeys` takes several), deploy,
-then switch the Conductor to the new private key, then remove the old
-public key.
+**Rotating a signing key.** Add the new public key on the verifying
+side first (`jobSigning.publicKeys` in the Runner configuration, or
+`resultSigningPublicKey` for the Conductor — both lists take several
+keys), deploy, then switch the signer to the new private key, then
+remove the old public key.
+
+**Latency and idle executions.** A run starts when the next scheduled
+execution takes it: up to `runnerCronExpression`'s interval (a minute)
+plus the platform's start latency. While nothing is pending, every tick
+still runs one execution that finds no job and exits at once; that is
+the price of not holding `jobs/start/action`, and an event-driven
+trigger is the noted follow-up if it matters.
 
 ## Not verified by this repository
 
@@ -149,15 +171,21 @@ documents load with the same validators the binaries use
 been deployed to a subscription by the project, so the following are
 documented from the platform's reference documentation, not observed:
 
-- **Execution template override.** The Conductor starts each execution
-  with a template that repeats the Job's container (name, image,
-  environment, resources) with only `args` replaced. Volume mounts are
-  not part of the execution template model and are expected to be
-  inherited from the Job; if the platform drops them on an override, the
-  Runner would not see `/exchange` and every run would end
-  `Internal`/"runner ended without reporting a result".
-- **Role action names.** `Microsoft.App/jobs/executions/read`,
-  `Microsoft.App/jobs/start/action`, `Microsoft.App/jobs/stop/action`,
+- **Schedule semantics.** Executions are expected to start every minute
+  with `parallelism` replicas that each take at most one job; a platform
+  that skips a tick while a previous execution is still running only
+  delays runs (`claimTimeoutSeconds` bounds the wait). `CONTAINER_APP_JOB_EXECUTION_NAME`
+  is documented as set in every execution's containers; the Runner
+  refuses to work without it.
+- **Rename atomicity on Azure Files (SMB).** Taking and withdrawing a
+  job are directory renames, which are atomic on a local filesystem and
+  expected to be on an SMB share (the server performs them); if two
+  executions could both succeed, both would run the same job and the
+  Runner's replay ledger would refuse the second. Not observed.
+- **Role action names.** `Microsoft.App/jobs/execution/read`,
+  `Microsoft.App/jobs/executions/read`,
+  `Microsoft.App/jobs/stop/execution/action` (the singular forms are
+  what the get-execution and stop-execution operations require),
   `Microsoft.KeyVault/vaults/certificates/import/action` and the DNS
   TXT actions are taken from the provider operation lists; a wrong name
   fails the deployment (role definitions are validated), not silently.

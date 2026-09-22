@@ -27,8 +27,8 @@ import (
 	"syscall"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor"
+	"github.com/CITS-NUE/acme-conductor/internal/keygen"
 	"github.com/CITS-NUE/acme-conductor/internal/version"
-	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
 const (
@@ -113,69 +113,9 @@ func runServe(ctx context.Context, args []string, stderr io.Writer, getenv func(
 	return conductor.Serve(ctx, conductor.Options{ConfigPath: *cfg, Logger: logger})
 }
 
-// runKeygen generates a job-signing key pair. The private key is written
-// to a new file (an existing file is never overwritten) with mode 0600;
-// the public key is written as PEM, and its one-line form and key id are
-// printed for pasting into the Runner's jobSigning.publicKeys.
+// runKeygen generates the job-signing key pair (internal/keygen).
 func runKeygen(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet(component+" keygen", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	private := fs.String("private", "", "path for the new PEM private key (created 0600; must not exist)")
-	public := fs.String("public", "", "path for the PEM public key (must not exist)")
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
-	}
-	if *private == "" || *public == "" || fs.NArg() > 0 || *private == *public {
-		fmt.Fprintf(stderr, "%s keygen: --private and --public are required and must differ\n", component)
-		fs.Usage()
-		return 2
-	}
-	pub, priv, err := v1alpha1.GenerateSigningKey()
-	if err != nil {
-		fmt.Fprintf(stderr, "%s keygen: %v\n", component, err)
-		return 1
-	}
-	privPEM, err := v1alpha1.MarshalSigningPrivateKey(priv)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s keygen: %v\n", component, err)
-		return 1
-	}
-	pubPEM, err := v1alpha1.MarshalSigningPublicKey(pub)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s keygen: %v\n", component, err)
-		return 1
-	}
-	if err := writeNew(*private, privPEM, 0o600); err != nil {
-		fmt.Fprintf(stderr, "%s keygen: private key: %v\n", component, err)
-		return 1
-	}
-	if err := writeNew(*public, pubPEM, 0o644); err != nil {
-		fmt.Fprintf(stderr, "%s keygen: public key: %v\n", component, err)
-		return 1
-	}
-	lines := strings.Split(strings.TrimSpace(string(pubPEM)), "\n")
-	fmt.Fprintf(stdout, "keyId: %s\npublicKey: %s\n", v1alpha1.KeyID(pub), strings.Join(lines[1:len(lines)-1], ""))
-	return 0
-}
-
-// writeNew creates path exclusively and writes data to it.
-func writeNew(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return keygen.Run(component, "job-signing", args, stdout, stderr)
 }
 
 // utcTime forces the time attribute of every log record to UTC RFC 3339.

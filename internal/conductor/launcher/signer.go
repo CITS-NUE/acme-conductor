@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -67,4 +68,58 @@ func JobDocument(spec *v1alpha1.JobSpec, signer *Signer) ([]byte, error) {
 		return nil, err
 	}
 	return append(data, '\n'), nil
+}
+
+// Verifier checks the Results Runners hand back: with a Verifier a launcher
+// accepts only SignedCertificateReconcileResult envelopes that verify
+// against the trusted Runner public keys (docs/adr/0015); a bare Result
+// is then an error. It holds public keys only.
+type Verifier struct {
+	keys map[string]ed25519.PublicKey
+	skew time.Duration
+	now  func() time.Time
+}
+
+// NewVerifier returns a Verifier trusting keys (indexed by KeyID).
+func NewVerifier(keys map[string]ed25519.PublicKey, skew time.Duration) (*Verifier, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("at least one result signing key is required")
+	}
+	copied := make(map[string]ed25519.PublicKey, len(keys))
+	for k, v := range keys {
+		if len(v) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("result signing key %s is not an Ed25519 public key", k)
+		}
+		copied[k] = v
+	}
+	if skew <= 0 {
+		skew = v1alpha1.DefaultClockSkew
+	}
+	return &Verifier{keys: copied, skew: skew, now: time.Now}, nil
+}
+
+// ResultDocument decodes what a Runner wrote as its result document: with
+// a Verifier, a signed envelope whose signature verifies, whose window
+// includes now, and whose payload is a valid Result; without one, a bare
+// Result. The other form is refused in each case, so signing is decided
+// once, by configuration, and never negotiated by the document.
+func ResultDocument(data []byte, v *Verifier) (*v1alpha1.Result, error) {
+	if v == nil {
+		if v1alpha1.IsSignedResult(data) {
+			return nil, errors.New("runner reported a signed result but resultSigning is not configured")
+		}
+		return v1alpha1.DecodeResult(bytes.NewReader(data))
+	}
+	if !v1alpha1.IsSignedResult(data) {
+		return nil, errors.New("runner reported an unsigned result; this conductor accepts signed results only")
+	}
+	sr, err := v1alpha1.DecodeSignedResult(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("signed result: %w", err)
+	}
+	res, _, err := sr.Verify(v.keys, v1alpha1.VerifyOptions{Now: v.now(), ClockSkew: v.skew})
+	if err != nil {
+		return nil, fmt.Errorf("signed result: %w", err)
+	}
+	return res, nil
 }

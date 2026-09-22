@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
@@ -61,6 +62,10 @@ func classifyCtx(ctx context.Context, f *failure) *failure {
 	return f
 }
 
+// EnvExecutionName is the variable Azure Container Apps sets to the name
+// of the job execution a container runs in.
+const EnvExecutionName = "CONTAINER_APP_JOB_EXECUTION_NAME"
+
 // clockSkewTolerance is how far in the future a certificate's NotBefore may
 // lie and still be treated as valid now. CAs backdate NotBefore by about an
 // hour; a larger offset indicates a wrong clock or a malformed certificate.
@@ -84,6 +89,16 @@ type Options struct {
 	// ResultPath is where the Result is written atomically. Empty means
 	// stdout only.
 	ResultPath string
+	// ExchangeDir, when set, selects the claim mode used on platforms that
+	// start Runners on their own (docs/adr/0014): instead of JobPath and
+	// ResultPath the Runner takes the oldest pending job from the exchange
+	// directory (internal/exchange), records its platform execution name
+	// there, and writes the Result next to the job. When nothing is
+	// pending the Runner exits 0 without a Result.
+	ExchangeDir string
+	// ExecutionName is the platform execution name recorded for a claimed
+	// job; empty selects the CONTAINER_APP_JOB_EXECUTION_NAME variable.
+	ExecutionName string
 	// Stdout receives the single-line JSON Result.
 	Stdout io.Writer
 	Logger *slog.Logger
@@ -142,6 +157,31 @@ func Reconcile(ctx context.Context, opts Options) int {
 	started := opts.Now().UTC()
 	log := opts.Logger
 
+	if opts.ExchangeDir != "" {
+		claim, err := exchange.Take(opts.ExchangeDir)
+		if err != nil {
+			log.Error("cannot take a job from the exchange directory", "error", err.Error())
+			return ExitNoResult
+		}
+		if claim == nil {
+			log.Info("no pending job in the exchange directory; nothing to do")
+			return ExitSucceeded
+		}
+		name := opts.ExecutionName
+		if name == "" {
+			name, _ = opts.LookupEnv(EnvExecutionName)
+		}
+		if err := claim.MarkExecution(name); err != nil {
+			// Without a valid execution name the Conductor can neither
+			// observe nor stop this execution; the job is left claimed
+			// with no result so the Conductor fails the run.
+			log.Error("cannot record the execution name for the claimed job", "runId", claim.RunID, "error", err.Error())
+			return ExitNoResult
+		}
+		log.Info("claimed job", "runId", claim.RunID, "execution", name)
+		opts.JobPath, opts.ResultPath = claim.JobPath, claim.ResultPath
+	}
+
 	jobData, err := readBounded(opts.JobPath, v1alpha1.MaxSignedDocumentSize+1)
 	if err != nil {
 		log.Error("cannot read job spec", "error", err.Error())
@@ -166,6 +206,10 @@ func Reconcile(ctx context.Context, opts Options) int {
 		log = log.With("runId", ids.RunID, "targetId", ids.TargetID)
 	}
 
+	// The result signer, if any, is loaded with the configuration below;
+	// a Result produced before the configuration is known (or when it
+	// cannot be loaded) is written bare.
+	var resultSigner *ResultSigner
 	finish := func(status v1alpha1.ResultStatus, out *outcome, f *failure) int {
 		res := buildResult(ids, started, opts.Now().UTC(), status, out, f)
 		if err := res.Validate(); err != nil {
@@ -181,7 +225,7 @@ func Reconcile(ctx context.Context, opts Options) int {
 				return ExitNoResult
 			}
 		}
-		delivered, err := WriteResult(res, opts.ResultPath, opts.Stdout)
+		delivered, err := WriteSignedResult(res, resultSigner, opts.ResultPath, opts.Stdout)
 		if err != nil {
 			// The Result could not be written to the file. If it reached
 			// stdout the run's outcome is still reported and the exit code
@@ -204,6 +248,21 @@ func Reconcile(ctx context.Context, opts Options) int {
 	// verified; a bare JobSpec is decoded first and its configuration
 	// failure reported afterwards, as before.
 	cfg, cfgErr := config.Load(opts.ConfigPath)
+	if cfgErr == nil && cfg.ResultSigning != nil {
+		signer, err := loadResultSigner(cfg.ResultSigning, opts.Now)
+		if err != nil {
+			// A Runner told to sign its Results must not report unsigned
+			// ones: the run fails and, for lack of a key, the failure is
+			// reported bare (the Conductor refuses it, which is the point).
+			log.Error("result signing key could not be loaded", "error", err.Error())
+			if !idsOK {
+				return ExitNoResult
+			}
+			return finish(v1alpha1.StatusFailed, nil, fail(v1alpha1.ErrorCodeInternal, "result signing key could not be loaded", err))
+		}
+		resultSigner = signer
+		log = log.With("resultKeyId", signer.KeyID())
+	}
 
 	var spec *v1alpha1.JobSpec
 	if envelope != nil {
@@ -253,6 +312,19 @@ func Reconcile(ctx context.Context, opts Options) int {
 		return finish(v1alpha1.StatusFailed, nil, f)
 	}
 	return finish(v1alpha1.StatusSucceeded, out, nil)
+}
+
+// loadResultSigner reads the Runner's result-signing key.
+func loadResultSigner(rs *config.ResultSigning, now func() time.Time) (*ResultSigner, error) {
+	data, err := readBounded(rs.PrivateKeyFile, 16*1024)
+	if err != nil {
+		return nil, err
+	}
+	key, err := v1alpha1.ParseSigningPrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", rs.PrivateKeyFile, err)
+	}
+	return NewResultSigner(key, time.Duration(rs.ValiditySeconds)*time.Second, now)
 }
 
 // unwrapSignedJob verifies an envelope against the trusted keys and the

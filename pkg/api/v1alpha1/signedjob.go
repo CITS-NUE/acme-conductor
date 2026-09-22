@@ -72,7 +72,8 @@ type SignedJob struct {
 	Signature string `json:"signature"`
 }
 
-// SignedJobHeader is the protected header of a SignedJob.
+// SignedJobHeader is the protected header of a SignedJob and of a
+// SignedResult (the envelopes share one construction).
 type SignedJobHeader struct {
 	// Alg is always SigningAlgorithm.
 	Alg string `json:"alg"`
@@ -188,7 +189,7 @@ func ParseSigningPublicKey(s string) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
-// SignOptions parameterize SignJob.
+// SignOptions parameterize SignJob and SignResult.
 type SignOptions struct {
 	// IssuedAt defaults to the current time.
 	IssuedAt time.Time
@@ -199,14 +200,18 @@ type SignOptions struct {
 	Nonce string
 }
 
-// SignJob wraps spec in a SignedJob signed with key. The spec is validated
-// and serialized here; the serialized bytes are what the signature covers.
-func SignJob(spec *JobSpec, key ed25519.PrivateKey, opts SignOptions) (*SignedJob, error) {
+// envelope is the signed part common to SignedJob and SignedResult (the
+// three JWS members); the kinds differ only in what the payload is.
+type envelope struct {
+	Protected string
+	Payload   string
+	Signature string
+}
+
+// signEnvelope signs payload with key under a header built from opts.
+func signEnvelope(payload []byte, key ed25519.PrivateKey, opts SignOptions) (envelope, error) {
 	if len(key) != ed25519.PrivateKeySize {
-		return nil, errors.New("signing key is not an Ed25519 private key")
-	}
-	if err := spec.Validate(); err != nil {
-		return nil, err
+		return envelope{}, errors.New("signing key is not an Ed25519 private key")
 	}
 	issued := opts.IssuedAt
 	if issued.IsZero() {
@@ -214,43 +219,163 @@ func SignJob(spec *JobSpec, key ed25519.PrivateKey, opts SignOptions) (*SignedJo
 	}
 	issued = issued.UTC().Truncate(time.Second)
 	if opts.Validity <= 0 || opts.Validity > MaxSignedJobValidity {
-		return nil, fmt.Errorf("validity must be between 1s and %s", MaxSignedJobValidity)
+		return envelope{}, fmt.Errorf("validity must be between 1s and %s", MaxSignedJobValidity)
 	}
 	nonce := opts.Nonce
 	if nonce == "" {
 		var b [NonceBytes]byte
 		if _, err := rand.Read(b[:]); err != nil {
-			return nil, fmt.Errorf("generate nonce: %w", err)
+			return envelope{}, fmt.Errorf("generate nonce: %w", err)
 		}
 		nonce = base64.RawURLEncoding.EncodeToString(b[:])
 	}
 	if !nonceRe.MatchString(nonce) {
-		return nil, errors.New("nonce must be 16 to 128 base64url characters")
+		return envelope{}, errors.New("nonce must be 16 to 128 base64url characters")
+	}
+	if len(payload) > MaxDocumentSize {
+		return envelope{}, ErrDocumentTooLarge
 	}
 	pub := key.Public().(ed25519.PublicKey)
 	hdr := SignedJobHeader{Alg: SigningAlgorithm, Kid: KeyID(pub), IssuedAt: issued, ExpiresAt: issued.Add(opts.Validity), Nonce: nonce}
 	hdrJSON, err := json.Marshal(hdr)
 	if err != nil {
+		return envelope{}, err
+	}
+	e := envelope{
+		Protected: base64.RawURLEncoding.EncodeToString(hdrJSON),
+		Payload:   base64.RawURLEncoding.EncodeToString(payload),
+	}
+	e.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, e.signingInput()))
+	return e, nil
+}
+
+func (e envelope) signingInput() []byte {
+	return []byte(e.Protected + "." + e.Payload)
+}
+
+// validate checks the structure of the three members (see DecodeSignedJob).
+func (e envelope) validate() error {
+	if _, err := e.header(); err != nil {
+		return err
+	}
+	payload, err := decodeB64("payload", e.Payload, MaxDocumentSize)
+	if err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return invalid("payload", "required")
+	}
+	sig, err := decodeB64("signature", e.Signature, ed25519.SignatureSize)
+	if err != nil {
+		return err
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return invalid("signature", fmt.Sprintf("must be %d bytes", ed25519.SignatureSize))
+	}
+	return nil
+}
+
+// header decodes and checks the protected header.
+func (e envelope) header() (*SignedJobHeader, error) {
+	raw, err := decodeB64("protected", e.Protected, maxHeaderSize)
+	if err != nil {
+		return nil, err
+	}
+	var h SignedJobHeader
+	if err := strictjson.Unmarshal(raw, &h); err != nil {
+		return nil, invalidErr("protected", "not a strict JSON header", err)
+	}
+	if h.Alg != SigningAlgorithm {
+		return nil, invalid("protected.alg", fmt.Sprintf("must be %q", SigningAlgorithm))
+	}
+	if len(h.Kid) != KeyIDLength || !isLowerHex(h.Kid) {
+		return nil, invalid("protected.kid", fmt.Sprintf("must be %d lower-case hex characters", KeyIDLength))
+	}
+	if h.IssuedAt.IsZero() {
+		return nil, invalid("protected.issuedAt", "required")
+	}
+	if h.ExpiresAt.IsZero() {
+		return nil, invalid("protected.expiresAt", "required")
+	}
+	if !h.ExpiresAt.After(h.IssuedAt) {
+		return nil, invalid("protected.expiresAt", "must be after issuedAt")
+	}
+	if h.ExpiresAt.Sub(h.IssuedAt) > MaxSignedJobValidity {
+		return nil, invalid("protected.expiresAt", fmt.Sprintf("validity must be at most %s", MaxSignedJobValidity))
+	}
+	if !nonceRe.MatchString(h.Nonce) {
+		return nil, invalid("protected.nonce", "must be 16 to 128 base64url characters")
+	}
+	return &h, nil
+}
+
+// verify checks the signature against the trusted keys and the validity
+// window and returns the raw payload with the header.
+func (e envelope) verify(keys map[string]ed25519.PublicKey, opts VerifyOptions) ([]byte, *SignedJobHeader, error) {
+	if err := e.validate(); err != nil {
+		return nil, nil, err
+	}
+	hdr, err := e.header()
+	if err != nil {
+		return nil, nil, err
+	}
+	pub, ok := keys[hdr.Kid]
+	if !ok || len(pub) != ed25519.PublicKeySize {
+		return nil, nil, fmt.Errorf("%w: kid %s", ErrUnknownSigningKey, hdr.Kid)
+	}
+	sig, _ := base64.RawURLEncoding.DecodeString(e.Signature)
+	if !ed25519.Verify(pub, e.signingInput(), sig) {
+		return nil, nil, ErrSignatureInvalid
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	skew := opts.ClockSkew
+	if skew <= 0 {
+		skew = DefaultClockSkew
+	}
+	if now.After(hdr.ExpiresAt) {
+		return nil, nil, fmt.Errorf("%w: expired at %s", ErrEnvelopeExpired, hdr.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	if now.Add(skew).Before(hdr.IssuedAt) {
+		return nil, nil, fmt.Errorf("%w: issued at %s", ErrEnvelopeNotYetValid, hdr.IssuedAt.UTC().Format(time.RFC3339))
+	}
+	payload, _ := base64.RawURLEncoding.DecodeString(e.Payload)
+	return payload, hdr, nil
+}
+
+// payloadBytes returns the raw payload without verifying anything.
+func (e envelope) payloadBytes() []byte {
+	payload, err := base64.RawURLEncoding.DecodeString(e.Payload)
+	if err != nil {
+		return nil
+	}
+	return payload
+}
+
+// SignJob wraps spec in a SignedJob signed with key. The spec is validated
+// and serialized here; the serialized bytes are what the signature covers.
+func SignJob(spec *JobSpec, key ed25519.PrivateKey, opts SignOptions) (*SignedJob, error) {
+	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
 	payload, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
-	if len(payload) > MaxDocumentSize {
-		return nil, ErrDocumentTooLarge
+	e, err := signEnvelope(payload, key, opts)
+	if err != nil {
+		return nil, err
 	}
-	sj := &SignedJob{
+	return &SignedJob{
 		APIVersion: APIVersion, Kind: KindSignedCertificateReconcileJob,
-		Protected: base64.RawURLEncoding.EncodeToString(hdrJSON),
-		Payload:   base64.RawURLEncoding.EncodeToString(payload),
-	}
-	sj.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, sj.signingInput()))
-	return sj, nil
+		Protected: e.Protected, Payload: e.Payload, Signature: e.Signature,
+	}, nil
 }
 
-func (s *SignedJob) signingInput() []byte {
-	return []byte(s.Protected + "." + s.Payload)
+func (s *SignedJob) envelope() envelope {
+	return envelope{Protected: s.Protected, Payload: s.Payload, Signature: s.Signature}
 }
 
 // DecodeSignedJob strictly decodes a SignedJob document and checks its
@@ -297,58 +422,12 @@ func (s *SignedJob) Validate() error {
 	if s.Kind != KindSignedCertificateReconcileJob {
 		return invalid("kind", fmt.Sprintf("must be %q", KindSignedCertificateReconcileJob))
 	}
-	if _, err := s.Header(); err != nil {
-		return err
-	}
-	payload, err := decodeB64("payload", s.Payload, MaxDocumentSize)
-	if err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return invalid("payload", "required")
-	}
-	sig, err := decodeB64("signature", s.Signature, ed25519.SignatureSize)
-	if err != nil {
-		return err
-	}
-	if len(sig) != ed25519.SignatureSize {
-		return invalid("signature", fmt.Sprintf("must be %d bytes", ed25519.SignatureSize))
-	}
-	return nil
+	return s.envelope().validate()
 }
 
 // Header decodes and checks the protected header.
 func (s *SignedJob) Header() (*SignedJobHeader, error) {
-	raw, err := decodeB64("protected", s.Protected, maxHeaderSize)
-	if err != nil {
-		return nil, err
-	}
-	var h SignedJobHeader
-	if err := strictjson.Unmarshal(raw, &h); err != nil {
-		return nil, invalidErr("protected", "not a strict JSON header", err)
-	}
-	if h.Alg != SigningAlgorithm {
-		return nil, invalid("protected.alg", fmt.Sprintf("must be %q", SigningAlgorithm))
-	}
-	if len(h.Kid) != KeyIDLength || !isLowerHex(h.Kid) {
-		return nil, invalid("protected.kid", fmt.Sprintf("must be %d lower-case hex characters", KeyIDLength))
-	}
-	if h.IssuedAt.IsZero() {
-		return nil, invalid("protected.issuedAt", "required")
-	}
-	if h.ExpiresAt.IsZero() {
-		return nil, invalid("protected.expiresAt", "required")
-	}
-	if !h.ExpiresAt.After(h.IssuedAt) {
-		return nil, invalid("protected.expiresAt", "must be after issuedAt")
-	}
-	if h.ExpiresAt.Sub(h.IssuedAt) > MaxSignedJobValidity {
-		return nil, invalid("protected.expiresAt", fmt.Sprintf("validity must be at most %s", MaxSignedJobValidity))
-	}
-	if !nonceRe.MatchString(h.Nonce) {
-		return nil, invalid("protected.nonce", "must be 16 to 128 base64url characters")
-	}
-	return &h, nil
+	return s.envelope().header()
 }
 
 // VerifyOptions parameterize Verify.
@@ -368,33 +447,10 @@ func (s *SignedJob) Verify(keys map[string]ed25519.PublicKey, opts VerifyOptions
 	if err := s.Validate(); err != nil {
 		return nil, nil, err
 	}
-	hdr, err := s.Header()
+	payload, hdr, err := s.envelope().verify(keys, opts)
 	if err != nil {
 		return nil, nil, err
 	}
-	pub, ok := keys[hdr.Kid]
-	if !ok || len(pub) != ed25519.PublicKeySize {
-		return nil, nil, fmt.Errorf("%w: kid %s", ErrUnknownSigningKey, hdr.Kid)
-	}
-	sig, _ := base64.RawURLEncoding.DecodeString(s.Signature)
-	if !ed25519.Verify(pub, s.signingInput(), sig) {
-		return nil, nil, ErrSignatureInvalid
-	}
-	now := opts.Now
-	if now.IsZero() {
-		now = time.Now()
-	}
-	skew := opts.ClockSkew
-	if skew <= 0 {
-		skew = DefaultClockSkew
-	}
-	if now.After(hdr.ExpiresAt) {
-		return nil, nil, fmt.Errorf("%w: expired at %s", ErrEnvelopeExpired, hdr.ExpiresAt.UTC().Format(time.RFC3339))
-	}
-	if now.Add(skew).Before(hdr.IssuedAt) {
-		return nil, nil, fmt.Errorf("%w: issued at %s", ErrEnvelopeNotYetValid, hdr.IssuedAt.UTC().Format(time.RFC3339))
-	}
-	payload, _ := base64.RawURLEncoding.DecodeString(s.Payload)
 	spec, err := DecodeJobSpec(bytes.NewReader(payload))
 	if err != nil {
 		return nil, nil, fmt.Errorf("payload: %w", err)
@@ -406,11 +462,7 @@ func (s *SignedJob) Verify(keys map[string]ed25519.PublicKey, opts VerifyOptions
 // without verifying anything. Callers use it to recover a run identity for
 // a failure Result when verification fails.
 func (s *SignedJob) PayloadBytes() []byte {
-	payload, err := base64.RawURLEncoding.DecodeString(s.Payload)
-	if err != nil {
-		return nil
-	}
-	return payload
+	return s.envelope().payloadBytes()
 }
 
 // decodeB64 decodes an unpadded base64url field of at most max bytes.

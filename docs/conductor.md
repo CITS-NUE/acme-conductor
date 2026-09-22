@@ -36,8 +36,8 @@ the Conductor's own replica.
   `maxConcurrentRuns` at a time;
 - one **launcher** per configured execution binding — `local-process`,
   which runs `acme-runner reconcile` as a child, or
-  `azure-container-apps-job`, which starts an execution of a Container
-  Apps Job (see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job)).
+  `azure-container-apps-job`, which hands a job to the next scheduled
+  execution of a Container Apps Job (see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job)).
 
 The Conductor never talks to an ACME CA, a DNS provider or a Certificate
 Store. It produces a `JobSpec` and consumes a `Result`; everything it
@@ -154,36 +154,50 @@ model records this as T10's local-launcher residual.
 
 ### Execution binding: Azure Container Apps Job
 
-`type: azure-container-apps-job` starts, for each run, one execution of
-an **existing** Container Apps Job — the Runner image with its own
-managed identity, its configuration, its state volume and an exchange
-volume, all provisioned in infrastructure
-([`deploy/azure`](../deploy/azure/README.md),
+`type: azure-container-apps-job` hands each run to an **existing**,
+**scheduled** Container Apps Job — the Runner image with its own managed
+identity, its configuration, its state volume, an exchange volume and a
+fixed command `reconcile --exchange /exchange`, all provisioned in
+infrastructure ([`deploy/azure`](../deploy/azure/README.md),
 [ADR 0014](adr/0014-azure-container-apps-job-launcher.md)). The Conductor
-never creates or changes the Job. For a run it:
+never creates, changes or **starts** the Job: the platform's start
+operation accepts an execution template that can replace the image,
+command and environment of the Job's containers, so an identity allowed
+to start the Job could run any image under the Runner's identity. The
+Conductor's identity is not allowed to. For a run it:
 
-1. writes the signed job to `<exchangeDir>/run-<runId>/job.json` on the
-   exchange volume (a file share both containers mount);
-2. reads the Job's template and starts an execution whose template
-   repeats the Job's containers (name, image, command, environment,
-   resources) with only the Runner container's arguments replaced by
-   `reconcile --job <runnerExchangeDir>/run-<runId>/job.json --result
-   <runnerExchangeDir>/run-<runId>/result.json`;
+1. offers the signed job on the exchange volume (a file share both
+   containers mount): it writes `<exchangeDir>/staging/run-<runId>/job.json`
+   and moves the directory to `<exchangeDir>/pending/` in one rename;
+2. waits for the next execution the platform's schedule starts (every
+   minute in the Bicep) to take the job — the Runner moves the directory
+   to `<exchangeDir>/claimed/` (exactly one execution wins) and records
+   its execution name there — and confirms with the platform that the
+   recorded name is an execution of this Job. If none takes it within
+   `claimTimeoutSeconds` the offer is withdrawn (by the same rename, so a
+   late taker cannot race it) and the run fails; a cancelled run is
+   withdrawn the same way and ends `cancelled`;
 3. polls the execution's status every `pollIntervalSeconds` until it is
-   terminal (`Succeeded`, `Failed`, `Stopped`, `Degraded`), stopping it
-   through the platform if the run is cancelled or `timeoutSeconds`
-   passes;
+   terminal (`Succeeded`, `Failed`, `Stopped`, `Degraded`). Whenever
+   polling ends without a terminal status — the run was cancelled,
+   `timeoutSeconds` passed, or the status could not be read any more —
+   the execution is stopped through the platform *before* the run
+   directory is removed, then given a bounded grace to end;
 4. reads `result.json` (waiting up to `resultGraceSeconds` for the share
-   to show it), decodes it strictly, checks it names this run and target
-   and that its status agrees with the platform's verdict (`Succeeded`
-   with a failed `Result`, or `Failed` with a succeeded one, is a
-   mismatch → `Internal`), and removes the run directory.
+   to show it), which must be a `SignedCertificateReconcileResult`
+   verifying against `resultSigning.publicKeys` (see below), checks it
+   names this run and target and that its status agrees with the
+   platform's verdict (`Succeeded` with a failed `Result`, or `Failed`
+   with a succeeded one, is a mismatch → `Internal`), and removes the run
+   directory.
 
 The run's `externalExecutionId` is `azure-container-apps-job:<execution
 name>`. The Conductor's identity needs, on the Job resource only, the
-four actions the Bicep grants (`jobs/read`, `jobs/start/action`,
-`jobs/stop/action`, `jobs/executions/read`) — it cannot change the Job and
-holds no DNS, Key Vault or storage data permission.
+three actions the Bicep grants (`jobs/execution/read`,
+`jobs/executions/read`, `jobs/stop/execution/action`) — it cannot start
+or change the Job and holds no DNS, Key Vault or storage data
+permission. A run therefore starts up to one schedule interval plus the
+platform's start latency after it is queued.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -193,16 +207,16 @@ holds no DNS, Key Vault or storage data permission.
 | `cloud` | string | `public` | `public`, `china` or `government`: selects the Resource Manager endpoint and identity authority. |
 | `credential` | string | `default` | How the Conductor authenticates to Resource Manager: `managed-identity` (the platform's identity — use this in production) or `default` (the SDK's `DefaultAzureCredential` chain, for a Conductor run on a developer host with the exchange share mounted). |
 | `managedIdentityClientId` | string | — | `managed-identity` only: the client ID of a user-assigned identity; omitted means system-assigned. |
-| `containerName` | string | — | Which container of the Job template receives the arguments. Required when the template has more than one container. |
-| `exchangeDir` | string | — (required) | Clean, absolute path where the exchange volume is mounted in the **Conductor's** filesystem (`/mnt/exchange` in the Bicep). Created if missing. |
-| `runnerExchangeDir` | string | — (required) | Clean, absolute path where the same volume is mounted in the **Runner** container (`/exchange` in the Bicep). |
-| `timeoutSeconds` | int | `1200` | Bounds one execution as seen by the Conductor; after it the execution is stopped. Set it above the Job's `replicaTimeout`, which is above the Runner's `lego.timeoutSeconds`. `1`–`86400`. |
-| `pollIntervalSeconds` | int | `10` | How often the execution's status is read. `1`–`300`. |
+| `exchangeDir` | string | — (required) | Clean, absolute path where the exchange volume is mounted in the **Conductor's** filesystem (`/mnt/exchange` in the Bicep). Created if missing. The Runner is told its own mount path by its fixed arguments in infrastructure. |
+| `claimTimeoutSeconds` | int | `300` | How long to wait for a scheduled execution to take an offered job before withdrawing it. Must not exceed `jobSigning.validitySeconds` (a job taken after its expiry is refused by the Runner). `1`–`86400`. |
+| `timeoutSeconds` | int | `1200` | Bounds one execution, from the moment it took the job, as seen by the Conductor; after it the execution is stopped. Set it above the Job's `replicaTimeout`, which is above the Runner's `lego.timeoutSeconds`. `1`–`86400`. |
+| `pollIntervalSeconds` | int | `10` | How often the exchange directory and the execution's status are read. `1`–`300`. |
 | `resultGraceSeconds` | int | `30` | How long to wait for `result.json` after the execution ended (file shares propagate writes with a delay). `0`–`600`. |
 
 A configuration with an `azure-container-apps-job` binding and no
-`jobSigning` is rejected: the exchange volume is not a transport the
-Conductor owns, so every job on it is signed. See
+`jobSigning` or no `resultSigning` is rejected: the exchange volume is
+not a transport the Conductor owns, so every job on it is signed and
+every Result on it must be. See
 [`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json).
 
 ### `jobSigning`
@@ -225,6 +239,25 @@ a DNS, Store or cloud credential. To rotate it, add the new public key to
 the Runners first, then switch `privateKeyFile`, then remove the old
 public key. The key id appears in the `job signing enabled` log line at
 start.
+
+### `resultSigning`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `publicKeys` | []string | — (required) | 1–8 Runner result-signing public keys (Ed25519), each either a PEM `PUBLIC KEY` block or the standard base64 of its DER SubjectPublicKeyInfo — the one-line `publicKey:` that `acme-runner keygen` prints. Several keys let a Runner key rotate. Duplicates are rejected. |
+| `clockSkewSeconds` | int | `300` | How far a signed Result's `issuedAt` may lie in the future of this Conductor's clock before it is refused. Expiry has no tolerance. `1`–`3600`. |
+
+With `resultSigning` present, **every** launcher accepts only a
+`SignedCertificateReconcileResult` ([ADR 0015](adr/0015-signed-job-envelope.md))
+whose signature verifies against one of these keys and whose payload is
+a valid `Result`; a bare `Result` is then "no result" and the run ends
+`Internal`. The Runner must then be configured with the matching private
+key under its `resultSigning.privateKeyFile`
+([`docs/runner.md`](runner.md#resultsigning)). Without `resultSigning`
+a signed Result is refused the same way, so signing is decided once, by
+configuration, never by the document. The Container Apps launcher
+requires it; the local launcher over a private directory may run either
+way. The Conductor holds public keys only.
 
 ## REST API
 

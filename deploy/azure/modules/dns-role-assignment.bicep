@@ -1,6 +1,6 @@
 // Grants the Runner identity the DNS TXT writer role on one DNS zone. The
-// zone may live in another resource group or subscription; main.bicep
-// deploys this module at the zone's resource group scope.
+// zone may live in another resource group of the same subscription;
+// main.bicep deploys this module at the zone's resource group scope.
 targetScope = 'resourceGroup'
 
 @description('Name of the existing DNS zone (the challenge zone).')

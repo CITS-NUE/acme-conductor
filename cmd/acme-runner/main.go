@@ -4,13 +4,18 @@
 //
 //	acme-runner --version
 //	acme-runner reconcile --job /input/job.json --result /output/result.json [--config /etc/acme-runner/config.json]
+//	acme-runner reconcile --exchange /exchange [--config /etc/acme-runner/config.json]
+//	acme-runner keygen --private FILE --public FILE
 //
 // reconcile handles exactly one JobSpec: it validates the document,
 // authorizes it against the trusted runner configuration, runs the bundled
 // lego CLI once if a certificate must be issued or renewed, stores the
 // result in the configured Certificate Store and writes a Result. It has no
 // server mode and no scheduler; the execution platform starts one process
-// per run.
+// per run. With --exchange the process takes the oldest job a Conductor
+// has offered in that directory (or exits at once when there is none),
+// which is how a scheduled Container Apps Job execution finds its work
+// without the Conductor being able to start or shape the execution.
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/CITS-NUE/acme-conductor/internal/keygen"
 	"github.com/CITS-NUE/acme-conductor/internal/runner"
 	"github.com/CITS-NUE/acme-conductor/internal/version"
 )
@@ -41,7 +47,7 @@ func main() {
 }
 
 func usage(stderr io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n\n", component, component)
+	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n  %s reconcile --exchange DIR [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component, component)
 	fmt.Fprintln(stderr, "ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate).")
 	fmt.Fprintln(stderr, "\nFlags:")
 	fs.PrintDefaults()
@@ -70,6 +76,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 	switch fs.Arg(0) {
 	case "reconcile":
 		return runReconcile(ctx, fs.Args()[1:], stdout, stderr, getenv)
+	case "keygen":
+		return keygen.Run(component, "result-signing", fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: unknown command %q\n\n", component, fs.Arg(0))
 		fs.Usage()
@@ -86,6 +94,7 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	}
 	job := fs.String("job", "", "path of the CertificateReconcileJob document (required)")
 	result := fs.String("result", "", "path where the CertificateReconcileResult is written atomically (required)")
+	exchangeDir := fs.String("exchange", "", "exchange directory to take the oldest pending job from (instead of --job/--result)")
 	cfg := fs.String("config", defaultConfig, "path of the runner configuration ($"+envConfigPath+")")
 	level := fs.String("log-level", "info", "log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -94,8 +103,9 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 		}
 		return 2
 	}
-	if *job == "" || *result == "" || fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "%s reconcile: --job and --result are required\n", component)
+	claiming := *exchangeDir != ""
+	if fs.NArg() > 0 || (claiming && (*job != "" || *result != "")) || (!claiming && (*job == "" || *result == "")) {
+		fmt.Fprintf(stderr, "%s reconcile: either --job and --result, or --exchange, are required\n", component)
 		fs.Usage()
 		return 2
 	}
@@ -107,11 +117,12 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: lvl, ReplaceAttr: utcTime}))
 	logger = logger.With("component", component, "version", version.Version)
 	return runner.Reconcile(ctx, runner.Options{
-		ConfigPath: *cfg,
-		JobPath:    *job,
-		ResultPath: *result,
-		Stdout:     stdout,
-		Logger:     logger,
+		ConfigPath:  *cfg,
+		JobPath:     *job,
+		ResultPath:  *result,
+		ExchangeDir: *exchangeDir,
+		Stdout:      stdout,
+		Logger:      logger,
 	})
 }
 

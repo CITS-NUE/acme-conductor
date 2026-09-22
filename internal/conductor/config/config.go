@@ -11,6 +11,7 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -50,8 +51,19 @@ const (
 	DefaultSigningValiditySeconds = 900
 	MaxSigningValiditySeconds     = 86400
 
+	// MaxSigningKeys bounds resultSigning.publicKeys (a rotation needs
+	// two); DefaultClockSkewSeconds and MaxClockSkewSeconds bound
+	// resultSigning.clockSkewSeconds.
+	MaxSigningKeys          = 8
+	DefaultClockSkewSeconds = 300
+	MaxClockSkewSeconds     = 3600
+
 	DefaultPollIntervalSeconds = 10
 	MaxPollIntervalSeconds     = 300
+	// DefaultClaimTimeoutSeconds covers a scheduled Job's cadence (one
+	// execution per minute) plus its start latency several times over.
+	DefaultClaimTimeoutSeconds = 300
+	MaxClaimTimeoutSeconds     = 86400
 	DefaultResultGraceSeconds  = 30
 	MaxResultGraceSeconds      = 600
 )
@@ -137,6 +149,67 @@ type Config struct {
 	// execution binding sends jobs over a transport the Conductor does
 	// not own (azure-container-apps-job).
 	JobSigning *JobSigning `json:"jobSigning,omitempty"`
+	// ResultSigning, when present, makes every launcher accept only
+	// Results wrapped in a SignedCertificateReconcileResult that verifies
+	// against one of these Runner public keys: a bare Result is then an
+	// error, not a Result. It is mandatory for the Container Apps
+	// launcher, whose Results travel over a shared volume.
+	ResultSigning *ResultSigning `json:"resultSigning,omitempty"`
+}
+
+// ResultSigning is the trust configuration for signed Results. It holds
+// public keys only.
+type ResultSigning struct {
+	// PublicKeys are the Runner signing keys this Conductor trusts, each
+	// a PEM "PUBLIC KEY" block or the standard base64 of its DER
+	// SubjectPublicKeyInfo. Several keys let a Runner key rotate.
+	PublicKeys []string `json:"publicKeys"`
+	// ClockSkewSeconds is how far an envelope's issuedAt may lie in the
+	// future of this Conductor's clock before it is refused (default
+	// DefaultClockSkewSeconds). Expiry has no tolerance.
+	ClockSkewSeconds int `json:"clockSkewSeconds,omitempty"`
+
+	keys map[string]ed25519.PublicKey
+}
+
+// Keys returns the trusted Runner public keys indexed by their KeyID.
+func (r *ResultSigning) Keys() map[string]ed25519.PublicKey {
+	if r == nil {
+		return nil
+	}
+	out := make(map[string]ed25519.PublicKey, len(r.keys))
+	for k, v := range r.keys {
+		out[k] = v
+	}
+	return out
+}
+
+func (r *ResultSigning) validate() error {
+	if len(r.PublicKeys) == 0 {
+		return invalid("resultSigning.publicKeys must list at least one key")
+	}
+	if len(r.PublicKeys) > MaxSigningKeys {
+		return invalid("resultSigning.publicKeys: at most %d keys", MaxSigningKeys)
+	}
+	r.keys = map[string]ed25519.PublicKey{}
+	for i, s := range r.PublicKeys {
+		pub, err := v1alpha1.ParseSigningPublicKey(s)
+		if err != nil {
+			return invalid("resultSigning.publicKeys[%d]: %v", i, err)
+		}
+		kid := v1alpha1.KeyID(pub)
+		if _, dup := r.keys[kid]; dup {
+			return invalid("resultSigning.publicKeys[%d]: key %s is listed twice", i, kid)
+		}
+		r.keys[kid] = pub
+	}
+	if r.ClockSkewSeconds == 0 {
+		r.ClockSkewSeconds = DefaultClockSkewSeconds
+	}
+	if r.ClockSkewSeconds < 1 || r.ClockSkewSeconds > MaxClockSkewSeconds {
+		return invalid("resultSigning.clockSkewSeconds must be between 1 and %d", MaxClockSkewSeconds)
+	}
+	return nil
 }
 
 // JobSigning locates the Conductor's job-signing key.
@@ -212,20 +285,20 @@ type AzureContainerAppsJob struct {
 	// ManagedIdentityClientID selects a user-assigned managed identity by
 	// client ID (credential "managed-identity" only).
 	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
-	// ContainerName names the container of the Job template that receives
-	// the run's arguments; it may be omitted when the template has exactly
-	// one container.
-	ContainerName string `json:"containerName,omitempty"`
 	// ExchangeDir is where the exchange volume is mounted in the
-	// Conductor's own filesystem; RunnerExchangeDir is where the same
-	// volume is mounted in the Runner container.
-	ExchangeDir       string `json:"exchangeDir"`
-	RunnerExchangeDir string `json:"runnerExchangeDir"`
-	// TimeoutSeconds bounds one execution as seen by the Conductor; after
-	// it the execution is stopped. It should exceed the Job's own
-	// replicaTimeout.
+	// Conductor's own filesystem (the Runner mounts the same volume and
+	// is told its own mount path by its arguments in infrastructure).
+	ExchangeDir string `json:"exchangeDir"`
+	// ClaimTimeoutSeconds is how long the Conductor waits for a scheduled
+	// execution of the Job to take an offered job before it withdraws the
+	// job and fails the run. It must not exceed jobSigning.validitySeconds.
+	ClaimTimeoutSeconds int `json:"claimTimeoutSeconds,omitempty"`
+	// TimeoutSeconds bounds one execution as seen by the Conductor from
+	// the moment it was taken; after it the execution is stopped. It
+	// should exceed the Job's own replicaTimeout.
 	TimeoutSeconds int `json:"timeoutSeconds"`
-	// PollIntervalSeconds is how often the execution's status is read.
+	// PollIntervalSeconds is how often the exchange directory and the
+	// execution's status are read.
 	PollIntervalSeconds int `json:"pollIntervalSeconds,omitempty"`
 	// ResultGraceSeconds is how long to wait for result.json to appear on
 	// the exchange volume after the execution has ended (file shares
@@ -328,9 +401,23 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	if c.ResultSigning != nil {
+		if err := c.ResultSigning.validate(); err != nil {
+			return err
+		}
+	}
 	for name, b := range c.ExecutionBindings {
-		if b.Type == ExecutionAzureContainerAppsJob && c.JobSigning == nil {
+		if b.Type != ExecutionAzureContainerAppsJob {
+			continue
+		}
+		if c.JobSigning == nil {
 			return invalid("executionBindings.%s: type %q requires jobSigning to be configured (the job travels over a shared volume)", name, b.Type)
+		}
+		if c.ResultSigning == nil {
+			return invalid("executionBindings.%s: type %q requires resultSigning to be configured (the result travels over a shared volume)", name, b.Type)
+		}
+		if b.AzureContainerAppsJob.ClaimTimeoutSeconds > c.JobSigning.ValiditySeconds {
+			return invalid("executionBindings.%s.azureContainerAppsJob.claimTimeoutSeconds must not exceed jobSigning.validitySeconds (a job claimed after its expiry is refused by the Runner)", name)
 		}
 	}
 	return nil
@@ -497,16 +584,17 @@ func (a *AzureContainerAppsJob) validate(field string) error {
 	default:
 		return invalid("%s.credential must be %q or %q", field, CredentialManagedIdentity, CredentialDefault)
 	}
-	if a.ContainerName != "" && !v1alpha1.IsBindingName(a.ContainerName) {
-		return invalid("%s.containerName is not a valid container name", field)
+	if a.ExchangeDir == "" {
+		return invalid("%s.exchangeDir is required", field)
 	}
-	for name, v := range map[string]string{"exchangeDir": a.ExchangeDir, "runnerExchangeDir": a.RunnerExchangeDir} {
-		if v == "" {
-			return invalid("%s.%s is required", field, name)
-		}
-		if !filepath.IsAbs(v) || filepath.Clean(v) != v {
-			return invalid("%s.%s must be a clean absolute path", field, name)
-		}
+	if !filepath.IsAbs(a.ExchangeDir) || filepath.Clean(a.ExchangeDir) != a.ExchangeDir {
+		return invalid("%s.exchangeDir must be a clean absolute path", field)
+	}
+	if a.ClaimTimeoutSeconds == 0 {
+		a.ClaimTimeoutSeconds = DefaultClaimTimeoutSeconds
+	}
+	if a.ClaimTimeoutSeconds < 1 || a.ClaimTimeoutSeconds > MaxClaimTimeoutSeconds {
+		return invalid("%s.claimTimeoutSeconds must be between 1 and %d", field, MaxClaimTimeoutSeconds)
 	}
 	if a.TimeoutSeconds == 0 {
 		a.TimeoutSeconds = DefaultLaunchTimeoutSeconds

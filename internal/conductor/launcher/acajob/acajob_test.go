@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,6 +29,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/fakerunner"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
+	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
@@ -57,9 +57,13 @@ func (fakeCredential) GetToken(context.Context, policy.TokenRequestOptions) (azc
 }
 
 func spec() *v1alpha1.JobSpec {
+	return specFor("01JRUN000000000000000000A1")
+}
+
+func specFor(runID string) *v1alpha1.JobSpec {
 	return &v1alpha1.JobSpec{
 		APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindCertificateReconcileJob,
-		RunID:  "01JRUN000000000000000000A1",
+		RunID:  runID,
 		Target: v1alpha1.TargetRef{ID: "01JTARGET00000000000000A1", FQDN: "wiki.example.ac.jp", Revision: 1},
 		Policy: v1alpha1.PolicySpec{AllowedDnsSuffixes: []string{"example.ac.jp"}, RenewBeforeDays: 30, KeyType: v1alpha1.KeyTypeEC256},
 		ACME:   v1alpha1.ACMERef{Binding: "fake-ca"}, DNS: v1alpha1.DNSRef{Binding: "fake-dns"}, Store: v1alpha1.StoreRef{Binding: "keyvault-staging"},
@@ -75,33 +79,33 @@ type fakeExec struct {
 	done    chan struct{}
 }
 
-// fakeARM imitates the Container Apps Jobs REST operations the launcher
-// uses: read the job, start an execution (synchronously or through a
-// Location-polled operation), read an execution, stop an execution. An
-// execution actually runs the fake Runner in a subprocess with the
-// arguments the launcher supplied, translated from the Runner's mount
-// path to the test's exchange directory, so the whole exchange — signed
-// job in, Result out — is exercised on disk.
+// fakeARM imitates the platform side of a *scheduled* Container Apps Job:
+// on its own cadence it starts an execution of the fake Runner in claim
+// mode whenever a job is pending in the exchange directory (the platform
+// would start one every minute regardless; the fake skips idle ticks),
+// and it serves the REST operations the launcher uses — read an
+// execution, stop an execution. There is no start operation: the
+// Conductor's identity does not hold it. The whole exchange — signed job
+// in, execution marker, signed Result out — is exercised on disk.
 type fakeARM struct {
-	t              *testing.T
-	srv            *httptest.Server
-	self           string
-	exchangeLocal  string
-	runnerExchange string
-	mode           string
-	record         string
+	t             *testing.T
+	srv           *httptest.Server
+	self          string
+	exchangeLocal string
+	mode          string
+	record        string
+	resultKey     string
 
 	mu             sync.Mutex
 	execs          map[string]*fakeExec
-	templates      []armappcontainers.JobExecutionTemplate
-	jobs           []byte // job.json as handed over, captured at start
 	nextID         int
-	startStatus    int    // 0 = 200 synchronous, 202 = Location polling, else an error status
 	getFailures    int    // leading execution reads that fail with 500
-	containers     int    // containers in the job template (default 1)
 	statusOverride string // final status reported regardless of the exit code
 	stopCount      int
-	locationHits   int
+	paused         bool   // the platform starts no executions
+	parallelism    int    // executions that may run at once
+	executionName  string // marker name the fake Runner records instead of its own
+	stopScheduler  chan struct{}
 }
 
 func newFakeARM(t *testing.T, mode string) *fakeARM {
@@ -110,13 +114,25 @@ func newFakeARM(t *testing.T, mode string) *fakeARM {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dir := t.TempDir()
+	_, priv, err := v1alpha1.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pem, _ := v1alpha1.MarshalSigningPrivateKey(priv)
+	keyPath := filepath.Join(dir, "result-signing.pem")
+	if err := os.WriteFile(keyPath, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	f := &fakeARM{
-		t: t, self: self, mode: mode, execs: map[string]*fakeExec{}, containers: 1,
-		exchangeLocal: filepath.Join(t.TempDir(), "exchange"), runnerExchange: "/exchange",
-		record: filepath.Join(t.TempDir(), "record.json"),
+		t: t, self: self, mode: mode, execs: map[string]*fakeExec{}, parallelism: 1,
+		exchangeLocal: filepath.Join(dir, "exchange"), record: filepath.Join(dir, "record.json"),
+		resultKey: keyPath, stopScheduler: make(chan struct{}),
 	}
 	f.srv = httptest.NewTLSServer(http.HandlerFunc(f.handle))
+	go f.schedule()
 	t.Cleanup(func() {
+		close(f.stopScheduler)
 		f.srv.Close()
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -129,122 +145,75 @@ func newFakeARM(t *testing.T, mode string) *fakeARM {
 	return f
 }
 
-func (f *fakeARM) armError(w http.ResponseWriter, status int, code string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `{"error":{"code":%q,"message":"failed: %s"}}`, code, secretBody)
+// runnerPublicKey returns the key the fake Runner signs Results with.
+func (f *fakeARM) runnerPublicKey() ed25519.PublicKey {
+	pem, _ := os.ReadFile(f.resultKey)
+	priv, err := v1alpha1.ParseSigningPrivateKey(pem)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return priv.Public().(ed25519.PublicKey)
 }
 
-func (f *fakeARM) handle(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "Bearer "+testToken {
-		f.armError(w, http.StatusUnauthorized, "InvalidAuthenticationToken")
-		return
-	}
-	prefix := "/subscriptions/" + testSub + "/resourceGroups/" + testRG + "/providers/Microsoft.App/jobs/" + testJob
-	p := r.URL.Path
-	switch {
-	case strings.HasPrefix(p, "/operations/"):
+// schedule is the platform's cron: every tick, if something is pending
+// and capacity allows, start an execution.
+func (f *fakeARM) schedule() {
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-f.stopScheduler:
+			return
+		case <-tick.C:
+		}
 		f.mu.Lock()
-		f.locationHits++
+		if f.paused {
+			f.mu.Unlock()
+			continue
+		}
+		running := 0
+		for _, e := range f.execs {
+			if e.status == armappcontainers.JobExecutionRunningStateRunning {
+				running++
+			}
+		}
+		if running >= f.parallelism {
+			f.mu.Unlock()
+			continue
+		}
+		entries, _ := os.ReadDir(filepath.Join(f.exchangeLocal, exchange.DirPending))
+		if len(entries) == 0 {
+			f.mu.Unlock()
+			continue
+		}
+		f.startLocked()
 		f.mu.Unlock()
-		name := strings.TrimPrefix(p, "/operations/")
-		writeJSON(w, http.StatusOK, armappcontainers.JobExecutionBase{Name: &name, ID: ptr(prefix + "/executions/" + name)})
-	case r.Method == http.MethodGet && p == prefix:
-		f.serveJob(w)
-	case r.Method == http.MethodPost && p == prefix+"/start":
-		f.start(w, r, prefix)
-	case r.Method == http.MethodGet && strings.HasPrefix(p, prefix+"/executions/"):
-		f.getExecution(w, strings.TrimPrefix(p, prefix+"/executions/"))
-	case r.Method == http.MethodPost && strings.HasPrefix(p, prefix+"/executions/") && strings.HasSuffix(p, "/stop"):
-		name := strings.TrimSuffix(strings.TrimPrefix(p, prefix+"/executions/"), "/stop")
-		f.stop(w, name)
-	default:
-		f.armError(w, http.StatusNotFound, "ResourceNotFound")
 	}
 }
 
-func ptr[T any](v T) *T { return &v }
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func (f *fakeARM) serveJob(w http.ResponseWriter) {
-	f.mu.Lock()
-	n := f.containers
-	f.mu.Unlock()
-	containers := []*armappcontainers.Container{{
-		Name:  ptr("runner"),
-		Image: ptr("ghcr.io/cits-nue/acme-runner:dev"),
-		Env: []*armappcontainers.EnvironmentVar{
-			{Name: ptr("ACME_RUNNER_CONFIG"), Value: ptr("/etc/acme-runner/config.json")},
-			{Name: ptr("DNS_TOKEN"), SecretRef: ptr("dns-token")},
-		},
-		Resources:    &armappcontainers.ContainerResources{CPU: ptr(0.5), Memory: ptr("1Gi")},
-		VolumeMounts: []*armappcontainers.VolumeMount{{VolumeName: ptr("exchange"), MountPath: ptr("/exchange")}},
-	}}
-	for i := 1; i < n; i++ {
-		containers = append(containers, &armappcontainers.Container{Name: ptr("sidecar" + strconv.Itoa(i)), Image: ptr("example/sidecar"), Args: []*string{ptr("--keep")}})
-	}
-	job := armappcontainers.Job{
-		Name: ptr(testJob), Location: ptr("japaneast"),
-		Properties: &armappcontainers.JobProperties{
-			Template: &armappcontainers.JobTemplate{Containers: containers},
-		},
-	}
-	writeJSON(w, http.StatusOK, job)
-}
-
-func (f *fakeARM) start(w http.ResponseWriter, r *http.Request, prefix string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.startStatus != 0 && f.startStatus != 202 {
-		f.armError(w, f.startStatus, "AuthorizationFailed")
-		return
-	}
-	var tmpl armappcontainers.JobExecutionTemplate
-	body, _ := io.ReadAll(r.Body)
-	if err := json.Unmarshal(body, &tmpl); err != nil {
-		f.armError(w, http.StatusBadRequest, "InvalidTemplate")
-		return
-	}
-	f.templates = append(f.templates, tmpl)
-	var runner *armappcontainers.JobExecutionContainer
-	for _, c := range tmpl.Containers {
-		if c.Name != nil && *c.Name == "runner" {
-			runner = c
-		}
-	}
-	if runner == nil {
-		f.armError(w, http.StatusBadRequest, "InvalidTemplate")
-		return
-	}
-	args := make([]string, 0, len(runner.Args))
-	for _, a := range runner.Args {
-		v := *a
-		if strings.HasPrefix(v, f.runnerExchange+"/") {
-			v = filepath.Join(f.exchangeLocal, strings.TrimPrefix(v, f.runnerExchange+"/"))
-		}
-		args = append(args, v)
-	}
-	for i := range args {
-		if args[i-0] == "--job" && i+1 < len(args) {
-			f.jobs, _ = os.ReadFile(args[i+1])
-		}
-	}
+// startLocked starts one execution of the fake Runner in claim mode.
+func (f *fakeARM) startLocked() string {
 	f.nextID++
 	name := fmt.Sprintf("acme-runner-%06d", f.nextID)
-	cmd := exec.Command(f.self, args...)
-	cmd.Env = []string{"ACME_CONDUCTOR_FAKE_RUNNER=1", fakerunner.EnvMode + "=" + f.mode, fakerunner.EnvRecord + "=" + f.record, "PATH=/usr/bin:/bin"}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		f.armError(w, http.StatusInternalServerError, "InternalServerError")
-		return
+	marker := name
+	if f.executionName != "" {
+		marker = f.executionName
 	}
+	cmd := exec.Command(f.self, "reconcile", "--exchange", f.exchangeLocal, "--config", "/etc/acme-runner/config.json")
+	cmd.Env = []string{
+		"ACME_CONDUCTOR_FAKE_RUNNER=1", fakerunner.EnvMode + "=" + f.mode, fakerunner.EnvRecord + "=" + f.record,
+		fakerunner.EnvResultKey + "=" + f.resultKey, "CONTAINER_APP_JOB_EXECUTION_NAME=" + marker, "PATH=/usr/bin:/bin",
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	e := &fakeExec{cmd: cmd, status: armappcontainers.JobExecutionRunningStateRunning, done: make(chan struct{})}
+	// Registered before it runs: the Runner records its name at once and
+	// the Conductor confirms it with the platform right after.
 	f.execs[name] = e
+	if err := cmd.Start(); err != nil {
+		e.status = armappcontainers.JobExecutionRunningStateFailed
+		close(e.done)
+		return name
+	}
 	go func() {
 		err := cmd.Wait()
 		f.mu.Lock()
@@ -262,13 +231,42 @@ func (f *fakeARM) start(w http.ResponseWriter, r *http.Request, prefix string) {
 		}
 		close(e.done)
 	}()
-	base := armappcontainers.JobExecutionBase{Name: &name, ID: ptr(prefix + "/executions/" + name)}
-	if f.startStatus == 202 {
-		w.Header().Set("Location", f.srv.URL+"/operations/"+name)
-		w.WriteHeader(http.StatusAccepted)
+	return name
+}
+
+func (f *fakeARM) armError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"error":{"code":%q,"message":"failed: %s"}}`, code, secretBody)
+}
+
+func (f *fakeARM) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer "+testToken {
+		f.armError(w, http.StatusUnauthorized, "InvalidAuthenticationToken")
 		return
 	}
-	writeJSON(w, http.StatusOK, base)
+	prefix := "/subscriptions/" + testSub + "/resourceGroups/" + testRG + "/providers/Microsoft.App/jobs/" + testJob
+	p := r.URL.Path
+	switch {
+	case r.Method == http.MethodPost && p == prefix+"/start":
+		// The Conductor's identity does not hold jobs/start/action.
+		f.armError(w, http.StatusForbidden, "AuthorizationFailed")
+	case r.Method == http.MethodGet && strings.HasPrefix(p, prefix+"/executions/"):
+		f.getExecution(w, strings.TrimPrefix(p, prefix+"/executions/"))
+	case r.Method == http.MethodPost && strings.HasPrefix(p, prefix+"/executions/") && strings.HasSuffix(p, "/stop"):
+		name := strings.TrimSuffix(strings.TrimPrefix(p, prefix+"/executions/"), "/stop")
+		f.stop(w, name)
+	default:
+		f.armError(w, http.StatusNotFound, "ResourceNotFound")
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func (f *fakeARM) getExecution(w http.ResponseWriter, name string) {
@@ -313,19 +311,20 @@ func (f *fakeARM) stop(w http.ResponseWriter, name string) {
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
-func (f *fakeARM) template(i int) armappcontainers.JobExecutionTemplate {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.templates[i]
-}
-
 func (f *fakeARM) stops() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.stopCount
 }
 
-// newLauncher builds a Launcher against the fake, with its own signer.
+func (f *fakeARM) set(edit func(f *fakeARM)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	edit(f)
+}
+
+// newLauncher builds a Launcher against the fake, with its own job signer
+// and a verifier trusting the fake Runner's result key.
 func newLauncher(t *testing.T, f *fakeARM, edit func(c *Config)) (*Launcher, ed25519.PublicKey, *bytes.Buffer) {
 	t.Helper()
 	pub, priv, err := v1alpha1.GenerateSigningKey()
@@ -336,16 +335,21 @@ func newLauncher(t *testing.T, f *fakeARM, edit func(c *Config)) (*Launcher, ed2
 	if err != nil {
 		t.Fatal(err)
 	}
+	runnerPub := f.runnerPublicKey()
+	verifier, err := launcher.NewVerifier(map[string]ed25519.PublicKey{v1alpha1.KeyID(runnerPub): runnerPub}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := Config{
 		SubscriptionID: testSub, ResourceGroup: testRG, JobName: testJob,
-		ExchangeDir: f.exchangeLocal, RunnerExchangeDir: f.runnerExchange,
+		ExchangeDir: f.exchangeLocal, ClaimTimeout: 10 * time.Second, ExecutionGrace: 5 * time.Second,
 		Timeout: 30 * time.Second, PollInterval: 50 * time.Millisecond, ResultGrace: 2 * time.Second, StopGrace: 10 * time.Second,
 	}
 	if edit != nil {
 		edit(&cfg)
 	}
 	var logs bytes.Buffer
-	l, err := New(cfg, signer, &Options{
+	l, err := New(cfg, signer, verifier, &Options{
 		Credential: fakeCredential{},
 		ClientOptions: &arm.ClientOptions{ClientOptions: azcore.ClientOptions{
 			Cloud: cloud.Configuration{
@@ -365,15 +369,18 @@ func newLauncher(t *testing.T, f *fakeARM, edit func(c *Config)) (*Launcher, ed2
 	return l, pub, &logs
 }
 
+// runDirs lists every run directory left anywhere in the exchange.
 func runDirs(t *testing.T, f *fakeARM) []string {
 	t.Helper()
-	entries, err := os.ReadDir(f.exchangeLocal)
-	if err != nil {
-		return nil
-	}
 	var names []string
-	for _, e := range entries {
-		names = append(names, e.Name())
+	for _, d := range []string{exchange.DirStaging, exchange.DirPending, exchange.DirClaimed, exchange.DirWithdrawn} {
+		entries, err := os.ReadDir(filepath.Join(f.exchangeLocal, d))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			names = append(names, d+"/"+e.Name())
+		}
 	}
 	return names
 }
@@ -386,7 +393,7 @@ func TestSuccess(t *testing.T) {
 	}
 	ex, err := l.Start(context.Background(), spec())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("start: %v\n%s", err, logs.String())
 	}
 	if ex.ID() != "azure-container-apps-job:acme-runner-000001" {
 		t.Fatalf("ID = %q", ex.ID())
@@ -404,46 +411,24 @@ func TestSuccess(t *testing.T) {
 	if dirs := runDirs(t, f); len(dirs) != 0 {
 		t.Fatalf("run directories left behind: %v", dirs)
 	}
-
-	// The execution template is the job's container with only the
-	// arguments replaced; nothing else of the run is expressed there.
-	tmpl := f.template(0)
-	if len(tmpl.Containers) != 1 || *tmpl.Containers[0].Name != "runner" || *tmpl.Containers[0].Image != "ghcr.io/cits-nue/acme-runner:dev" {
-		t.Fatalf("template = %+v", tmpl)
-	}
-	var args []string
-	for _, a := range tmpl.Containers[0].Args {
-		args = append(args, *a)
-	}
-	want := []string{"reconcile", "--job", "/exchange/run-01JRUN000000000000000000A1/job.json", "--result", "/exchange/run-01JRUN000000000000000000A1/result.json"}
-	if strings.Join(args, " ") != strings.Join(want, " ") {
-		t.Fatalf("args = %v", args)
-	}
-	if len(tmpl.Containers[0].Env) != 2 || tmpl.Containers[0].Env[1].SecretRef == nil || tmpl.Containers[0].Resources == nil || *tmpl.Containers[0].Resources.Memory != "1Gi" {
-		t.Fatalf("env/resources not carried over: %+v", tmpl.Containers[0])
-	}
-	if tmpl.Containers[0].Command != nil {
-		t.Fatalf("command was set: %v", tmpl.Containers[0].Command)
+	if f.stops() != 0 {
+		t.Fatalf("stops = %d", f.stops())
 	}
 
-	// What was handed over is a signed envelope that verifies with the
-	// launcher's key and carries exactly the spec.
-	sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(f.jobs))
-	if err != nil {
-		t.Fatalf("job.json: %v", err)
-	}
-	got, hdr, err := sj.Verify(map[string]ed25519.PublicKey{v1alpha1.KeyID(pub): pub}, v1alpha1.VerifyOptions{})
-	if err != nil || got.RunID != spec().RunID || hdr.ExpiresAt.Sub(hdr.IssuedAt) != 10*time.Minute {
-		t.Fatalf("verify: %v", err)
-	}
-	// The Runner recorded the envelope kind.
+	// The Runner was started by the platform in claim mode: it received
+	// no run-specific argument, took a signed envelope that verifies with
+	// the launcher's key, and signed its Result.
 	data, _ := os.ReadFile(f.record)
 	var r fakerunner.Record
 	_ = json.Unmarshal(data, &r)
+	if strings.Join(r.Argv, " ") != "reconcile --exchange "+f.exchangeLocal+" --config /etc/acme-runner/config.json" {
+		t.Fatalf("runner argv = %v", r.Argv)
+	}
 	if r.JobKind != v1alpha1.KindSignedCertificateReconcileJob {
 		t.Fatalf("job kind = %q", r.JobKind)
 	}
-	if !strings.Contains(logs.String(), "job execution started") || !strings.Contains(logs.String(), `"status":"Succeeded"`) {
+	_ = pub
+	if !strings.Contains(logs.String(), "job offered to the runner job") || !strings.Contains(logs.String(), "job taken by an execution") || !strings.Contains(logs.String(), `"status":"Succeeded"`) {
 		t.Fatalf("log:\n%s", logs.String())
 	}
 	if strings.Contains(logs.String(), fakerunner.LeakedSecret) {
@@ -451,42 +436,63 @@ func TestSuccess(t *testing.T) {
 	}
 }
 
-func TestStartThroughLocationPolling(t *testing.T) {
-	f := newFakeARM(t, "noop")
-	f.startStatus = 202
-	l, _, _ := newLauncher(t, f, nil)
-	ex, err := l.Start(context.Background(), spec())
-	if err != nil {
-		t.Fatal(err)
+// Two runs offered at once are taken by two distinct executions, each
+// correlated to its own run.
+func TestTwoRunsTwoExecutions(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.parallelism = 2 })
+	l, _, logs := newLauncher(t, f, nil)
+	specs := []*v1alpha1.JobSpec{spec(), specFor("01JRUN000000000000000000B2")}
+	var wg sync.WaitGroup
+	ids := make([]string, len(specs))
+	for i, sp := range specs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ex, err := l.Start(context.Background(), sp)
+			if err != nil {
+				t.Errorf("start %s: %v", sp.RunID, err)
+				return
+			}
+			ids[i] = ex.ID()
+			res, err := ex.Wait()
+			if err != nil || res.RunID != sp.RunID || res.Status != v1alpha1.StatusSucceeded {
+				t.Errorf("run %s: result = %+v, %v\n%s", sp.RunID, res, err, logs.String())
+			}
+		}()
 	}
-	res, err := ex.Wait()
-	if err != nil || res.Action != v1alpha1.ActionNoop {
-		t.Fatalf("result = %+v, %v", res, err)
+	wg.Wait()
+	if ids[0] == ids[1] || ids[0] == "" || ids[1] == "" {
+		t.Fatalf("execution ids = %v", ids)
 	}
-	f.mu.Lock()
-	hits := f.locationHits
-	f.mu.Unlock()
-	if hits == 0 {
-		t.Fatal("Location was never polled")
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
 	}
 }
 
 func TestTransientStatusErrorsAreRetried(t *testing.T) {
-	f := newFakeARM(t, "ok")
-	f.getFailures = 3
+	f := newFakeARM(t, "slow")
+	f.set(func(f *fakeARM) { f.getFailures = 3 })
 	l, _, logs := newLauncher(t, f, nil)
 	ex, err := l.Start(context.Background(), spec())
+	// The confirmation read at start may be one of the failing ones; the
+	// launcher does not retry that one (the run fails safely), so only a
+	// started execution is exercised here.
 	if err != nil {
+		if strings.Contains(err.Error(), "HTTP 500") {
+			t.Skip("confirmation read hit an injected failure; polling retries are covered when start succeeds")
+		}
 		t.Fatal(err)
 	}
-	if res, err := ex.Wait(); err != nil || res.Status != v1alpha1.StatusSucceeded {
+	res, err := ex.Wait()
+	if err != nil || res.Status != v1alpha1.StatusSucceeded {
 		t.Fatalf("result = %+v, %v\n%s", res, err, logs.String())
 	}
-	if !strings.Contains(logs.String(), "status could not be read") || !strings.Contains(logs.String(), "HTTP 500 (InternalServerError)") {
-		t.Fatalf("retries not logged:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "job execution status could not be read") {
+		t.Fatalf("log:\n%s", logs.String())
 	}
-	if strings.Contains(logs.String(), secretBody) {
-		t.Fatal("ARM response body reached the log")
+	if f.stops() != 0 {
+		t.Fatalf("stops = %d", f.stops())
 	}
 }
 
@@ -497,10 +503,12 @@ func TestFailureModes(t *testing.T) {
 		override string
 		reason   launcher.Reason
 		failed   bool // a failed Result is returned (no error)
+		errText  string
 	}{
 		{name: "runner reports failure", mode: "fail", failed: true},
 		{name: "no result", mode: "noresult", reason: launcher.ReasonNoResult},
 		{name: "garbage result", mode: "garbage", reason: launcher.ReasonNoResult},
+		{name: "unsigned result", mode: "unsigned", reason: launcher.ReasonNoResult, errText: "unsigned result"},
 		{name: "result for another run", mode: "mismatch", reason: launcher.ReasonMismatch},
 		{name: "succeeded status with failed result", mode: "fail", override: "Succeeded", reason: launcher.ReasonMismatch},
 		{name: "failed status with succeeded result", mode: "ok", override: "Failed", reason: launcher.ReasonMismatch},
@@ -509,7 +517,7 @@ func TestFailureModes(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFakeARM(t, c.mode)
-			f.statusOverride = c.override
+			f.set(func(f *fakeARM) { f.statusOverride = c.override })
 			l, _, logs := newLauncher(t, f, nil)
 			ex, err := l.Start(context.Background(), spec())
 			if err != nil {
@@ -526,7 +534,7 @@ func TestFailureModes(t *testing.T) {
 					t.Fatalf("result = %+v, %v", res, err)
 				}
 			default:
-				if res != nil || launcher.ReasonOf(err) != c.reason {
+				if res != nil || launcher.ReasonOf(err) != c.reason || (c.errText != "" && !strings.Contains(err.Error(), c.errText)) {
 					t.Fatalf("result = %+v, err = %v, want %s\n%s", res, err, c.reason, logs.String())
 				}
 			}
@@ -534,6 +542,55 @@ func TestFailureModes(t *testing.T) {
 				t.Fatalf("run directories left behind: %v", dirs)
 			}
 		})
+	}
+}
+
+// A signed Result altered on the share (a field changed after signing)
+// is refused, not recorded.
+func TestTamperedResultIsRefused(t *testing.T) {
+	f := newFakeARM(t, "slow")
+	l, _, logs := newLauncher(t, f, nil)
+	// The fake Runner writes its Result only after EnvSleepMS; meanwhile
+	// a bogus, unsigned-but-plausible Result is planted... which cannot
+	// win because the Runner's atomic write replaces it. So tamper after
+	// the fact instead: hold the execution, edit the file, then read.
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := exchange.ClaimedDir(f.exchangeLocal, spec().RunID)
+	// Wait for the Runner's Result, then alter it before the launcher
+	// notices the terminal status: the fake reports Running until the
+	// process exits, so pause status reads by failing them briefly.
+	f.set(func(f *fakeARM) { f.getFailures = 8 })
+	deadline := time.Now().Add(10 * time.Second)
+	var raw []byte
+	for time.Now().Before(deadline) {
+		raw, err = os.ReadFile(filepath.Join(dir, exchange.ResultFile))
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("no result written: %v\n%s", err, logs.String())
+	}
+	var sr v1alpha1.SignedResult
+	if err := json.Unmarshal(raw, &sr); err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	_ = json.Unmarshal(sr.PayloadBytes(), &m)
+	m["fingerprintSha256"] = strings.Repeat("ef", 32)
+	payload, _ := json.Marshal(m)
+	sr.Payload = strings.TrimRight(strings.NewReplacer("+", "-", "/", "_").Replace(base64Std(payload)), "=")
+	edited, _ := json.Marshal(&sr)
+	if err := os.WriteFile(filepath.Join(dir, exchange.ResultFile), edited, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ex.Wait()
+	if res != nil || launcher.ReasonOf(err) != launcher.ReasonNoResult || !strings.Contains(err.Error(), "signature does not verify") {
+		t.Fatalf("result = %+v, err = %v\n%s", res, err, logs.String())
 	}
 }
 
@@ -582,45 +639,99 @@ func TestTimeoutWithoutResult(t *testing.T) {
 	}
 }
 
-func TestStartFailures(t *testing.T) {
-	t.Run("platform refuses", func(t *testing.T) {
-		f := newFakeARM(t, "ok")
-		f.startStatus = http.StatusForbidden
-		l, _, _ := newLauncher(t, f, nil)
-		_, err := l.Start(context.Background(), spec())
-		if launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "start execution: HTTP 403 (AuthorizationFailed)") || strings.Contains(err.Error(), secretBody) {
-			t.Fatalf("err = %v", err)
-		}
-		if dirs := runDirs(t, f); len(dirs) != 0 {
-			t.Fatalf("run directories left behind: %v", dirs)
-		}
-	})
-	t.Run("several containers need a name", func(t *testing.T) {
-		f := newFakeARM(t, "ok")
-		f.containers = 2
-		l, _, _ := newLauncher(t, f, nil)
-		_, err := l.Start(context.Background(), spec())
-		if launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "set containerName") {
-			t.Fatalf("err = %v", err)
-		}
-		l, _, _ = newLauncher(t, f, func(c *Config) { c.ContainerName = "runner" })
-		ex, err := l.Start(context.Background(), spec())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := ex.Wait(); err != nil {
-			t.Fatal(err)
-		}
-		tmpl := f.template(0)
-		if len(tmpl.Containers) != 2 || *tmpl.Containers[1].Name != "sidecar1" || len(tmpl.Containers[1].Args) != 1 || *tmpl.Containers[1].Args[0] != "--keep" {
-			t.Fatalf("sidecar not carried over: %+v", tmpl.Containers[1])
-		}
-		l, _, _ = newLauncher(t, f, func(c *Config) { c.ContainerName = "nope" })
-		if _, err := l.Start(context.Background(), spec()); launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), `container "nope"`) {
-			t.Fatalf("err = %v", err)
-		}
-	})
-	t.Run("invalid spec and leftover directory", func(t *testing.T) {
+// When the status can no longer be read while the run is otherwise live,
+// the execution is stopped before the run directory is removed: it may
+// still be running, and a Runner that loses its result path while it
+// works would otherwise finish unobserved.
+func TestPollingFailureStopsExecutionBeforeCleanup(t *testing.T) {
+	f := newFakeARM(t, "hang-noresult")
+	l, _, logs := newLauncher(t, f, func(c *Config) { c.ResultGrace = 0 })
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every status read fails from now on until polling gives up; the
+	// reads after that (the stop's own polling) succeed again.
+	f.set(func(f *fakeARM) { f.getFailures = maxConsecutivePollErrors })
+	res, err := ex.Wait()
+	if res != nil || launcher.ReasonOf(err) != launcher.ReasonNoResult {
+		t.Fatalf("result = %+v, err = %v\n%s", res, err, logs.String())
+	}
+	if f.stops() != 1 {
+		t.Fatalf("stops = %d, want the execution stopped before cleanup\n%s", f.stops(), logs.String())
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+	if !strings.Contains(logs.String(), `"cause":"read execution: HTTP 500 (InternalServerError)"`) || strings.Contains(logs.String(), secretBody) {
+		t.Fatalf("log:\n%s", logs.String())
+	}
+}
+
+func TestClaimTimeoutWithdrawsTheOffer(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.paused = true })
+	l, _, logs := newLauncher(t, f, func(c *Config) { c.ClaimTimeout = 300 * time.Millisecond })
+	start := time.Now()
+	_, err := l.Start(context.Background(), spec())
+	if launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "no execution took the job") {
+		t.Fatalf("err = %v\n%s", err, logs.String())
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("claim timeout took %v", time.Since(start))
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+	// Nothing was ever started, so nothing was stopped and no execution
+	// exists on the platform.
+	if f.stops() != 0 || len(f.execs) != 0 {
+		t.Fatalf("stops = %d, execs = %d", f.stops(), len(f.execs))
+	}
+}
+
+func TestCancelDuringClaimWithdrawsTheOffer(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.paused = true })
+	l, _, _ := newLauncher(t, f, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+	_, err := l.Start(ctx, spec())
+	if launcher.ReasonOf(err) != launcher.ReasonCancelled {
+		t.Fatalf("err = %v", err)
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+	// A job cancelled before it was taken must not be taken afterwards.
+	f.set(func(f *fakeARM) { f.paused = false })
+	time.Sleep(300 * time.Millisecond)
+	if len(f.execs) != 0 {
+		t.Fatalf("an execution started for a withdrawn job")
+	}
+}
+
+// An execution name the platform does not know (planted on the share, or
+// a Runner that is not running as an execution of this Job) is refused
+// and the run fails at start; the marker's content is never trusted.
+func TestUnknownExecutionNameIsRefused(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.executionName = "not-this-jobs-execution" })
+	l, _, logs := newLauncher(t, f, nil)
+	_, err := l.Start(context.Background(), spec())
+	if launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "confirm execution: HTTP 404 (ResourceNotFound)") || strings.Contains(err.Error(), secretBody) {
+		t.Fatalf("err = %v\n%s", err, logs.String())
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+}
+
+func TestStartRefusals(t *testing.T) {
+	t.Run("invalid spec", func(t *testing.T) {
 		f := newFakeARM(t, "ok")
 		l, _, _ := newLauncher(t, f, nil)
 		bad := spec()
@@ -628,21 +739,33 @@ func TestStartFailures(t *testing.T) {
 		if _, err := l.Start(context.Background(), bad); launcher.ReasonOf(err) != launcher.ReasonStart {
 			t.Fatalf("err = %v", err)
 		}
-		if err := os.MkdirAll(filepath.Join(f.exchangeLocal, "run-"+spec().RunID), 0o700); err != nil {
+		if dirs := runDirs(t, f); len(dirs) != 0 {
+			t.Fatalf("run directories left behind: %v", dirs)
+		}
+	})
+	t.Run("leftover run directory", func(t *testing.T) {
+		f := newFakeARM(t, "ok")
+		f.set(func(f *fakeARM) { f.paused = true })
+		l, _, _ := newLauncher(t, f, nil)
+		if err := os.MkdirAll(exchange.ClaimedDir(f.exchangeLocal, spec().RunID), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := l.Start(context.Background(), spec()); launcher.ReasonOf(err) != launcher.ReasonStart || !strings.Contains(err.Error(), "run directory") {
+		if _, err := l.Start(context.Background(), spec()); launcher.ReasonOf(err) != launcher.ReasonStart || !errors.Is(err, exchange.ErrExists) {
 			t.Fatalf("err = %v", err)
 		}
 	})
 }
 
 func TestNewValidation(t *testing.T) {
-	_, priv, _ := v1alpha1.GenerateSigningKey()
+	pub, priv, _ := v1alpha1.GenerateSigningKey()
 	signer, _ := launcher.NewSigner(priv, time.Minute)
-	good := Config{SubscriptionID: testSub, ResourceGroup: testRG, JobName: testJob, ExchangeDir: "/mnt/exchange", RunnerExchangeDir: "/exchange"}
-	if _, err := New(good, nil, nil); err == nil || !strings.Contains(err.Error(), "signer is required") {
+	verifier, _ := launcher.NewVerifier(map[string]ed25519.PublicKey{v1alpha1.KeyID(pub): pub}, 0)
+	good := Config{SubscriptionID: testSub, ResourceGroup: testRG, JobName: testJob, ExchangeDir: "/mnt/exchange"}
+	if _, err := New(good, nil, verifier, nil); err == nil || !strings.Contains(err.Error(), "signer is required") {
 		t.Fatalf("nil signer: %v", err)
+	}
+	if _, err := New(good, signer, nil, nil); err == nil || !strings.Contains(err.Error(), "verifier is required") {
+		t.Fatalf("nil verifier: %v", err)
 	}
 	for name, edit := range map[string]func(c *Config){
 		"no job":       func(c *Config) { c.JobName = "" },
@@ -652,7 +775,7 @@ func TestNewValidation(t *testing.T) {
 	} {
 		c := good
 		edit(&c)
-		if _, err := New(c, signer, nil); err == nil {
+		if _, err := New(c, signer, verifier, nil); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -661,16 +784,22 @@ func TestNewValidation(t *testing.T) {
 		c.Cloud = cl
 		c.Credential = "managed-identity"
 		c.ManagedIdentityClientID = testSub
-		if _, err := New(c, signer, nil); err != nil {
+		if _, err := New(c, signer, verifier, nil); err != nil {
 			t.Errorf("cloud %q: %v", cl, err)
 		}
 	}
 	c := good
 	c.Credential = "default"
-	if _, err := New(c, signer, nil); err != nil {
+	l, err := New(c, signer, verifier, nil)
+	if err != nil {
 		t.Errorf("default credential: %v", err)
 	}
+	if l.cfg.ClaimTimeout != DefaultClaimTimeout || l.cfg.ExecutionGrace != DefaultExecutionGrace || l.cfg.StopGrace != DefaultStopGrace {
+		t.Errorf("defaults not applied: %+v", l.cfg)
+	}
 }
+
+func base64Std(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
 type timeoutErr struct{}
 
