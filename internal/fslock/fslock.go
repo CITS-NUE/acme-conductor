@@ -46,9 +46,38 @@ const (
 	maxPoll = 100 * time.Millisecond
 )
 
+// ErrLocked is returned (wrapped) by TryExclusive when another holder has
+// the lock.
+var ErrLocked = errors.New("lock is held elsewhere")
+
 // Lock is a held advisory lock; Unlock releases it.
 type Lock struct {
 	f *os.File
+}
+
+// TryExclusive takes an exclusive lock on path without waiting: it returns
+// ErrLocked when the lock is held elsewhere. A long-lived process that
+// must be the only one operating on a state directory or database takes
+// its ownership lock this way and exits when it cannot.
+func TryExclusive(path string) (*Lock, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return &Lock{f: f}, nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("lock %s: %w", path, ErrLocked)
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
 }
 
 // Exclusive takes an exclusive (writer) lock on path, creating the lock

@@ -587,3 +587,297 @@ func TestSanitize(t *testing.T) {
 		t.Fatalf("len = %d", len(got))
 	}
 }
+
+// flakyRegistry injects UpdateRun failures. fail receives the status being
+// recorded and the status expected; a non-nil error is returned instead of
+// performing the update.
+type flakyRegistry struct {
+	registry.Registry
+	mu    sync.Mutex
+	fail  func(status, expected registry.RunStatus) error
+	calls int
+}
+
+func (r *flakyRegistry) UpdateRun(ctx context.Context, run *registry.Run, expected registry.RunStatus, ev *registry.AuditEvent) error {
+	r.mu.Lock()
+	r.calls++
+	fail := r.fail
+	r.mu.Unlock()
+	if fail != nil {
+		if err := fail(run.Status, expected); err != nil {
+			return err
+		}
+	}
+	return r.Registry.UpdateRun(ctx, run, expected, ev)
+}
+
+func (r *flakyRegistry) setFail(fail func(status, expected registry.RunStatus) error) {
+	r.mu.Lock()
+	r.fail = fail
+	r.mu.Unlock()
+}
+
+// flaky wraps the fixture's registry so UpdateRun can be made to fail.
+func (f *fixture) flaky() *flakyRegistry {
+	fr := &flakyRegistry{Registry: f.reg}
+	f.s.reg = fr
+	f.s.recordRetry = time.Millisecond
+	f.s.recordWindow = 2 * time.Second
+	return fr
+}
+
+func (f *fixture) assertNextRunRegistrable(t *testing.T) {
+	t.Helper()
+	next := &registry.Run{TargetID: f.target.ID, TargetRevision: f.target.Revision, RequestedBy: "operator"}
+	if err := f.reg.CreateRun(context.Background(), next, nil); err != nil {
+		t.Fatalf("next run could not be registered: %v", err)
+	}
+}
+
+// The start transition (starting -> running) fails once with a transient
+// error while the Runner is already executing. The outcome must still be
+// recorded, with the full audit trail, whether the Runner succeeds or
+// fails, and the target must accept a new run afterwards.
+func TestStartRecordFailureOnceStillFinalizes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result func(spec *v1alpha1.JobSpec) *v1alpha1.Result
+		status registry.RunStatus
+		audit  registry.AuditAction
+	}{
+		{"runner succeeds", func(spec *v1alpha1.JobSpec) *v1alpha1.Result { return okResult(spec, v1alpha1.ActionIssued, 90) }, registry.RunSucceeded, registry.AuditRunSucceeded},
+		{"runner fails", func(spec *v1alpha1.JobSpec) *v1alpha1.Result {
+			return failResult(spec, v1alpha1.ErrorCodeACMEFailure, "order failed")
+		}, registry.RunFailed, registry.AuditRunFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t, 1)
+			fr := f.flaky()
+			failures := 0
+			fr.setFail(func(status, expected registry.RunStatus) error {
+				if status == registry.RunRunning && expected == registry.RunStarting && failures == 0 {
+					failures++
+					return errors.New("database is locked")
+				}
+				return nil
+			})
+			f.fake.respond = func(ctx context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+				return tc.result(spec), nil
+			}
+			if planned, started := f.cycle(t); planned != 1 || started != 1 {
+				t.Fatalf("planned %d started %d", planned, started)
+			}
+			run := f.lastRun(t)
+			if run.Status != tc.status || run.FinishedAt == nil || run.StartedAt == nil || run.ExternalExecutionID != "fake:"+run.ID {
+				t.Fatalf("run = %+v", run)
+			}
+			want := []registry.AuditAction{registry.AuditRunRequested, registry.AuditRunStarted, tc.audit}
+			if got := f.auditActions(t, run.ID); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+				t.Fatalf("audit = %v, want %v", got, want)
+			}
+			f.assertNextRunRegistrable(t)
+		})
+	}
+}
+
+// The start transition never succeeds: the outcome is recorded against
+// starting, the status the registry actually holds.
+func TestStartRecordFailurePersistentFinalizesAgainstStarting(t *testing.T) {
+	f := setup(t, 1)
+	fr := f.flaky()
+	fr.setFail(func(status, expected registry.RunStatus) error {
+		if status == registry.RunRunning {
+			return errors.New("database is locked")
+		}
+		return nil
+	})
+	f.cycle(t)
+	run := f.lastRun(t)
+	if run.Status != registry.RunSucceeded || run.Action != v1alpha1.ActionIssued || run.StartedAt == nil {
+		t.Fatalf("run = %+v", run)
+	}
+	if got := f.auditActions(t, run.ID); len(got) != 2 || got[0] != registry.AuditRunRequested || got[1] != registry.AuditRunSucceeded {
+		t.Fatalf("audit = %v", got)
+	}
+	f.assertNextRunRegistrable(t)
+}
+
+// A terminal transition that fails transiently is retried until it lands.
+func TestOutcomeRecordingRetriesTransientErrors(t *testing.T) {
+	f := setup(t, 1)
+	fr := f.flaky()
+	var mu sync.Mutex
+	attempts := 0
+	fr.setFail(func(status, expected registry.RunStatus) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if status == registry.RunSucceeded {
+			attempts++
+			if attempts <= 3 {
+				return errors.New("disk I/O error")
+			}
+		}
+		return nil
+	})
+	f.cycle(t)
+	run := f.lastRun(t)
+	if run.Status != registry.RunSucceeded {
+		t.Fatalf("run = %+v", run)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+	if got := f.auditActions(t, run.ID); len(got) != 3 || got[2] != registry.AuditRunSucceeded {
+		t.Fatalf("audit = %v", got)
+	}
+}
+
+// The start write commits but reports an error (a timeout after commit).
+// The scheduler's view (starting) is stale; the conflict on the terminal
+// write must be resolved by re-reading the registry, without duplicating
+// the run.started audit event.
+func TestConflictRereadsRegistryStatus(t *testing.T) {
+	f := setup(t, 1)
+	fr := f.flaky()
+	committed := 0
+	fr.setFail(func(status, expected registry.RunStatus) error {
+		if status == registry.RunRunning && expected == registry.RunStarting {
+			committed++
+			if committed == 1 {
+				// Apply the update for real, then report failure.
+				r, err := f.reg.GetRun(context.Background(), f.lastRun(t).ID)
+				if err != nil {
+					return err
+				}
+				r.Status = registry.RunRunning
+				if err := f.reg.UpdateRun(context.Background(), r, registry.RunStarting, &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunStarted, Detail: "committed"}); err != nil {
+					return err
+				}
+				return errors.New("connection lost after commit")
+			}
+		}
+		return nil
+	})
+	f.cycle(t)
+	run := f.lastRun(t)
+	if run.Status != registry.RunSucceeded {
+		t.Fatalf("run = %+v", run)
+	}
+	if got := f.auditActions(t, run.ID); len(got) != 3 || got[0] != registry.AuditRunRequested || got[1] != registry.AuditRunStarted || got[2] != registry.AuditRunSucceeded {
+		t.Fatalf("audit = %v", got)
+	}
+	f.assertNextRunRegistrable(t)
+}
+
+// When every attempt to record the outcome fails within the window, the
+// run is left active by the execution and closed by the sweep at the next
+// loop iteration, which frees the target for its next run.
+func TestSweepClosesRunWhoseOutcomeCouldNotBeRecorded(t *testing.T) {
+	f := setup(t, 1)
+	fr := f.flaky()
+	f.s.recordWindow = 20 * time.Millisecond
+	fr.setFail(func(status, expected registry.RunStatus) error {
+		if !status.Active() {
+			return errors.New("database is locked")
+		}
+		return nil
+	})
+	f.cycle(t)
+	run := f.lastRun(t)
+	if run.Status != registry.RunRunning {
+		t.Fatalf("run after exhausted recording = %+v", run)
+	}
+	next := &registry.Run{TargetID: f.target.ID, TargetRevision: f.target.Revision, RequestedBy: "operator"}
+	if err := f.reg.CreateRun(context.Background(), next, nil); !errors.Is(err, registry.ErrRunActive) {
+		t.Fatalf("CreateRun while the stranded run is active = %v", err)
+	}
+	fr.setFail(nil)
+	n, err := f.s.sweep(context.Background(), strandedSummary, "run marked failed by the scheduler: ")
+	if err != nil || n != 1 {
+		t.Fatalf("sweep = %d, %v", n, err)
+	}
+	run = f.lastRun(t)
+	if run.Status != registry.RunFailed || run.ErrorCode != v1alpha1.ErrorCodeInternal || run.ErrorSummary != strandedSummary || run.FinishedAt == nil {
+		t.Fatalf("swept run = %+v", run)
+	}
+	if got := f.auditActions(t, run.ID); len(got) != 3 || got[2] != registry.AuditRunFailed {
+		t.Fatalf("audit = %v", got)
+	}
+	f.assertNextRunRegistrable(t)
+}
+
+// The sweep never touches a run this process is executing.
+func TestSweepSkipsExecutingRuns(t *testing.T) {
+	f := setup(t, 1)
+	f.fake.respond = func(ctx context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+		<-ctx.Done()
+		return failResult(spec, v1alpha1.ErrorCodeCancelled, "cancelled"), nil
+	}
+	ctx := context.Background()
+	if _, err := f.s.Plan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if started, err := f.s.Dispatch(ctx); err != nil || started != 1 {
+		t.Fatalf("dispatch = %d, %v", started, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for f.lastRun(t).Status != registry.RunRunning {
+		if time.Now().After(deadline) {
+			t.Fatalf("run never reached running: %+v", f.lastRun(t))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n, err := f.s.sweep(ctx, strandedSummary, "x: "); err != nil || n != 0 {
+		t.Fatalf("sweep = %d, %v", n, err)
+	}
+	if run := f.lastRun(t); run.Status != registry.RunRunning {
+		t.Fatalf("executing run was swept: %+v", run)
+	}
+	f.s.Cancel(f.lastRun(t).ID)
+	f.s.Drain(ctx)
+	if run := f.lastRun(t); run.Status != registry.RunCancelled {
+		t.Fatalf("run = %+v", run)
+	}
+}
+
+// The run loop itself closes a stranded run, without a restart.
+func TestRunLoopSweepsStrandedRuns(t *testing.T) {
+	f := setup(t, 1)
+	ctx := context.Background()
+	stranded := &registry.Run{TargetID: f.target.ID, TargetRevision: 1, RequestedBy: "x"}
+	if err := f.reg.CreateRun(ctx, stranded, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.reg.ClaimQueuedRun(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stranded.Status = registry.RunRunning
+	if err := f.reg.UpdateRun(ctx, stranded, registry.RunStarting, nil); err != nil {
+		t.Fatal(err)
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- f.s.Run(loopCtx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r, err := f.reg.GetRun(ctx, stranded.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Status == registry.RunFailed {
+			if r.ErrorSummary != strandedSummary {
+				t.Fatalf("swept run = %+v", r)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stranded run not swept: %+v", r)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	f.s.Drain(ctx)
+}

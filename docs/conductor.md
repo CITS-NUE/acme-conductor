@@ -62,7 +62,7 @@ signal kills the process outright; see [Shutdown and recovery](#shutdown-and-rec
 |---|---|
 | `0` | Stopped cleanly after a signal. |
 | `1` | The configuration was rejected, or a launcher could not be built from it, or the bound address was not loopback. |
-| `2` | A fatal runtime error: the registry could not be opened or migrated, in-flight runs could not be recovered, the listener could not be bound, or the HTTP server failed. |
+| `2` | A fatal runtime error: another Conductor process owns the database (see [Shutdown and recovery](#shutdown-and-recovery)), the registry could not be opened or migrated, in-flight runs could not be recovered, the listener could not be bound, or the HTTP server failed. |
 
 ## Configuration reference
 
@@ -81,7 +81,7 @@ Top level:
 | `apiVersion` | string | Must equal `acme-conductor.cits-nue.github.io/v1alpha1`. |
 | `kind` | string | Must equal `ConductorConfig`. |
 | `server` | object | Listener, authentication, shutdown — see below. |
-| `database` | object | `{ "path": "..." }` — clean, absolute path of the SQLite file (created `0600` if missing; a symbolic link is refused). Its directory must exist and be writable; SQLite also creates `<path>-wal` and `<path>-shm` next to it. |
+| `database` | object | `{ "path": "..." }` — clean, absolute path of the SQLite file (created `0600` if missing; a symbolic link is refused). Its directory must exist and be writable; SQLite also creates `<path>-wal` and `<path>-shm` next to it, and `serve` holds its ownership lock at `<path>.lock` (see [Shutdown and recovery](#shutdown-and-recovery)). |
 | `scheduler` | object | Pacing — see below. |
 | `executionBindings` | map | At least one. Keys are binding names (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, ≤63 chars). |
 | `acmeBindings` | []string | Non-empty, distinct binding names a policy may select. |
@@ -223,6 +223,35 @@ Request body (`POST`, `PUT`):
 
 Response adds `id`, `createdAt`, `updatedAt`.
 
+**When a policy change takes effect.** A policy is not versioned and
+targets do not carry a policy revision; an update is accepted only if
+every existing target under the policy still satisfies it (`409
+conflict` naming the offending targets otherwise), and the new values are read at each
+target's **next run**. A run is next due when the certificate enters its
+`renewBeforeDays` window, when the target itself changes (its revision
+moves), or when an operator requests one (`POST /targets/{id}/runs`).
+Updating a policy does not by itself queue runs or bump target revisions.
+What each field does at that next run:
+
+- `keyType` — the Runner compares the stored certificate's key type with
+  the requested one and reissues on a mismatch, even if the certificate
+  is otherwise current; so after a `keyType` change, a manual run on each
+  target rotates it now, and the renewal window rotates it later
+  otherwise.
+- `renewBeforeDays` — read by the scheduler at every due check, so a
+  larger window can make targets due at the next tick.
+- `acmeBinding` — selects the CA for the next ACME order only; a current
+  certificate from the previous CA is not reissued on account of the
+  change alone, so a target moves to the new CA at its next renewal (or
+  at a manual run that finds something else to reissue). Phase 2 does
+  not force reissue on a binding change ([ADR 0011](adr/0011-conductor-storage-and-run-model.md)).
+- `allowedDnsSuffixes`, `allowWildcard` — enforced on the update itself
+  against existing targets and on every later target create/update; the
+  Runner re-validates the snapshot it receives.
+
+The `JobSpec` handed to the Runner carries the policy values as a snapshot,
+so the audit trail of a run always shows the values it was executed with.
+
 ### Target
 
 Create:
@@ -360,6 +389,26 @@ curl -s "$C/audit?targetId=$T" | jq '.items[].action'
    (stopped before reporting), or `Internal` (no/unusable/mismatched
    result, could not start). Nothing the Runner printed is copied into a
    run record.
+6. **Recording.** Every status transition is written against the status
+   the registry is known to hold, not the one the scheduler intended, and
+   each write carries its audit event in the same transaction. If the
+   `starting → running` write fails while the Runner is already executing,
+   the scheduler keeps waiting for the Runner and records the outcome
+   against `starting` (after one more attempt to record the start, so the
+   trail carries `run.started` whenever the registry is back). A terminal
+   write that fails transiently is retried with backoff for up to two
+   minutes; a conflict (the registry holds another status than expected,
+   for example after a write that committed but reported an error) is
+   resolved by re-reading the run and retrying against its actual status,
+   never by recording a transition twice. Should the outcome still not be
+   recorded, the run is left `running` by its execution and closed at the
+   next loop iteration by the **sweep**, which marks every `starting` or
+   `running` run this process is not executing as `failed`/`Internal`
+   "run outcome could not be recorded while the runner ran; outcome
+   unknown", so the target's exclusion slot is freed and its next run can
+   be registered. The sweep runs in the loop goroutine only, after
+   dispatch has registered what it claimed, so it never mistakes a run
+   claimed a moment ago for a stranded one.
 
 The Runner stays the authority on whether a certificate must actually be
 issued or renewed (it asks the Store, see [ADR 0009](adr/0009-runner-execution-model.md)):
@@ -373,6 +422,19 @@ continue for up to `server.shutdownGraceSeconds`, then are cancelled (the
 Runner receives `SIGTERM` and normally reports `Cancelled`, `SIGKILL`
 follows after 10 s). A second signal kills the Conductor immediately and
 leaves any Runner child running on its own.
+
+**Exactly one Conductor per database.** Before it opens the registry,
+recovers anything or binds its port, `serve` takes an exclusive advisory
+lock (`flock`) on `<database.path>.lock`. If another process holds it,
+`serve` logs "another conductor process owns this database; refusing to
+start" and exits with code `2` without having changed any state — in
+particular without marking the owner's in-flight runs failed. The lock is
+released when the process exits (also on a crash: the kernel drops it with
+the descriptor), so a restart owns the database again. The database path
+must be on a local filesystem for the lock to be meaningful (`flock`
+semantics on network filesystems vary; the same caveat as for the
+Runner's `internal/fslock`). A second instance on another port with the
+same `database.path` is therefore refused, not merely a port clash.
 
 At start, runs still `starting` or `running` in the registry are marked
 `failed` with `Internal` — "conductor stopped while the run was in flight;
@@ -463,7 +525,9 @@ resolved configuration (it has none), or anything from the Runner's
   ([architecture](architecture.md#validation-vs-authorization)).
 - Per-target exclusion, optimistic locking on `revision`, and the
   re-check before start keep a stale or duplicate request from being
-  actioned (threat model T7).
+  actioned (threat model T7); the database ownership lock keeps a second
+  Conductor process from planning against the same registry or marking
+  the owner's runs failed.
 - The audit log is append-only and written atomically with each change;
   targets, runs and policies cannot be deleted ([ADR 0008](adr/0008-no-purge-in-mvp.md)).
 - The Runner child gets an explicit environment (only `passthroughEnv`
@@ -487,7 +551,13 @@ resolved configuration (it has none), or anything from the Runner's
   duplicate ACME order is not prevented).
 - **Single process, single connection.** The registry serializes every
   statement; that is fine for hundreds of targets and one operator, not
-  for a busy multi-tenant API. Multi-replica is a non-goal.
+  for a busy multi-tenant API. Multi-replica is a non-goal, and the
+  ownership lock makes a second process on the same database a startup
+  error rather than a supported shape.
+- **Policy changes are not versioned or pushed.** A policy update applies
+  at each target's next run (see [Policy](#policy)); an `acmeBinding`
+  change does not force reissue of current certificates, and there is no
+  policy revision on runs, only the snapshot in each `JobSpec`.
 - **No `JobSpec` signing or replay check** (Phase 4); the local launcher
   hands the document to the Runner over a private directory, but nothing
   authenticates it end to end.

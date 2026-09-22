@@ -15,6 +15,9 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/fakerunner"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 )
 
 func TestMain(m *testing.M) {
@@ -83,22 +86,26 @@ func TestServeRejectsBadConfig(t *testing.T) {
 // (this test binary re-executed with ACME_CONDUCTOR_FAKE_RUNNER=1),
 // registers a policy and a target over the API and watches the scheduler
 // drive a run to success. No network beyond loopback, no ACME CA.
-func TestServeEndToEnd(t *testing.T) {
+// writeTestConfig writes a Conductor configuration under dir that runs
+// this test binary as a fake Runner (ACME_CONDUCTOR_FAKE_RUNNER=1) and
+// returns the configuration and database paths.
+func writeTestConfig(t *testing.T, dir string) (cfgPath, dbPath string) {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
 	runnerCfg := filepath.Join(dir, "runner-config.json")
 	if err := os.WriteFile(runnerCfg, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfgPath := filepath.Join(dir, "conductor.json")
+	cfgPath = filepath.Join(dir, "conductor.json")
+	dbPath = filepath.Join(dir, "conductor.db")
 	cfg := `{
   "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
   "kind": "ConductorConfig",
   "server": {"listen": "127.0.0.1:0", "auth": {"mode": "localhost-dev"}, "shutdownGraceSeconds": 30},
-  "database": {"path": "` + filepath.Join(dir, "conductor.db") + `"},
+  "database": {"path": "` + dbPath + `"},
   "scheduler": {"tickSeconds": 1, "maxConcurrentRuns": 2, "retryBackoffSeconds": 1, "maxRetryBackoffSeconds": 2},
   "executionBindings": {"local": {"type": "local-process", "localProcess": {
     "runnerBinary": "` + self + `", "runnerConfig": "` + runnerCfg + `", "workDir": "` + filepath.Join(dir, "runs") + `",
@@ -110,44 +117,56 @@ func TestServeEndToEnd(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("ACME_CONDUCTOR_FAKE_RUNNER", "1")
-	t.Setenv("FAKE_RUNNER_MODE", "ok")
+	return cfgPath, dbPath
+}
 
-	start := func(t *testing.T) (base string, stop func() int) {
-		t.Helper()
-		ctx, cancel := context.WithCancel(context.Background())
-		addrCh := make(chan net.Addr, 1)
-		done := make(chan int, 1)
-		var logs bytes.Buffer
-		go func() {
-			done <- conductor.Serve(ctx, conductor.Options{
-				ConfigPath: cfgPath,
-				Logger:     newTestLogger(&logs),
-				Listening:  func(a net.Addr) { addrCh <- a },
-			})
-		}()
+// startServe runs Serve in the background until stop is called; stop
+// returns the exit code.
+func startServe(t *testing.T, cfgPath string) (base string, stop func() int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	addrCh := make(chan net.Addr, 1)
+	done := make(chan int, 1)
+	var logs bytes.Buffer
+	go func() {
+		done <- conductor.Serve(ctx, conductor.Options{
+			ConfigPath: cfgPath,
+			Logger:     newTestLogger(&logs),
+			Listening:  func(a net.Addr) { addrCh <- a },
+		})
+	}()
+	select {
+	case a := <-addrCh:
+		base = "http://" + a.String()
+	case code := <-done:
+		t.Fatalf("Serve exited early with %d: %s", code, logs.String())
+	case <-time.After(20 * time.Second):
+		t.Fatalf("Serve did not start: %s", logs.String())
+	}
+	return base, func() int {
+		cancel()
 		select {
-		case a := <-addrCh:
-			base = "http://" + a.String()
 		case code := <-done:
-			t.Fatalf("Serve exited early with %d: %s", code, logs.String())
-		case <-time.After(20 * time.Second):
-			t.Fatalf("Serve did not start: %s", logs.String())
-		}
-		return base, func() int {
-			cancel()
-			select {
-			case code := <-done:
-				if t.Failed() {
-					t.Logf("conductor log:\n%s", logs.String())
-				}
-				return code
-			case <-time.After(60 * time.Second):
-				t.Fatalf("Serve did not stop: %s", logs.String())
-				return -1
+			if t.Failed() {
+				t.Logf("conductor log:\n%s", logs.String())
 			}
+			return code
+		case <-time.After(60 * time.Second):
+			t.Fatalf("Serve did not stop: %s", logs.String())
+			return -1
 		}
 	}
+}
+
+// TestServeEndToEnd starts the whole Conductor against a fake Runner
+// (this test binary re-executed with ACME_CONDUCTOR_FAKE_RUNNER=1),
+// registers a policy and a target over the API and watches the scheduler
+// drive a run to success. No network beyond loopback, no ACME CA.
+func TestServeEndToEnd(t *testing.T) {
+	cfgPath, _ := writeTestConfig(t, t.TempDir())
+	t.Setenv("ACME_CONDUCTOR_FAKE_RUNNER", "1")
+	t.Setenv("FAKE_RUNNER_MODE", "ok")
+	start := func(t *testing.T) (string, func() int) { return startServe(t, cfgPath) }
 
 	base, stop := start(t)
 	call := func(method, path string, body any) (int, map[string]any) {
@@ -239,4 +258,108 @@ func TestServeEndToEnd(t *testing.T) {
 	if code := stop(); code != conductor.ExitOK {
 		t.Fatalf("Serve exit = %d", code)
 	}
+}
+
+// TestServeRequiresDatabaseOwnership: a Conductor whose database is owned
+// by another process exits with ExitFatal before it recovers, plans or
+// serves anything, so a run the owner has in flight is left untouched;
+// and a second Conductor on the same database (on its own port) is
+// refused while the first one runs.
+func TestServeRequiresDatabaseOwnership(t *testing.T) {
+	cfgPath, dbPath := writeTestConfig(t, t.TempDir())
+	t.Setenv("ACME_CONDUCTOR_FAKE_RUNNER", "1")
+	t.Setenv("FAKE_RUNNER_MODE", "ok")
+	ctx := context.Background()
+
+	// Seed a running run, as an owner process would have it mid-flight.
+	reg, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := &registry.Policy{AllowedDnsSuffixes: []string{"example.ac.jp"}, ACMEBinding: "fake-ca", RenewBeforeDays: 30, KeyType: "ec256", MaxSANs: 1, Enabled: true}
+	if err := reg.CreatePolicy(ctx, policy, nil); err != nil {
+		t.Fatal(err)
+	}
+	target := &registry.Target{FQDN: "wiki.example.ac.jp", Enabled: true, Owner: "web", PolicyRef: policy.ID, ExecutionBinding: "local", DNSBinding: "fake-dns", StoreBinding: "filesystem-dev"}
+	if err := reg.CreateTarget(ctx, target, nil); err != nil {
+		t.Fatal(err)
+	}
+	run := &registry.Run{TargetID: target.ID, TargetRevision: target.Revision, RequestedBy: "owner"}
+	if err := reg.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.ClaimQueuedRun(ctx); err != nil {
+		t.Fatal(err)
+	}
+	run.Status = registry.RunRunning
+	if err := reg.UpdateRun(ctx, run, registry.RunStarting, nil); err != nil {
+		t.Fatal(err)
+	}
+	reg.Close()
+	runIs := func(t *testing.T, want registry.RunStatus) {
+		t.Helper()
+		reg, err := sqlite.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reg.Close()
+		got, err := reg.GetRun(ctx, run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != want {
+			t.Fatalf("run status = %s, want %s", got.Status, want)
+		}
+		events, err := reg.ListAudit(ctx, registry.ListAuditOptions{RunID: run.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ev := range events {
+			if ev.Action == registry.AuditRunFailed && want != registry.RunFailed {
+				t.Fatalf("run was recovered by a process that does not own the database: %+v", ev)
+			}
+		}
+	}
+
+	// The lock is held elsewhere: Serve must exit before touching state.
+	held, err := fslock.TryExclusive(conductor.LockPath(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	code := conductor.Serve(ctx, conductor.Options{
+		ConfigPath: cfgPath, Logger: newTestLogger(&logs),
+		Listening: func(a net.Addr) { t.Errorf("Serve listened on %s without owning the database", a) },
+	})
+	if code != conductor.ExitFatal || !strings.Contains(logs.String(), "another conductor process owns this database") {
+		t.Fatalf("Serve with the lock held: exit %d, log %s", code, logs.String())
+	}
+	runIs(t, registry.RunRunning)
+	held.Unlock()
+
+	// A live Conductor owns the lock: a second one on the same database is
+	// refused, the first keeps serving and is the one that recovers.
+	base, stop := startServe(t, cfgPath)
+	logs.Reset()
+	if code := conductor.Serve(ctx, conductor.Options{ConfigPath: cfgPath, Logger: newTestLogger(&logs)}); code != conductor.ExitFatal {
+		t.Fatalf("second Serve: exit %d, log %s", code, logs.String())
+	}
+	res, err := http.Get(base + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("first conductor readyz = %d after the second one was refused", res.StatusCode)
+	}
+	if code := stop(); code != conductor.ExitOK {
+		t.Fatalf("Serve exit = %d", code)
+	}
+	runIs(t, registry.RunFailed)
+	// The lock is released on exit, so a restart owns the database again.
+	l, err := fslock.TryExclusive(conductor.LockPath(dbPath))
+	if err != nil {
+		t.Fatalf("lock not released after Serve returned: %v", err)
+	}
+	l.Unlock()
 }

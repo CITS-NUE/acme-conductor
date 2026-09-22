@@ -85,12 +85,44 @@ needs answers to several coupled questions:
   `SIGKILL` after a grace period. It is a development shape: the only way
   a DNS credential can reach the Runner through it is `passthroughEnv`,
   which means the Conductor's own environment carries that credential.
+- **One process owns a registry.** `serve` takes an exclusive advisory
+  lock on `<database.path>.lock` before it opens the database, recovers
+  anything or binds a port, and exits (code 2) without touching state
+  when another process holds it. SQLite itself would let two processes
+  share the file; what must be exclusive is the scheduler's view of which
+  runs are in flight, since a second process would otherwise mark the
+  first one's runs failed at its own startup and both would plan and
+  dispatch against the same targets. The lock is `flock`-based like the
+  Runner's (`internal/fslock`), so a crashed owner leaves nothing stale.
+- **Recording follows the registry, not the scheduler's intent.** Each
+  transition is written against the status the registry is known to hold
+  (`expectedStatus`) and carries its audit event in the same transaction.
+  A failed `starting → running` write while the Runner is already running
+  is not fatal to the run: the outcome is later recorded against
+  `starting`, after one more attempt to record the start. Terminal writes
+  that fail transiently are retried with backoff for a bounded window;
+  `ErrConflict` is resolved by re-reading the run and retrying against its
+  actual status (a transition found already committed is not recorded
+  twice). A run whose outcome still cannot be recorded is closed by the
+  loop's sweep — every `starting`/`running` run the process is not
+  executing becomes `failed`/"outcome unknown" — which is the same
+  operation startup recovery performs, so a stranded run never holds a
+  target's exclusion slot until the next restart.
 - **Shutdown and recovery.** On shutdown the API stops, planning stops,
   and in-flight runs are given `server.shutdownGraceSeconds` to finish
   before they are cancelled. Runs still `starting` or `running` when a
   process starts (a crash, a hard kill, an expired grace) are marked
   `failed` with `Internal` "outcome unknown" and audited; they are never
   resumed, because the Conductor cannot know whether the Runner finished.
+- **Policy changes apply at the next run.** Policies are not versioned;
+  an update must keep every existing target valid, and its values are
+  read when a target's next run is planned (`renewBeforeDays`) and
+  executed (`keyType`, `acmeBinding`, copied into the `JobSpec`
+  snapshot). The Runner reissues a current certificate whose key type
+  differs from the requested one, so a `keyType` change rotates a target
+  at its next run (manual or renewal). An `acmeBinding` change only
+  selects the CA for the next order; forcing reissue of current
+  certificates on a CA change is deferred until a phase needs it.
 - **What the Conductor knows about a certificate** is exactly the last
   successful `Result` for the target: expiry, fingerprint and logical
   store object name. It never opens the Store.

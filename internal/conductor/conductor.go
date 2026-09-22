@@ -4,6 +4,13 @@
 // Serve runs until its context is cancelled, then stops accepting API
 // requests, stops planning new runs, and waits for in-flight runs up to
 // server.shutdownGraceSeconds before cancelling them.
+//
+// Exactly one Conductor process may operate a registry: Serve takes an
+// exclusive advisory lock next to the database file before it opens the
+// database or changes any state, and exits (ExitFatal) when another
+// process holds it. Without that lock a second process would mark the
+// first one's in-flight runs failed at its own startup recovery and both
+// would plan and dispatch runs against the same targets.
 package conductor
 
 import (
@@ -23,6 +30,7 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 )
 
 // Exit codes of Serve.
@@ -43,6 +51,10 @@ type Options struct {
 	LookupEnv func(string) (string, bool)
 }
 
+// LockPath returns the path of the ownership lock Serve holds for the
+// database at dbPath.
+func LockPath(dbPath string) string { return dbPath + ".lock" }
+
 // Serve runs the Conductor until ctx is done and returns the exit code.
 func Serve(ctx context.Context, opts Options) int {
 	log := opts.Logger
@@ -54,6 +66,18 @@ func Serve(ctx context.Context, opts Options) int {
 		log.Error("configuration rejected", "path", opts.ConfigPath, "error", err.Error())
 		return ExitConfig
 	}
+	// Ownership first: nothing below may run, and no state may change,
+	// unless this process is the only Conductor on this registry.
+	lock, err := fslock.TryExclusive(LockPath(cfg.Database.Path))
+	if err != nil {
+		if errors.Is(err, fslock.ErrLocked) {
+			log.Error("another conductor process owns this database; refusing to start", "path", cfg.Database.Path, "lock", LockPath(cfg.Database.Path))
+		} else {
+			log.Error("database ownership lock could not be taken", "lock", LockPath(cfg.Database.Path), "error", err.Error())
+		}
+		return ExitFatal
+	}
+	defer lock.Unlock()
 	reg, err := sqlite.Open(cfg.Database.Path)
 	if err != nil {
 		log.Error("registry could not be opened", "path", cfg.Database.Path, "error", err.Error())

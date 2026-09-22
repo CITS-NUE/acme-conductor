@@ -193,11 +193,14 @@ One `reconcile` invocation:
 7. Ask the store for the current certificate (`Store.Current`) for
    `store.ObjectName(fqdn)`.
 8. Decide whether anything needs to happen: if a certificate is stored,
-   its SAN list covers the target FQDN, and its `NotAfter` is still after
-   `now + renewBeforeDays`, the run stops here as a **noop** — `lego` is
-   never invoked. Otherwise (no stored certificate, its SANs don't cover
-   the FQDN, or it is due within `renewBeforeDays`) the Runner proceeds to
-   issue.
+   its SAN list covers the target FQDN, it is already valid (`NotBefore`
+   within clock-skew tolerance), its public key is of the policy's
+   `keyType`, and its `NotAfter` is still after `now + renewBeforeDays`,
+   the run stops here as a **noop** — `lego` is never invoked. Otherwise
+   (no stored certificate, its SANs don't cover the FQDN, it is not yet
+   valid, its key type differs from `policy.keyType` — a policy change
+   applied at this run — or it is due within `renewBeforeDays`) the Runner
+   proceeds to issue.
 9. Create a private per-run work directory `<workDir>/run-<runId>-<rand>`
    (mode `0700`).
 10. Copy the `accounts` subtree of `stateDir` into the work directory, so

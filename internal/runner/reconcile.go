@@ -252,7 +252,10 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 		renewBefore := time.Duration(spec.Policy.RenewBeforeDays) * 24 * time.Hour
 		covers := containsFold(current.DNSNames, spec.Target.FQDN)
 		valid := !current.NotBefore.After(now.Add(clockSkewTolerance))
-		if covers && valid && current.NotAfter.After(now.Add(renewBefore)) {
+		// A policy whose keyType changed takes effect at the target's next
+		// run: a stored certificate with another key type is reissued.
+		keyOK := current.KeyType == spec.Policy.KeyType
+		if covers && valid && keyOK && current.NotAfter.After(now.Add(renewBefore)) {
 			log.Info("certificate is current; nothing to do", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 			return &outcome{action: v1alpha1.ActionNoop, info: current, objectRef: object, storeType: st.Type()}, nil
 		}
@@ -261,6 +264,8 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 			log.Warn("stored certificate does not cover the target; reissuing", "fingerprintSha256", current.FingerprintSHA256)
 		case !valid:
 			log.Warn("stored certificate is not yet valid; reissuing", "fingerprintSha256", current.FingerprintSHA256, "notBefore", current.NotBefore.Format(time.RFC3339))
+		case !keyOK:
+			log.Info("stored certificate key type differs from the policy; reissuing", "fingerprintSha256", current.FingerprintSHA256, "storedKeyType", string(current.KeyType), "keyType", string(spec.Policy.KeyType))
 		default:
 			log.Info("certificate is due for renewal", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 		}

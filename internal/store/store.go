@@ -49,6 +49,10 @@ type Info struct {
 	NotBefore         time.Time
 	NotAfter          time.Time
 	DNSNames          []string
+	// KeyType is the policy key type (lego --key-type name) the
+	// certificate's public key corresponds to, or empty when the key is of
+	// no supported type or size.
+	KeyType v1alpha1.KeyType
 }
 
 // Store is the adapter interface implemented per binding type.
@@ -169,7 +173,19 @@ func InfoOf(c *x509.Certificate) *Info {
 		NotBefore:         c.NotBefore.UTC(),
 		NotAfter:          c.NotAfter.UTC(),
 		DNSNames:          append([]string(nil), c.DNSNames...),
+		KeyType:           KeyTypeOf(c),
 	}
+}
+
+// KeyTypeOf returns the policy key type of the certificate's public key,
+// or "" when it is of no supported algorithm or size.
+func KeyTypeOf(c *x509.Certificate) v1alpha1.KeyType {
+	for _, kt := range []v1alpha1.KeyType{v1alpha1.KeyTypeEC256, v1alpha1.KeyTypeEC384, v1alpha1.KeyTypeRSA2048, v1alpha1.KeyTypeRSA3072, v1alpha1.KeyTypeRSA4096} {
+		if KeyMatchesType(c, kt) == nil {
+			return kt
+		}
+	}
+	return ""
 }
 
 // Covers reports whether the certificate's SANs include fqdn exactly.

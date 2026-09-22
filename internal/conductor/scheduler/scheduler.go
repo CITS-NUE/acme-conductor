@@ -9,6 +9,15 @@
 // revision moved on since the run was requested, the run is cancelled
 // instead of started, so a stale request is never actioned
 // (docs/threat-model.md, T7).
+//
+// Bookkeeping is tracked by what the registry actually holds, not by what
+// the scheduler intended: every status transition is attempted against the
+// last status known to be recorded, a conflict re-reads the registry, and
+// a transient failure is retried for a bounded window so a Runner's outcome
+// is not lost to one failed write. A run whose outcome still could not be
+// recorded is closed by the sweep at the next loop iteration (and by
+// Recover at the next start), so the target's exclusion slot is freed and
+// the next run can be registered.
 package scheduler
 
 import (
@@ -40,7 +49,20 @@ type Options struct {
 	MaxRetryBackoff   time.Duration
 	Logger            *slog.Logger
 	Now               func() time.Time
+	// RecordRetry is the initial wait between attempts to record a status
+	// transition that failed with a transient registry error (doubled per
+	// attempt, capped at ten times the initial); RecordWindow bounds the
+	// total time spent retrying one transition. Zero selects the defaults
+	// (DefaultRecordRetry, DefaultRecordWindow).
+	RecordRetry  time.Duration
+	RecordWindow time.Duration
 }
+
+// Defaults for Options.RecordRetry and Options.RecordWindow.
+const (
+	DefaultRecordRetry  = 250 * time.Millisecond
+	DefaultRecordWindow = 2 * time.Minute
+)
 
 // Scheduler runs the planning/dispatch loop.
 type Scheduler struct {
@@ -52,6 +74,9 @@ type Scheduler struct {
 	maxBack   time.Duration
 	log       *slog.Logger
 	now       func() time.Time
+
+	recordRetry  time.Duration
+	recordWindow time.Duration
 
 	wake chan struct{}
 
@@ -85,10 +110,17 @@ func New(o Options) *Scheduler {
 	if o.MaxRetryBackoff < o.RetryBackoff {
 		o.MaxRetryBackoff = o.RetryBackoff
 	}
+	if o.RecordRetry <= 0 {
+		o.RecordRetry = DefaultRecordRetry
+	}
+	if o.RecordWindow <= 0 {
+		o.RecordWindow = DefaultRecordWindow
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		reg: o.Registry, launchers: o.Launchers, tick: o.Tick, maxRuns: o.MaxConcurrentRuns,
 		backoff: o.RetryBackoff, maxBack: o.MaxRetryBackoff, log: o.Logger, now: o.Now,
+		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow,
 		wake: make(chan struct{}, 1), runsCtx: ctx, cancelRuns: cancel, inflight: map[string]context.CancelFunc{},
 	}
 }
@@ -104,6 +136,10 @@ func (s *Scheduler) Wake() {
 
 // Run executes the loop until ctx is done. It does not wait for in-flight
 // executions; call Drain for that.
+//
+// Each iteration plans, dispatches and then sweeps. The sweep runs in this
+// goroutine only, after Dispatch has registered every run it claimed, so
+// it can never mistake a freshly claimed run for a stranded one.
 func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()
@@ -113,6 +149,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 		if _, err := s.Dispatch(ctx); err != nil && ctx.Err() == nil {
 			s.log.Error("scheduler dispatch failed", "error", err.Error())
+		}
+		if _, err := s.sweep(ctx, strandedSummary, "run marked failed by the scheduler: "); err != nil && ctx.Err() == nil {
+			s.log.Error("scheduler sweep failed", "error", err.Error())
 		}
 		select {
 		case <-ctx.Done():
@@ -160,10 +199,29 @@ func (s *Scheduler) Cancel(runID string) bool {
 	return ok
 }
 
+// Summaries recorded on runs whose outcome this process does not know.
+const (
+	recoveredSummary = "conductor stopped while the run was in flight; outcome unknown"
+	strandedSummary  = "run outcome could not be recorded while the runner ran; outcome unknown"
+)
+
 // Recover marks every run left in starting or running by a previous
 // process as failed: their outcome is unknown to this process. Queued runs
-// are left for Dispatch. It returns the number of runs marked.
+// are left for Dispatch. It returns the number of runs marked. It is meant
+// to be called once, before Run, by the process that owns the registry.
 func (s *Scheduler) Recover(ctx context.Context) (int, error) {
+	return s.sweep(ctx, recoveredSummary, "run marked failed at startup: ")
+}
+
+// sweep marks every starting or running run that this process is not
+// executing as failed with summary. Such a run exists when a previous
+// process stopped mid-flight (Recover) or when an execution exhausted its
+// attempts to record the outcome; either way the outcome is unknown, and
+// leaving the run active would hold the target's exclusion slot forever.
+// Runs that another writer closed between the listing and the update are
+// skipped (ErrConflict): the registry's expected-status guard, not the
+// listing, decides.
+func (s *Scheduler) sweep(ctx context.Context, summary, detailPrefix string) (int, error) {
 	active, err := s.reg.ListActiveRuns(ctx)
 	if err != nil {
 		return 0, err
@@ -173,18 +231,28 @@ func (s *Scheduler) Recover(ctx context.Context) (int, error) {
 		if r.Status == registry.RunQueued {
 			continue
 		}
+		s.mu.Lock()
+		_, executing := s.inflight[r.ID]
+		s.mu.Unlock()
+		if executing {
+			continue
+		}
 		now := s.now().UTC()
 		prev := r.Status
 		r.Status = registry.RunFailed
 		r.FinishedAt = &now
 		r.Action = v1alpha1.ActionFailed
 		r.ErrorCode = v1alpha1.ErrorCodeInternal
-		r.ErrorSummary = "conductor stopped while the run was in flight; outcome unknown"
-		ev := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunFailed, Detail: "run marked failed at startup: " + r.ErrorSummary}
-		if err := s.reg.UpdateRun(ctx, r, prev, ev); err != nil {
+		r.ErrorSummary = summary
+		ev := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunFailed, Detail: detailPrefix + summary}
+		err := s.reg.UpdateRun(ctx, r, prev, ev)
+		if errors.Is(err, registry.ErrConflict) {
+			continue
+		}
+		if err != nil {
 			return n, err
 		}
-		s.log.Warn("run recovered as failed", "runId", r.ID, "targetId", r.TargetID, "previousStatus", string(prev))
+		s.log.Warn("stranded run marked failed", "runId", r.ID, "targetId", r.TargetID, "previousStatus", string(prev), "summary", summary)
 		n++
 	}
 	return n, nil
@@ -344,14 +412,18 @@ func (s *Scheduler) Dispatch(ctx context.Context) (int, error) {
 func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	ctx := context.WithoutCancel(runCtx)
 	log := s.log.With("runId", run.ID, "targetId", run.TargetID)
+	// recorded is the status the registry is known to hold for this run.
+	// Every transition is attempted against it, never against the status
+	// the scheduler meant to record.
+	recorded := registry.RunStarting
 
-	finish := func(prev registry.RunStatus, status registry.RunStatus, action registry.AuditAction, detail string) {
+	finish := func(status registry.RunStatus, action registry.AuditAction, detail string) {
 		now := s.now().UTC()
 		run.Status = status
 		run.FinishedAt = &now
 		ev := &registry.AuditEvent{Actor: Actor, Action: action, Detail: detail}
-		if err := s.reg.UpdateRun(ctx, run, prev, ev); err != nil {
-			log.Error("run outcome could not be recorded", "status", string(status), "error", err.Error())
+		if err := s.record(ctx, log, run, &recorded, ev, s.recordWindow); err != nil {
+			log.Error("run outcome could not be recorded; the sweep will close the run with an unknown outcome", "status", string(status), "error", err.Error())
 			return
 		}
 		switch status {
@@ -361,40 +433,40 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 			log.Warn("run "+string(status), "code", string(run.ErrorCode), "summary", run.ErrorSummary)
 		}
 	}
-	failed := func(prev registry.RunStatus, code v1alpha1.ErrorCode, summary string) {
+	failed := func(code v1alpha1.ErrorCode, summary string) {
 		run.Action = v1alpha1.ActionFailed
 		run.ErrorCode = code
 		run.ErrorSummary = summary
-		finish(prev, registry.RunFailed, registry.AuditRunFailed, "run failed: "+string(code)+": "+summary)
+		finish(registry.RunFailed, registry.AuditRunFailed, "run failed: "+string(code)+": "+summary)
 	}
-	cancelled := func(prev registry.RunStatus, summary string) {
+	cancelled := func(summary string) {
 		run.Action = v1alpha1.ActionFailed
 		run.ErrorCode = v1alpha1.ErrorCodeCancelled
 		run.ErrorSummary = summary
-		finish(prev, registry.RunCancelled, registry.AuditRunCancelled, "run cancelled: "+summary)
+		finish(registry.RunCancelled, registry.AuditRunCancelled, "run cancelled: "+summary)
 	}
 
 	target, err := s.reg.GetTarget(ctx, run.TargetID)
 	if err != nil {
-		failed(registry.RunStarting, v1alpha1.ErrorCodeInternal, "target could not be loaded")
+		failed(v1alpha1.ErrorCodeInternal, "target could not be loaded")
 		return
 	}
 	log = log.With("fqdn", target.FQDN)
 	switch {
 	case !target.Enabled:
-		cancelled(registry.RunStarting, "target was disabled before the run started")
+		cancelled("target was disabled before the run started")
 		return
 	case target.Revision != run.TargetRevision:
-		cancelled(registry.RunStarting, fmt.Sprintf("target revision changed from %d to %d before the run started", run.TargetRevision, target.Revision))
+		cancelled(fmt.Sprintf("target revision changed from %d to %d before the run started", run.TargetRevision, target.Revision))
 		return
 	}
 	policy, err := s.reg.GetPolicy(ctx, target.PolicyRef)
 	if err != nil {
-		failed(registry.RunStarting, v1alpha1.ErrorCodeInternal, "target policy could not be loaded")
+		failed(v1alpha1.ErrorCodeInternal, "target policy could not be loaded")
 		return
 	}
 	if !policy.Enabled {
-		cancelled(registry.RunStarting, "policy was disabled before the run started")
+		cancelled("policy was disabled before the run started")
 		return
 	}
 	spec := BuildJobSpec(run, target, policy)
@@ -404,45 +476,56 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		if aerr := s.reg.AppendAudit(ctx, rej); aerr != nil {
 			log.Error("policy rejection could not be audited", "error", aerr.Error())
 		}
-		failed(registry.RunStarting, v1alpha1.ErrorCodePolicyViolation, summary)
+		failed(v1alpha1.ErrorCodePolicyViolation, summary)
 		return
 	}
 	l, ok := s.launchers[target.ExecutionBinding]
 	if !ok {
-		failed(registry.RunStarting, v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("execution binding %q is not configured", target.ExecutionBinding))
+		failed(v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("execution binding %q is not configured", target.ExecutionBinding))
 		return
 	}
 	if runCtx.Err() != nil {
-		cancelled(registry.RunStarting, "run was cancelled before the runner started")
+		cancelled("run was cancelled before the runner started")
 		return
 	}
 	exec, err := l.Start(runCtx, spec)
 	if err != nil {
 		log.Error("runner could not be started", "launcher", l.Type(), "error", err.Error())
-		failed(registry.RunStarting, v1alpha1.ErrorCodeInternal, "runner could not be started")
+		failed(v1alpha1.ErrorCodeInternal, "runner could not be started")
 		return
 	}
 	now := s.now().UTC()
 	run.Status = registry.RunRunning
 	run.StartedAt = &now
 	run.ExternalExecutionID = exec.ID()
-	if err := s.reg.UpdateRun(ctx, run, registry.RunStarting, &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunStarted, Detail: "runner started via " + l.Type() + " (" + exec.ID() + ")"}); err != nil {
-		// The Runner is already executing; keep waiting for it so the
-		// outcome is not lost, but record the bookkeeping failure.
-		log.Error("run start could not be recorded", "error", err.Error())
+	started := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunStarted, Detail: "runner started via " + l.Type() + " (" + exec.ID() + ")"}
+	// The Runner is already executing, so the start is recorded without
+	// retrying (a wait here would only delay collecting the outcome). If
+	// it fails, recorded stays starting: the outcome below is then
+	// recorded against starting, after one more attempt at the start.
+	if err := s.record(ctx, log, run, &recorded, started, 0); err != nil {
+		log.Error("run start could not be recorded; the outcome will be recorded against the last known status", "error", err.Error())
 	}
 	res, err := exec.Wait()
+	if recorded == registry.RunStarting {
+		// One more attempt now that the Runner has finished, so the
+		// audit trail carries run.started when the registry is back.
+		run.Status = registry.RunRunning
+		if rerr := s.record(ctx, log, run, &recorded, started, 0); rerr != nil {
+			log.Warn("run start still could not be recorded", "error", rerr.Error())
+		}
+	}
 	if err != nil {
 		log.Error("runner produced no result", "launcher", l.Type(), "error", err.Error())
 		switch launcher.ReasonOf(err) {
 		case launcher.ReasonTimeout:
-			failed(registry.RunRunning, v1alpha1.ErrorCodeTimeout, "runner did not report a result before the launcher timeout")
+			failed(v1alpha1.ErrorCodeTimeout, "runner did not report a result before the launcher timeout")
 		case launcher.ReasonCancelled:
-			cancelled(registry.RunRunning, "run was cancelled before the runner reported a result")
+			cancelled("run was cancelled before the runner reported a result")
 		case launcher.ReasonMismatch:
-			failed(registry.RunRunning, v1alpha1.ErrorCodeInternal, "runner reported a result for another run")
+			failed(v1alpha1.ErrorCodeInternal, "runner reported a result for another run")
 		default:
-			failed(registry.RunRunning, v1alpha1.ErrorCodeInternal, "runner ended without reporting a result")
+			failed(v1alpha1.ErrorCodeInternal, "runner ended without reporting a result")
 		}
 		return
 	}
@@ -455,16 +538,77 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	if res.Status == v1alpha1.StatusSucceeded {
 		run.ErrorCode = ""
 		run.ErrorSummary = ""
-		finish(registry.RunRunning, registry.RunSucceeded, registry.AuditRunSucceeded, "run succeeded: "+string(res.Action))
+		finish(registry.RunSucceeded, registry.AuditRunSucceeded, "run succeeded: "+string(res.Action))
 		return
 	}
 	run.ErrorCode = res.Error.Code
 	run.ErrorSummary = res.Error.Summary
 	if res.Error.Code == v1alpha1.ErrorCodeCancelled {
-		finish(registry.RunRunning, registry.RunCancelled, registry.AuditRunCancelled, "run cancelled: "+res.Error.Summary)
+		finish(registry.RunCancelled, registry.AuditRunCancelled, "run cancelled: "+res.Error.Summary)
 		return
 	}
-	finish(registry.RunRunning, registry.RunFailed, registry.AuditRunFailed, "run failed: "+string(res.Error.Code)+": "+res.Error.Summary)
+	finish(registry.RunFailed, registry.AuditRunFailed, "run failed: "+string(res.Error.Code)+": "+res.Error.Summary)
+}
+
+// record writes run (whose Status is the status to reach) to the registry
+// against *recorded, the status the registry is known to hold, and sets
+// *recorded on success.
+//
+// ErrConflict means the registry holds another status than expected (a
+// write that reported failure after committing, for example): the run is
+// re-read and, if it is still active, the transition is retried against
+// the actual status; a run already terminal is left alone. ErrNotFound is
+// final. Any other error is retried with backoff until window has passed
+// or the scheduler is being drained (s.runsCtx), then returned. With a
+// zero window a single attempt is made, but a conflict is still resolved.
+func (s *Scheduler) record(ctx context.Context, log *slog.Logger, run *registry.Run, recorded *registry.RunStatus, ev *registry.AuditEvent, window time.Duration) error {
+	want := run.Status
+	deadline := time.Now().Add(window)
+	wait := s.recordRetry
+	for attempt := 1; ; attempt++ {
+		run.Status = want
+		err := s.reg.UpdateRun(ctx, run, *recorded, ev)
+		if err == nil {
+			*recorded = want
+			return nil
+		}
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			return err
+		case errors.Is(err, registry.ErrConflict):
+			actual, gerr := s.reg.GetRun(ctx, run.ID)
+			if gerr == nil {
+				if actual.Status == want {
+					// The transition had already committed (a write that
+					// reported failure after committing); recording it
+					// again would duplicate its audit event.
+					*recorded = want
+					return nil
+				}
+				if !actual.Status.Active() {
+					*recorded = actual.Status
+					return fmt.Errorf("run is already %s: %w", actual.Status, err)
+				}
+				if actual.Status != *recorded {
+					log.Warn("registry holds another status than recorded; retrying against it", "recorded", string(*recorded), "actual", string(actual.Status))
+					*recorded = actual.Status
+					continue
+				}
+			}
+		}
+		if window <= 0 || !time.Now().Before(deadline) || s.runsCtx.Err() != nil {
+			return err
+		}
+		log.Warn("status transition could not be recorded; retrying", "status", string(want), "attempt", attempt, "error", err.Error())
+		select {
+		case <-s.runsCtx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		if wait < 10*s.recordRetry {
+			wait *= 2
+		}
+	}
 }
 
 // BuildJobSpec produces the JobSpec for run against the current target and

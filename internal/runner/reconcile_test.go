@@ -734,6 +734,26 @@ func TestSweepHonoursCreatorDeadline(t *testing.T) {
 	}
 }
 
+// A policy keyType change applies at the next run: a current certificate
+// with another key type is reissued instead of reported as noop.
+func TestReconcileReissuesWhenStoredKeyTypeDiffers(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(func(m map[string]any) { m["policy"].(map[string]any)["keyType"] = "rsa2048" })
+	// The stored certificate is current but has an EC P-256 key.
+	h.putCert("wiki.example.ac.jp", h.now.Add(-24*time.Hour), h.now.Add(90*24*time.Hour))
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionRenewed {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "key type differs") {
+		t.Fatalf("expected a key type warning:\n%s", h.logs.String())
+	}
+	// Once the stored key type matches, the same job is a noop.
+	if code, res := h.run(context.Background()); code != ExitSucceeded || res.Action != v1alpha1.ActionNoop {
+		t.Fatalf("second run: code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+}
+
 func TestReconcileRejectsWrongKeyType(t *testing.T) {
 	h := newHarness(t, "ok", map[string]string{fakelego.EnvKeyTypeOverride: "rsa2048"})
 	h.job(nil)

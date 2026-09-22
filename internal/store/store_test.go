@@ -231,6 +231,20 @@ func TestInfoOf(t *testing.T) {
 	if len(info.DNSNames) != 2 || info.DNSNames[0] != "wiki.example.ac.jp" || info.DNSNames[1] != "mail.example.ac.jp" {
 		t.Errorf("InfoOf.DNSNames = %v, want [wiki.example.ac.jp mail.example.ac.jp]", info.DNSNames)
 	}
+	if info.KeyType != v1alpha1.KeyTypeEC256 {
+		t.Errorf("InfoOf.KeyType = %q, want ec256", info.KeyType)
+	}
+}
+
+func TestKeyTypeOf(t *testing.T) {
+	_, _, ec := genECCert(t, "wiki.example.ac.jp")
+	if got := KeyTypeOf(ec); got != v1alpha1.KeyTypeEC256 {
+		t.Errorf("KeyTypeOf(P-256) = %q", got)
+	}
+	unsupported := &x509.Certificate{PublicKey: struct{}{}}
+	if got := KeyTypeOf(unsupported); got != "" {
+		t.Errorf("KeyTypeOf(unsupported) = %q, want empty", got)
+	}
 }
 
 // --- Covers ------------------------------------------------------------------
