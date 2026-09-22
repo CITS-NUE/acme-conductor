@@ -142,12 +142,26 @@ func Reconcile(ctx context.Context, opts Options) int {
 	started := opts.Now().UTC()
 	log := opts.Logger
 
-	jobData, err := readBounded(opts.JobPath, v1alpha1.MaxDocumentSize+1)
+	jobData, err := readBounded(opts.JobPath, v1alpha1.MaxSignedDocumentSize+1)
 	if err != nil {
 		log.Error("cannot read job spec", "error", err.Error())
 		return ExitNoResult
 	}
-	ids, idsOK := peekIdentity(jobData)
+	// A signed envelope carries the JobSpec as its payload; the identity
+	// is peeked from there so that a Result can name the run even when the
+	// envelope fails verification.
+	var envelope *v1alpha1.SignedJob
+	identityData := jobData
+	if v1alpha1.IsSignedJob(jobData) {
+		sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(jobData))
+		if err != nil {
+			log.Error("signed job envelope rejected and no run identity could be recovered", "error", err.Error())
+			return ExitNoResult
+		}
+		envelope = sj
+		identityData = sj.PayloadBytes()
+	}
+	ids, idsOK := peekIdentity(identityData)
 	if idsOK {
 		log = log.With("runId", ids.RunID, "targetId", ids.TargetID)
 	}
@@ -186,31 +200,87 @@ func Reconcile(ctx context.Context, opts Options) int {
 		return ExitSucceeded
 	}
 
-	spec, err := v1alpha1.DecodeJobSpec(bytes.NewReader(jobData))
-	if err != nil {
-		f := fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("job spec rejected", err), err)
-		if !idsOK {
-			log.Error("job spec rejected and no run identity could be recovered", "error", err.Error())
-			return ExitNoResult
+	// The trusted configuration is needed before an envelope can be
+	// verified; a bare JobSpec is decoded first and its configuration
+	// failure reported afterwards, as before.
+	cfg, cfgErr := config.Load(opts.ConfigPath)
+
+	var spec *v1alpha1.JobSpec
+	if envelope != nil {
+		if cfgErr != nil {
+			if !idsOK {
+				log.Error("runner configuration could not be loaded and no run identity could be recovered", "error", cfgErr.Error())
+				return ExitNoResult
+			}
+			return finish(v1alpha1.StatusFailed, nil, fail(v1alpha1.ErrorCodeInternal, "runner configuration could not be loaded", cfgErr))
 		}
-		return finish(v1alpha1.StatusFailed, nil, f)
+		var f *failure
+		spec, f = unwrapSignedJob(ctx, opts, cfg, envelope)
+		if f != nil {
+			if !idsOK {
+				log.Error("signed job envelope rejected and no run identity could be recovered", "error", f.Error())
+				return ExitNoResult
+			}
+			return finish(v1alpha1.StatusFailed, nil, f)
+		}
+		log.Info("signed job envelope verified")
+	} else {
+		if cfgErr == nil && cfg.JobSigning != nil {
+			err := errors.New("this runner accepts signed job envelopes only")
+			if !idsOK {
+				log.Error("unsigned job spec rejected and no run identity could be recovered", "error", err.Error())
+				return ExitNoResult
+			}
+			return finish(v1alpha1.StatusFailed, nil, fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("unsigned job spec rejected", err), err))
+		}
+		spec, err = v1alpha1.DecodeJobSpec(bytes.NewReader(jobData))
+		if err != nil {
+			f := fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("job spec rejected", err), err)
+			if !idsOK {
+				log.Error("job spec rejected and no run identity could be recovered", "error", err.Error())
+				return ExitNoResult
+			}
+			return finish(v1alpha1.StatusFailed, nil, f)
+		}
 	}
 	log = log.With("fqdn", spec.Target.FQDN)
+	if cfgErr != nil {
+		return finish(v1alpha1.StatusFailed, nil, fail(v1alpha1.ErrorCodeInternal, "runner configuration could not be loaded", cfgErr))
+	}
 
-	out, f := reconcile(ctx, opts, log, spec)
+	out, f := reconcile(ctx, opts, log, cfg, spec)
 	if f != nil {
 		return finish(v1alpha1.StatusFailed, nil, f)
 	}
 	return finish(v1alpha1.StatusSucceeded, out, nil)
 }
 
-// reconcile performs steps 2-5 and returns either an outcome or a failure.
-func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alpha1.JobSpec) (*outcome, *failure) {
-	cfg, err := config.Load(opts.ConfigPath)
-	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeInternal, "runner configuration could not be loaded", err)
+// unwrapSignedJob verifies an envelope against the trusted keys and the
+// clock, records its runId in the replay ledger, and returns the JobSpec
+// it carries. Every failure is a rejection of the document, never a
+// reason to fall back to the payload unverified.
+func unwrapSignedJob(ctx context.Context, opts Options, cfg *config.Config, sj *v1alpha1.SignedJob) (*v1alpha1.JobSpec, *failure) {
+	if cfg.JobSigning == nil {
+		err := errors.New("this runner has no jobSigning keys configured")
+		return nil, fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("signed job envelope rejected", err), err)
 	}
+	now := opts.Now().UTC()
+	skew := time.Duration(cfg.JobSigning.ClockSkewSeconds) * time.Second
+	spec, hdr, err := sj.Verify(cfg.JobSigning.Keys(), v1alpha1.VerifyOptions{Now: now, ClockSkew: skew})
+	if err != nil {
+		return nil, fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("signed job envelope rejected", err), err)
+	}
+	if err := recordJob(ctx, cfg.Lego.StateDir, spec.RunID, hdr.ExpiresAt, now, skew); err != nil {
+		if errors.Is(err, ErrJobReplayed) {
+			return nil, fail(v1alpha1.ErrorCodeInvalidJobSpec, summarize("signed job envelope rejected", err), err)
+		}
+		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeInternal, "replay ledger could not be updated", err))
+	}
+	return spec, nil
+}
 
+// reconcile performs steps 2-5 and returns either an outcome or a failure.
+func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.Config, spec *v1alpha1.JobSpec) (*outcome, *failure) {
 	// Authorization against trusted configuration. This is the check that
 	// bounds what any JobSpec, forged or not, can make this Runner do.
 	req := policy.AuthorizationRequest{

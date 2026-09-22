@@ -1,0 +1,59 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "RunnerConfig",
+  "authorization": {
+    "allowedDnsSuffixes": [
+      "example.ac.jp"
+    ],
+    "allowWildcard": false,
+    "allowedAcmeBindings": [
+      "letsencrypt-staging"
+    ],
+    "allowedDnsBindings": [
+      "azure-dns-staging"
+    ],
+    "allowedStoreBindings": [
+      "keyvault-staging"
+    ]
+  },
+  "lego": {
+    "binary": "/usr/local/bin/lego",
+    "stateDir": "/state",
+    "workDir": "/work",
+    "timeoutSeconds": 900
+  },
+  "acmeBindings": {
+    "letsencrypt-staging": {
+      "directoryURL": "https://acme-staging-v02.api.letsencrypt.org/directory",
+      "email": "acme-staging@example.ac.jp"
+    }
+  },
+  "dnsBindings": {
+    "azure-dns-staging": {
+      "provider": "azuredns",
+      "env": {
+        "AZURE_AUTH_METHOD": "msi",
+        "AZURE_ZONE_NAME": "example.ac.jp",
+        "AZURE_RESOURCE_GROUP": "rg-dns-example",
+        "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000"
+      },
+      "passthroughEnv": [
+        "AZURE_CLIENT_ID",
+        "IDENTITY_ENDPOINT",
+        "IDENTITY_HEADER"
+      ]
+    }
+  },
+  "storeBindings": {
+    "keyvault-staging": {
+      "type": "azure-keyvault",
+      "vaultURL": "https://kv-acme-staging.vault.azure.net",
+      "credential": "managed-identity"
+    }
+  },
+  "jobSigning": {
+    "publicKeys": [
+      "MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms="
+    ]
+  }
+}

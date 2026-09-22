@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acme-conductor.cits-nue.github.io/schemas/v1alpha1/signedjob.schema.json",
+  "title": "ACME Conductor SignedCertificateReconcileJob v1alpha1",
+  "description": "A CertificateReconcileJob wrapped in a signed, expiring envelope (JWS construction, RFC 7515 with the EdDSA algorithm of RFC 8037): 'signature' is the Ed25519 signature over the ASCII bytes of 'protected', a period, and 'payload'. 'protected' is the base64url (unpadded) JSON header {alg, kid, issuedAt, expiresAt, nonce}; 'payload' is the base64url (unpadded) JobSpec document exactly as the producer serialized it. The envelope detects tampering in transit and bounds replay; it does not replace the Runner's own authorization of the unwrapped JobSpec. Go validation (pkg/api/v1alpha1/signedjob.go) is authoritative and stricter than this schema: it decodes and checks the header, verifies the signature against trusted keys, and enforces the validity window.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "protected", "payload", "signature"],
+  "properties": {
+    "apiVersion": {
+      "const": "acme-conductor.cits-nue.github.io/v1alpha1"
+    },
+    "kind": {
+      "const": "SignedCertificateReconcileJob"
+    },
+    "protected": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 5462,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "base64url (no padding) of the JSON protected header. Decoded, it is a strict JSON object {\"alg\":\"EdDSA\",\"kid\":\"<16 lower-case hex>\",\"issuedAt\":<RFC 3339>,\"expiresAt\":<RFC 3339>,\"nonce\":\"<16..128 base64url chars>\"} with no other members; expiresAt must be after issuedAt and at most 24 hours later."
+    },
+    "payload": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 87382,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "base64url (no padding) of the CertificateReconcileJob document (jobspec.schema.json), at most 65536 bytes decoded."
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 86,
+      "maxLength": 86,
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "base64url (no padding) of the 64-byte Ed25519 signature."
+    }
+  }
+}

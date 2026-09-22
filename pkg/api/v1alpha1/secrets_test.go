@@ -13,7 +13,7 @@ import (
 var forbiddenFieldRe = regexp.MustCompile(`(?i)(privatekey|secret|password|passphrase|token|credential|pem|pfx|hmac|eab|command|image|env|args|path|resourceid|clientid|tenantid|subscription|certificatebody|cert$)`)
 
 func TestContractTypesHaveNoSecretBearingFields(t *testing.T) {
-	for _, typ := range []reflect.Type{reflect.TypeOf(JobSpec{}), reflect.TypeOf(Result{})} {
+	for _, typ := range []reflect.Type{reflect.TypeOf(JobSpec{}), reflect.TypeOf(Result{}), reflect.TypeOf(SignedJob{}), reflect.TypeOf(SignedJobHeader{})} {
 		walkFields(t, typ, typ.Name())
 	}
 }

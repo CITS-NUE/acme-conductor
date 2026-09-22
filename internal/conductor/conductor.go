@@ -28,9 +28,11 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/acajob"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
+	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
 // Exit codes of Serve.
@@ -87,7 +89,15 @@ func Serve(ctx context.Context, opts Options) int {
 	version, _ := reg.Version(ctx)
 	log.Info("registry opened", "path", cfg.Database.Path, "schemaVersion", version)
 
-	launchers, err := buildLaunchers(cfg, log, opts.LookupEnv)
+	signer, err := loadSigner(cfg)
+	if err != nil {
+		log.Error("job signing key could not be loaded", "error", err.Error())
+		return ExitConfig
+	}
+	if signer != nil {
+		log.Info("job signing enabled", "keyId", signer.KeyID(), "validitySeconds", cfg.JobSigning.ValiditySeconds)
+	}
+	launchers, err := buildLaunchers(cfg, signer, log, opts.LookupEnv)
 	if err != nil {
 		log.Error("launchers could not be built", "error", err.Error())
 		return ExitConfig
@@ -189,7 +199,30 @@ func Serve(ctx context.Context, opts Options) int {
 	return code
 }
 
-func buildLaunchers(cfg *config.Config, log *slog.Logger, lookup func(string) (string, bool)) (map[string]launcher.Launcher, error) {
+// loadSigner reads the job signing key named by the configuration, if
+// any. The key file is the only secret the Conductor reads; it is read
+// once, here, and handed to the launchers through a Signer.
+func loadSigner(cfg *config.Config) (*launcher.Signer, error) {
+	if cfg.JobSigning == nil {
+		return nil, nil
+	}
+	f, err := os.Open(cfg.JobSigning.PrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 16*1024))
+	if err != nil {
+		return nil, err
+	}
+	key, err := v1alpha1.ParseSigningPrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", cfg.JobSigning.PrivateKeyFile, err)
+	}
+	return launcher.NewSigner(key, time.Duration(cfg.JobSigning.ValiditySeconds)*time.Second)
+}
+
+func buildLaunchers(cfg *config.Config, signer *launcher.Signer, log *slog.Logger, lookup func(string) (string, bool)) (map[string]launcher.Launcher, error) {
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
@@ -204,8 +237,25 @@ func buildLaunchers(cfg *config.Config, log *slog.Logger, lookup func(string) (s
 			out[name] = &launcher.LocalProcess{
 				RunnerBinary: lp.RunnerBinary, RunnerConfig: lp.RunnerConfig, WorkDir: lp.WorkDir,
 				Timeout: time.Duration(lp.TimeoutSeconds) * time.Second, PassthroughEnv: lp.PassthroughEnv,
-				Logger: log.With("component", "launcher", "executionBinding", name), LookupEnv: lookup,
+				Signer: signer, Logger: log.With("component", "launcher", "executionBinding", name), LookupEnv: lookup,
 			}
+		case config.ExecutionAzureContainerAppsJob:
+			a := b.AzureContainerAppsJob
+			if err := os.MkdirAll(a.ExchangeDir, 0o700); err != nil {
+				return nil, fmt.Errorf("execution binding %q: exchange directory: %w", name, err)
+			}
+			l, err := acajob.New(acajob.Config{
+				SubscriptionID: a.SubscriptionID, ResourceGroup: a.ResourceGroup, JobName: a.JobName,
+				Cloud: a.Cloud, Credential: a.Credential, ManagedIdentityClientID: a.ManagedIdentityClientID,
+				ContainerName: a.ContainerName, ExchangeDir: a.ExchangeDir, RunnerExchangeDir: a.RunnerExchangeDir,
+				Timeout:      time.Duration(a.TimeoutSeconds) * time.Second,
+				PollInterval: time.Duration(a.PollIntervalSeconds) * time.Second,
+				ResultGrace:  time.Duration(a.ResultGraceSeconds) * time.Second,
+			}, signer, &acajob.Options{Logger: log.With("component", "launcher", "executionBinding", name)})
+			if err != nil {
+				return nil, fmt.Errorf("execution binding %q: %w", name, err)
+			}
+			out[name] = l
 		default:
 			return nil, fmt.Errorf("execution binding %q: unsupported type %q", name, b.Type)
 		}

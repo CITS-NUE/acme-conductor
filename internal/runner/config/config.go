@@ -19,6 +19,7 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,13 @@ const (
 	MaxTimeoutSeconds     = 86400
 	MaxEnvEntries         = 64
 	MaxEnvValueLength     = 4096
+
+	// MaxSigningKeys bounds jobSigning.publicKeys (a rotation needs two).
+	MaxSigningKeys = 8
+	// DefaultClockSkewSeconds and MaxClockSkewSeconds bound
+	// jobSigning.clockSkewSeconds.
+	DefaultClockSkewSeconds = 300
+	MaxClockSkewSeconds     = 3600
 )
 
 // Errors.
@@ -112,6 +120,69 @@ type Config struct {
 	ACMEBindings  map[string]ACMEBinding  `json:"acmeBindings"`
 	DNSBindings   map[string]DNSBinding   `json:"dnsBindings"`
 	StoreBindings map[string]StoreBinding `json:"storeBindings"`
+	// JobSigning, when present, makes signed job envelopes mandatory: the
+	// Runner then refuses a bare JobSpec and accepts only a
+	// SignedCertificateReconcileJob whose signature verifies against one
+	// of these keys, whose validity window includes now, and whose runId
+	// it has not executed before. When absent, only bare JobSpecs are
+	// accepted (the Phase 2 local launcher over a private directory).
+	JobSigning *JobSigning `json:"jobSigning,omitempty"`
+}
+
+// JobSigning is the trust configuration for signed job envelopes. It holds
+// public keys only.
+type JobSigning struct {
+	// PublicKeys are the Conductor signing keys this Runner trusts, each
+	// a PEM "PUBLIC KEY" block or the standard base64 of its DER
+	// SubjectPublicKeyInfo (the PEM body on one line). Several keys let
+	// the Conductor rotate its key without a simultaneous change here.
+	PublicKeys []string `json:"publicKeys"`
+	// ClockSkewSeconds is how far an envelope's issuedAt may lie in the
+	// future of this Runner's clock before it is refused (default 300).
+	// Expiry has no tolerance.
+	ClockSkewSeconds int `json:"clockSkewSeconds,omitempty"`
+
+	keys map[string]ed25519.PublicKey
+}
+
+// Keys returns the trusted public keys indexed by their KeyID.
+func (j *JobSigning) Keys() map[string]ed25519.PublicKey {
+	if j == nil {
+		return nil
+	}
+	out := make(map[string]ed25519.PublicKey, len(j.keys))
+	for k, v := range j.keys {
+		out[k] = v
+	}
+	return out
+}
+
+func (j *JobSigning) validate() error {
+	if len(j.PublicKeys) == 0 {
+		return invalid("jobSigning.publicKeys must list at least one key")
+	}
+	if len(j.PublicKeys) > MaxSigningKeys {
+		return invalid("jobSigning.publicKeys: at most %d keys", MaxSigningKeys)
+	}
+	j.keys = map[string]ed25519.PublicKey{}
+	for i, s := range j.PublicKeys {
+		pub, err := v1alpha1.ParseSigningPublicKey(s)
+		if err != nil {
+			return invalid("jobSigning.publicKeys[%d]: %v", i, err)
+		}
+		kid := v1alpha1.KeyID(pub)
+		if _, dup := j.keys[kid]; dup {
+			return invalid("jobSigning.publicKeys[%d]: key %s is listed twice", i, kid)
+		}
+		j.keys[kid] = pub
+	}
+	if j.ClockSkewSeconds == 0 {
+		j.ClockSkewSeconds = DefaultClockSkewSeconds
+	}
+	if j.ClockSkewSeconds < 1 || j.ClockSkewSeconds > MaxClockSkewSeconds {
+		return invalid("jobSigning.clockSkewSeconds must be between 1 and %d", MaxClockSkewSeconds)
+	}
+	return nil
 }
 
 // Authorization is the serialized form of policy.RunnerAuthorizationPolicy.
@@ -278,6 +349,11 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Authorization.validate(c); err != nil {
 		return err
+	}
+	if c.JobSigning != nil {
+		if err := c.JobSigning.validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -192,3 +192,147 @@ func TestShippedExampleAgreesWithRunnerExample(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+const acaBinding = `"aca": {"type": "azure-container-apps-job", "azureContainerAppsJob": {
+  "subscriptionId": "0f8fad5b-d9cb-469f-a165-70867728950e", "resourceGroup": "rg-acme", "jobName": "acme-runner",
+  "credential": "managed-identity", "managedIdentityClientId": "1f8fad5b-d9cb-469f-a165-70867728950e",
+  "exchangeDir": "/mnt/exchange", "runnerExchangeDir": "/exchange"}}`
+
+const signing = `"jobSigning": {"privateKeyFile": "/etc/acme-conductor/keys/job-signing.pem"},`
+
+func withACA(s string) string {
+	s = strings.Replace(s, `"executionBindings": {`, `"executionBindings": {`+acaBinding+`, `, 1)
+	return strings.Replace(s, `"database"`, signing+` "database"`, 1)
+}
+
+func TestAzureContainerAppsJobBinding(t *testing.T) {
+	c, err := Read(strings.NewReader(withACA(minimal)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.ExecutionBindings["aca"].AzureContainerAppsJob
+	if a == nil || a.Cloud != CloudPublic || a.TimeoutSeconds != DefaultLaunchTimeoutSeconds || a.PollIntervalSeconds != DefaultPollIntervalSeconds || a.ResultGraceSeconds != DefaultResultGraceSeconds || a.Credential != CredentialManagedIdentity {
+		t.Fatalf("binding = %+v", a)
+	}
+	if c.JobSigning == nil || c.JobSigning.ValiditySeconds != DefaultSigningValiditySeconds {
+		t.Fatalf("jobSigning = %+v", c.JobSigning)
+	}
+	// Signing alone is fine with the local launcher too.
+	if _, err := Read(strings.NewReader(strings.Replace(minimal, `"database"`, signing+` "database"`, 1))); err != nil {
+		t.Fatal(err)
+	}
+	// The default credential is "default" with no client id.
+	c, err = Read(strings.NewReader(strings.Replace(withACA(minimal), `"credential": "managed-identity", "managedIdentityClientId": "1f8fad5b-d9cb-469f-a165-70867728950e",`, "", 1)))
+	if err != nil || c.ExecutionBindings["aca"].AzureContainerAppsJob.Credential != CredentialDefault {
+		t.Fatalf("credential default: %v", err)
+	}
+
+	rejects := map[string]func(string) string{
+		"aca without signing": func(s string) string { return strings.Replace(s, signing, "", 1) },
+		"signing relative path": func(s string) string {
+			return strings.Replace(s, "/etc/acme-conductor/keys/job-signing.pem", "keys/job-signing.pem", 1)
+		},
+		"signing validity too long": func(s string) string {
+			return strings.Replace(s, `"privateKeyFile": "/etc/acme-conductor/keys/job-signing.pem"`, `"privateKeyFile": "/etc/acme-conductor/keys/job-signing.pem", "validitySeconds": 90000`, 1)
+		},
+		"bad subscription": func(s string) string {
+			return strings.Replace(s, "0f8fad5b-d9cb-469f-a165-70867728950e", "not-a-guid", 1)
+		},
+		"bad job name": func(s string) string {
+			return strings.Replace(s, `"jobName": "acme-runner"`, `"jobName": "Acme_Runner"`, 1)
+		},
+		"double hyphen": func(s string) string {
+			return strings.Replace(s, `"jobName": "acme-runner"`, `"jobName": "acme--runner"`, 1)
+		},
+		"bad resource group": func(s string) string {
+			return strings.Replace(s, `"resourceGroup": "rg-acme"`, `"resourceGroup": "rg acme"`, 1)
+		},
+		"bad cloud": func(s string) string { return strings.Replace(s, `"jobName"`, `"cloud": "mars", "jobName"`, 1) },
+		"client id with default credential": func(s string) string {
+			return strings.Replace(s, `"credential": "managed-identity"`, `"credential": "default"`, 1)
+		},
+		"bad client id": func(s string) string { return strings.Replace(s, "1f8fad5b-d9cb-469f-a165-70867728950e", "x", 1) },
+		"relative exchange dir": func(s string) string {
+			return strings.Replace(s, `"exchangeDir": "/mnt/exchange"`, `"exchangeDir": "exchange"`, 1)
+		},
+		"unclean runner dir": func(s string) string {
+			return strings.Replace(s, `"runnerExchangeDir": "/exchange"`, `"runnerExchangeDir": "/exchange/"`, 1)
+		},
+		"missing sub-object": func(s string) string { return strings.Replace(s, `"azureContainerAppsJob": {`, `"localProcess": {`, 1) },
+		"bad container name": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"containerName": "Runner", "jobName"`, 1)
+		},
+		"poll interval too large": func(s string) string {
+			return strings.Replace(s, `"jobName"`, `"pollIntervalSeconds": 1000, "jobName"`, 1)
+		},
+		"unknown field": func(s string) string { return strings.Replace(s, `"jobName"`, `"image": "evil", "jobName"`, 1) },
+		"local process with aca object": func(s string) string {
+			return strings.Replace(s, `"type": "local-process", "localProcess"`, `"type": "local-process", "azureContainerAppsJob": {}, "localProcess"`, 1)
+		},
+	}
+	for name, edit := range rejects {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Read(strings.NewReader(edit(withACA(minimal)))); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+// TestShippedContainerAppsExamplesAgree checks the Container Apps example
+// pair: the Conductor example names only bindings the Runner example
+// defines and allows, the Runner example requires signed jobs, and the
+// paths match what deploy/azure/main.bicep mounts.
+func TestShippedContainerAppsExamplesAgree(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "deploy", "examples")
+	c, err := Load(filepath.Join(root, "conductor-config.aca.example.json"))
+	if err != nil {
+		t.Fatalf("conductor example: %v", err)
+	}
+	r, err := runnerconfig.Load(filepath.Join(root, "runner-config.aca.example.json"))
+	if err != nil {
+		t.Fatalf("runner example: %v", err)
+	}
+	allowed := func(list []string, n string) bool {
+		for _, a := range list {
+			if a == n {
+				return true
+			}
+		}
+		return false
+	}
+	for _, n := range c.ACMEBindings {
+		if _, ok := r.ACMEBindings[n]; !ok || !allowed(r.Authorization.AllowedACMEBindings, n) {
+			t.Fatalf("acme binding %q is not defined/allowed in the runner example", n)
+		}
+	}
+	for _, n := range c.DNSBindings {
+		if _, ok := r.DNSBindings[n]; !ok || !allowed(r.Authorization.AllowedDNSBindings, n) {
+			t.Fatalf("dns binding %q is not defined/allowed in the runner example", n)
+		}
+	}
+	for _, n := range c.StoreBindings {
+		if _, ok := r.StoreBindings[n]; !ok || !allowed(r.Authorization.AllowedStoreBindings, n) {
+			t.Fatalf("store binding %q is not defined/allowed in the runner example", n)
+		}
+	}
+	a := c.ExecutionBindings["azure"].AzureContainerAppsJob
+	if a == nil || a.Credential != CredentialManagedIdentity || a.ExchangeDir != "/mnt/exchange" || a.RunnerExchangeDir != "/exchange" || a.ContainerName != "runner" {
+		t.Fatalf("example azure launcher: %+v", a)
+	}
+	if c.JobSigning == nil || c.JobSigning.PrivateKeyFile != "/etc/acme-conductor/job-signing.pem" {
+		t.Fatalf("example signing: %+v", c.JobSigning)
+	}
+	if r.JobSigning == nil || len(r.JobSigning.Keys()) != 1 {
+		t.Fatalf("runner example must require signed jobs: %+v", r.JobSigning)
+	}
+	if r.Lego.StateDir != "/state" || r.Lego.WorkDir != "/work" {
+		t.Fatalf("runner example paths: %+v", r.Lego)
+	}
+	if r.StoreBindings["keyvault-staging"].Credential != "managed-identity" {
+		t.Fatal("runner example must authenticate with the managed identity")
+	}
+	if a.TimeoutSeconds <= r.Lego.TimeoutSeconds {
+		t.Fatalf("conductor timeout %d must exceed the runner lego timeout %d", a.TimeoutSeconds, r.Lego.TimeoutSeconds)
+	}
+}

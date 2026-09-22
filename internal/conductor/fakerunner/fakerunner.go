@@ -10,6 +10,7 @@
 package fakerunner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,18 +53,13 @@ type Record struct {
 	Argv []string `json:"argv"`
 	Env  []string `json:"env"`
 	Dir  string   `json:"dir"`
+	// JobKind is the kind of the job document that was handed over: a
+	// bare CertificateReconcileJob or a SignedCertificateReconcileJob.
+	JobKind string `json:"jobKind"`
 }
 
 // Main runs the fake and returns the exit code.
 func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
-	if rec := getenv(EnvRecord); rec != "" {
-		dir, _ := os.Getwd()
-		data, _ := json.Marshal(Record{Argv: args, Env: os.Environ(), Dir: dir})
-		if err := os.WriteFile(rec, data, 0o600); err != nil {
-			fmt.Fprintln(stderr, "fake runner: record:", err)
-			return 3
-		}
-	}
 	if len(args) == 0 || args[0] != "reconcile" {
 		fmt.Fprintln(stderr, "fake runner: expected reconcile")
 		return 2
@@ -85,6 +81,28 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	if err != nil {
 		fmt.Fprintln(stderr, "fake runner:", err)
 		return 2
+	}
+	// A signed envelope is unwrapped structurally, without verifying the
+	// signature: the fake stands in for the Runner's observable
+	// behaviour, not for its trust decisions (those are tested in
+	// internal/runner).
+	jobKind := v1alpha1.KindCertificateReconcileJob
+	if v1alpha1.IsSignedJob(raw) {
+		sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(raw))
+		if err != nil {
+			fmt.Fprintln(stderr, "fake runner: envelope:", err)
+			return 2
+		}
+		raw = sj.PayloadBytes()
+		jobKind = v1alpha1.KindSignedCertificateReconcileJob
+	}
+	if rec := getenv(EnvRecord); rec != "" {
+		dir, _ := os.Getwd()
+		data, _ := json.Marshal(Record{Argv: args, Env: os.Environ(), Dir: dir, JobKind: jobKind})
+		if err := os.WriteFile(rec, data, 0o600); err != nil {
+			fmt.Fprintln(stderr, "fake runner: record:", err)
+			return 3
+		}
 	}
 	var spec v1alpha1.JobSpec
 	if err := json.Unmarshal(raw, &spec); err != nil {

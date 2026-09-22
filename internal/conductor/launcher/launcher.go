@@ -13,7 +13,6 @@ package launcher
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -130,7 +129,10 @@ type LocalProcess struct {
 	PassthroughEnv []string
 	// GracePeriod is how long to wait after SIGTERM before SIGKILL.
 	GracePeriod time.Duration
-	Logger      *slog.Logger
+	// Signer, when set, wraps every JobSpec in a signed envelope; the
+	// Runner must then be configured with the matching public key.
+	Signer *Signer
+	Logger *slog.Logger
 	// LookupEnv is os.LookupEnv unless a test injects one.
 	LookupEnv func(string) (string, bool)
 }
@@ -148,8 +150,9 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	if err := spec.Validate(); err != nil {
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("job spec: %w", err)}
+	data, err := JobDocument(spec, l.Signer)
+	if err != nil {
+		return nil, &Error{Reason: ReasonStart, Err: err}
 	}
 	if !filepath.IsAbs(l.RunnerBinary) || !filepath.IsAbs(l.RunnerConfig) || !filepath.IsAbs(l.WorkDir) {
 		return nil, &Error{Reason: ReasonStart, Err: errors.New("runner binary, runner config and work directory must be absolute paths")}
@@ -164,14 +167,9 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("create run directory: %w", err)}
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	data, err := json.Marshal(spec)
-	if err != nil {
-		cleanup()
-		return nil, &Error{Reason: ReasonStart, Err: err}
-	}
 	jobPath := filepath.Join(dir, JobFile)
 	resultPath := filepath.Join(dir, ResultFile)
-	if err := os.WriteFile(jobPath, append(data, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(jobPath, data, 0o600); err != nil {
 		cleanup()
 		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("write job spec: %w", err)}
 	}

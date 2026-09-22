@@ -15,8 +15,13 @@ targets and launches the Runner as a local child process (see
 that and can still be invoked by hand exactly as described here. Phase 3
 adds the Azure Key Vault Certificate Store, authenticated with the
 execution platform's managed identity — see
-[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault)
-and the [roadmap](architecture.md#roadmap).
+[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault).
+Phase 4 adds the signed job envelope: with [`jobSigning`](#jobsigning)
+configured, the Runner accepts only jobs the Conductor signed, within
+their validity window, once — and it runs as an Azure Container Apps Job
+under its own managed identity (see
+[Running as a Container Apps Job](#running-as-a-container-apps-job) and
+the [roadmap](architecture.md#roadmap)).
 
 ## Overview
 
@@ -87,6 +92,7 @@ Top level:
 | `acmeBindings` | map | At least one entry. Keys are binding names (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, ≤63 chars). |
 | `dnsBindings` | map | At least one entry, same key rules. |
 | `storeBindings` | map | At least one entry, same key rules. |
+| `jobSigning` | object | Optional. When present, only signed job envelopes are accepted — see below. |
 
 ### `authorization`
 
@@ -163,6 +169,58 @@ same name cannot appear in both `env` and `passthroughEnv`.
 | `credential` | string | `azure-keyvault` only. How the Runner authenticates to Azure: `managed-identity` (the platform's managed identity and nothing else — use this in production) or `default` (the SDK's `DefaultAzureCredential`, which tries environment variables, workload identity, managed identity and then the developer tools `az`/`azd`/Azure PowerShell in that order — for development). Defaults to `default` when omitted. No credential value is ever in this file. |
 | `managedIdentityClientId` | string | `azure-keyvault` with `credential: managed-identity` only. The client ID (GUID) of a user-assigned managed identity; omitted means the system-assigned identity. |
 
+### `jobSigning`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `publicKeys` | []string | — (required) | 1–8 Conductor signing public keys (Ed25519), each either a PEM `PUBLIC KEY` block or the standard base64 of its DER SubjectPublicKeyInfo — the one-line `publicKey:` that `acme-conductor keygen` prints. Several keys let the Conductor rotate its key without a simultaneous change here. Duplicates are rejected. |
+| `clockSkewSeconds` | int | `300` | How far an envelope's `issuedAt` may lie in the future of this Runner's clock before it is refused. Expiry has no tolerance. `1`–`3600`. |
+
+When `jobSigning` is present the Runner is **strict in both directions**:
+a bare `CertificateReconcileJob` is refused (`InvalidJobSpec`, "signed
+job envelopes only"), and a `SignedCertificateReconcileJob` is acted upon
+only if its signature verifies against one of these keys, its validity
+window includes now, and its `runId` has not been accepted before (see
+[Execution flow](#execution-flow)). When `jobSigning` is absent, only
+bare JobSpecs are accepted and an envelope is refused — the Runner never
+ignores a signature it cannot check. Which to use is a deployment
+decision: the local launcher over a private directory on one host may
+run unsigned; anything that hands jobs over a shared volume or a
+platform must sign ([ADR 0015](adr/0015-signed-job-envelope.md)).
+
+### Running as a Container Apps Job
+
+In the Phase 4 deployment ([`deploy/azure`](../deploy/azure/README.md))
+the Runner is a Container Apps Job with a user-assigned managed
+identity, and both DNS and Key Vault authenticate with it: the store
+binding says `credential: managed-identity`, and the `azuredns` DNS
+binding says `AZURE_AUTH_METHOD=msi` in its `env`. Container Apps
+exposes the identity to the container through the `IDENTITY_ENDPOINT`
+and `IDENTITY_HEADER` environment variables (and the Job template sets
+`AZURE_CLIENT_ID` to the identity's client ID); because the Runner builds
+`lego`'s environment from scratch, the DNS binding must forward exactly
+those names:
+
+```json
+"azure-dns-staging": {
+  "provider": "azuredns",
+  "env": {
+    "AZURE_AUTH_METHOD": "msi",
+    "AZURE_ZONE_NAME": "example.ac.jp",
+    "AZURE_RESOURCE_GROUP": "rg-dns-example",
+    "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000"
+  },
+  "passthroughEnv": ["AZURE_CLIENT_ID", "IDENTITY_ENDPOINT", "IDENTITY_HEADER"]
+}
+```
+
+No credential value is in the file; `IDENTITY_HEADER` is the
+per-container token of the local identity endpoint and is redacted from
+the Runner's log like every passthrough value.
+[`deploy/examples/runner-config.aca.example.json`](../deploy/examples/runner-config.aca.example.json)
+is the complete, validated example for that deployment (paths `/state`
+and `/work`, `jobSigning` required).
+
 ### Example
 
 See [`deploy/examples/runner-config.example.json`](../deploy/examples/runner-config.example.json)
@@ -180,17 +238,31 @@ example `JobSpec` is at
 
 One `reconcile` invocation:
 
-1. Read the job file (capped at 64 KiB). Leniently peek `runId` and
-   `target.id` out of the raw JSON first, so that a `Result` can still be
-   produced for a `runId` even if the document goes on to fail strict
-   validation.
-2. Strictly decode and validate the `JobSpec` (`v1alpha1.DecodeJobSpec` /
-   `JobSpec.Validate`) — unknown fields, duplicate keys and trailing data
-   are all rejected; this is a self-consistency check of the document, not
-   authorization.
-3. Load the Runner configuration (strict JSON: unknown fields, duplicate
+1. Read the job file (capped at 128 KiB, the size of a signed envelope
+   around a 64 KiB JobSpec). If the document is a
+   `SignedCertificateReconcileJob`, decode the envelope's structure
+   strictly and take the JobSpec bytes from its payload — unverified for
+   now. Leniently peek `runId` and `target.id` out of those bytes first,
+   so that a `Result` can still be produced for a `runId` even if the
+   document goes on to fail verification or strict validation.
+2. Load the Runner configuration (strict JSON: unknown fields, duplicate
    keys, trailing data and over-deep nesting rejected, 256 KiB cap — the
    same decoder as the JobSpec, `internal/strictjson`).
+3. **Signed envelope** (Phase 4, [`jobSigning`](#jobsigning)): verify the
+   Ed25519 signature over the exact `protected.payload` bytes against the
+   trusted public keys (`kid` selects the key), check `expiresAt` is not
+   past and `issuedAt` is not more than `clockSkewSeconds` ahead, then
+   record the `runId` in the replay ledger — one marker file per run
+   under `stateDir/jobs.d/`, created exclusively under a lock on
+   `stateDir/.jobs.lock`, holding the envelope's expiry; markers whose
+   expiry plus skew has passed are pruned on the way. A run already in
+   the ledger is refused ("already executed"). Every failure here is
+   `InvalidJobSpec`; a ledger I/O problem is `Internal`. With
+   `jobSigning` configured a bare JobSpec is refused at this step;
+   without it, an envelope is. Only then strictly decode and validate the
+   `JobSpec` (`v1alpha1.DecodeJobSpec` / `JobSpec.Validate`) — unknown
+   fields, duplicate keys and trailing data are all rejected; this is a
+   self-consistency check of the document, not authorization.
 4. Authorize the request with `RunnerAuthorizationPolicy` built from that
    configuration — deny by default, suffix matched on a label boundary,
    wildcard gated by `allowWildcard`, and all three binding names checked
@@ -489,7 +561,7 @@ Inside `Dockerfile.runner`'s runtime image
 | `/usr/local/bin/lego` | The pinned, checksum-verified `lego` v4.35.2 binary (see [ADR 0010](adr/0010-pinned-lego-binary.md)). |
 | `/etc/acme-runner/config.json` | The Runner configuration, mounted **read-only**. |
 | `/work` | The `lego.workDir`. Must be a writable `tmpfs`/`emptyDir`; a certificate private key exists here only transiently, for the duration of one run. |
-| `/state` | The `lego.stateDir`. Must be a writable, **persistent** volume; holds only the ACME account key and registration — never a certificate private key. |
+| `/state` | The `lego.stateDir`. Must be a writable, **persistent** volume; holds only the ACME account key and registration and, since Phase 4, the replay ledger (`jobs.d/`) — never a certificate private key. |
 | `/store` | An example `filesystem` store root (dev/test only). |
 
 The image supports `--read-only` / Kubernetes `readOnlyRootFilesystem:
@@ -582,6 +654,12 @@ across the rest of the codebase's log statements is still Phase 3+ work
 ## Security boundaries
 
 - No HTTP server, no cron, no database: one job, one process, one exit.
+- **A signed job proves who produced it, not that it should run.** With
+  `jobSigning` the Runner refuses tampered, expired and replayed
+  envelopes before it resolves a binding; the unwrapped `JobSpec` is then
+  validated and authorized against the trusted configuration exactly as
+  an unsigned one would be. The Runner holds public keys only; it cannot
+  produce a job another Runner would trust.
 - The Runner needs store **read** (for the renewal decision) and **write**
   (to store a new bundle) on exactly the one store binding a `JobSpec`
   selects and that binding names — nothing else. For Key Vault that is
@@ -720,14 +798,14 @@ across the rest of the codebase's log statements is still Phase 3+ work
   that (last writer wins). The Conductor (Phase 2) prevents it for the
   runs it launches — at most one active run per target — but not for a
   Runner started by hand or by another launcher.
-- Only one execution shape (a single local process per run) exists; an
-  Azure Container Apps Job launcher, and with it a Runner that actually
-  runs under a managed identity, is Phase 4. Until then a Key Vault
-  binding is usable from a Runner started by hand or by the local
-  launcher only with `credential: default` and a developer's own Azure
-  sign-in or a service principal in the Runner's environment.
-- The `JobSpec` itself is neither signed nor authenticated end-to-end, and
-  there is no replay/expiry check — see `docs/threat-model.md`'s T2/T3.
+- The replay ledger is per `stateDir`: Runners with separate state
+  directories do not see each other's accepted runs, and a Runner
+  without `jobSigning` has no expiry or replay check at all (a bare
+  JobSpec carries neither). The ledger's lock has the same
+  network-filesystem caveat as the account state's.
+- Signing does not verify the producer's *decisions*: a Conductor that
+  holds the signing key can sign a job for any name; the trusted
+  authorization policy is what bounds that (`docs/threat-model.md`, T1).
 - The Runner has no way to verify that a DNS credential/workload identity
   it is handed is actually scoped to the challenge zone it needs; that
   scoping is an operational requirement on how each `DnsBinding` is
@@ -735,8 +813,11 @@ across the rest of the codebase's log statements is still Phase 3+ work
 - Log redaction of `lego` output is value-based and heuristic (known
   secret values, known PEM markers), not a general secret detector, and
   has no dedicated test suite yet outside this package.
-- The only launcher that exists (Phase 2) runs the Runner as a local
-  child process of the Conductor on the same host; a platform launcher
-  with workload identity (Azure Container Apps Job) is Phase 4. A
-  `JobSpec` can still be produced and a `Result` consumed by hand, as the
-  command line above shows.
+- The Container Apps deployment (Phase 4) is tested against fakes and
+  compiled Bicep, not a real subscription: managed-identity
+  authentication of `lego`'s `azuredns` provider through the Container
+  Apps identity endpoint, and the platform's execution-template
+  override, are documented expectations until a first deployment
+  confirms them (`deploy/azure/README.md`). A `JobSpec` can still be
+  produced and a `Result` consumed by hand, as the command line above
+  shows.

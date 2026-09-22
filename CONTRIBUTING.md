@@ -1,7 +1,7 @@
 # Contributing to ACME Conductor
 
 Thanks for your interest in ACME Conductor. This project is early
-(Phase 3 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
+(Phase 4 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
 its security properties depend on a strict, boundary-respecting design;
 please read this document before opening a pull request.
 
@@ -35,6 +35,10 @@ make vulncheck # govulncheck against the module
 make images    # build both container images and confirm they build cleanly
 ```
 
+Changes under `deploy/azure` should also compile and lint with the Bicep
+CLI (`bicep build deploy/azure/main.bicep`, `bicep lint
+deploy/azure/main.bicep`); CI does not run it yet.
+
 ## Coding rules
 
 - **No secrets in logs, config, the database, or `Result` documents.**
@@ -44,8 +48,9 @@ make images    # build both container images and confirm they build cleanly
   see [`docs/threat-model.md`](docs/threat-model.md), T6.
 - **No cloud SDK in Conductor core.** Azure/AWS/GCP SDK imports belong only
   in launcher and Certificate Store adapter implementations
-  (`internal/store/keyvault` today), never in `acme-conductor`'s core
-  packages (Target Registry, Policy, Audit Log, Run Registry, Scheduler).
+  (`internal/store/keyvault` and `internal/conductor/launcher/acajob`
+  today), never in `acme-conductor`'s core packages (Target Registry,
+  Policy, Audit Log, Run Registry, Scheduler).
   Keep the SDK's pinned versions within the Go version `go.mod` declares.
 - **Strict decoders.** Any new wire format follows the same rule the
   `v1alpha1` contract does: reject unknown fields, duplicate keys, and

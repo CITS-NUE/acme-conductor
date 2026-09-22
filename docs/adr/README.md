@@ -19,6 +19,8 @@ Conductor, in the lightweight MADR-like format described in
 | [0011](0011-conductor-storage-and-run-model.md) | Conductor storage and run model |
 | [0012](0012-localhost-only-dev-auth.md) | Localhost-only development authentication |
 | [0013](0013-azure-key-vault-store-adapter.md) | Azure Key Vault store adapter |
+| [0014](0014-azure-container-apps-job-launcher.md) | Azure Container Apps Job launcher |
+| [0015](0015-signed-job-envelope.md) | Signed job envelope and replay ledger |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).

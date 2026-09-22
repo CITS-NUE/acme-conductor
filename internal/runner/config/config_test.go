@@ -700,3 +700,70 @@ func TestKeyVaultStoreBinding(t *testing.T) {
 		mustReject(t, marshalDoc(t, m), "")
 	})
 }
+
+func TestJobSigning(t *testing.T) {
+	pub, _, err := v1alpha1.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pem, _ := v1alpha1.MarshalSigningPublicKey(pub)
+	lines := strings.Split(strings.TrimSpace(string(pem)), "\n")
+	oneLine := strings.Join(lines[1:len(lines)-1], "")
+	pub2, _, _ := v1alpha1.GenerateSigningKey()
+	pem2, _ := v1alpha1.MarshalSigningPublicKey(pub2)
+
+	t.Run("absent means unsigned jobs only", func(t *testing.T) {
+		c := mustAccept(t, marshalDoc(t, validDoc()))
+		if c.JobSigning != nil || c.JobSigning.Keys() != nil {
+			t.Fatal("jobSigning should be nil")
+		}
+	})
+	t.Run("pem and one-line keys, defaults, ids", func(t *testing.T) {
+		m := validDoc()
+		m["jobSigning"] = map[string]any{"publicKeys": []any{string(pem), string(pem2)}}
+		c := mustAccept(t, marshalDoc(t, m))
+		keys := c.JobSigning.Keys()
+		if len(keys) != 2 || !keys[v1alpha1.KeyID(pub)].Equal(pub) || !keys[v1alpha1.KeyID(pub2)].Equal(pub2) {
+			t.Fatalf("keys = %v", keys)
+		}
+		if c.JobSigning.ClockSkewSeconds != DefaultClockSkewSeconds {
+			t.Fatalf("skew = %d", c.JobSigning.ClockSkewSeconds)
+		}
+		m["jobSigning"] = map[string]any{"publicKeys": []any{oneLine}, "clockSkewSeconds": 60}
+		c = mustAccept(t, marshalDoc(t, m))
+		if len(c.JobSigning.Keys()) != 1 || c.JobSigning.ClockSkewSeconds != 60 {
+			t.Fatalf("one-line key: %+v", c.JobSigning)
+		}
+	})
+	rejections := []struct {
+		name string
+		js   map[string]any
+		want string
+	}{
+		{"empty list", map[string]any{"publicKeys": []any{}}, "at least one key"},
+		{"garbage key", map[string]any{"publicKeys": []any{"not a key"}}, "publicKeys[0]"},
+		{"duplicate key", map[string]any{"publicKeys": []any{string(pem), oneLine}}, "listed twice"},
+		{"private key pem", map[string]any{"publicKeys": []any{"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n"}}, "PUBLIC KEY"},
+		{"skew too large", map[string]any{"publicKeys": []any{string(pem)}, "clockSkewSeconds": 7200}, "clockSkewSeconds"},
+		{"skew negative", map[string]any{"publicKeys": []any{string(pem)}, "clockSkewSeconds": -1}, "clockSkewSeconds"},
+		{"unknown field", map[string]any{"publicKeys": []any{string(pem)}, "privateKey": "x"}, "privateKey"},
+	}
+	for _, r := range rejections {
+		t.Run(r.name, func(t *testing.T) {
+			m := validDoc()
+			m["jobSigning"] = r.js
+			mustReject(t, marshalDoc(t, m), r.want)
+		})
+	}
+	t.Run("too many keys", func(t *testing.T) {
+		var keys []any
+		for i := 0; i <= MaxSigningKeys; i++ {
+			p, _, _ := v1alpha1.GenerateSigningKey()
+			b, _ := v1alpha1.MarshalSigningPublicKey(p)
+			keys = append(keys, string(b))
+		}
+		m := validDoc()
+		m["jobSigning"] = map[string]any{"publicKeys": keys}
+		mustReject(t, marshalDoc(t, m), "at most")
+	})
+}

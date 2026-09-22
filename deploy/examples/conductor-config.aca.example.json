@@ -1,0 +1,44 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "ConductorConfig",
+  "server": {
+    "listen": "127.0.0.1:8080",
+    "auth": { "mode": "localhost-dev" },
+    "shutdownGraceSeconds": 1800
+  },
+  "database": {
+    "path": "/var/lib/acme-conductor/conductor.db"
+  },
+  "scheduler": {
+    "tickSeconds": 60,
+    "maxConcurrentRuns": 2,
+    "retryBackoffSeconds": 300,
+    "maxRetryBackoffSeconds": 21600
+  },
+  "jobSigning": {
+    "privateKeyFile": "/etc/acme-conductor/job-signing.pem",
+    "validitySeconds": 900
+  },
+  "executionBindings": {
+    "azure": {
+      "type": "azure-container-apps-job",
+      "azureContainerAppsJob": {
+        "subscriptionId": "00000000-0000-0000-0000-000000000000",
+        "resourceGroup": "rg-acme",
+        "jobName": "acme-runner",
+        "cloud": "public",
+        "credential": "managed-identity",
+        "managedIdentityClientId": "11111111-1111-1111-1111-111111111111",
+        "containerName": "runner",
+        "exchangeDir": "/mnt/exchange",
+        "runnerExchangeDir": "/exchange",
+        "timeoutSeconds": 1800,
+        "pollIntervalSeconds": 10,
+        "resultGraceSeconds": 30
+      }
+    }
+  },
+  "acmeBindings": ["letsencrypt-staging"],
+  "dnsBindings": ["azure-dns-staging"],
+  "storeBindings": ["keyvault-staging"]
+}

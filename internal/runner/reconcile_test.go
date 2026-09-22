@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -1019,5 +1021,222 @@ func TestOpenStoreByType(t *testing.T) {
 	}
 	if _, err := openStore(config.StoreBinding{Type: "aws-secretsmanager"}); err == nil {
 		t.Fatalf("unknown store type accepted")
+	}
+}
+
+// --- signed job envelopes ------------------------------------------------------
+
+// signingKeys generates a key pair and configures the harness to trust it.
+func (h *harness) signingKeys() (ed25519.PublicKey, ed25519.PrivateKey) {
+	h.t.Helper()
+	pub, priv, err := v1alpha1.GenerateSigningKey()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	pem, err := v1alpha1.MarshalSigningPublicKey(pub)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.mutateConfig(func(m map[string]any) {
+		m["jobSigning"] = map[string]any{"publicKeys": []string{string(pem)}}
+	})
+	return pub, priv
+}
+
+// signedJob writes a signed envelope for the default job to the job path.
+func (h *harness) signedJob(priv ed25519.PrivateKey, opts v1alpha1.SignOptions, mut func(m map[string]any)) *v1alpha1.SignedJob {
+	h.t.Helper()
+	h.job(mut)
+	raw, err := os.ReadFile(h.jobPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	spec, err := v1alpha1.DecodeJobSpec(bytes.NewReader(raw))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if opts.IssuedAt.IsZero() {
+		opts.IssuedAt = h.now
+	}
+	if opts.Validity == 0 {
+		opts.Validity = 15 * time.Minute
+	}
+	sj, err := v1alpha1.SignJob(spec, priv, opts)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.writeJSON(h.jobPath, sj)
+	return sj
+}
+
+func TestReconcileSignedJob(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	_, priv := h.signingKeys()
+	h.signedJob(priv, v1alpha1.SignOptions{}, nil)
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Status != v1alpha1.StatusSucceeded || res.Action != v1alpha1.ActionIssued {
+		t.Fatalf("code = %d, result = %+v\n%s", code, res, h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "signed job envelope verified") {
+		t.Fatalf("verification not logged:\n%s", h.logs.String())
+	}
+	marker := filepath.Join(h.stateDir, jobsLedgerDir, "01JABCDEFGHJKMNPQRSTVWXYZ0")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("ledger marker: %v", err)
+	}
+
+	// The very same envelope presented again is a replay: refused before
+	// lego runs.
+	os.Remove(h.record)
+	code, res = h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInvalidJobSpec || !strings.Contains(res.Error.Summary, "already executed") {
+		t.Fatalf("replay: code = %d, result = %+v", code, res)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego ran for a replayed job")
+	}
+
+	// A fresh envelope for a different run is fine; the old marker is
+	// pruned once its expiry (plus skew) has passed.
+	h.now = h.now.Add(30 * time.Minute)
+	h.signedJob(priv, v1alpha1.SignOptions{}, func(m map[string]any) { m["runId"] = "01JABCDEFGHJKMNPQRSTVWXYZ9" })
+	if code, _ := h.run(context.Background()); code != ExitSucceeded {
+		t.Fatalf("second run: code = %d\n%s", code, h.logs.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired marker not pruned: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(h.stateDir, jobsLedgerDir, "01JABCDEFGHJKMNPQRSTVWXYZ9")); err != nil {
+		t.Fatalf("new marker: %v", err)
+	}
+}
+
+func TestReconcileSignedJobRejections(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(h *harness, priv ed25519.PrivateKey)
+		code    v1alpha1.ErrorCode
+		summary string
+	}{
+		{name: "payload tampered", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			sj := h.signedJob(priv, v1alpha1.SignOptions{}, nil)
+			var m map[string]any
+			_ = json.Unmarshal(sj.PayloadBytes(), &m)
+			m["target"].(map[string]any)["fqdn"] = "evil.example.ac.jp"
+			b, _ := json.Marshal(m)
+			sj.Payload = base64.RawURLEncoding.EncodeToString(b)
+			h.writeJSON(h.jobPath, sj)
+		}, code: v1alpha1.ErrorCodeInvalidJobSpec, summary: "signature does not verify"},
+		{name: "expired", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			h.signedJob(priv, v1alpha1.SignOptions{IssuedAt: h.now.Add(-time.Hour), Validity: 10 * time.Minute}, nil)
+		}, code: v1alpha1.ErrorCodeInvalidJobSpec, summary: "expired"},
+		{name: "from the future", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			h.signedJob(priv, v1alpha1.SignOptions{IssuedAt: h.now.Add(time.Hour)}, nil)
+		}, code: v1alpha1.ErrorCodeInvalidJobSpec, summary: "not yet valid"},
+		{name: "unknown key", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			_, other, _ := v1alpha1.GenerateSigningKey()
+			h.signedJob(other, v1alpha1.SignOptions{}, nil)
+		}, code: v1alpha1.ErrorCodeInvalidJobSpec, summary: "unknown key"},
+		{name: "unsigned job when signing is required", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			h.job(nil)
+		}, code: v1alpha1.ErrorCodeInvalidJobSpec, summary: "signed job envelopes only"},
+		{name: "signed payload fails authorization", prepare: func(h *harness, priv ed25519.PrivateKey) {
+			h.signedJob(priv, v1alpha1.SignOptions{}, func(m map[string]any) {
+				m["target"].(map[string]any)["fqdn"] = "wiki.evil.com"
+				m["policy"].(map[string]any)["allowedDnsSuffixes"] = []string{"evil.com"}
+			})
+		}, code: v1alpha1.ErrorCodePolicyViolation, summary: "authorization policy rejected"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, "ok", nil)
+			_, priv := h.signingKeys()
+			c.prepare(h, priv)
+			code, res := h.run(context.Background())
+			if code != ExitFailed || res.Error == nil {
+				t.Fatalf("code = %d, result = %+v\n%s", code, res, h.logs.String())
+			}
+			if res.Error.Code != c.code || !strings.Contains(res.Error.Summary, c.summary) {
+				t.Fatalf("error = %+v, want %s containing %q", res.Error, c.code, c.summary)
+			}
+			if _, err := os.Stat(h.record); err == nil {
+				t.Fatal("lego ran for a rejected job")
+			}
+			if res.RunID != "01JABCDEFGHJKMNPQRSTVWXYZ0" {
+				t.Fatalf("result names run %q", res.RunID)
+			}
+		})
+	}
+}
+
+func TestReconcileSignedJobWithoutKeysIsRefused(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	_, priv, _ := v1alpha1.GenerateSigningKey()
+	h.signedJob(priv, v1alpha1.SignOptions{}, nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInvalidJobSpec || !strings.Contains(res.Error.Summary, "no jobSigning keys") {
+		t.Fatalf("code = %d, result = %+v", code, res)
+	}
+}
+
+func TestReconcileSignedJobConfigMissing(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	_, priv := h.signingKeys()
+	h.signedJob(priv, v1alpha1.SignOptions{}, nil)
+	os.Remove(h.cfgPath)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInternal || res.RunID != "01JABCDEFGHJKMNPQRSTVWXYZ0" {
+		t.Fatalf("code = %d, result = %+v", code, res)
+	}
+}
+
+func TestReconcileMalformedEnvelopeHasNoResult(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.signingKeys()
+	if err := os.WriteFile(h.jobPath, []byte(`{"kind":"SignedCertificateReconcileJob","payload":"!!"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := h.run(context.Background()); code != ExitNoResult {
+		t.Fatalf("code = %d, want %d", code, ExitNoResult)
+	}
+}
+
+func TestReplayLedgerConcurrentRunnersAcceptOnce(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	const n = 8
+	var wg sync.WaitGroup
+	accepted := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := recordJob(context.Background(), dir, "01JRUN000000000000000000A1", now.Add(time.Hour), now, 5*time.Minute)
+			if err == nil {
+				accepted <- struct{}{}
+			} else if !errors.Is(err, ErrJobReplayed) {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(accepted)
+	if len(accepted) != 1 {
+		t.Fatalf("accepted %d times, want 1", len(accepted))
+	}
+	// A symbolic link planted at the ledger path is refused.
+	other := t.TempDir()
+	if err := os.Symlink(other, filepath.Join(dir, "jobs.d2")); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	os.RemoveAll(filepath.Join(dir, jobsLedgerDir))
+	if err := os.Symlink(other, filepath.Join(dir, jobsLedgerDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordJob(context.Background(), dir, "01JRUN000000000000000000A2", now.Add(time.Hour), now, 0); err == nil || !strings.Contains(err.Error(), "not a real directory") {
+		t.Fatalf("err = %v", err)
+	}
+	if entries, _ := os.ReadDir(other); len(entries) != 0 {
+		t.Fatal("wrote through the planted link")
 	}
 }

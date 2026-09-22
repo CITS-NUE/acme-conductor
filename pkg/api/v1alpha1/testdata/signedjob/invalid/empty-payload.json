@@ -1,0 +1,7 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "SignedCertificateReconcileJob",
+  "payload": "",
+  "protected": "eyJhbGciOiJFZERTQSIsImtpZCI6IjU2NDc1YWE3NTQ2MzQ3NGMiLCJpc3N1ZWRBdCI6IjIwMjYtMDktMjJUMTI6MDA6MDBaIiwiZXhwaXJlc0F0IjoiMjAyNi0wOS0yMlQxMjoxNTowMFoiLCJub25jZSI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUEifQ",
+  "signature": "GfzatBEERJSU4ibL2eoZnXFlxF8-OAx5BWiijDOh0OQERTJZJHSKo--tlRb52XkFbUmnhMgSTJ4KcMJCMr4LDw"
+}
