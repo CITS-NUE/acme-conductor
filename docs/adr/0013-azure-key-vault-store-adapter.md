@@ -9,9 +9,9 @@ Phase 3 adds the first Certificate Store meant for real deployments. The
 filesystem store (Phase 1) exists to make the Runner runnable without a
 cloud dependency; it has no access control of its own and is not where a
 production certificate and its private key can live. Azure Key Vault is
-the target platform's secrets store, and it is also where the
-certificate's consumers (Application Gateway, App Service, Front Door,
-VM extensions) already read certificates from. The store contract
+the target platform's secrets store, with access control and audit of
+its own, and it is where a consumer on that platform reads a certificate
+from (through the certificate's secret). The store contract
 (`internal/store.Store`: `Current`, `Put`, `Type`) was designed for this
 adapter; what remained to decide is how a bundle maps onto Key Vault's
 object model, how the Runner authenticates, how object names are
@@ -26,12 +26,25 @@ derived, and what the Runner may never do to the vault.
   operation with content type `application/x-pem-file`. This uses Key
   Vault's own certificate object — versions, the backing key, and the
   secret consumers read — rather than a bare secret holding a PEM blob,
-  so platform services can reference the certificate the way they
-  already do. It also means **no PFX and no PFX password** exist
-  anywhere in the system (the threat model's "temporary PFX password"
-  concern in T6 has nothing to leak). Every `Put` creates a new version;
-  nothing is overwritten, and the store never deletes, disables, recovers
-  or purges ([ADR 0008](0008-no-purge-in-mvp.md)).
+  so a consumer references the certificate by its versionless name and
+  sees each new version on its next refresh. It also means **no PFX and
+  no PFX password** exist anywhere in the system (the threat model's
+  "temporary PFX password" concern in T6 has nothing to leak). Every
+  `Put` creates a new version; nothing is overwritten, and the store
+  never deletes, disables, recovers or purges
+  ([ADR 0008](0008-no-purge-in-mvp.md)).
+- **PEM is the only content type; PKCS #12 consumers are out of scope
+  for Phase 3.** A consumer that reads the certificate's secret and
+  accepts PEM content is served (an application fetching the secret, a
+  VM or container receiving it through a Key Vault reference, any
+  service whose Key Vault integration accepts PEM). The built-in Key
+  Vault integrations of App Service and Azure Front Door require PKCS #12
+  (`application/x-pkcs12`; Front Door also rejects EC certificates), so
+  those services are **not** served by this store as it stands. Adding a
+  PKCS #12 import would mean building a PFX in the Runner (an encoding
+  step with a password, even if empty, that T6 then has to cover), a
+  per-consumer key-type constraint, and tests for both; that is a later
+  phase, decided when a target actually needs one of those services.
 - **`Current` reads the public part only.** The renewal decision needs
   the certificate's SANs, validity and key type, all of which the
   `certificates/get` operation returns (`cer`). The Runner never calls
@@ -70,11 +83,17 @@ derived, and what the Runner may never do to the vault.
   bounded to 127 characters with `.`/`_` mapped to `-`. The 64-bit hash
   suffix is untouched, so uniqueness per FQDN is unchanged, and the
   Result's `storeObjectRef` is the actual vault certificate name.
-- **Errors carry status and code only.** A vault error becomes
-  `key vault <op>: HTTP <status> (<code>)`. The SDK's own error type
-  prints the whole response; the store never lets that reach a log line,
-  and (as for every other failure) only a fixed template reaches the
-  `Result`.
+- **Errors are fixed wording, whatever their source.** A vault error
+  becomes `key vault <op>: HTTP <status> (<code>)`; a token failure
+  becomes `key vault <op>: authentication failed (identity endpoint HTTP
+  <status>)` or `(credential unavailable)`; a transport failure `request
+  timed out` or `connection failed`; anything else names the Go type of
+  the innermost error. Both the vault's `ResponseError` and azidentity's
+  `AuthenticationFailedError` print whole response bodies in their own
+  `Error()`; neither is ever wrapped into what the store returns, so the
+  Runner's `cause` log field and the `Result` cannot carry them. Context
+  cancellation and deadline errors are wrapped as bare sentinels so the
+  Runner still classifies them.
 - **Tests use an in-process fake vault, never a real one.** The fake
   imitates the REST API's shapes — bearer-challenge authentication, PEM
   import validation with a key-matches-certificate check, get, error
@@ -88,10 +107,13 @@ derived, and what the Runner may never do to the vault.
 
 ## Consequences
 
-- Deployments get a store with real access control and audit, and the
-  certificate is consumable by Azure services directly. The Runner's
-  vault permissions are two data actions (`certificates/get`,
+- Deployments get a store with real access control and audit, and a
+  certificate that PEM-capable consumers read through its secret. The
+  Runner's vault permissions are two data actions (`certificates/get`,
   `certificates/import`); the Conductor has none.
+- App Service and Azure Front Door cannot consume the stored certificate
+  through their built-in Key Vault integrations until a PKCS #12 import
+  exists; the operator guide says so.
 - An imported certificate's key is **exportable through its secret**:
   that is the delivery mechanism and it is deliberate. Whoever holds
   `secrets/get` on the vault can read every certificate's key; that is

@@ -28,6 +28,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
 
 	"github.com/CITS-NUE/acme-conductor/internal/store"
@@ -84,6 +85,9 @@ func genRSACert(t *testing.T, dnsNames ...string) (certPEM, keyPEM []byte, cert 
 // --- fake vault ----------------------------------------------------------------
 
 const fakeToken = "fake-access-token-0123456789"
+
+// testGUID is a user-assigned managed identity client ID used in tests.
+const testGUID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 
 // fakeCredential hands out a fixed bearer token and records what was asked.
 type fakeCredential struct {
@@ -514,6 +518,135 @@ func TestCancelledContext(t *testing.T) {
 	if err == nil || errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Current with a cancelled context: %v", err)
 	}
+	// The Runner classifies the run by errors.Is; the text carries no URL.
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "http") {
+		t.Fatalf("cancelled error = %q", err)
+	}
+}
+
+// transportFunc is an azcore transport backed by a function.
+type transportFunc func(*http.Request) (*http.Response, error)
+
+func (f transportFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func vaultOptions(f *fakeVault) *Options {
+	return &Options{
+		InsecureSkipVaultHostCheck: true,
+		ClientOptions: &azcertificates.ClientOptions{
+			ClientOptions:                        azcore.ClientOptions{Transport: f.srv.Client(), Retry: policy.RetryOptions{MaxRetries: -1}},
+			DisableChallengeResourceVerification: true,
+		},
+	}
+}
+
+// A real azidentity.ManagedIdentityCredential whose identity endpoint (a
+// fake transport, no Azure) answers every token request with an error
+// body. The SDK's AuthenticationFailedError prints that body; the store's
+// error must not.
+func TestAuthenticationErrorsCarryNoResponseBody(t *testing.T) {
+	f := newFakeVault(t)
+	const marker = "REVIEW-IDENTITY-BODY-MUST-NOT-REACH-LOG"
+	identity := transportFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"error":"invalid_request","error_description":"` + marker + `"}`
+		return &http.Response{
+			StatusCode: 400, Status: "400 Bad Request", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header: http.Header{"Content-Type": {"application/json"}},
+			Body:   io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: r,
+		}, nil
+	})
+	cred, err := azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+		ClientOptions: azcore.ClientOptions{Transport: identity, Retry: policy.RetryOptions{MaxRetries: -1}},
+		ID:            azidentity.ClientID(testGUID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(f.srv.URL, cred, vaultOptions(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(t *testing.T, op string, err error) {
+		t.Helper()
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("%s: %v", op, err)
+		}
+		text := err.Error()
+		for _, forbidden := range []string{marker, "invalid_request", "error_description", "RESPONSE", "http", "{"} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%s error carries identity response content %q: %q", op, forbidden, text)
+			}
+		}
+		var re *RequestError
+		if !errors.As(err, &re) || re.Op != op || re.Kind != KindAuthentication {
+			t.Fatalf("%s error = %#v (%q), want a RequestError of kind authentication", op, err, text)
+		}
+		if re.StatusCode != 0 && re.StatusCode != 400 {
+			t.Fatalf("%s error status = %d", op, re.StatusCode)
+		}
+		var af *azidentity.AuthenticationFailedError
+		if errors.As(err, &af) {
+			t.Fatalf("%s error still wraps the SDK error (its text would be reachable through errors.As)", op)
+		}
+	}
+	_, err = st.Current(context.Background(), "wiki-example-ac-jp-0123456789abcdef")
+	check(t, "get", err)
+	certPEM, keyPEM, _ := genECCert(t, "wiki.example.ac.jp")
+	err = st.Put(context.Background(), st.ObjectName("wiki.example.ac.jp"), store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
+	check(t, "import", err)
+	if n := f.requestCount(); n == 0 {
+		t.Fatal("the vault was never asked (no bearer challenge happened)")
+	}
+}
+
+// failingCredential returns a fixed error from every token request.
+type failingCredential struct{ err error }
+
+func (c failingCredential) GetToken(context.Context, policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{}, c.err
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "dial tcp 10.0.0.1:443: i/o timeout (SECRET-LOOKING)" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// Errors that are not vault responses are reduced to fixed wording too.
+func TestOtherErrorsAreFixedText(t *testing.T) {
+	f := newFakeVault(t)
+	const marker = "SECRET-LOOKING"
+	cases := []struct {
+		name string
+		cred azcore.TokenCredential
+		opts *Options
+		kind string
+		want string
+	}{
+		{"credential unavailable", failingCredential{azidentity.NewCredentialUnavailableError("ManagedIdentityCredential: no identity endpoint " + marker)}, vaultOptions(f), KindAuthentication, "key vault get: authentication failed (credential unavailable)"},
+		{"unknown error", failingCredential{errors.New("token broker exploded " + marker)}, vaultOptions(f), KindOther, "key vault get: request failed (*errors.errorString)"},
+		{"timeout", &fakeCredential{}, &Options{InsecureSkipVaultHostCheck: true, ClientOptions: &azcertificates.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: transportFunc(func(*http.Request) (*http.Response, error) { return nil, timeoutError{} }), Retry: policy.RetryOptions{MaxRetries: -1}}}}, KindTimeout, "key vault get: request timed out"},
+		{"connection refused", &fakeCredential{}, &Options{InsecureSkipVaultHostCheck: true, ClientOptions: &azcertificates.ClientOptions{ClientOptions: azcore.ClientOptions{Retry: policy.RetryOptions{MaxRetries: -1}}}}, KindConnection, "key vault get: connection failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vaultURL := f.srv.URL
+			if tc.name == "connection refused" {
+				vaultURL = "https://127.0.0.1:1"
+			}
+			st, err := New(vaultURL, tc.cred, tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = st.Current(context.Background(), "wiki-example-ac-jp-0123456789abcdef")
+			var re *RequestError
+			if !errors.As(err, &re) || re.Kind != tc.kind || err.Error() != tc.want {
+				t.Fatalf("error = %q (%#v), want %q", err, err, tc.want)
+			}
+			if strings.Contains(err.Error(), marker) || strings.Contains(err.Error(), "127.0.0.1") {
+				t.Fatalf("error carries raw detail: %q", err)
+			}
+		})
+	}
 }
 
 // --- naming --------------------------------------------------------------------
@@ -605,7 +738,7 @@ func TestParseVaultURL(t *testing.T) {
 }
 
 func TestValidateCredential(t *testing.T) {
-	const guid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+	guid := testGUID
 	ok := [][2]string{{CredentialDefault, ""}, {CredentialManagedIdentity, ""}, {CredentialManagedIdentity, guid}, {CredentialManagedIdentity, strings.ToUpper(guid)}}
 	for _, c := range ok {
 		if err := ValidateCredential(c[0], c[1]); err != nil {
@@ -621,7 +754,7 @@ func TestValidateCredential(t *testing.T) {
 }
 
 func TestOpenBuildsAStoreWithoutNetwork(t *testing.T) {
-	const guid = "0f8fad5b-d9cb-469f-a165-70867728950e"
+	guid := testGUID
 	for _, cfg := range []Config{
 		{VaultURL: "https://kv-acme-dev.vault.azure.net", Credential: CredentialManagedIdentity},
 		{VaultURL: "https://kv-acme-dev.vault.azure.net", Credential: CredentialManagedIdentity, ManagedIdentityClientID: guid},

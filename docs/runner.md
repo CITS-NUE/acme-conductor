@@ -353,9 +353,12 @@ disclosure).
 The Azure Key Vault Certificate Store (`internal/store/keyvault`, binding
 type `azure-keyvault`, [ADR 0013](adr/0013-azure-key-vault-store-adapter.md))
 keeps one Key Vault **certificate** per target. It is the store for real
-deployments: the vault is what the certificate's consumers (Application
-Gateway, App Service, Front Door, a VM extension, ...) read it from, and
-the Runner's own access to it is narrow and short-lived.
+deployments: the vault is where a consumer reads the certificate from
+(through the certificate's secret), with its own access control and
+audit, and the Runner's own access to it is narrow and short-lived. What
+this store writes is a **PEM** certificate; which consumers can use that
+is set out under [Consumers and content type](#consumers-and-content-type)
+below.
 
 **Object name.** The Result's `storeObjectRef` is the Key Vault
 certificate name. Key Vault allows only letters, digits and hyphens (at
@@ -381,6 +384,25 @@ consumers through the certificate's secret. The Runner then checks that the cert
 vault reports back is the one it imported (same SHA-256 fingerprint,
 same name) and fails the run otherwise. No PFX and no PFX password are
 involved at any point.
+
+**Consumers and content type.** The store imports with content type
+`application/x-pem-file` only, so the certificate's secret holds the
+certificate chain and the private key as PEM. That serves consumers that
+read the secret with `secrets/get` and accept PEM content: an application
+or sidecar that fetches the secret itself, a virtual machine or container
+that receives the secret through a Key Vault reference, and any service
+whose Key Vault integration accepts PEM. It does **not** serve the
+built-in Key Vault integrations that require PKCS #12
+(`application/x-pkcs12`): [App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
+imports only PKCS #12 certificates from a vault, and
+[Azure Front Door](https://learn.microsoft.com/en-us/azure/frontdoor/domain#certificate-requirements)
+requires PFX (and does not accept EC certificates at all). A target whose
+certificate must reach one of those services needs a PKCS #12 import,
+which Phase 3 does not implement (no PFX and no PFX password exist in the
+system; [ADR 0013](adr/0013-azure-key-vault-store-adapter.md)). Check the
+consumer's own documentation for its content-type and key-type
+requirements before pointing it at a certificate this store manages;
+Application Gateway is not verified either way.
 
 **What `Current` does.** `GET /certificates/<name>/` — the current version
 of the certificate, *public part only* (`cer`, attributes). Key Vault
@@ -427,15 +449,26 @@ Runner's `PATH` — the Runner container image carries none of those
 programs, and a production binding should say `managed-identity` so that
 none of that is even tried. The vault's error responses are reduced to
 their HTTP status and error code before they reach a log line
-(`key vault get: HTTP 403 (Forbidden)`); the response body, headers and
-tokens are never logged, and as with every other failure only a fixed
-template reaches the `Result`.
+(`key vault get: HTTP 403 (Forbidden)`), and an identity endpoint's error
+response is reduced to its status the same way (see **Errors** below);
+response bodies, headers and tokens are never logged, and as with every
+other failure only a fixed template reaches the `Result`.
 
 **Exportable keys.** An imported certificate's key is exportable through
 its secret — that is how consumers obtain the certificate and it is the
 point of using the vault as the store. Whoever holds `secrets/get` on the
 vault can read the private key, so the vault's access policy / role
 assignments, not this code, decide who that is.
+
+**Errors.** Whatever the SDK or the transport produced, the store reduces
+it to fixed wording before it can reach a log line or a `Result` cause: a
+vault response becomes `key vault <op>: HTTP <status> (<code>)`; a
+failure to obtain a token becomes `key vault <op>: authentication failed
+(identity endpoint HTTP <status>)` or `(credential unavailable)`, never
+the identity endpoint's response body that the SDK's own error prints; a
+transport failure becomes `request timed out` or `connection failed`
+(no URL); anything else names only the Go type of the error. A cancelled
+or expired run is still recognized by the Runner (`Cancelled`/`Timeout`).
 
 **Not covered by automated tests.** The store is exercised against a fake
 in-process vault that imitates the REST API's shapes (bearer-challenge
@@ -673,6 +706,10 @@ across the rest of the codebase's log statements is still Phase 3+ work
   import operation is documented, not CI-verified. It never recovers or
   purges a soft-deleted certificate that blocks an import, and it cannot
   verify that its identity's role assignment is as narrow as documented.
+- The Key Vault store writes PEM only. The built-in Key Vault
+  integrations of App Service and Azure Front Door require PKCS #12 and
+  are not served by it; a PKCS #12 import is not part of Phase 3 (see
+  [Consumers and content type](#consumers-and-content-type)).
 - With `credential: default`, the SDK's `DefaultAzureCredential` chain
   reads service-principal variables from the Runner's environment and may
   execute developer tooling from `PATH`; that is a development

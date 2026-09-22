@@ -2,15 +2,20 @@
 //
 // One store object is one Key Vault *certificate*: Put imports the leaf
 // certificate, its chain and its private key as a single PEM document
-// (Key Vault's certificate import), which makes Key Vault keep the key
-// (exportable, so that the platform services which consume the vault —
-// Application Gateway, App Service, Front Door, ... — can read the
-// certificate through its secret) and creates a new version of the
-// certificate; consumers that reference the versionless certificate see
-// the new version on their next refresh. Current reads the certificate's
-// public part only (the certificates/get permission): the Runner never
-// reads a private key back out of the vault, so it never needs the
-// secrets/get permission, and its identity should not be granted it.
+// (Key Vault's certificate import, content type application/x-pem-file),
+// which makes Key Vault keep the key (exportable through the certificate's
+// secret, so that a consumer with secrets/get can read the certificate and
+// key as PEM) and creates a new version of the certificate; consumers that
+// reference the versionless certificate see the new version on their next
+// refresh. The store writes PEM only: consumers that read the secret and
+// accept PEM content are served, while the built-in Key Vault integrations
+// of Azure services that require PKCS #12 (application/x-pkcs12) — App
+// Service and Azure Front Door among them — are not served by this store
+// (docs/runner.md, "Consumers and content type"). Current reads the
+// certificate's public part only (the certificates/get permission): the
+// Runner never reads a private key back out of the vault, so it never
+// needs the secrets/get permission, and its identity should not be
+// granted it.
 //
 // The Runner authenticates with the execution platform's workload identity
 // through the Azure SDK's credential types ("managed-identity", or the
@@ -20,10 +25,14 @@
 // suffixes, and the SDK's authentication-challenge policy verifies that
 // the resource the vault asks a token for matches that host.
 //
-// Errors returned to the caller name the operation, the HTTP status and
-// the vault's error code only — never the response body, a header, a
-// token, or the certificate material — so an error can be logged by the
-// Runner as is.
+// Errors returned to the caller are built from fixed wording: a vault
+// response becomes the operation, the HTTP status and the vault's error
+// code; an authentication failure becomes the operation and the identity
+// endpoint's HTTP status; a transport failure becomes "timed out" or
+// "connection failed"; anything else names the Go type of the error. The
+// SDK's own error strings — which print response bodies — never reach the
+// caller, so an error can be logged by the Runner as is. Context
+// cancellation and deadline errors stay recognizable with errors.Is.
 package keyvault
 
 import (
@@ -32,6 +41,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -287,29 +297,111 @@ func CertificateName(object string) string {
 	return name
 }
 
-// RequestError is a vault response the store could not use: the operation,
-// the HTTP status and the vault's machine-readable error code. It never
-// carries the response body.
+// Kinds of a RequestError.
+const (
+	// KindVault: the vault answered with an error response.
+	KindVault = "vault"
+	// KindAuthentication: no token could be obtained from the selected
+	// credential (the identity endpoint answered with an error, or the
+	// credential is unavailable on this host).
+	KindAuthentication = "authentication"
+	// KindTimeout: the request or the token request timed out.
+	KindTimeout = "timeout"
+	// KindConnection: the vault or the identity endpoint could not be
+	// reached.
+	KindConnection = "connection"
+	// KindOther: an error of another kind; Detail names its Go type.
+	KindOther = "other"
+)
+
+// RequestError is a Key Vault request that did not succeed, reduced to
+// what is safe to log: the operation, the kind of failure, an HTTP status
+// (0 when there was no response) and the vault's machine-readable error
+// code or a fixed detail. It never carries a response body, a header, a
+// token, a URL or the certificate material.
 type RequestError struct {
 	Op         string
+	Kind       string
 	StatusCode int
-	Code       string
+	// Code is the vault's error code (KindVault) or a fixed detail.
+	Code string
 }
 
 func (e *RequestError) Error() string {
-	code := e.Code
-	if code == "" {
-		code = "no error code"
+	switch e.Kind {
+	case KindVault:
+		code := e.Code
+		if code == "" {
+			code = "no error code"
+		}
+		return fmt.Sprintf("key vault %s: HTTP %d (%s)", e.Op, e.StatusCode, code)
+	case KindAuthentication:
+		if e.StatusCode > 0 {
+			return fmt.Sprintf("key vault %s: authentication failed (identity endpoint HTTP %d)", e.Op, e.StatusCode)
+		}
+		if e.Code != "" {
+			return fmt.Sprintf("key vault %s: authentication failed (%s)", e.Op, e.Code)
+		}
+		return fmt.Sprintf("key vault %s: authentication failed", e.Op)
+	case KindTimeout:
+		return fmt.Sprintf("key vault %s: request timed out", e.Op)
+	case KindConnection:
+		return fmt.Sprintf("key vault %s: connection failed", e.Op)
+	default:
+		return fmt.Sprintf("key vault %s: request failed (%s)", e.Op, e.Code)
 	}
-	return fmt.Sprintf("key vault %s: HTTP %d (%s)", e.Op, e.StatusCode, code)
 }
 
+// wrap reduces err, whatever the SDK or the transport produced, to an
+// error whose text is safe to log (see the package comment). Context
+// errors are wrapped as the bare sentinel so the Runner can classify a
+// cancelled or expired run with errors.Is without the SDK's URL-bearing
+// message coming along.
 func wrap(op string, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("key vault %s: %w", op, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("key vault %s: %w", op, context.DeadlineExceeded)
+	}
 	var re *azcore.ResponseError
 	if errors.As(err, &re) {
-		return &RequestError{Op: op, StatusCode: re.StatusCode, Code: re.ErrorCode}
+		return &RequestError{Op: op, Kind: KindVault, StatusCode: re.StatusCode, Code: re.ErrorCode}
 	}
-	return fmt.Errorf("key vault %s: %w", op, err)
+	var af *azidentity.AuthenticationFailedError
+	if errors.As(err, &af) {
+		status := 0
+		if af.RawResponse != nil {
+			status = af.RawResponse.StatusCode
+		}
+		return &RequestError{Op: op, Kind: KindAuthentication, StatusCode: status}
+	}
+	// azidentity's credential-unavailable error type is not exported; it
+	// means the credential could not even attempt authentication here (no
+	// managed identity endpoint, no developer sign-in, ...).
+	if fmt.Sprintf("%T", err) == "*azidentity.credentialUnavailableError" {
+		return &RequestError{Op: op, Kind: KindAuthentication, Code: "credential unavailable"}
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if ne.Timeout() {
+			return &RequestError{Op: op, Kind: KindTimeout}
+		}
+		return &RequestError{Op: op, Kind: KindConnection}
+	}
+	return &RequestError{Op: op, Kind: KindOther, Code: fmt.Sprintf("%T", rootCause(err))}
+}
+
+// rootCause follows Unwrap to the innermost error, whose type is the
+// informative one (the SDK wraps errors in its own retry-marker types).
+func rootCause(err error) error {
+	for {
+		next := errors.Unwrap(err)
+		if next == nil {
+			return err
+		}
+		err = next
+	}
 }
 
 func certificateName(object string) (string, error) {
