@@ -485,14 +485,33 @@ across the rest of the codebase's log statements is still Phase 2+ work
   behaviour on network filesystems (NFS, SMB) varies, so these stores are
   for local filesystems; a deployment that places `stateDir` on a network
   mount must verify `flock` semantics there first.
-- **Account state layout is strict.** `stateDir/accounts` is either
-  absent (first run) or a symbolic link into `accounts.d/`. A plain
-  directory there is refused (`ErrLegacyAccountsLayout`, no in-place
-  migration is attempted because none can be made crash-safe with
-  `rename` alone), and a link whose target is missing or unreadable is
-  reported as corruption (`ErrAccountsCorrupt`) and fails the run with
-  `Internal` before `lego` starts; a corrupted state never looks like a
-  first run, which would silently register a new ACME account.
+- **Account state layout is strict and confined to `stateDir`.** The
+  invariant every reader and writer checks first (`validateAccountsLayout`,
+  with `Lstat`, so a link is seen as a link and never followed):
+
+  ```
+  stateDir/accounts.d/        absent, or a real directory (never a link)
+  stateDir/accounts.d/<v>/    a real directory; <v> is <unix-nanos>-<8 hex>
+  stateDir/accounts           absent, or a symbolic link whose target is
+                              exactly the relative path accounts.d/<v>
+  ```
+
+  `accounts.d` being a link or a file, `accounts` being a plain directory
+  (`ErrLegacyAccountsLayout`; no in-place migration is attempted because
+  none can be made crash-safe with `rename` alone), and an absolute,
+  escaping (`../outside`), dangling, oddly named or link-typed `accounts`
+  target are all refused (`ErrAccountsCorrupt`). The run then fails with
+  `Internal` before `lego` starts, nothing is copied into the work
+  directory, and nothing is written to or pruned from any path outside
+  `stateDir`: `accounts.d` is created with a plain `Mkdir` after the
+  check, and pruning only removes real directories whose names match the
+  version format. A corrupted state never looks like a first run, which
+  would silently register a new ACME account.
+- **What the layout check does not cover.** It is a check at a point in
+  time by the same user that owns `stateDir`; a process with the same UID
+  that races it (replacing `accounts.d` with a link between the check and
+  the write) is outside the Phase 1 threat model, which assumes a local
+  filesystem owned by the Runner's user.
 
 ## Crash safety
 

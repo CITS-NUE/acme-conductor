@@ -866,3 +866,118 @@ func TestSweepDeadlineCoversTimeoutAndGrace(t *testing.T) {
 		t.Fatalf("deadline %d is before timeout+grace %d", secs, minimum)
 	}
 }
+
+// TestAccountsVersionsSymlinkNeverEscapesStateDir is the regression test
+// for a pre-planted accounts.d link: nothing may be written under, or
+// pruned from, the link target.
+func TestAccountsVersionsSymlinkNeverEscapesStateDir(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	outside := filepath.Join(dir, "outside")
+	victim := filepath.Join(outside, "1700000000000000000-deadbeef") // looks like a version
+	if err := os.MkdirAll(victim, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victim, "keep.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(state, accountVersionsDir)); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(dir, "work")
+	acct := filepath.Join(work, "accounts", "host", "user", "account.json")
+	os.MkdirAll(filepath.Dir(acct), 0o700)
+	os.WriteFile(acct, []byte("new"), 0o600)
+
+	if err := persistAccounts(context.Background(), work, state); !errors.Is(err, ErrAccountsCorrupt) {
+		t.Fatalf("persistAccounts = %v, want ErrAccountsCorrupt", err)
+	}
+	if err := loadAccounts(context.Background(), state, filepath.Join(dir, "reader")); !errors.Is(err, ErrAccountsCorrupt) {
+		t.Fatalf("loadAccounts = %v, want ErrAccountsCorrupt", err)
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(victim) {
+		t.Fatalf("outside directory was modified: %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keep.txt")); err != nil {
+		t.Fatalf("outside subdirectory was pruned: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(state, "accounts")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accounts link must not be created on a corrupt layout: %v", err)
+	}
+}
+
+func TestAccountsLinkMustPointIntoVersions(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(dir, "outside", "host", "user")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(outside, "account.json"), []byte("evil"), 0o600)
+	cases := map[string]func(state string) string{
+		"relative escape": func(state string) string { return "../outside" },
+		"absolute":        func(state string) string { return filepath.Join(dir, "outside") },
+		"deep path":       func(state string) string { return accountVersionsDir + "/1700000000000000000-deadbeef/host" },
+		"bad version name": func(state string) string {
+			os.MkdirAll(filepath.Join(state, accountVersionsDir, "evil"), 0o700)
+			return accountVersionsDir + "/evil"
+		},
+		"version is a link": func(state string) string {
+			os.MkdirAll(filepath.Join(state, accountVersionsDir), 0o700)
+			os.Symlink(filepath.Join(dir, "outside"), filepath.Join(state, accountVersionsDir, "1700000000000000000-deadbeef"))
+			return accountVersionsDir + "/1700000000000000000-deadbeef"
+		},
+		"dangling": func(state string) string { return accountVersionsDir + "/1700000000000000000-00000000" },
+	}
+	for name, target := range cases {
+		t.Run(name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state")
+			if err := os.MkdirAll(state, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target(state), filepath.Join(state, "accounts")); err != nil {
+				t.Fatal(err)
+			}
+			work := filepath.Join(t.TempDir(), "work")
+			if err := loadAccounts(context.Background(), state, work); !errors.Is(err, ErrAccountsCorrupt) {
+				t.Fatalf("loadAccounts = %v, want ErrAccountsCorrupt", err)
+			}
+			if _, err := os.Stat(filepath.Join(work, "accounts")); err == nil {
+				t.Fatal("outside state was copied into the work directory")
+			}
+		})
+	}
+	// The happy path still validates.
+	state := filepath.Join(t.TempDir(), "state")
+	work := filepath.Join(t.TempDir(), "work")
+	acct := filepath.Join(work, "accounts", "host", "user", "account.json")
+	os.MkdirAll(filepath.Dir(acct), 0o700)
+	os.WriteFile(acct, []byte("good"), 0o600)
+	if err := persistAccounts(context.Background(), work, state); err != nil {
+		t.Fatal(err)
+	}
+	current, err := validateAccountsLayout(state)
+	if err != nil || !strings.HasPrefix(current, filepath.Join(state, accountVersionsDir)+string(os.PathSeparator)) {
+		t.Fatalf("validateAccountsLayout = %q, %v", current, err)
+	}
+}
+
+func TestReconcileRefusesEscapingAccountsLink(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	os.MkdirAll(h.stateDir, 0o700)
+	if err := os.Symlink("../outside", filepath.Join(h.stateDir, "accounts")); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(h.dir, "outside"), 0o700)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInternal {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run on an escaping account link")
+	}
+}

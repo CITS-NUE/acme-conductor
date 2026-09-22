@@ -139,10 +139,15 @@ it can safely call the pinned `lego` binary (see
   itself: both processes can still execute `lego` and place two ACME
   orders. Per-target mutual exclusion across runs is Phase 2 work (see
   `docs/threat-model.md`, T7) and is a residual risk until then.
-- `stateDir/accounts` is strictly either absent or a symbolic link into
-  `accounts.d/`; a plain directory is refused rather than migrated, since
-  no released layout ever used one and an in-place migration cannot be
-  made crash-safe with `rename` alone.
+- The account state layout is a checked invariant (`validateAccountsLayout`
+  in `internal/runner/workdir.go`): `accounts.d` must be a real directory,
+  each version a real directory named `<unix-nanos>-<8 hex>`, and
+  `accounts` absent or a link whose target is exactly `accounts.d/<v>`.
+  Anything else is refused before any write, so a pre-planted link cannot
+  make the Runner write to, read from, or prune anything outside
+  `stateDir`. A plain `accounts` directory is refused rather than
+  migrated, since no released layout ever used one and an in-place
+  migration cannot be made crash-safe with `rename` alone.
 - `Result.action` correctness depends entirely on the Store's `Current`
   read being accurate and on `store.ObjectName` being a stable, collision-
   resistant function of the FQDN; both already hold by construction (see

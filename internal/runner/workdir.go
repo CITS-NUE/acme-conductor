@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -174,32 +175,77 @@ const stateLockFile = ".lock"
 // it, so it is refused and left for the operator to move aside.
 var ErrLegacyAccountsLayout = errors.New("stateDir/accounts is a plain directory, not a link to a version under accounts.d; unsupported layout")
 
-// ErrAccountsCorrupt is returned when the account state link exists but
-// what it points at cannot be read. It is deliberately distinct from "no
-// state yet": a corrupted state must never look like a first run, which
-// would silently register a new ACME account.
-var ErrAccountsCorrupt = errors.New("stateDir/accounts exists but its target is unreadable")
+// ErrAccountsCorrupt is returned when the account state does not satisfy
+// the layout invariant below. It is deliberately distinct from "no state
+// yet": a corrupted state must never look like a first run, which would
+// silently register a new ACME account, and a malformed layout must never
+// let the Runner write or delete outside stateDir.
+var ErrAccountsCorrupt = errors.New("stateDir account state layout is invalid")
 
-// accountsLinkState classifies <stateDir>/accounts: absent, a link, or
-// something else.
-func accountsLinkState(stateDir string) (exists bool, err error) {
-	info, err := os.Lstat(filepath.Join(stateDir, lego.AccountsDir))
+// accountVersionRe matches the version directory names persistAccounts
+// creates (<unix-nanos>-<8 hex>).
+var accountVersionRe = regexp.MustCompile(`^[0-9]+-[0-9a-f]{8}$`)
+
+// validateAccountsLayout checks the on-disk layout of the account state and
+// returns the directory of the current version, or "" when there is no
+// state yet. The invariant, which every reader and writer relies on so that
+// nothing ever escapes stateDir:
+//
+//	stateDir/accounts.d/          absent, or a real directory (never a link)
+//	stateDir/accounts.d/<v>/      a real directory; <v> matches accountVersionRe
+//	stateDir/accounts             absent, or a symbolic link whose target is
+//	                              exactly the relative path accounts.d/<v>
+//
+// Anything else — accounts.d being a link or a file, accounts being a plain
+// directory (ErrLegacyAccountsLayout), an absolute, escaping, dangling or
+// oddly named link target, a version that is itself a link — is refused.
+// Checks use Lstat so a link is seen as a link, never followed.
+func validateAccountsLayout(stateDir string) (current string, err error) {
+	versions := filepath.Join(stateDir, accountVersionsDir)
+	if info, err := os.Lstat(versions); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return "", fmt.Errorf("%w: %s is not a real directory", ErrAccountsCorrupt, accountVersionsDir)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	link := filepath.Join(stateDir, lego.AccountsDir)
+	info, err := os.Lstat(link)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return "", nil
 		}
-		return false, err
+		return "", err
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		return true, ErrLegacyAccountsLayout
+		return "", ErrLegacyAccountsLayout
 	}
-	return true, nil
+	target, err := os.Readlink(link)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrAccountsCorrupt, err)
+	}
+	// The target must be exactly "accounts.d/<version>": relative, two
+	// components, no traversal, a well-formed version name.
+	parts := strings.Split(target, string(os.PathSeparator))
+	if filepath.IsAbs(target) || len(parts) != 2 || parts[0] != accountVersionsDir || !accountVersionRe.MatchString(parts[1]) {
+		return "", fmt.Errorf("%w: accounts link target %q is not accounts.d/<version>", ErrAccountsCorrupt, target)
+	}
+	dir := filepath.Join(versions, parts[1])
+	vinfo, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("%w: accounts link target %q: %v", ErrAccountsCorrupt, target, err)
+	}
+	if vinfo.Mode()&os.ModeSymlink != 0 || !vinfo.IsDir() {
+		return "", fmt.Errorf("%w: accounts link target %q is not a real directory", ErrAccountsCorrupt, target)
+	}
+	return dir, nil
 }
 
 // loadAccounts copies the current ACME account state from stateDir into
 // the work directory under a shared lock, so a concurrent publisher cannot
-// prune the version being read. A missing state is not an error; a state
-// link whose target is missing or unreadable is (ErrAccountsCorrupt).
+// prune the version being read. A missing state is not an error; any
+// violation of the layout invariant is (ErrAccountsCorrupt or
+// ErrLegacyAccountsLayout), and lego is never started on it.
 func loadAccounts(ctx context.Context, stateDir, work string) error {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return err
@@ -209,14 +255,14 @@ func loadAccounts(ctx context.Context, stateDir, work string) error {
 		return err
 	}
 	defer lock.Unlock()
-	exists, err := accountsLinkState(stateDir)
+	current, err := validateAccountsLayout(stateDir)
 	if err != nil {
 		return err
 	}
-	if !exists {
+	if current == "" {
 		return nil
 	}
-	if err := copyTree(filepath.Join(stateDir, lego.AccountsDir), filepath.Join(work, lego.AccountsDir)); err != nil {
+	if err := copyTree(current, filepath.Join(work, lego.AccountsDir)); err != nil {
 		return fmt.Errorf("%w: %v", ErrAccountsCorrupt, err)
 	}
 	return nil
@@ -238,7 +284,10 @@ func loadAccounts(ctx context.Context, stateDir, work string) error {
 // is fsynced in order, so the same holds for a power loss. The whole
 // operation runs under an exclusive lock on stateDir, so two publishers
 // are serialized and step 3 can never prune the version a concurrent
-// publisher just referenced: the last one to take the lock wins. A
+// publisher just referenced: the last one to take the lock wins. The
+// layout invariant (validateAccountsLayout) is checked first, so a
+// pre-planted link at accounts.d or an escaping accounts link can never
+// make this function write to, or prune, anything outside stateDir. A
 // pre-existing plain "accounts" directory (not a link) is refused
 // (ErrLegacyAccountsLayout): replacing a directory cannot be made
 // crash-safe with rename alone, and no released layout ever used one.
@@ -258,11 +307,14 @@ func persistAccounts(ctx context.Context, work, stateDir string) error {
 		return err
 	}
 	defer lock.Unlock()
-	if _, err := accountsLinkState(stateDir); err != nil {
+	if _, err := validateAccountsLayout(stateDir); err != nil {
 		return err
 	}
 	versions := filepath.Join(stateDir, accountVersionsDir)
-	if err := os.MkdirAll(versions, 0o700); err != nil {
+	// Mkdir, not MkdirAll: the layout check above has established that
+	// accounts.d is either absent or a real directory, and a plain Mkdir
+	// cannot be satisfied by a link that appeared in between.
+	if err := os.Mkdir(versions, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
 	var nonce [4]byte
@@ -297,15 +349,19 @@ func persistAccounts(ctx context.Context, work, stateDir string) error {
 	if err := fsyncDir(stateDir); err != nil {
 		return err
 	}
-	// Prune every version except the one now referenced.
+	// Prune every version except the one now referenced. Only real
+	// directories with a name this Runner would have generated are touched;
+	// a link (which RemoveAll would not follow anyway) or a foreign entry is
+	// left alone.
 	entries, err := os.ReadDir(versions)
 	if err != nil {
 		return nil
 	}
 	for _, e := range entries {
-		if e.Name() != version && e.IsDir() {
-			_ = os.RemoveAll(filepath.Join(versions, e.Name()))
+		if e.Name() == version || !e.Type().IsDir() || !accountVersionRe.MatchString(e.Name()) {
+			continue
 		}
+		_ = os.RemoveAll(filepath.Join(versions, e.Name()))
 	}
 	return nil
 }
