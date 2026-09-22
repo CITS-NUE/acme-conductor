@@ -37,9 +37,9 @@ Both images share a common baseline (`Dockerfile.conductor`,
   — `latest` (or any other floating tag) is never an acceptable deployment
   reference.
 - **Digest pinning of the base image at release time.** The builder stage
-  currently pins `golang:1.24-bookworm` by tag for Phase 0 development
+  currently pins `golang:1.25-bookworm` by tag for Phase 0 development
   velocity; a release build pins the same base image by digest
-  (`golang:1.24-bookworm@sha256:<digest>`) instead, so a released image's
+  (`golang:1.25-bookworm@sha256:<digest>`) instead, so a released image's
   build is fully reproducible and immune to a tag being silently
   repointed. This pinning is done at release time, not in the
   Phase-0-era Dockerfile itself.
