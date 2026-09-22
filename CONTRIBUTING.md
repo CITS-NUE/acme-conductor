@@ -1,7 +1,7 @@
 # Contributing to ACME Conductor
 
 Thanks for your interest in ACME Conductor. This project is early
-(Phase 0 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
+(Phase 2 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
 its security properties depend on a strict, boundary-respecting design;
 please read this document before opening a pull request.
 

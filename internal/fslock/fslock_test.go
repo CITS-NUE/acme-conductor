@@ -120,3 +120,32 @@ func TestLockFileMode(t *testing.T) {
 		t.Fatalf("mode = %o", st.Mode().Perm())
 	}
 }
+
+func TestTryExclusiveDoesNotWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+	first, err := TryExclusive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	second, err := TryExclusive(path)
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second TryExclusive = %v, %v; want ErrLocked", second, err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("TryExclusive waited %s", time.Since(start))
+	}
+	// A shared waiter is blocked too, and released with the lock.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if l, err := Shared(ctx, path); err == nil {
+		l.Unlock()
+		t.Fatal("Shared succeeded while TryExclusive held the lock")
+	}
+	first.Unlock()
+	third, err := TryExclusive(path)
+	if err != nil {
+		t.Fatalf("TryExclusive after Unlock: %v", err)
+	}
+	third.Unlock()
+}

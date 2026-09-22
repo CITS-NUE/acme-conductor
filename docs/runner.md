@@ -8,8 +8,10 @@ Certificate Store, how to run the container, the `Result`/error-code
 contract, and what the Runner does and does not guarantee today.
 
 Phase 1 ships a one-shot Runner that bundles the official `lego` CLI and a
-filesystem Certificate Store; the Conductor is still a skeleton (Phase 0)
-and nothing yet schedules or launches a Runner job automatically — see the
+filesystem Certificate Store. Since Phase 2 the Conductor schedules
+targets and launches the Runner as a local child process (see
+[`docs/conductor.md`](conductor.md)); the Runner itself is unchanged by
+that and can still be invoked by hand exactly as described here — see the
 [roadmap](architecture.md#roadmap).
 
 ## Overview
@@ -191,11 +193,14 @@ One `reconcile` invocation:
 7. Ask the store for the current certificate (`Store.Current`) for
    `store.ObjectName(fqdn)`.
 8. Decide whether anything needs to happen: if a certificate is stored,
-   its SAN list covers the target FQDN, and its `NotAfter` is still after
-   `now + renewBeforeDays`, the run stops here as a **noop** — `lego` is
-   never invoked. Otherwise (no stored certificate, its SANs don't cover
-   the FQDN, or it is due within `renewBeforeDays`) the Runner proceeds to
-   issue.
+   its SAN list covers the target FQDN, it is already valid (`NotBefore`
+   within clock-skew tolerance), its public key is of the policy's
+   `keyType`, and its `NotAfter` is still after `now + renewBeforeDays`,
+   the run stops here as a **noop** — `lego` is never invoked. Otherwise
+   (no stored certificate, its SANs don't cover the FQDN, it is not yet
+   valid, its key type differs from `policy.keyType` — a policy change
+   applied at this run — or it is due within `renewBeforeDays`) the Runner
+   proceeds to issue.
 9. Create a private per-run work directory `<workDir>/run-<runId>-<rand>`
    (mode `0700`).
 10. Copy the `accounts` subtree of `stateDir` into the work directory, so
@@ -431,7 +436,7 @@ never reaches a `Result`** — only the fixed templates above do.
 This redaction is **value-based and heuristic**: it masks the specific
 secret values the Runner itself resolved and known PEM markers, not an
 arbitrary or unknown-format secret. A dedicated redaction test suite
-across the rest of the codebase's log statements is still Phase 2+ work
+across the rest of the codebase's log statements is still Phase 3+ work
 (see [`docs/threat-model.md`](threat-model.md)).
 
 ## Security boundaries
@@ -465,10 +470,13 @@ across the rest of the codebase's log statements is still Phase 2+ work
   copy-in at run start are serialized by an advisory `flock` on
   `stateDir/.lock` (publisher exclusive, reader shared), and the
   filesystem Certificate Store does the same per object. What is *not*
-  provided is run-level exclusion: two Runner processes for the same
-  target can still both execute `lego`, place two ACME orders and race on
-  the DNS challenge. That is Phase 2 work (the Conductor's run
-  registry/scheduler), not a property of these stores.
+  provided *by the Runner* is run-level exclusion: two Runner processes
+  for the same target can still both execute `lego`, place two ACME
+  orders and race on the DNS challenge. The Conductor's run registry and
+  scheduler provide that exclusion for the runs they launch (Phase 2, see
+  [`docs/conductor.md`](conductor.md#run-lifecycle-and-scheduling)); it
+  is not a property of these stores, and a Runner started by other means
+  is not covered by it.
 - **Locks and cancellation.** Lock acquisition never blocks in the
   kernel: it retries non-blocking `flock` with a 10–100 ms backoff while
   honouring the run's context, so a SIGTERM/SIGINT received while
@@ -550,10 +558,12 @@ across the rest of the codebase's log statements is still Phase 2+ work
 - The filesystem Certificate Store is for **local development and tests
   only** — it has no access control of its own beyond filesystem
   permissions and is not a substitute for a real secrets store.
-- No run-level concurrency control: two Runner processes for the same
-  target can both issue (double issuance, ACME rate-limit cost). The
-  filesystem store and the account state survive that (last writer wins),
-  but nothing prevents it; per-target exclusion is Phase 2.
+- No run-level concurrency control in the Runner itself: two Runner
+  processes for the same target can both issue (double issuance, ACME
+  rate-limit cost). The filesystem store and the account state survive
+  that (last writer wins). The Conductor (Phase 2) prevents it for the
+  runs it launches — at most one active run per target — but not for a
+  Runner started by hand or by another launcher.
 - Only one store backend (`filesystem`) and one execution shape (a single
   local process per run) exist; Azure Key Vault (Phase 3) and an Azure
   Container Apps Job launcher (Phase 4) are not implemented yet.
@@ -566,7 +576,8 @@ across the rest of the codebase's log statements is still Phase 2+ work
 - Log redaction of `lego` output is value-based and heuristic (known
   secret values, known PEM markers), not a general secret detector, and
   has no dedicated test suite yet outside this package.
-- The Conductor is unchanged in this phase (still Phase 0: contracts and
-  skeleton only) — nothing yet schedules a `Target` for renewal or
-  launches a Runner job automatically; a `JobSpec` must be produced and a
-  `Result` consumed by some other means until Phase 2.
+- The only launcher that exists (Phase 2) runs the Runner as a local
+  child process of the Conductor on the same host; a platform launcher
+  with workload identity (Azure Container Apps Job) is Phase 4. A
+  `JobSpec` can still be produced and a `Result` consumed by hand, as the
+  command line above shows.
