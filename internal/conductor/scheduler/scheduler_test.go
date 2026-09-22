@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -880,4 +881,57 @@ func TestRunLoopSweepsStrandedRuns(t *testing.T) {
 	cancel()
 	<-done
 	f.s.Drain(ctx)
+}
+
+// A conflict that never converges (a second writer keeps moving the run
+// between active statuses) is given up after a bounded number of
+// re-reads instead of spinning, so Drain stays bounded.
+func TestConflictRereadsAreBounded(t *testing.T) {
+	f := setup(t, 1)
+	fr := f.flaky()
+	f.s.recordWindow = 0
+	var mu sync.Mutex
+	conflicts := 0
+	fr.setFail(func(status, expected registry.RunStatus) error {
+		if status == registry.RunSucceeded {
+			mu.Lock()
+			conflicts++
+			mu.Unlock()
+			// Flip the registry between running and starting behind the
+			// scheduler's back, then report the conflict.
+			r, err := f.reg.GetRun(context.Background(), f.lastRun(t).ID)
+			if err != nil {
+				return err
+			}
+			prev := r.Status
+			if r.Status == registry.RunRunning {
+				r.Status = registry.RunStarting
+			} else {
+				r.Status = registry.RunRunning
+			}
+			if err := f.reg.UpdateRun(context.Background(), r, prev, nil); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: flipped", registry.ErrConflict)
+		}
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		f.cycle(t)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("record spun on an unresolvable conflict")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if conflicts != 1+maxConflictRereads {
+		t.Fatalf("attempts = %d, want %d", conflicts, 1+maxConflictRereads)
+	}
+	if run := f.lastRun(t); !run.Status.Active() {
+		t.Fatalf("run = %+v, want left active for the sweep", run)
+	}
 }

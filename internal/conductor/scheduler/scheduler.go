@@ -199,6 +199,10 @@ func (s *Scheduler) Cancel(runID string) bool {
 	return ok
 }
 
+// maxConflictRereads bounds how many times one record call re-reads the
+// registry to resolve a status conflict before giving up.
+const maxConflictRereads = 2
+
 // Summaries recorded on runs whose outcome this process does not know.
 const (
 	recoveredSummary = "conductor stopped while the run was in flight; outcome unknown"
@@ -561,10 +565,14 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 // final. Any other error is retried with backoff until window has passed
 // or the scheduler is being drained (s.runsCtx), then returned. With a
 // zero window a single attempt is made, but a conflict is still resolved.
+// Re-reading is itself bounded (maxConflictRereads): only this process
+// writes an active run, so one re-read converges; a bound keeps a future
+// second writer from turning the loop into a spin.
 func (s *Scheduler) record(ctx context.Context, log *slog.Logger, run *registry.Run, recorded *registry.RunStatus, ev *registry.AuditEvent, window time.Duration) error {
 	want := run.Status
 	deadline := time.Now().Add(window)
 	wait := s.recordRetry
+	rereads := 0
 	for attempt := 1; ; attempt++ {
 		run.Status = want
 		err := s.reg.UpdateRun(ctx, run, *recorded, ev)
@@ -589,7 +597,8 @@ func (s *Scheduler) record(ctx context.Context, log *slog.Logger, run *registry.
 					*recorded = actual.Status
 					return fmt.Errorf("run is already %s: %w", actual.Status, err)
 				}
-				if actual.Status != *recorded {
+				if actual.Status != *recorded && rereads < maxConflictRereads {
+					rereads++
 					log.Warn("registry holds another status than recorded; retrying against it", "recorded", string(*recorded), "actual", string(actual.Status))
 					*recorded = actual.Status
 					continue
