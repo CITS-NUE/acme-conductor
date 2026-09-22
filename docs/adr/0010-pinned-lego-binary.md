@@ -31,7 +31,7 @@ stage:
   `TARGETARCH`. The build fails outright if the checksum does not match.
 - Only after that check does the stage extract the single `lego` binary
   from the archive and `chmod` it `0755`.
-- This build stage reuses the `golang:1.24-bookworm` image already used
+- This build stage reuses the `golang:1.25-bookworm` image already used
   as the Go builder (it already has `curl` and `tar`), rather than pulling
   in another base image just for this fetch.
 - The final runtime stage (`gcr.io/distroless/static-debian12:nonroot`,

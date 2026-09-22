@@ -2,11 +2,20 @@
   "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
   "kind": "RunnerConfig",
   "authorization": {
-    "allowedDnsSuffixes": ["example.ac.jp"],
+    "allowedDnsSuffixes": [
+      "example.ac.jp"
+    ],
     "allowWildcard": false,
-    "allowedAcmeBindings": ["letsencrypt-staging"],
-    "allowedDnsBindings": ["azure-dns-staging"],
-    "allowedStoreBindings": ["filesystem-dev"]
+    "allowedAcmeBindings": [
+      "letsencrypt-staging"
+    ],
+    "allowedDnsBindings": [
+      "azure-dns-staging"
+    ],
+    "allowedStoreBindings": [
+      "filesystem-dev",
+      "keyvault-staging"
+    ]
   },
   "lego": {
     "binary": "/usr/local/bin/lego",
@@ -34,6 +43,11 @@
     "filesystem-dev": {
       "type": "filesystem",
       "directory": "/store"
+    },
+    "keyvault-staging": {
+      "type": "azure-keyvault",
+      "vaultURL": "https://kv-acme-staging.vault.azure.net",
+      "credential": "managed-identity"
     }
   }
 }

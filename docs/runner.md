@@ -3,16 +3,20 @@
 This is the operator-facing reference for `acme-runner`, the one-shot
 data-plane job described in [`docs/architecture.md`](architecture.md). It
 covers the command line, the configuration file format, what one
-`reconcile` invocation actually does, the bundled (Phase 1) filesystem
-Certificate Store, how to run the container, the `Result`/error-code
+`reconcile` invocation actually does, the two Certificate Stores (the
+filesystem store for development and tests, Azure Key Vault for real
+deployments), how to run the container, the `Result`/error-code
 contract, and what the Runner does and does not guarantee today.
 
 Phase 1 ships a one-shot Runner that bundles the official `lego` CLI and a
 filesystem Certificate Store. Since Phase 2 the Conductor schedules
 targets and launches the Runner as a local child process (see
 [`docs/conductor.md`](conductor.md)); the Runner itself is unchanged by
-that and can still be invoked by hand exactly as described here — see the
-[roadmap](architecture.md#roadmap).
+that and can still be invoked by hand exactly as described here. Phase 3
+adds the Azure Key Vault Certificate Store, authenticated with the
+execution platform's managed identity — see
+[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault)
+and the [roadmap](architecture.md#roadmap).
 
 ## Overview
 
@@ -153,8 +157,11 @@ same name cannot appear in both `env` and `passthroughEnv`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | Only `"filesystem"` is supported in Phase 1. |
-| `directory` | string | Clean, absolute path — the filesystem store root. Required when `type` is `filesystem`. |
+| `type` | string | `"filesystem"` (development and tests) or `"azure-keyvault"`. Exactly the fields of the chosen type may be set; a field of the other type is rejected, not ignored. |
+| `directory` | string | `filesystem` only. Clean, absolute path — the filesystem store root. Required. |
+| `vaultURL` | string | `azure-keyvault` only. The vault's base URL, `https://<vault-name>.vault.azure.net` (or the equivalent under `.vault.azure.cn` / `.vault.usgovcloudapi.net`, which also selects the identity endpoint of that cloud). Nothing else: no port, path, query, fragment or credentials, and the host must be under one of those three suffixes with a well-formed vault name. Required. |
+| `credential` | string | `azure-keyvault` only. How the Runner authenticates to Azure: `managed-identity` (the platform's managed identity and nothing else — use this in production) or `default` (the SDK's `DefaultAzureCredential`, which tries environment variables, workload identity, managed identity and then the developer tools `az`/`azd`/Azure PowerShell in that order — for development). Defaults to `default` when omitted. No credential value is ever in this file. |
+| `managedIdentityClientId` | string | `azure-keyvault` with `credential: managed-identity` only. The client ID (GUID) of a user-assigned managed identity; omitted means the system-assigned identity. |
 
 ### Example
 
@@ -164,7 +171,9 @@ for a complete, validated example (Let's Encrypt **staging**, an
 since Managed Identity is assumed from Phase 3+; for local development
 against a service principal instead, add `AZURE_CLIENT_SECRET` to
 `passthroughEnv` and export it in the Runner's own environment — and a
-`filesystem` store rooted at `/store`). A matching example `JobSpec` is at
+`filesystem` store rooted at `/store` plus an `azure-keyvault` store
+authenticated with the system-assigned managed identity). A matching
+example `JobSpec` is at
 [`deploy/examples/job.example.json`](../deploy/examples/job.example.json).
 
 ## Execution flow
@@ -190,8 +199,9 @@ One `reconcile` invocation:
    `acmeBindings`/`dnsBindings`/`storeBindings`; an authorized name that is
    not defined fails with `BindingNotFound`.
 6. Open the Certificate Store for the resolved store binding.
-7. Ask the store for the current certificate (`Store.Current`) for
-   `store.ObjectName(fqdn)`.
+7. Ask the store for the current certificate (`Store.Current`) for the
+   store's object name of the FQDN (`Store.ObjectName`; see the naming
+   rules under each store below).
 8. Decide whether anything needs to happen: if a certificate is stored,
    its SAN list covers the target FQDN, it is already valid (`NotBefore`
    within clock-skew tolerance), its public key is of the policy's
@@ -287,9 +297,9 @@ visible in a process listing.
 
 ## Certificate Store (filesystem)
 
-Phase 1 ships one Certificate Store implementation, backed by a local
-directory (`internal/store/filesystem`). **It is for local development and
-tests only** — see [Limitations](#limitations-in-phase-1).
+The filesystem Certificate Store (`internal/store/filesystem`) is backed
+by a local directory. **It is for local development and tests only** —
+see [Limitations](#limitations).
 
 Layout under the store's `directory`:
 
@@ -337,6 +347,136 @@ other; a collision between two registered names is not a practical
 concern at 64 bits, but it is not impossible, and its effect would be two
 targets sharing one store object (an availability fault, never a key
 disclosure).
+
+## Certificate Store (Azure Key Vault)
+
+The Azure Key Vault Certificate Store (`internal/store/keyvault`, binding
+type `azure-keyvault`, [ADR 0013](adr/0013-azure-key-vault-store-adapter.md))
+keeps one Key Vault **certificate** per target. It is the store for real
+deployments: the vault is where a consumer reads the certificate from
+(through the certificate's secret), with its own access control and
+audit, and the Runner's own access to it is narrow and short-lived. What
+this store writes is a **PEM** certificate; which consumers can use that
+is set out under [Consumers and content type](#consumers-and-content-type)
+below.
+
+**Object name.** The Result's `storeObjectRef` is the Key Vault
+certificate name. Key Vault allows only letters, digits and hyphens (at
+most 127 characters) in a certificate name, so the logical
+`store.ObjectName` is derived with that bound and every `.` or `_` becomes
+a `-`: `wiki.example.ac.jp` is stored as `wiki-example-ac-jp-<16 hex>`,
+`*.example.ac.jp` as `wildcard-example-ac-jp-<16 hex>`. The 16-hex-character
+suffix is the same SHA-256 prefix of the exact FQDN as for the filesystem
+store, so two names that differ only in the readable part still map to
+different certificates.
+
+**What `Put` does.** After verifying the bundle locally (the certificate
+parses, the private key matches it, the chain holds only certificates),
+the Runner re-encodes the private key as unencrypted PKCS #8 (`lego`
+writes SEC 1 for EC keys), concatenates leaf + chain + key into one PEM
+document and calls the vault's *import certificate* operation
+(`POST /certificates/<name>/import`, content type
+`application/x-pem-file`, tag `managed-by=acme-conductor`, enabled). Key
+Vault keeps the key in its own key store, creates a new *version* of the
+certificate — an existing certificate of that name is never overwritten,
+its previous versions remain readable — and exposes the certificate to
+consumers through the certificate's secret. The Runner then checks that the certificate the
+vault reports back is the one it imported (same SHA-256 fingerprint,
+same name) and fails the run otherwise. No PFX and no PFX password are
+involved at any point.
+
+**Consumers and content type.** The store imports with content type
+`application/x-pem-file` only, so the certificate's secret holds the
+certificate chain and the private key as PEM. That serves consumers that
+read the secret with `secrets/get` and accept PEM content: an application
+or sidecar that fetches the secret itself, a virtual machine or container
+that receives the secret through a Key Vault reference, and any service
+whose Key Vault integration accepts PEM. It does **not** serve the
+built-in Key Vault integrations that require PKCS #12
+(`application/x-pkcs12`): [App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
+imports only PKCS #12 certificates from a vault, and
+[Azure Front Door](https://learn.microsoft.com/en-us/azure/frontdoor/domain#certificate-requirements)
+requires PFX (and does not accept EC certificates at all). A target whose
+certificate must reach one of those services needs a PKCS #12 import,
+which Phase 3 does not implement (no PFX and no PFX password exist in the
+system; [ADR 0013](adr/0013-azure-key-vault-store-adapter.md)). Check the
+consumer's own documentation for its content-type and key-type
+requirements before pointing it at a certificate this store manages;
+Application Gateway is not verified either way.
+
+**What `Current` does.** `GET /certificates/<name>/` — the current version
+of the certificate, *public part only* (`cer`, attributes). Key Vault
+answers that call with the `certificates/get` permission; the private key
+lives behind `secrets/get`, which the Runner never calls and must not be
+granted. A missing certificate (HTTP 404, which is also what a
+soft-deleted certificate returns) is "nothing stored" and leads to
+issuance. A certificate that exists but is *disabled*, has no body, or
+is not the one asked for is an error (`StoreFailure`), never treated as
+absent: disabling a certificate in the vault is an operator decision the
+Runner must not paper over by issuing a new one.
+
+**Permissions.** The Runner's identity needs exactly `certificates/get`
+and `certificates/import` on the vault — with Azure RBAC that is the
+built-in *Key Vault Certificates Officer* role (it carries more than
+needed; a custom role with just those two data actions is tighter). It
+does not need, and should not have, `secrets/*`, `keys/*`, or any purge
+permission (the Runner never deletes — [ADR 0008](adr/0008-no-purge-in-mvp.md)).
+Consumers read the certificate with `secrets/get` on the certificate's
+secret. The Conductor's identity is granted nothing on the vault at all
+([ADR 0005](adr/0005-conductor-never-touches-secrets.md)).
+
+**Soft delete.** Key Vault soft-deletes by default. If a certificate of
+the same name has been deleted but not yet purged, the vault refuses the
+import (`HTTP 409 Conflict`, code `Conflict` /
+`ObjectIsDeletedButRecoverable`); the run fails with `StoreFailure` and
+the operator recovers or purges the deleted certificate. The Runner
+never does either.
+
+**Authentication and network.** Every request goes over TLS to the vault's
+own host, which the configuration requires to be under one of the known
+Key Vault DNS suffixes; the SDK's authentication-challenge policy also
+verifies that the resource the vault asks a token for matches that host
+before a token is ever sent. Tokens come from the selected `credential`
+(see [`storeBindings.<name>`](#storebindingsname)): with
+`managed-identity` the Runner talks only to the vault and to the
+platform's identity endpoint (IMDS, or the identity endpoint the platform
+injects into the environment); with `default` the `DefaultAzureCredential`
+chain additionally reads the `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
+`AZURE_CLIENT_SECRET` / `AZURE_FEDERATED_TOKEN_FILE` variables of the
+Runner's own environment, contacts `login.microsoftonline.com` (or the
+selected cloud's authority), and may run `az`, `azd` or `pwsh` from the
+Runner's `PATH` — the Runner container image carries none of those
+programs, and a production binding should say `managed-identity` so that
+none of that is even tried. The vault's error responses are reduced to
+their HTTP status and error code before they reach a log line
+(`key vault get: HTTP 403 (Forbidden)`), and an identity endpoint's error
+response is reduced to its status the same way (see **Errors** below);
+response bodies, headers and tokens are never logged, and as with every
+other failure only a fixed template reaches the `Result`.
+
+**Exportable keys.** An imported certificate's key is exportable through
+its secret — that is how consumers obtain the certificate and it is the
+point of using the vault as the store. Whoever holds `secrets/get` on the
+vault can read the private key, so the vault's access policy / role
+assignments, not this code, decide who that is.
+
+**Errors.** Whatever the SDK or the transport produced, the store reduces
+it to fixed wording before it can reach a log line or a `Result` cause: a
+vault response becomes `key vault <op>: HTTP <status> (<code>)`; a
+failure to obtain a token becomes `key vault <op>: authentication failed
+(identity endpoint HTTP <status>)` or `(credential unavailable)`, never
+the identity endpoint's response body that the SDK's own error prints; a
+transport failure becomes `request timed out` or `connection failed`
+(no URL); anything else names only the Go type of the error. A cancelled
+or expired run is still recognized by the Runner (`Cancelled`/`Timeout`).
+
+**Not covered by automated tests.** The store is exercised against a fake
+in-process vault that imitates the REST API's shapes (bearer-challenge
+authentication, PEM import validation, get, error bodies) — never against
+a real vault, in line with principle 8. The exact acceptance rules of the
+real import operation (PEM layout, PKCS #8 key, chain handling) are
+therefore documented from the service's documentation, not verified by
+CI; the first run against a real vault is the verification.
 
 ## Directories and container usage
 
@@ -444,7 +584,9 @@ across the rest of the codebase's log statements is still Phase 3+ work
 - No HTTP server, no cron, no database: one job, one process, one exit.
 - The Runner needs store **read** (for the renewal decision) and **write**
   (to store a new bundle) on exactly the one store binding a `JobSpec`
-  selects and that binding names — nothing else.
+  selects and that binding names — nothing else. For Key Vault that is
+  `certificates/get` and `certificates/import`; the Runner never reads a
+  private key back (`secrets/get`) and never deletes.
 - `lego` is always invoked through an explicit `argv`, never a shell
   string; its environment is built from scratch, never inherited from the
   Runner process except through a binding's declared `env`/`passthroughEnv`.
@@ -553,20 +695,37 @@ across the rest of the codebase's log statements is still Phase 3+ work
   is rejected when lego produces it (`AcmeFailure`) and, when found in
   the store, is treated as unusable and reissued.
 
-## Limitations in Phase 1
+## Limitations
 
 - The filesystem Certificate Store is for **local development and tests
   only** — it has no access control of its own beyond filesystem
-  permissions and is not a substitute for a real secrets store.
+  permissions and is not a substitute for a real secrets store. Use the
+  Azure Key Vault store for anything else.
+- The Key Vault store is tested against an in-process fake of the vault
+  API, not a real vault (principle 8); its behavior against the real
+  import operation is documented, not CI-verified. It never recovers or
+  purges a soft-deleted certificate that blocks an import, and it cannot
+  verify that its identity's role assignment is as narrow as documented.
+- The Key Vault store writes PEM only. The built-in Key Vault
+  integrations of App Service and Azure Front Door require PKCS #12 and
+  are not served by it; a PKCS #12 import is not part of Phase 3 (see
+  [Consumers and content type](#consumers-and-content-type)).
+- With `credential: default`, the SDK's `DefaultAzureCredential` chain
+  reads service-principal variables from the Runner's environment and may
+  execute developer tooling from `PATH`; that is a development
+  convenience, not a production posture — say `managed-identity`.
 - No run-level concurrency control in the Runner itself: two Runner
   processes for the same target can both issue (double issuance, ACME
   rate-limit cost). The filesystem store and the account state survive
   that (last writer wins). The Conductor (Phase 2) prevents it for the
   runs it launches — at most one active run per target — but not for a
   Runner started by hand or by another launcher.
-- Only one store backend (`filesystem`) and one execution shape (a single
-  local process per run) exist; Azure Key Vault (Phase 3) and an Azure
-  Container Apps Job launcher (Phase 4) are not implemented yet.
+- Only one execution shape (a single local process per run) exists; an
+  Azure Container Apps Job launcher, and with it a Runner that actually
+  runs under a managed identity, is Phase 4. Until then a Key Vault
+  binding is usable from a Runner started by hand or by the local
+  launcher only with `credential: default` and a developer's own Azure
+  sign-in or a service principal in the Runner's environment.
 - The `JobSpec` itself is neither signed nor authenticated end-to-end, and
   there is no replay/expiry check — see `docs/threat-model.md`'s T2/T3.
 - The Runner has no way to verify that a DNS credential/workload identity

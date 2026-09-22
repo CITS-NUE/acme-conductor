@@ -34,6 +34,7 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
+	"github.com/CITS-NUE/acme-conductor/internal/store/keyvault"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
@@ -237,7 +238,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, spec *v1alph
 	if err != nil {
 		return nil, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store could not be opened", err)
 	}
-	object := store.ObjectName(spec.Target.FQDN)
+	object := st.ObjectName(spec.Target.FQDN)
 	log = log.With("storeObjectRef", object, "storeType", st.Type())
 
 	now := opts.Now().UTC()
@@ -390,6 +391,12 @@ func openStore(b config.StoreBinding) (store.Store, error) {
 	switch b.Type {
 	case config.StoreTypeFilesystem:
 		return filesystem.New(b.Directory)
+	case config.StoreTypeAzureKeyVault:
+		return keyvault.Open(keyvault.Config{
+			VaultURL:                b.VaultURL,
+			Credential:              b.Credential,
+			ManagedIdentityClientID: b.ManagedIdentityClientID,
+		})
 	default:
 		return nil, fmt.Errorf("unsupported store type %q", b.Type)
 	}

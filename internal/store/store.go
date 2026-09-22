@@ -59,6 +59,12 @@ type Info struct {
 type Store interface {
 	// Type is the binding type name (for example "filesystem").
 	Type() string
+	// ObjectName derives this store's object name for a target FQDN. It is
+	// deterministic, satisfies v1alpha1.IsStoreObjectRef, and is what a
+	// Result reports as storeObjectRef. Stores whose backend restricts
+	// object names further (Azure Key Vault) derive a stricter name; the
+	// filesystem store uses ObjectName as is.
+	ObjectName(fqdn string) string
 	// Current returns information about the stored certificate for object,
 	// or ErrNotFound.
 	Current(ctx context.Context, object string) (*Info, error)
@@ -83,10 +89,21 @@ const ObjectNameHashBytes = 8
 // satisfies v1alpha1.IsStoreObjectRef and is at most
 // v1alpha1.MaxStoreObjectRefLength characters long.
 func ObjectName(fqdn string) string {
+	return ObjectNameN(fqdn, v1alpha1.MaxStoreObjectRefLength)
+}
+
+// ObjectNameN is ObjectName bounded to maxLen characters (at least the
+// hash suffix plus one readable character), for stores whose backend
+// allows shorter names than the Result contract does. The hash suffix is
+// never shortened, only the readable prefix.
+func ObjectNameN(fqdn string, maxLen int) string {
 	sum := sha256.Sum256([]byte(fqdn))
 	suffix := "-" + hex.EncodeToString(sum[:ObjectNameHashBytes])
 	readable := strings.Replace(fqdn, "*.", "wildcard.", 1)
-	max := v1alpha1.MaxStoreObjectRefLength - len(suffix)
+	max := maxLen - len(suffix)
+	if max < 1 {
+		max = 1
+	}
 	if len(readable) > max {
 		readable = strings.TrimRight(readable[:max], ".-")
 	}
@@ -227,11 +244,13 @@ func KeyMatchesType(c *x509.Certificate, keyType v1alpha1.KeyType) error {
 	}
 }
 
-// PrivateKeyMatches reports whether keyPEM is the private key of c.
-func PrivateKeyMatches(c *x509.Certificate, keyPEM []byte) error {
+// ParsePrivateKey parses one PEM-encoded private key in SEC 1 ("EC PRIVATE
+// KEY"), PKCS #1 ("RSA PRIVATE KEY") or PKCS #8 ("PRIVATE KEY") form — the
+// forms lego writes — and returns it as a crypto.Signer.
+func ParsePrivateKey(keyPEM []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
-		return errors.New("no PEM block in private key")
+		return nil, errors.New("no PEM block in private key")
 	}
 	var key any
 	var err error
@@ -243,14 +262,39 @@ func PrivateKeyMatches(c *x509.Certificate, keyPEM []byte) error {
 	case "PRIVATE KEY":
 		key, err = x509.ParsePKCS8PrivateKey(block.Bytes)
 	default:
-		return fmt.Errorf("unsupported private key block %q", block.Type)
+		return nil, fmt.Errorf("unsupported private key block %q", block.Type)
 	}
 	if err != nil {
-		return fmt.Errorf("parse private key: %w", err)
+		return nil, fmt.Errorf("parse private key: %w", err)
 	}
 	signer, ok := key.(crypto.Signer)
 	if !ok {
-		return errors.New("private key has no public key")
+		return nil, errors.New("private key has no public key")
+	}
+	return signer, nil
+}
+
+// PrivateKeyToPKCS8 re-encodes a PEM private key (any form ParsePrivateKey
+// accepts) as an unencrypted PKCS #8 "PRIVATE KEY" PEM block, the one form
+// every store backend accepts.
+func PrivateKeyToPKCS8(keyPEM []byte) ([]byte, error) {
+	signer, err := ParsePrivateKey(keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(signer)
+	if err != nil {
+		return nil, fmt.Errorf("encode private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
+}
+
+// PrivateKeyMatches reports whether keyPEM (any form ParsePrivateKey
+// accepts) is the private key of c's public key.
+func PrivateKeyMatches(c *x509.Certificate, keyPEM []byte) error {
+	signer, err := ParsePrivateKey(keyPEM)
+	if err != nil {
+		return err
 	}
 	pub, ok := signer.Public().(interface{ Equal(x crypto.PublicKey) bool })
 	if !ok || !pub.Equal(c.PublicKey) {

@@ -407,3 +407,58 @@ func TestObjectNameDefensiveInputs(t *testing.T) {
 		}
 	}
 }
+
+func TestObjectNameN(t *testing.T) {
+	long := strings.Repeat("a", 60) + "." + strings.Repeat("b", 60) + ".example.ac.jp"
+	for _, max := range []int{127, 64, 32, 18} {
+		name := ObjectNameN(long, max)
+		if len(name) > max {
+			t.Errorf("ObjectNameN(long, %d) is %d characters: %q", max, len(name), name)
+		}
+		full := ObjectName(long)
+		if name[len(name)-17:] != full[len(full)-17:] {
+			t.Errorf("ObjectNameN(long, %d) = %q lost the hash suffix of %q", max, name, full)
+		}
+		if !v1alpha1.IsStoreObjectRef(name) {
+			t.Errorf("ObjectNameN(long, %d) = %q is not a storeObjectRef", max, name)
+		}
+	}
+	if ObjectNameN("wiki.example.ac.jp", v1alpha1.MaxStoreObjectRefLength) != ObjectName("wiki.example.ac.jp") {
+		t.Errorf("ObjectName and ObjectNameN at the contract maximum differ")
+	}
+	if name := ObjectNameN("wiki.example.ac.jp", 0); len(name) != 18 {
+		t.Errorf("ObjectNameN with an impossible bound = %q, want one readable character plus the suffix", name)
+	}
+}
+
+func TestPrivateKeyToPKCS8(t *testing.T) {
+	ecPEM, ecKey, ecCert := genECCert(t, "ec.example.ac.jp")
+	_ = ecPEM
+	rsaPEM, rsaKey, rsaCert := genRSACert(t, "rsa.example.ac.jp")
+	_ = rsaPEM
+	for name, tc := range map[string]struct {
+		key  []byte
+		cert *x509.Certificate
+	}{"ec": {ecKey, ecCert}, "rsa": {rsaKey, rsaCert}} {
+		out, err := PrivateKeyToPKCS8(tc.key)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		block, rest := pem.Decode(out)
+		if block == nil || block.Type != "PRIVATE KEY" || len(rest) != 0 {
+			t.Fatalf("%s: output is not a single PRIVATE KEY block", name)
+		}
+		if err := PrivateKeyMatches(tc.cert, out); err != nil {
+			t.Fatalf("%s: re-encoded key does not match: %v", name, err)
+		}
+		again, err := PrivateKeyToPKCS8(out)
+		if err != nil || string(again) != string(out) {
+			t.Fatalf("%s: PKCS #8 input is not passed through unchanged: %v", name, err)
+		}
+	}
+	for name, in := range map[string][]byte{"empty": nil, "not pem": []byte("nope"), "certificate": ecPEM} {
+		if _, err := PrivateKeyToPKCS8(in); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

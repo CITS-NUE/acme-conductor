@@ -1,7 +1,7 @@
 # Contributing to ACME Conductor
 
 Thanks for your interest in ACME Conductor. This project is early
-(Phase 2 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
+(Phase 3 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
 its security properties depend on a strict, boundary-respecting design;
 please read this document before opening a pull request.
 
@@ -43,9 +43,10 @@ make images    # build both container images and confirm they build cleanly
   checked into the repo, a database column, or a `Result.error.summary` —
   see [`docs/threat-model.md`](docs/threat-model.md), T6.
 - **No cloud SDK in Conductor core.** Azure/AWS/GCP SDK imports belong only
-  in launcher and Certificate Store adapter implementations, never in
-  `acme-conductor`'s core packages (Target Registry, Policy, Audit Log,
-  Run Registry, Scheduler).
+  in launcher and Certificate Store adapter implementations
+  (`internal/store/keyvault` today), never in `acme-conductor`'s core
+  packages (Target Registry, Policy, Audit Log, Run Registry, Scheduler).
+  Keep the SDK's pinned versions within the Go version `go.mod` declares.
 - **Strict decoders.** Any new wire format follows the same rule the
   `v1alpha1` contract does: reject unknown fields, duplicate keys, and
   trailing/oversized data rather than accepting and ignoring them.

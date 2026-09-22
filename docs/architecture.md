@@ -20,8 +20,8 @@ The system is split into two binaries with a hard boundary between them:
   own trusted, Runner-side policy (`policy.RunnerAuthorizationPolicy`,
   Phase 1), invokes `lego` exactly once, normalizes
   the result, writes the certificate directly into an external
-  **Certificate Store** (filesystem for local development; Azure Key Vault
-  and others in later phases), and exits. It runs no server and no
+  **Certificate Store** (filesystem for local development, Azure Key Vault
+  since Phase 3), and exits. It runs no server and no
   scheduler of its own.
 
 This split exists so that the two halves can be deployed with different,
@@ -98,8 +98,8 @@ below).
   an expiry timestamp, and a logical store reference. No certificate body,
   key material or credential ever appears in a `Result`.
 - **Certificate Store adapter** — writes the private key and certificate
-  directly into the configured store (filesystem in Phase 1, Azure Key
-  Vault in Phase 3, ...) and then destroys the local copy. This is the
+  directly into the configured store (filesystem since Phase 1, Azure Key
+  Vault since Phase 3) and then destroys the local copy. This is the
   only place in the whole system that ever holds a private key, and only
   for the duration of one run.
 
@@ -112,8 +112,12 @@ provider its binding names, scoped to the challenge zone.
 ### Certificate Store
 
 An external system that durably holds issued certificates and their private
-keys (filesystem for dev, Azure Key Vault and others later), addressed
-through a `StoreBinding`. The Conductor never reads from it.
+keys (filesystem for dev, Azure Key Vault for deployments — see
+[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)), addressed
+through a `StoreBinding`. The Conductor never reads from it. A store
+adapter writes a bundle and reads back a certificate's public part for
+the renewal decision; no adapter reads a private key back out of its
+store.
 
 ## Control plane vs data plane
 
@@ -439,6 +443,7 @@ internal/
   runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
   store/            Certificate Store adapter contract shared by store implementations (Phase 1)
   store/filesystem/ filesystem-backed Certificate Store (dev/test only, Phase 1)
+  store/keyvault/   Azure Key Vault Certificate Store (Phase 3) — the only package importing the Azure SDK
   version/          build metadata injected via -ldflags
 pkg/api/v1alpha1/   the versioned JobSpec/Result contract (types, validation, strict decoding)
 schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
@@ -520,7 +525,7 @@ These hold across every phase and are traced to concrete mitigations in
 
 ## Roadmap
 
-**Phases 0, 1 and 2** are implemented today. Phases are strictly
+**Phases 0, 1, 2 and 3** are implemented today. Phases are strictly
 sequential; a given pull request implements one phase's scope and no more
 (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
@@ -529,7 +534,7 @@ sequential; a given pull request implements one phase's scope and no more
 | 0 | Bootstrap: module layout, JobSpec/Result contract, CI. |
 | 1 | **Implemented.** Runner + filesystem Certificate Store, with a pinned `lego` CLI. See [`docs/runner.md`](runner.md), [ADR 0009](adr/0009-runner-execution-model.md) and [ADR 0010](adr/0010-pinned-lego-binary.md). |
 | 2 | **Implemented.** Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. See [`docs/conductor.md`](conductor.md), [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and [ADR 0012](adr/0012-localhost-only-dev-auth.md). |
-| 3 | Azure Key Vault store adapter, authenticated via `DefaultAzureCredential`. |
+| 3 | **Implemented.** Azure Key Vault store adapter, authenticated with the platform's managed identity (or the SDK's `DefaultAzureCredential` chain for development). See [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) and [ADR 0013](adr/0013-azure-key-vault-store-adapter.md). |
 | 4 | Azure Container Apps Job launcher, provisioned via Bicep. |
 | 5 | OIDC auth, a minimal GUI, GHCR releases with SBOM and provenance. |
 | 6 | Migration tooling from the existing cert-infra repository (import/diff/shadow mode, feature-flag switch). |

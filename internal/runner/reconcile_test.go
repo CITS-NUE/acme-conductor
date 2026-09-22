@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/internal/store"
@@ -999,5 +1000,24 @@ func TestReconcileRefusesEscapingAccountsLink(t *testing.T) {
 	}
 	if _, err := os.Stat(h.record); err == nil {
 		t.Fatal("lego must not run on an escaping account link")
+	}
+}
+
+func TestOpenStoreByType(t *testing.T) {
+	st, err := openStore(config.StoreBinding{Type: config.StoreTypeFilesystem, Directory: t.TempDir()})
+	if err != nil || st.Type() != "filesystem" {
+		t.Fatalf("filesystem: %v, %v", st, err)
+	}
+	// Opening a Key Vault store must not touch the network: the credential
+	// and client are built lazily, so this works offline.
+	st, err = openStore(config.StoreBinding{Type: config.StoreTypeAzureKeyVault, VaultURL: "https://kv-acme-dev.vault.azure.net", Credential: "managed-identity"})
+	if err != nil || st.Type() != "azure-keyvault" {
+		t.Fatalf("azure-keyvault: %v, %v", st, err)
+	}
+	if got := st.ObjectName("wiki.example.ac.jp"); !strings.HasPrefix(got, "wiki-example-ac-jp-") {
+		t.Fatalf("azure-keyvault ObjectName = %q", got)
+	}
+	if _, err := openStore(config.StoreBinding{Type: "aws-secretsmanager"}); err == nil {
+		t.Fatalf("unknown store type accepted")
 	}
 }
