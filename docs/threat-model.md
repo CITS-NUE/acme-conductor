@@ -259,11 +259,30 @@ loopback-only API. Being explicit about what remains open:
   state and writing the filesystem store are serialized by advisory locks
   (last writer wins; readers hold the lock shared), so neither is
   corrupted, but that duplicate work is not prevented.
-- **The filesystem Certificate Store is dev/test only.** The only Store
-  implementation shipped so far (`internal/store/filesystem`) has no
-  access control beyond filesystem permissions and is not a production
-  secrets store; it exists to make Phase 1 runnable end-to-end without a
-  cloud dependency. A production-grade store (Azure Key Vault) is Phase 3.
+- **The filesystem Certificate Store is dev/test only.** The filesystem
+  Store (`internal/store/filesystem`) has no access control beyond
+  filesystem permissions and is not a production secrets store; it exists
+  to make the Runner runnable end-to-end without a cloud dependency. The
+  Azure Key Vault Store (Phase 3, `internal/store/keyvault`,
+  [ADR 0013](adr/0013-azure-key-vault-store-adapter.md)) is the store
+  for deployments: the Runner imports the bundle as a Key Vault
+  certificate and reads back only the certificate's public part, so its
+  identity needs `certificates/get` and `certificates/import` and never
+  `secrets/get`. What is *not* enforced by code: that the identity's
+  role assignment is actually that narrow (a deployment/IAM concern,
+  Bicep in Phase 4), and who else holds `secrets/get` on the vault — an
+  imported certificate's key is exportable through its secret by design,
+  because that is how consumers obtain it.
+- **`credential: default` is a development posture (T4/T10).** A Key
+  Vault binding that selects the SDK's `DefaultAzureCredential` chain
+  lets the Runner authenticate from service-principal variables in its
+  own environment or by executing `az`/`azd`/PowerShell from `PATH`; the
+  Runner image carries none of those, and the binding's `credential`
+  is named in configuration so that a production deployment says
+  `managed-identity` explicitly. The Key Vault store is tested against
+  an in-process fake of the vault's API, never a real vault (principle
+  8), so the real import operation's acceptance rules are documented,
+  not CI-verified.
 - **`lego` output redaction is value-based and heuristic, not exhaustive
   (T6).** `internal/runner/lego.Redactor` masks the specific secret values
   the Runner itself resolved (`passthroughEnv`, EAB) and known PEM
@@ -276,7 +295,9 @@ loopback-only API. Being explicit about what remains open:
   credential itself — the Runner cannot confirm that a DNS credential it
   is handed is actually scoped to its intended zone, only that the
   binding it selected is one an administrator registered and the policy
-  allows. Real workload-identity provisioning is Phase 3/4 work.
+  allows. The Key Vault store authenticates with a managed identity
+  (Phase 3); provisioning that identity and its role assignments in
+  infrastructure is Phase 4 work.
 - **The secret-marker heuristic is not a secret detector (T6).** It cannot
   detect an arbitrary or unknown-format secret; it is defense-in-depth on
   top of the Phase 1 Runner behavior of never copying raw external output

@@ -100,6 +100,16 @@ func storeBinding(m map[string]any) map[string]any {
 	return m["storeBindings"].(map[string]any)["filesystem-dev"].(map[string]any)
 }
 
+// setKeyVault turns the store binding into a valid azure-keyvault binding
+// (managed identity, system-assigned).
+func setKeyVault(m map[string]any) {
+	b := storeBinding(m)
+	delete(b, "directory")
+	b["type"] = "azure-keyvault"
+	b["vaultURL"] = "https://kv-acme-dev.vault.azure.net"
+	b["credential"] = "managed-identity"
+}
+
 func legoSection(m map[string]any) map[string]any {
 	return m["lego"].(map[string]any)
 }
@@ -361,9 +371,67 @@ func TestRead_Rejections(t *testing.T) {
 			wantSubstr: "resolvers",
 		},
 		{
-			name:       "store type azure-keyvault unsupported",
-			mutate:     func(m map[string]any) { storeBinding(m)["type"] = "azure-keyvault" },
+			name:       "store type unknown",
+			mutate:     func(m map[string]any) { storeBinding(m)["type"] = "aws-secretsmanager" },
 			wantSubstr: "not supported",
+		},
+		{
+			name:       "filesystem store with vaultURL",
+			mutate:     func(m map[string]any) { storeBinding(m)["vaultURL"] = "https://kv.vault.azure.net" },
+			wantSubstr: "vaultURL",
+		},
+		{
+			name:       "keyvault store without vaultURL",
+			mutate:     func(m map[string]any) { setKeyVault(m); delete(storeBinding(m), "vaultURL") },
+			wantSubstr: "vaultURL",
+		},
+		{
+			name:       "keyvault store with directory",
+			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["directory"] = "/store" },
+			wantSubstr: "directory",
+		},
+		{
+			name: "keyvault store http vaultURL",
+			mutate: func(m map[string]any) {
+				setKeyVault(m)
+				storeBinding(m)["vaultURL"] = "http://kv-acme-dev.vault.azure.net"
+			},
+			wantSubstr: "vaultURL",
+		},
+		{
+			name: "keyvault store vaultURL not a key vault host",
+			mutate: func(m map[string]any) {
+				setKeyVault(m)
+				storeBinding(m)["vaultURL"] = "https://kv-acme-dev.example.com"
+			},
+			wantSubstr: "vaultURL",
+		},
+		{
+			name: "keyvault store vaultURL with path",
+			mutate: func(m map[string]any) {
+				setKeyVault(m)
+				storeBinding(m)["vaultURL"] = "https://kv-acme-dev.vault.azure.net/certificates"
+			},
+			wantSubstr: "vaultURL",
+		},
+		{
+			name:       "keyvault store unknown credential",
+			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["credential"] = "azure-cli" },
+			wantSubstr: "credential",
+		},
+		{
+			name: "keyvault store client id with default credential",
+			mutate: func(m map[string]any) {
+				setKeyVault(m)
+				storeBinding(m)["credential"] = "default"
+				storeBinding(m)["managedIdentityClientId"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
+			},
+			wantSubstr: "managedIdentityClientId",
+		},
+		{
+			name:       "keyvault store client id not a guid",
+			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["managedIdentityClientId"] = "my-identity" },
+			wantSubstr: "managedIdentityClientId",
 		},
 		{
 			name:       "store directory relative",
@@ -603,4 +671,32 @@ func TestResolversRejectCommaAndWhitespace(t *testing.T) {
 			t.Errorf("resolver %q accepted", bad)
 		}
 	}
+}
+
+func TestKeyVaultStoreBinding(t *testing.T) {
+	t.Run("managed identity with client id", func(t *testing.T) {
+		m := validDoc()
+		setKeyVault(m)
+		storeBinding(m)["managedIdentityClientId"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
+		c := mustAccept(t, marshalDoc(t, m))
+		b := c.StoreBindings["filesystem-dev"]
+		if b.Type != StoreTypeAzureKeyVault || b.VaultURL != "https://kv-acme-dev.vault.azure.net" || b.Credential != "managed-identity" || b.ManagedIdentityClientID != "0f8fad5b-d9cb-469f-a165-70867728950e" {
+			t.Fatalf("binding = %+v", b)
+		}
+	})
+	t.Run("credential defaults to default", func(t *testing.T) {
+		m := validDoc()
+		setKeyVault(m)
+		delete(storeBinding(m), "credential")
+		c := mustAccept(t, marshalDoc(t, m))
+		if got := c.StoreBindings["filesystem-dev"].Credential; got != "default" {
+			t.Fatalf("credential = %q, want the documented default", got)
+		}
+	})
+	t.Run("unknown field rejected", func(t *testing.T) {
+		m := validDoc()
+		setKeyVault(m)
+		storeBinding(m)["clientSecret"] = "hunter2"
+		mustReject(t, marshalDoc(t, m), "")
+	})
 }

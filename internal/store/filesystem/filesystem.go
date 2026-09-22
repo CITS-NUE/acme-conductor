@@ -72,6 +72,10 @@ func New(root string) (*Store, error) {
 // Type implements store.Store.
 func (s *Store) Type() string { return Type }
 
+// ObjectName implements store.Store: the filesystem store uses the logical
+// store.ObjectName unchanged.
+func (s *Store) ObjectName(fqdn string) string { return store.ObjectName(fqdn) }
+
 // versionRe matches the version directories this store creates.
 var versionRe = regexp.MustCompile(`^[0-9a-f]{16}-[0-9]+$`)
 

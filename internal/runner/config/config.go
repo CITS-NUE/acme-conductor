@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
+	"github.com/CITS-NUE/acme-conductor/internal/store/keyvault"
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -174,16 +175,33 @@ type DNSBinding struct {
 	Resolvers []string `json:"resolvers,omitempty"`
 }
 
-// StoreBinding describes one certificate store.
+// StoreBinding describes one certificate store. Exactly the fields of its
+// Type may be set; a field of another type is rejected rather than ignored.
 type StoreBinding struct {
 	Type string `json:"type"`
 	// Directory is the root of a filesystem store (type "filesystem").
 	Directory string `json:"directory,omitempty"`
+	// VaultURL is the base URL of an Azure Key Vault (type
+	// "azure-keyvault"), "https://<name>.vault.azure.net" or the
+	// equivalent in another Azure cloud. Nothing else: no path, port,
+	// query, fragment or credentials.
+	VaultURL string `json:"vaultURL,omitempty"`
+	// Credential selects how the Runner authenticates to Azure (type
+	// "azure-keyvault"): "managed-identity" (the platform's managed
+	// identity, the production choice) or "default" (DefaultAzureCredential,
+	// which also tries environment variables and developer tooling). The
+	// credential itself is never in this file.
+	Credential string `json:"credential,omitempty"`
+	// ManagedIdentityClientID selects a user-assigned managed identity by
+	// client ID (credential "managed-identity" only). Empty means the
+	// system-assigned identity.
+	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
 }
 
 // Store binding types.
 const (
-	StoreTypeFilesystem = "filesystem"
+	StoreTypeFilesystem    = "filesystem"
+	StoreTypeAzureKeyVault = keyvault.Type
 )
 
 // Load reads, strictly decodes and validates a configuration file.
@@ -256,6 +274,7 @@ func (c *Config) Validate() error {
 		if err := b.validate("storeBindings." + name); err != nil {
 			return err
 		}
+		c.StoreBindings[name] = b // validate applies defaults to the copy
 	}
 	if err := c.Authorization.validate(c); err != nil {
 		return err
@@ -367,8 +386,25 @@ func splitHostPort(s string) (string, string, error) {
 func (b *StoreBinding) validate(field string) error {
 	switch b.Type {
 	case StoreTypeFilesystem:
+		if b.VaultURL != "" || b.Credential != "" || b.ManagedIdentityClientID != "" {
+			return invalid("%s: vaultURL, credential and managedIdentityClientId apply to type %q only", field, StoreTypeAzureKeyVault)
+		}
 		if b.Directory == "" || !filepath.IsAbs(b.Directory) || filepath.Clean(b.Directory) != b.Directory {
 			return invalid("%s.directory must be a clean absolute path", field)
+		}
+		return nil
+	case StoreTypeAzureKeyVault:
+		if b.Directory != "" {
+			return invalid("%s: directory applies to type %q only", field, StoreTypeFilesystem)
+		}
+		if _, err := keyvault.ParseVaultURL(b.VaultURL); err != nil {
+			return invalid("%s.vaultURL: %v", field, err)
+		}
+		if b.Credential == "" {
+			b.Credential = keyvault.CredentialDefault
+		}
+		if err := keyvault.ValidateCredential(b.Credential, b.ManagedIdentityClientID); err != nil {
+			return invalid("%s: %v", field, err)
 		}
 		return nil
 	default:

@@ -8,15 +8,16 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 2 (Conductor MVP on top of the Phase 1 Runner).** The
+**Status: Phase 3 (Azure Key Vault Certificate Store).** The
 `acme-conductor` control plane keeps targets, certificate policies, runs
 and an append-only audit log in a SQLite registry, exposes them over a
 REST API on the local host only (`localhost-dev` authentication), decides
 when a target is due, and launches the Runner as a local child process —
 at most one active run per target. The `acme-runner` data-plane binary
 validates and authorizes a `JobSpec` against its own trusted configuration,
-invokes the pinned `lego` CLI, and stores certificates in a filesystem
-Certificate Store (dev/test only). See
+invokes the pinned `lego` CLI, and stores certificates either in a
+filesystem Certificate Store (dev/test only) or, since Phase 3, in Azure
+Key Vault, authenticated with the platform's managed identity. See
 [`docs/conductor.md`](docs/conductor.md) and
 [`docs/runner.md`](docs/runner.md) for how to run and configure each
 binary, and the [roadmap](docs/architecture.md#roadmap) for what each
@@ -75,7 +76,7 @@ cmd/acme-conductor/   control-plane binary
 cmd/acme-runner/      data-plane binary
 internal/conductor/   Conductor: config, registry (SQLite), scheduler, launchers, REST API
 internal/runner/      Runner: config, reconcile loop, lego invocation
-internal/store/       Certificate Store contract and the filesystem store
+internal/store/       Certificate Store contract, the filesystem store and the Azure Key Vault store
 internal/policy/      FQDN normalization and suffix-matching
 internal/version/     build metadata (injected via -ldflags)
 pkg/api/v1alpha1/     the versioned JobSpec/Result contract
