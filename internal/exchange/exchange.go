@@ -122,13 +122,18 @@ const (
 	StateClaimed State = "claimed"
 )
 
-// StateOf reports whether the run is pending, claimed or absent.
+// StateOf reports whether the run is pending, claimed or absent. A run
+// directory only ever moves from pending to claimed (or from pending to
+// withdrawn, which removes it), so pending is looked at first: a
+// directory that has left pending by the time claimed is looked at is
+// then found there, and "absent" is reported only for a run that is in
+// neither place after both looks in that order.
 func StateOf(root, runID string) (State, error) {
 	name := RunDirName(runID)
 	for _, s := range []struct {
 		dir   string
 		state State
-	}{{DirClaimed, StateClaimed}, {DirPending, StatePending}} {
+	}{{DirPending, StatePending}, {DirClaimed, StateClaimed}} {
 		_, err := os.Lstat(filepath.Join(root, s.dir, name))
 		if err == nil {
 			return s.state, nil

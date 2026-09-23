@@ -241,19 +241,62 @@ func (l *Launcher) Start(ctx context.Context, spec *v1alpha1.JobSpec) (launcher.
 	if err != nil {
 		return nil, err
 	}
-	// The marker is untrusted content from the share: the name must be an
-	// execution of this Job as far as the platform is concerned.
-	if _, err := l.api.JobExecution(ctx, l.cfg.ResourceGroup, l.cfg.JobName, name, nil); err != nil {
-		_ = exchange.Remove(root, spec.RunID)
-		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: describe("confirm execution", err)}
-	}
 	log = log.With("execution", name)
-	log.Info("job taken by an execution")
 	dir := exchange.ClaimedDir(root, spec.RunID)
-	return &execution{
+	e := &execution{
 		l: l, id: Type + ":" + name, name: name, parent: ctx, dir: dir,
 		cleanup: func() { _ = exchange.Remove(root, spec.RunID) }, spec: spec, log: log,
-	}, nil
+	}
+	// From here on a Runner holds the job and is working: whatever the
+	// confirmation below finds, the run is only ever ended through Wait,
+	// which stops the execution before the directory is removed. The one
+	// exception is the platform stating that no such execution exists.
+	if err := l.confirm(ctx, e); err != nil {
+		return nil, err
+	}
+	log.Info("job taken by an execution")
+	return e, nil
+}
+
+// confirmAttempts bounds how many times Start asks the platform about the
+// execution a Runner recorded before it watches it unconfirmed.
+const confirmAttempts = 5
+
+// confirm checks with the platform that the name a Runner recorded is an
+// execution of this Job. The marker is untrusted content from the share,
+// so a name the platform does not know ends the run at start (nothing of
+// this Job is running under it). Any other failure to read the execution
+// — the platform unreachable, the context cancelled — does not: the
+// Runner may well be running, so the execution is returned unconfirmed
+// and Wait, whose polling retries and whose every non-terminal exit
+// stops the execution, takes it from there.
+func (l *Launcher) confirm(ctx context.Context, e *execution) error {
+	var last error
+	for attempt := 1; attempt <= confirmAttempts; attempt++ {
+		_, err := l.api.JobExecution(ctx, l.cfg.ResourceGroup, l.cfg.JobName, e.name, nil)
+		if err == nil {
+			return nil
+		}
+		var re *azcore.ResponseError
+		if errors.As(err, &re) && re.StatusCode == 404 {
+			e.cleanup()
+			return &launcher.Error{Reason: launcher.ReasonStart, Err: describe("confirm execution", err)}
+		}
+		last = describe("confirm execution", err)
+		e.log.Warn("execution could not be confirmed", "attempt", attempt, "error", last.Error())
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(l.cfg.PollInterval):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	e.log.Warn("watching the execution unconfirmed", "error", last.Error())
+	return nil
 }
 
 // awaitClaim waits until an execution has taken the job and recorded its
@@ -359,15 +402,26 @@ func terminal(s *armappcontainers.JobExecutionRunningState) bool {
 }
 
 func (e *execution) wait() (*v1alpha1.Result, error) {
-	defer e.cleanup()
 	l := e.l
+	// The run directory is removed only once the execution is known to
+	// have ended: a Runner that may still be working keeps its result
+	// path, and the directory is reported for an operator to remove.
+	var status *armappcontainers.JobExecutionRunningState
+	defer func() {
+		if terminal(status) {
+			e.cleanup()
+			return
+		}
+		e.log.Warn("run directory kept: the execution has not been seen to end", "dir", e.dir)
+	}()
 	runCtx, cancel := context.WithCancel(e.parent)
 	if l.cfg.Timeout > 0 {
 		runCtx, cancel = context.WithTimeout(e.parent, l.cfg.Timeout)
 	}
 	defer cancel()
 
-	status, pollErr := e.poll(runCtx)
+	var pollErr error
+	status, pollErr = e.poll(runCtx)
 	stopped := false
 	if !terminal(status) {
 		// Cancelled, timed out, or the status could not be read any more:

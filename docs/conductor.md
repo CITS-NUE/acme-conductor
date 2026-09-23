@@ -173,10 +173,13 @@ Conductor's identity is not allowed to. For a run it:
    minute in the Bicep) to take the job — the Runner moves the directory
    to `<exchangeDir>/claimed/` (exactly one execution wins) and records
    its execution name there — and confirms with the platform that the
-   recorded name is an execution of this Job. If none takes it within
-   `claimTimeoutSeconds` the offer is withdrawn (by the same rename, so a
-   late taker cannot race it) and the run fails; a cancelled run is
-   withdrawn the same way and ends `cancelled`;
+   recorded name is an execution of this Job (a name the platform does
+   not know ends the run; a platform that cannot be asked, after a few
+   attempts, does not — the execution is watched unconfirmed, because a
+   Runner holds the job). If none takes it within `claimTimeoutSeconds`
+   the offer is withdrawn (by the same rename, so a late taker cannot
+   race it) and the run fails; a cancelled run is withdrawn the same way
+   and ends `cancelled`;
 3. polls the execution's status every `pollIntervalSeconds` until it is
    terminal (`Succeeded`, `Failed`, `Stopped`, `Degraded`). Whenever
    polling ends without a terminal status — the run was cancelled,
@@ -189,7 +192,10 @@ Conductor's identity is not allowed to. For a run it:
    names this run and target and that its status agrees with the
    platform's verdict (`Succeeded` with a failed `Result`, or `Failed`
    with a succeeded one, is a mismatch → `Internal`), and removes the run
-   directory.
+   directory — only once the execution has been seen to end; an
+   execution whose status stayed unreadable and whose stop could not be
+   confirmed keeps its directory (a Runner may still be writing there),
+   logged as "run directory kept" for an operator to remove.
 
 The run's `externalExecutionId` is `azure-container-apps-job:<execution
 name>`. The Conductor's identity needs, on the Job resource only, the
@@ -197,7 +203,8 @@ three actions the Bicep grants (`jobs/execution/read`,
 `jobs/executions/read`, `jobs/stop/execution/action`) — it cannot start
 or change the Job and holds no DNS, Key Vault or storage data
 permission. A run therefore starts up to one schedule interval plus the
-platform's start latency after it is queued.
+platform's start latency after it is queued, and at most one run starts
+per schedule tick (each execution runs one replica and takes one job).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

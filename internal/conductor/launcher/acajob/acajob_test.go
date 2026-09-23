@@ -103,7 +103,7 @@ type fakeARM struct {
 	statusOverride string // final status reported regardless of the exit code
 	stopCount      int
 	paused         bool   // the platform starts no executions
-	parallelism    int    // executions that may run at once
+	stopFailures   int    // leading stop requests that fail with 500
 	executionName  string // marker name the fake Runner records instead of its own
 	stopScheduler  chan struct{}
 }
@@ -125,7 +125,7 @@ func newFakeARM(t *testing.T, mode string) *fakeARM {
 		t.Fatal(err)
 	}
 	f := &fakeARM{
-		t: t, self: self, mode: mode, execs: map[string]*fakeExec{}, parallelism: 1,
+		t: t, self: self, mode: mode, execs: map[string]*fakeExec{},
 		exchangeLocal: filepath.Join(dir, "exchange"), record: filepath.Join(dir, "record.json"),
 		resultKey: keyPath, stopScheduler: make(chan struct{}),
 	}
@@ -155,8 +155,10 @@ func (f *fakeARM) runnerPublicKey() ed25519.PublicKey {
 	return priv.Public().(ed25519.PublicKey)
 }
 
-// schedule is the platform's cron: every tick, if something is pending
-// and capacity allows, start an execution.
+// schedule is the platform's cron: every tick, if something is pending,
+// start one execution (one replica: parallelism is replicas per
+// execution and the Job fixes it at 1). Executions of successive ticks
+// may overlap, as the platform is expected to allow.
 func (f *fakeARM) schedule() {
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
@@ -168,16 +170,6 @@ func (f *fakeARM) schedule() {
 		}
 		f.mu.Lock()
 		if f.paused {
-			f.mu.Unlock()
-			continue
-		}
-		running := 0
-		for _, e := range f.execs {
-			if e.status == armappcontainers.JobExecutionRunningStateRunning {
-				running++
-			}
-		}
-		if running >= f.parallelism {
 			f.mu.Unlock()
 			continue
 		}
@@ -295,6 +287,12 @@ func (f *fakeARM) stop(w http.ResponseWriter, name string) {
 		return
 	}
 	f.stopCount++
+	if f.stopFailures > 0 {
+		f.stopFailures--
+		f.mu.Unlock()
+		f.armError(w, http.StatusInternalServerError, "InternalServerError")
+		return
+	}
 	e.stopped = true
 	pid := e.cmd.Process.Pid
 	done := e.done
@@ -436,11 +434,10 @@ func TestSuccess(t *testing.T) {
 	}
 }
 
-// Two runs offered at once are taken by two distinct executions, each
-// correlated to its own run.
+// Two runs offered at once are taken by two distinct executions (one per
+// schedule tick), each correlated to its own run.
 func TestTwoRunsTwoExecutions(t *testing.T) {
 	f := newFakeARM(t, "ok")
-	f.set(func(f *fakeARM) { f.parallelism = 2 })
 	l, _, logs := newLauncher(t, f, nil)
 	specs := []*v1alpha1.JobSpec{spec(), specFor("01JRUN000000000000000000B2")}
 	var wg sync.WaitGroup
@@ -472,27 +469,115 @@ func TestTwoRunsTwoExecutions(t *testing.T) {
 
 func TestTransientStatusErrorsAreRetried(t *testing.T) {
 	f := newFakeARM(t, "slow")
+	// The first reads are the confirmation at start, which retries too.
 	f.set(func(f *fakeARM) { f.getFailures = 3 })
 	l, _, logs := newLauncher(t, f, nil)
 	ex, err := l.Start(context.Background(), spec())
-	// The confirmation read at start may be one of the failing ones; the
-	// launcher does not retry that one (the run fails safely), so only a
-	// started execution is exercised here.
 	if err != nil {
-		if strings.Contains(err.Error(), "HTTP 500") {
-			t.Skip("confirmation read hit an injected failure; polling retries are covered when start succeeds")
-		}
-		t.Fatal(err)
+		t.Fatalf("start: %v\n%s", err, logs.String())
+	}
+	if !strings.Contains(logs.String(), "execution could not be confirmed") || strings.Contains(logs.String(), "watching the execution unconfirmed") {
+		t.Fatalf("confirmation was not retried to success:\n%s", logs.String())
 	}
 	res, err := ex.Wait()
 	if err != nil || res.Status != v1alpha1.StatusSucceeded {
 		t.Fatalf("result = %+v, %v\n%s", res, err, logs.String())
 	}
-	if !strings.Contains(logs.String(), "job execution status could not be read") {
-		t.Fatalf("log:\n%s", logs.String())
-	}
 	if f.stops() != 0 {
 		t.Fatalf("stops = %d", f.stops())
+	}
+}
+
+// A taken job is never abandoned because the platform could not confirm
+// the execution: the confirmation gives up after a few attempts, the
+// execution is watched anyway, and when its status stays unreadable it is
+// stopped before the run directory is removed.
+func TestUnconfirmedExecutionIsStillWatchedAndStopped(t *testing.T) {
+	f := newFakeARM(t, "hang-noresult")
+	// confirmAttempts reads fail at start, maxConsecutivePollErrors more
+	// while waiting; the reads after the stop succeed and see Stopped.
+	f.set(func(f *fakeARM) { f.getFailures = confirmAttempts + maxConsecutivePollErrors })
+	l, _, logs := newLauncher(t, f, func(c *Config) { c.ResultGrace = 0 })
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatalf("start failed although a runner holds the job: %v\n%s", err, logs.String())
+	}
+	if !strings.Contains(logs.String(), "watching the execution unconfirmed") {
+		t.Fatalf("log:\n%s", logs.String())
+	}
+	res, err := ex.Wait()
+	if res != nil || launcher.ReasonOf(err) != launcher.ReasonNoResult {
+		t.Fatalf("result = %+v, err = %v\n%s", res, err, logs.String())
+	}
+	if f.stops() != 1 {
+		t.Fatalf("stops = %d, want the execution stopped\n%s", f.stops(), logs.String())
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+}
+
+// A context cancelled while the execution is being confirmed does not
+// abandon the Runner either: the execution is stopped through Wait.
+func TestCancelDuringConfirmStopsExecution(t *testing.T) {
+	f := newFakeARM(t, "hang")
+	f.set(func(f *fakeARM) { f.getFailures = 2 })
+	l, _, logs := newLauncher(t, f, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel as soon as the job has been taken (the marker exists).
+	go func() {
+		for {
+			if _, err := exchange.ReadExecution(f.exchangeLocal, spec().RunID); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	ex, err := l.Start(ctx, spec())
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, logs.String())
+	}
+	res, err := ex.Wait()
+	if err != nil && launcher.ReasonOf(err) != launcher.ReasonCancelled {
+		t.Fatalf("result = %+v, err = %v\n%s", res, err, logs.String())
+	}
+	if err == nil && (res.Status != v1alpha1.StatusFailed || res.Error.Code != v1alpha1.ErrorCodeCancelled) {
+		t.Fatalf("result = %+v\n%s", res, logs.String())
+	}
+	if f.stops() != 1 {
+		t.Fatalf("stops = %d\n%s", f.stops(), logs.String())
+	}
+}
+
+// When the execution cannot be stopped and is not seen to end, the run
+// directory is kept (a Runner may still be writing there) and reported.
+func TestUnstoppableExecutionKeepsTheRunDirectory(t *testing.T) {
+	f := newFakeARM(t, "hang-noresult")
+	l, _, logs := newLauncher(t, f, func(c *Config) {
+		c.Timeout = 300 * time.Millisecond
+		c.StopGrace = 500 * time.Millisecond
+		c.ResultGrace = 0
+	})
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After the timeout every read and the stop fail.
+	f.set(func(f *fakeARM) { f.getFailures = 1000; f.stopFailures = 1000 })
+	res, err := ex.Wait()
+	if res != nil || launcher.ReasonOf(err) != launcher.ReasonTimeout {
+		t.Fatalf("result = %+v, err = %v\n%s", res, err, logs.String())
+	}
+	if f.stops() == 0 {
+		t.Fatal("no stop attempted")
+	}
+	dirs := runDirs(t, f)
+	if len(dirs) != 1 || dirs[0] != exchange.DirClaimed+"/"+exchange.RunDirName(spec().RunID) {
+		t.Fatalf("run directories = %v, want the claimed directory kept", dirs)
+	}
+	if !strings.Contains(logs.String(), "run directory kept") {
+		t.Fatalf("log:\n%s", logs.String())
 	}
 }
 

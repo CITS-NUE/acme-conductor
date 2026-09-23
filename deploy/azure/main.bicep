@@ -105,10 +105,6 @@ param claimTimeoutSeconds int = 300
 @description('Cron schedule on which the platform starts Runner executions; each execution takes one offered job or exits at once. Every minute is the finest schedule Container Apps supports and bounds the start latency of a run.')
 param runnerCronExpression string = '* * * * *'
 
-@description('Runner executions the platform may run at once (each takes one job). Defaults to schedulerMaxConcurrentRuns, which it should equal.')
-@minValue(1)
-@maxValue(10)
-param runnerParallelism int = schedulerMaxConcurrentRuns
 
 @description('Optional image for an administration sidecar in the Conductor replica (a shell with curl reaches the loopback-only API through `az containerapp exec`). Empty deploys no sidecar. Pin by digest.')
 param adminSidecarImage string = ''
@@ -286,9 +282,21 @@ resource exchangeStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01'
 // --- the Runner: a scheduled Job -------------------------------------------
 
 // The operator's Runner configuration plus the Conductor's public key (so
-// the Runner cannot be deployed without the key it needs to verify jobs)
-// and the path of its own result-signing key.
-var runnerConfig = union(json(runnerConfigJson), {
+// the Runner cannot be deployed without the key it needs to verify jobs),
+// the path of its own result-signing key, and the client ID of the
+// Runner's user-assigned identity on every Key Vault store binding that
+// authenticates with a managed identity: the Job carries a user-assigned
+// identity only, and a managed-identity credential that names no client
+// ID asks for the system-assigned one, which this Job does not have.
+var runnerConfigInput = json(runnerConfigJson)
+var runnerStoreBindings = toObject(
+  items(runnerConfigInput.storeBindings),
+  b => b.key,
+  b => (b.value.type == 'azure-keyvault' && (b.value.?credential ?? 'default') == 'managed-identity')
+    ? union(b.value, { managedIdentityClientId: runnerIdentity.properties.clientId })
+    : b.value
+)
+var runnerConfig = union(runnerConfigInput, {
   jobSigning: {
     publicKeys: [
       jobSigningPublicKey
@@ -297,6 +305,7 @@ var runnerConfig = union(json(runnerConfigJson), {
   resultSigning: {
     privateKeyFile: '/etc/acme-runner/result-signing.pem'
   }
+  storeBindings: runnerStoreBindings
 })
 
 resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
@@ -324,7 +333,12 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: runnerCronExpression
-        parallelism: runnerParallelism
+        // parallelism is replicas *per execution*, and the launcher's
+        // contract is one run per execution (stop and verdict are per
+        // execution): several replicas of one execution would share an
+        // execution name while taking different runs. Concurrency comes
+        // from executions of successive ticks overlapping.
+        parallelism: 1
         replicaCompletionCount: 1
       }
       secrets: [

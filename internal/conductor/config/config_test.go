@@ -359,6 +359,14 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 	if r.ResultSigning == nil || r.ResultSigning.PrivateKeyFile != "/etc/acme-runner/result-signing.pem" {
 		t.Fatalf("runner example must sign results: %+v", r.ResultSigning)
 	}
+	// The Job carries a user-assigned identity only, so a managed-identity
+	// Key Vault binding must name its client ID (the Bicep injects the
+	// real one; the example shows the field).
+	for name, b := range r.StoreBindings {
+		if b.Type == "azure-keyvault" && b.Credential == "managed-identity" && b.ManagedIdentityClientID == "" {
+			t.Fatalf("store binding %q: managed-identity without managedIdentityClientId selects a system-assigned identity the Job does not have", name)
+		}
+	}
 	if r.Lego.StateDir != "/state" || r.Lego.WorkDir != "/work" {
 		t.Fatalf("runner example paths: %+v", r.Lego)
 	}

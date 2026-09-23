@@ -35,6 +35,12 @@ the infrastructure is provisioned.
   the launcher code refrained from doing. The Conductor's identity
   therefore does not hold it. What the Conductor chooses is *what run*
   a Runner executes; *what the Runner is* is fixed in infrastructure.
+- **One run is one execution, with one replica.** The platform's
+  `parallelism` is the number of replicas *within* one execution; they
+  would share the execution name, and stop and verdict are per
+  execution, so replicas taking different runs would tie those runs
+  together. The Job fixes `parallelism` and `replicaCompletionCount` at
+  1; concurrency is executions of successive schedule ticks overlapping.
 - **Documents travel over a file share both containers mount, through a
   claim protocol** (`internal/exchange`). The Conductor writes the signed
   job under `staging/run-<runId>/` and moves the directory to `pending/`
@@ -46,7 +52,14 @@ the infrastructure is provisioned.
   an execution of this Job, watches it, and removes the directory when
   it ends. If no execution takes the job within `claimTimeoutSeconds`
   the Conductor withdraws it by the same rename, so a job is either taken
-  or withdrawn, never both. The share holds no certificate material and
+  or withdrawn, never both. Once a job is taken, the Conductor never
+  abandons the Runner behind it: the recorded execution name is
+  confirmed with the platform (a name the platform does not know ends
+  the run, a platform that cannot be asked does not — the execution is
+  watched unconfirmed), and the run directory is removed only once the
+  execution has been seen to end; otherwise it is kept and reported, so
+  a Runner that may still be working keeps its result path. The share
+  holds no certificate material and
   no credential, only these documents. It is not a transport the
   Conductor owns (anyone with the storage key or a mount can write it),
   so both directions are authenticated: the job is a **signed envelope**
@@ -157,15 +170,18 @@ the infrastructure is provisioned.
   is closed for it, and a Conductor compromise is bounded to choosing
   which runs execute (T1).
 - A run starts up to a minute plus the platform's start latency after it
-  is queued, and the platform runs one short, idle execution per schedule
-  tick while nothing is pending; `runnerParallelism` bounds how many jobs
-  are taken at once and should equal the scheduler's
-  `maxConcurrentRuns`.
+  is queued, at most one run per tick, and the platform runs one short,
+  idle execution per tick while nothing is pending; the scheduler's
+  `maxConcurrentRuns` bounds how many runs wait for or hold an execution
+  at once.
+- A run directory can outlive its run when the execution was never seen
+  to end; the operator guide says how to recognize and remove it.
 - Both signing keys are operator-owned secrets: the Conductor's
   job-signing key and the Runner's result-signing key, each mounted for
   its own binary only. Rotation is additive on the verifying side.
 - The launcher's behaviour against the real platform (schedule cadence
-  and `parallelism` semantics, rename atomicity on an SMB share, role
+  and overlap of executions across ticks, rename atomicity on an SMB
+  share, role
   action names, SQLite and `flock` on an SMB share, Result propagation
   delay) is documented from the reference documentation and verified only
   by a first real deployment, not by CI; `deploy/azure/README.md` lists

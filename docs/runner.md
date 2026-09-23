@@ -233,8 +233,11 @@ launcher over a private directory may run without.
 In the Phase 4 deployment ([`deploy/azure`](../deploy/azure/README.md))
 the Runner is a Container Apps Job with a user-assigned managed
 identity, and both DNS and Key Vault authenticate with it: the store
-binding says `credential: managed-identity`, and the `azuredns` DNS
-binding says `AZURE_AUTH_METHOD=msi` in its `env`. Container Apps
+binding says `credential: managed-identity` **with
+`managedIdentityClientId` set to that identity's client ID** (the Bicep
+injects it; a managed-identity credential without a client ID asks for
+a system-assigned identity, which the Job does not have), and the
+`azuredns` DNS binding says `AZURE_AUTH_METHOD=msi` in its `env`. Container Apps
 exposes the identity to the container through the `IDENTITY_ENDPOINT`
 and `IDENTITY_HEADER` environment variables (and the Job template sets
 `AZURE_CLIENT_ID` to the identity's client ID); because the Runner builds

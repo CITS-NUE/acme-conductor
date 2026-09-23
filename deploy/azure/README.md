@@ -27,7 +27,7 @@ verified against is listed at the end; read that before relying on it.**
 | `<prefix><hash>` (storage account) | Three Azure Files shares, mounted into the environment: `conductor-state` (the SQLite registry, mounted with `nobrl`), `runner-state` (ACME account state, `/state`), `exchange` (signed jobs in, results out). |
 | `<prefix>-id-conductor` (user-assigned identity) | The Conductor's identity. Granted the **Conductor Job Execution Observer** custom role (read, list and stop executions; no start) on the Runner Job only. |
 | `<prefix>-id-runner` (user-assigned identity) | The Runner's identity. Granted the **Runner DNS TXT Writer** custom role on the challenge zone and the **Runner Key Vault Certificate Writer** custom role on the vault. |
-| `<prefix>-runner` (Container Apps Job) | The Runner image with the Runner configuration and its result-signing private key mounted under `/etc/acme-runner/`, `/exchange`, `/state`, and an ephemeral `/work`. Schedule trigger (`runnerCronExpression`, every minute), `runnerParallelism` replicas at most, no retries, fixed command `reconcile --exchange /exchange`. |
+| `<prefix>-runner` (Container Apps Job) | The Runner image with the Runner configuration and its result-signing private key mounted under `/etc/acme-runner/`, `/exchange`, `/state`, and an ephemeral `/work`. Schedule trigger (`runnerCronExpression`, every minute), one replica per execution (`parallelism: 1`: the launcher's contract is one run per execution), no retries, fixed command `reconcile --exchange /exchange`. |
 | `<prefix>-conductor` (Container App) | The Conductor image with its configuration and the job-signing private key mounted under `/etc/acme-conductor/`, `/var/lib/acme-conductor` and `/mnt/exchange`. One replica, no ingress, optional admin sidecar. |
 | Three custom role definitions (subscription scope) | See `modules/roles.bicep`. |
 
@@ -97,9 +97,12 @@ Conductor runs with.
 
 ### The Runner's identity inside the Job
 
-The Runner authenticates to Key Vault with its user-assigned identity
-(`credential: managed-identity` in the store binding; the template sets
-`AZURE_CLIENT_ID` in the Job's environment). `lego`'s `azuredns`
+The Runner authenticates to Key Vault with its user-assigned identity:
+the template sets `managedIdentityClientId` on every `azure-keyvault`
+store binding with `credential: managed-identity` to the identity's
+client ID (a managed-identity credential that names no client ID asks
+the platform for a system-assigned identity, which this Job does not
+have), and sets `AZURE_CLIENT_ID` in the Job's environment for `lego`. `lego`'s `azuredns`
 provider uses the same identity when the DNS binding says
 `AZURE_AUTH_METHOD=msi`. Container Apps exposes the identity through the
 `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` variables of the container,
@@ -156,12 +159,21 @@ side first (`jobSigning.publicKeys` in the Runner configuration, or
 keys), deploy, then switch the signer to the new private key, then
 remove the old public key.
 
-**Latency and idle executions.** A run starts when the next scheduled
-execution takes it: up to `runnerCronExpression`'s interval (a minute)
-plus the platform's start latency. While nothing is pending, every tick
-still runs one execution that finds no job and exits at once; that is
-the price of not holding `jobs/start/action`, and an event-driven
+**Latency, throughput and idle executions.** A run starts when the next
+scheduled execution takes it: up to `runnerCronExpression`'s interval (a
+minute) plus the platform's start latency. Each execution runs one
+replica and takes one job, so at most one run starts per tick; runs
+overlap only insofar as executions of successive ticks overlap
+(expected, not observed — see below). While nothing is pending, every
+tick still runs one execution that finds no job and exits at once; that
+is the price of not holding `jobs/start/action`, and an event-driven
 trigger is the noted follow-up if it matters.
+
+**Stale run directories.** When an execution could not be seen to end —
+its status unreadable and the stop not confirmed — the Conductor keeps
+`claimed/run-<runId>/` on the `exchange` share (a Runner may still be
+writing there) and logs "run directory kept". Remove such directories by
+hand once the execution has ended (`az containerapp job execution list`).
 
 ## Not verified by this repository
 
@@ -171,12 +183,13 @@ documents load with the same validators the binaries use
 been deployed to a subscription by the project, so the following are
 documented from the platform's reference documentation, not observed:
 
-- **Schedule semantics.** Executions are expected to start every minute
-  with `parallelism` replicas that each take at most one job; a platform
-  that skips a tick while a previous execution is still running only
-  delays runs (`claimTimeoutSeconds` bounds the wait). `CONTAINER_APP_JOB_EXECUTION_NAME`
-  is documented as set in every execution's containers; the Runner
-  refuses to work without it.
+- **Schedule semantics.** An execution with one replica is expected to
+  start every minute and to overlap with a still-running execution of an
+  earlier tick; a platform that skips a tick instead only delays runs
+  (`claimTimeoutSeconds` bounds the wait, and the run then fails and is
+  retried by the scheduler). `CONTAINER_APP_JOB_EXECUTION_NAME` is
+  documented as set in every execution's containers; the Runner refuses
+  to work without it.
 - **Rename atomicity on Azure Files (SMB).** Taking and withdrawing a
   job are directory renames, which are atomic on a local filesystem and
   expected to be on an SMB share (the server performs them); if two

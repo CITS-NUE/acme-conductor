@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -180,5 +181,49 @@ func TestExecutionMarker(t *testing.T) {
 	os.WriteFile(filepath.Join(c.Dir, ExecutionFile), []byte("../../evil\n"), 0o644)
 	if _, err := ReadExecution(root, runA); err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("invalid marker = %v", err)
+	}
+}
+
+// A run being taken while its state is observed is never reported absent:
+// the directory only moves, it is not removed.
+func TestStateOfNeverAbsentWhileTaken(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 300; i++ {
+		if err := Publish(root, runA, []byte("{}")); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var absent int32
+		stop := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				st, err := StateOf(root, runA)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if st == StateAbsent {
+					atomic.AddInt32(&absent, 1)
+				}
+			}
+		}()
+		if c, err := Take(root); err != nil || c == nil {
+			t.Fatalf("Take = %+v, %v", c, err)
+		}
+		close(stop)
+		wg.Wait()
+		if atomic.LoadInt32(&absent) != 0 {
+			t.Fatalf("iteration %d: StateOf reported absent during a take", i)
+		}
+		if err := Remove(root, runA); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
