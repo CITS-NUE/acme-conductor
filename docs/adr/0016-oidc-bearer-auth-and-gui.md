@@ -61,11 +61,34 @@ keep secure ([architecture, technology choices](../architecture.md#technology-ch
   forget it and no new endpoint can bypass it. Finer permissions (per
   policy, per target) are not modelled: the registry is one operator
   team's, and a viewer role is what an auditor or a dashboard needs.
-- **The principal is one claim, recorded as is.** `preferred_username`
-  by default (configurable), bounded and printable like every other
-  actor string, written to the audit log and to `requestedBy`. The
-  Conductor does not look users up anywhere; what the provider asserts
-  is what the log says.
+- **Audience and scopes are two settings; nothing is derived.**
+  `audience` is what the provider writes into `aud` and is used for
+  verification only; `scopes` is what the GUI asks the provider for and
+  is required whenever a GUI client is configured. They are different
+  identifiers at Entra ID: a v2 access token's `aud` is the API
+  registration's client ID (a GUID), while the scope is
+  `<application ID URI>/.default` (`api://<client-id>/.default` by
+  default). An earlier draft derived `<audience>/.default`, which is
+  right for no provider in general and wrong for Entra ID v2 in
+  particular; the configuration now refuses a client id without scopes
+  rather than guessing.
+- **The principal is one claim, recorded as is, and it identifies.** The
+  actor written to the audit log and to `requestedBy` is the value of
+  `principalClaim`, bounded and printable like every other actor
+  string. The default is `sub`, the stable subject identifier every
+  provider issues; Entra ID deployments set `oid`, since `sub` is
+  pairwise per client there. A display name (`preferred_username`,
+  `email`, `name`) is not the actor: it changes when a user is renamed
+  and can be reassigned, and an audit record that names a person by
+  something mutable stops identifying them. The GUI shows the signed-in
+  user's display name for its own header only; the Conductor does not
+  look users up anywhere, and what the provider asserts is what the log
+  says.
+- **A published key verifies its published algorithm only.** A JWK that
+  carries `alg` is used for that algorithm and no other, so an RSA key
+  published for RS256 does not verify a PS256 token; a key published
+  for an algorithm outside the three is not used at all, and a key
+  whose `alg` does not fit its type makes the whole set untrusted.
 - **The listener may leave loopback only with TLS or an explicit
   statement.** In `oidc` mode a non-loopback `server.listen` needs
   `server.tls` (the Conductor's own certificate, TLS 1.2+) or
@@ -97,7 +120,9 @@ keep secure ([architecture, technology choices](../architecture.md#technology-ch
 ## Consequences
 
 - A deployment names its principals: the audit log's actor is the
-  operator's identity at the provider, and a read-only role exists.
+  operator's stable identifier at the provider (an Entra ID `oid`, a
+  `sub`), which an administrator resolves to a person at the provider,
+  and a read-only role exists.
   Threat T13's residual (a local user is an administrator) is closed for
   `oidc` deployments; `localhost-dev` stays what it was, for one host.
 - The trust the Conductor places in the provider is total within the

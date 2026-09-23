@@ -15,9 +15,13 @@ keep the property that a published image is exactly what CI verified.
 
 ## Decision
 
-- **A version tag is a release, and CI gates it.** `release.yml` runs on
-  a `v*.*.*` tag, first as the CI workflow itself (`workflow_call`), then
-  builds and pushes `ghcr.io/cits-nue/acme-conductor` and
+- **A version tag on `main` is a release, and CI gates it.** `release.yml`
+  runs on a `v*.*.*` tag, first as the CI workflow itself
+  (`workflow_call`) and, in parallel, as a check that the tagged commit
+  is in the history of `origin/main` (`git merge-base --is-ancestor`,
+  on a full clone); a tag on any other commit publishes nothing, so a
+  feature branch cannot be released by tagging it, whatever the
+  repository's tag rules say. Only then does it build and push `ghcr.io/cits-nue/acme-conductor` and
   `ghcr.io/cits-nue/acme-runner` for `linux/amd64` and `linux/arm64`,
   tagged `<major>.<minor>.<patch>`, `<major>.<minor>` and, for a
   non-prerelease, `latest`. The published image is smoke-tested by
@@ -57,6 +61,10 @@ keep the property that a published image is exactly what CI verified.
   commit and the Dockerfile inputs are in the attestation; the SBOM lists
   what is in the image (both Go binaries' modules, the pinned `lego`
   binary, the distroless base).
+- The `main` check is enforced in the workflow, where the invariant is
+  reviewed with the code; a repository ruleset restricting who may
+  create `v*` tags is a second layer an administrator can add, not a
+  substitute.
 - The pipeline is not verified by a run from this repository yet: it
   needs a tag on `main` and the repository's packages permission. Its
   first run is the verification, and the smoke test fails the release if

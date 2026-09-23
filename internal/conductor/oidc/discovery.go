@@ -2,7 +2,6 @@ package oidc
 
 import (
 	"context"
-	"crypto"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,7 +110,7 @@ func (a *Authenticator) fetchDiscovery(ctx context.Context) (*discovery, error) 
 	return &doc, nil
 }
 
-func (a *Authenticator) fetchKeys(ctx context.Context, jwksURI string) (map[string]crypto.PublicKey, error) {
+func (a *Authenticator) fetchKeys(ctx context.Context, jwksURI string) (map[string]signingKey, error) {
 	data, err := a.get(ctx, jwksURI, MaxJWKSSize)
 	if err != nil {
 		return nil, fmt.Errorf("key set: %w", err)
@@ -152,7 +151,7 @@ func (a *Authenticator) get(ctx context.Context, url string, limit int64) ([]byt
 // when it is older than the configured cache time or does not hold the
 // id (rate-limited, RefreshMinInterval). A stale set is still used when a
 // refresh fails.
-func (a *Authenticator) keyFor(ctx context.Context, kid string) (crypto.PublicKey, error) {
+func (a *Authenticator) keyFor(ctx context.Context, kid string) (signingKey, error) {
 	now := a.now()
 	a.mu.Lock()
 	key, known := a.keys[kid]
@@ -169,7 +168,7 @@ func (a *Authenticator) keyFor(ctx context.Context, kid string) (crypto.PublicKe
 		a.mu.Unlock()
 	}
 	if !known {
-		return nil, errors.New("token names a signing key the issuer does not publish")
+		return signingKey{}, errors.New("token names a signing key the issuer does not publish")
 	}
 	return key, nil
 }

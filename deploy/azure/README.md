@@ -70,7 +70,8 @@ never enters either container.
   GHCR public images need no registry credential.
 - **An OpenID Connect provider** and, for Microsoft Entra ID, two app
   registrations (see [Identity](#identity) below): one that *is* the API
-  (its application ID URI is `oidcAudience`, its app roles are the
+  (its Application (client) ID is `oidcAudience`, its application ID
+  URI is the prefix of the scope in `oidcScopes`, its app roles are the
   values in `oidcAdminRoles`/`oidcViewerRoles`) and one *public client*
   for the GUI (`oidcClientId`, single-page application platform, redirect
   URI = the `conductorGuiRedirectUri` output).
@@ -123,35 +124,48 @@ The Conductor is an OIDC *resource server*
 verifies tokens with the provider's published keys and holds no client
 secret. With Microsoft Entra ID:
 
-1. **API app registration** (`acme-conductor-api`): set an application
-   ID URI (`api://acme-conductor` → `oidcAudience`), set
+1. **API app registration** (`acme-conductor-api`): set
    `requestedAccessTokenVersion` to `2` (the Conductor checks the v2
    issuer `https://login.microsoftonline.com/<tenant>/v2.0`
-   → `oidcIssuer`), expose one scope (`access`, admin consent) so a
-   client can request `api://acme-conductor/.default`, and define two
-   **app roles** for users/groups, for example `ACME.Admin` and
-   `ACME.Viewer` (→ `oidcAdminRoles`, `oidcViewerRoles`). Assign users
-   or groups to the roles on the enterprise application. A token that
-   carries neither role is refused.
+   → `oidcIssuer`), set an application ID URI (the default
+   `api://<client-id>`, or a verified-domain URI), expose one scope
+   (`access`, admin consent) so a client can request
+   `<application ID URI>/.default`, and define two **app roles** for
+   users/groups, for example `ACME.Admin` and `ACME.Viewer`
+   (→ `oidcAdminRoles`, `oidcViewerRoles`). Assign users or groups to
+   the roles on the enterprise application. A token that carries
+   neither role is refused.
+
+   **Two identifiers, two parameters.** A v2 access token's `aud` is the
+   API registration's **Application (client) ID** (a GUID), whatever
+   the application ID URI is and whatever scope the client requested;
+   the application ID URI appears only in the scope the client asks
+   for. So `oidcAudience` is the client ID (`1111…`), and `oidcScopes`
+   is `['openid', 'profile', 'api://1111…/.default']` (or
+   `https://<verified domain>/<name>/.default` with such a URI). Setting
+   the URI as the audience makes the Conductor refuse every correctly
+   issued token with `401 token audience does not include this API`.
 2. **GUI app registration** (`acme-conductor-gui`): platform
    *Single-page application*, redirect URI `https://<app fqdn>/ui/`
    (the `conductorGuiRedirectUri` output), no client secret, API
    permission `acme-conductor-api / access` with admin consent. Its
-   client ID is `oidcClientId`. The GUI requests the scopes `openid`,
-   `profile` and `api://acme-conductor/.default` (the default
-   `server.auth.oidc.scopes`).
+   client ID is `oidcClientId`; the GUI requests exactly `oidcScopes`
+   (required with a client ID; the Conductor does not guess them).
 
-For the API from a terminal, obtain a token for the API's audience and
-present it as a bearer token:
+For the API from a terminal, obtain a token for the API's scope and
+present it as a bearer token; the provider writes the client ID into
+`aud`:
 
 ```sh
-token="$(az account get-access-token --scope api://acme-conductor/.default --query accessToken -o tsv)"
+token="$(az account get-access-token --scope api://11111111-1111-1111-1111-111111111111/.default --query accessToken -o tsv)"
 curl -s -H "Authorization: Bearer $token" https://<app fqdn>/api/v1alpha1/targets
 ```
 
-The audit log records the token's `preferred_username` as the actor.
-Any provider that publishes a discovery document and signs RS256/PS256/
-ES256 tokens works the same way; the claim names are configurable
+The audit log records the token's `oid` (`oidcPrincipalClaim`) as the
+actor: the user's object ID, which does not change when a user is
+renamed, unlike `preferred_username`. Any provider that publishes a
+discovery document and signs RS256/PS256/ES256 tokens works the same
+way; the claim names are configurable
 (`server.auth.oidc.principalClaim`, `rolesClaim`).
 
 ### The Runner's identity inside the Job

@@ -129,10 +129,10 @@ Top level:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `issuer` | string | — (required) | The provider's issuer URL, `https://…` (plain `http://` only to a loopback host, for tests); no user information, query or fragment. Its discovery document is read from `<issuer>/.well-known/openid-configuration` and must name the same issuer; every token's `iss` must equal it exactly. Entra ID v2: `https://login.microsoftonline.com/<tenant-id>/v2.0`. |
-| `audience` | string | — (required) | The value every token's `aud` must contain — the API's own identifier at the provider (Entra ID: the API app registration's application ID URI such as `api://acme-conductor`, or its client ID). Printable ASCII without whitespace, ≤256 bytes. |
+| `audience` | string | — (required) | The value every token's `aud` must contain, as the provider writes it. Entra ID v2 access tokens carry the API app registration's **Application (client) ID** (a GUID) as `aud`, never its application ID URI, whatever scope was requested. Verification only; nothing is derived from it. Printable ASCII without whitespace, ≤256 bytes. |
 | `clientId` | string | — | The public client the GUI signs in as (Entra ID: a single-page-application registration with redirect URI `https://<host>/ui/`). Without it the GUI cannot sign in; the API still accepts tokens obtained elsewhere. |
-| `scopes` | []string | `openid profile <audience>/.default` | What the GUI requests at sign-in (needs `clientId`). ≤16 distinct values. |
-| `principalClaim` | string | `preferred_username` | The claim whose value is recorded as the audit actor and `requestedBy`. It must be a string of printable characters, ≤256 bytes. |
+| `scopes` | []string | — (required with `clientId`) | What the GUI requests at sign-in; not derived from `audience`, since the scope a client requests and the audience the provider writes are different identifiers. Entra ID: `openid`, `profile` and `<application ID URI>/.default`, e.g. `api://<api-client-id>/.default`. ≤16 distinct values; only with `clientId`. |
+| `principalClaim` | string | `sub` | The claim whose value is recorded as the audit actor and `requestedBy`: a **stable identifier** of the subject, not a display name (`preferred_username`, `email` and `name` change when a user is renamed). Entra ID: set `oid` (`sub` is pairwise per client there). It must be a string of printable characters, ≤256 bytes. |
 | `rolesClaim` | string | `roles` | The claim (a string or an array of strings) whose values are matched against `roles`. |
 | `roles.admin` | []string | — (required, non-empty) | Values that grant the **admin** role: every endpoint. |
 | `roles.viewer` | []string | — | Values that grant the **viewer** role: `GET` only. A value may appear in one list only; a token carrying values from both is an admin. |
@@ -486,7 +486,8 @@ run failed.
 `storeObjectRef` and `error` mirror the Runner's `Result`
 ([contract](architecture.md#certificatereconcileresult-result)); `error`
 is `{ "code", "summary" }` on failure or cancellation. `requestedBy` is
-`scheduler` or the API principal (`localhost-dev`).
+`scheduler` or the API principal (`localhost-dev`, or in `oidc` mode the
+value of `principalClaim`, an identifier such as an Entra ID `oid`).
 
 ### Audit event
 
@@ -638,7 +639,7 @@ query parameter — and a token is accepted only if **all** hold:
   `iat`, if present, are not in the future;
 - its header and payload decode strictly (a duplicated claim is refused);
 - `principalClaim` is a printable string, which becomes the caller's
-  name in the audit log and in `requestedBy`;
+  identity in the audit log and in `requestedBy`;
 - `rolesClaim` carries a value in `roles.admin` (→ **admin**, every
   endpoint) or `roles.viewer` (→ **viewer**, `GET` only). A token with
   neither verified but is refused with `403`.
@@ -665,11 +666,13 @@ environment's peer-traffic encryption
 ([`deploy/azure/README.md`](../deploy/azure/README.md)).
 
 **Obtaining a token.** The GUI does it in the browser (see [GUI](#gui)).
-From a terminal, ask the provider for a token for the API's audience;
-with Microsoft Entra ID and the audience `api://acme-conductor`:
+From a terminal, ask the provider for a token for the API's scope; with
+Microsoft Entra ID, an API app registration whose client ID (the
+`audience`) is `1111…` and whose application ID URI is the default
+`api://1111…`:
 
 ```sh
-token="$(az account get-access-token --scope api://acme-conductor/.default --query accessToken -o tsv)"
+token="$(az account get-access-token --scope api://11111111-1111-1111-1111-111111111111/.default --query accessToken -o tsv)"
 curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1alpha1/targets
 ```
 
@@ -758,7 +761,8 @@ read-only) or behind an ingress that terminates TLS
 (`server.behindTlsProxy: true`); the peer address does not matter.
 
 Released images are published to `ghcr.io/cits-nue/acme-conductor` and
-`ghcr.io/cits-nue/acme-runner` on a version tag, for `linux/amd64` and
+`ghcr.io/cits-nue/acme-runner` on a version tag whose commit is on
+`main` (the workflow refuses any other), for `linux/amd64` and
 `linux/arm64`, with an SBOM and provenance attached
 ([ADR 0017](adr/0017-release-pipeline.md)); verify one with
 `gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE`

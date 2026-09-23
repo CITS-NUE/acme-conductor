@@ -96,11 +96,15 @@ const (
 	AuthOIDC = "oidc"
 )
 
-// Default OIDC claim names: the token claim that names the principal and
-// the one that lists its roles (both are what Microsoft Entra ID v2
-// access tokens carry; other providers are configured explicitly).
+// Default OIDC claim names: the token claim that identifies the
+// principal and the one that lists its roles. The principal is recorded
+// as the actor of audit events, so its claim must be a stable identifier
+// of the subject, not a display name: "sub" is the one every provider
+// issues; Microsoft Entra ID deployments set "oid" (sub is pairwise per
+// client there). "roles" is what an Entra ID app-role assignment emits;
+// other providers are configured explicitly.
 const (
-	DefaultOIDCPrincipalClaim = "preferred_username"
+	DefaultOIDCPrincipalClaim = "sub"
 	DefaultOIDCRolesClaim     = "roles"
 )
 
@@ -302,18 +306,26 @@ type OIDC struct {
 	// issuer; every token's iss must equal it exactly.
 	Issuer string `json:"issuer"`
 	// Audience is the value every token's aud must contain: the API's
-	// own identifier at the provider (an application ID URI or client
-	// ID). A token issued for anything else is refused.
+	// own identifier at the provider, as the provider writes it into
+	// access tokens. It is a verification setting only; nothing is
+	// derived from it. Microsoft Entra ID v2 access tokens carry the API
+	// app registration's client ID (a GUID) as aud, never its
+	// application ID URI, whatever scope the client requested. A token
+	// issued for anything else is refused.
 	Audience string `json:"audience"`
 	// ClientID is the public client the GUI signs in as. Without it the
 	// GUI cannot sign in (the API still accepts tokens obtained by other
 	// means).
 	ClientID string `json:"clientId,omitempty"`
-	// Scopes are what the GUI requests at sign-in. Default: "openid",
-	// "profile" and "<audience>/.default" (the Entra ID shape).
+	// Scopes are what the GUI requests at sign-in; required with
+	// ClientID and never derived from Audience, since the scope a client
+	// requests and the audience the provider writes are different
+	// identifiers (Entra ID: "openid", "profile" and
+	// "<application ID URI>/.default", e.g. "api://<client-id>/.default").
 	Scopes []string `json:"scopes,omitempty"`
 	// PrincipalClaim names the claim recorded as the actor of audit events
-	// and the requestedBy of runs (default preferred_username).
+	// and the requestedBy of runs (default sub; oid for Entra ID). It
+	// identifies the subject; it is not a display name.
 	PrincipalClaim string `json:"principalClaim,omitempty"`
 	// RolesClaim names the claim (a string or an array of strings) whose
 	// values are matched against Roles (default roles).
@@ -643,7 +655,7 @@ func (o *OIDC) validate() error {
 		seenScope[sc] = struct{}{}
 	}
 	if o.ClientID != "" && len(o.Scopes) == 0 {
-		o.Scopes = []string{"openid", "profile", o.Audience + "/.default"}
+		return invalid("server.auth.oidc.scopes is required with clientId: the scope the GUI requests (e.g. openid, profile, api://<api-client-id>/.default) is not derived from audience")
 	}
 	if o.PrincipalClaim == "" {
 		o.PrincipalClaim = DefaultOIDCPrincipalClaim

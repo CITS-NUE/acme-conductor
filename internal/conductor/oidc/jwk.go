@@ -36,12 +36,23 @@ type jwkSet struct {
 	Keys []jwk `json:"keys"`
 }
 
+// signingKey is a published key with the algorithm, if any, the issuer
+// published it for. A token verified with the key must name that
+// algorithm: the header cannot pick another one the key type happens to
+// support (an RSA key published for RS256 does not verify PS256).
+type signingKey struct {
+	key crypto.PublicKey
+	alg string
+}
+
 // parseJWKS turns a JWK set document into the signing keys this package
-// can use, indexed by key id. Keys of other types, without a key id, or
-// marked for a use other than signing are skipped; a key that claims a
-// usable type but is malformed is an error, since a set with such a key
-// cannot be trusted to be what the issuer published.
-func parseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
+// can use, indexed by key id. Keys of other types, without a key id,
+// marked for a use other than signing, or published for an algorithm
+// this package does not accept are skipped; a key that claims a usable
+// type but is malformed, or whose declared algorithm does not fit its
+// type, is an error, since a set with such a key cannot be trusted to be
+// what the issuer published.
+func parseJWKS(data []byte) (map[string]signingKey, error) {
 	var set jwkSet
 	if err := json.Unmarshal(data, &set); err != nil {
 		return nil, fmt.Errorf("key set is not valid JSON: %w", err)
@@ -49,7 +60,7 @@ func parseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
 	if len(set.Keys) > MaxKeys {
 		return nil, fmt.Errorf("key set has %d keys, more than %d", len(set.Keys), MaxKeys)
 	}
-	out := map[string]crypto.PublicKey{}
+	out := map[string]signingKey{}
 	for i, k := range set.Keys {
 		if k.Kid == "" || (k.Use != "" && k.Use != "sig") {
 			continue
@@ -60,8 +71,20 @@ func parseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
 		)
 		switch k.Kty {
 		case "RSA":
+			if k.Alg != "" && k.Alg != algRS256 && k.Alg != algPS256 {
+				if k.Alg == algES256 {
+					return nil, fmt.Errorf("key %d: RSA key published for %s", i, k.Alg)
+				}
+				continue
+			}
 			key, err = rsaKey(k)
 		case "EC":
+			if k.Alg != "" && k.Alg != algES256 {
+				if k.Alg == algRS256 || k.Alg == algPS256 {
+					return nil, fmt.Errorf("key %d: EC key published for %s", i, k.Alg)
+				}
+				continue
+			}
 			key, err = ecKey(k)
 		default:
 			continue
@@ -72,7 +95,7 @@ func parseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
 		if _, dup := out[k.Kid]; dup {
 			return nil, fmt.Errorf("key %d: key id %q appears twice", i, k.Kid)
 		}
-		out[k.Kid] = key
+		out[k.Kid] = signingKey{key: key, alg: k.Alg}
 	}
 	if len(out) == 0 {
 		return nil, errors.New("key set contains no usable signing key")

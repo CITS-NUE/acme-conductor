@@ -82,7 +82,9 @@ func TestAcceptsValidTokens(t *testing.T) {
 		want     api.Role
 	}{
 		{"RS256", f.is.RSAKid, []string{"ACME.Admin"}, api.RoleAdmin},
-		{"PS256", f.is.RSAKid, []string{"other", "ACME.Viewer"}, api.RoleViewer},
+		{"PS256", f.is.RSAPSKid, []string{"other", "ACME.Viewer"}, api.RoleViewer},
+		{"RS256", f.is.RSAAnyKid, []string{"ACME.Admin"}, api.RoleAdmin},
+		{"PS256", f.is.RSAAnyKid, []string{"ACME.Viewer"}, api.RoleViewer},
 		{"ES256", f.is.ECKid, "ACME.Admin", api.RoleAdmin},
 		{"ES256", f.is.ECKid, []string{"ACME.Viewer", "ACME.Admin"}, api.RoleAdmin},
 	} {
@@ -148,7 +150,11 @@ func TestRefusesBadTokens(t *testing.T) {
 		"no-kid":             {f.is.Sign("RS256", "", nil, valid()), "key id", false},
 		"unknown-kid":        {f.is.Sign("RS256", "rsa-9", nil, valid()), "does not publish", false},
 		"alg-key-mismatch":   {f.is.Sign("RS256", f.is.ECKid, nil, valid()), "does not match", false},
-		"es-with-rsa-key":    {f.is.Sign("ES256", f.is.RSAKid, nil, valid()), "does not match", false},
+		"es-with-rsa-key":    {f.is.Sign("ES256", f.is.RSAAnyKid, nil, valid()), "does not match", false},
+		"ps-with-rs-key":     {f.is.Sign("PS256", f.is.RSAKid, nil, valid()), "published for", false},
+		"rs-with-ps-key":     {f.is.Sign("RS256", f.is.RSAPSKid, nil, valid()), "published for", false},
+		"es-with-rs-key":     {f.is.Sign("ES256", f.is.RSAKid, nil, valid()), "published for", false},
+		"rs512-key":          {f.is.Sign("RS256", "rsa-512", nil, valid()), "does not publish", false},
 		"crit":               {f.is.Sign("RS256", f.is.RSAKid, map[string]any{"crit": []string{"exp"}}, valid()), "critical", false},
 		"tampered":           {tamper(f.is.Sign("RS256", f.is.RSAKid, nil, valid())), "does not verify", false},
 		"two-parts":          {"aaaa.bbbb", "three parts", false},
@@ -350,4 +356,116 @@ func dupClaim(is *oidctest.Issuer) string {
 	digest := sha256.Sum256([]byte(header + "." + payload))
 	sig, _ := rsa.SignPKCS1v15(rand.Reader, is.RSAKey, crypto.SHA256, digest[:])
 	return header + "." + payload + "." + oidctest.B64(sig)
+}
+
+// TestEntraV2TokenShape models a Microsoft Entra ID v2.0 access token
+// as issued for an API whose app registration requests v2 tokens: aud
+// is the API's client ID (a GUID), never its application ID URI; the
+// scope the client asked for appears in scp; the stable identifier of
+// the user is oid. The configuration names the GUID as the audience and
+// oid as the principal claim; the scope the GUI requests is a separate
+// setting and is not derived from the audience.
+func TestEntraV2TokenShape(t *testing.T) {
+	const (
+		apiClientID = "11111111-1111-1111-1111-111111111111"
+		oid         = "33333333-3333-3333-3333-333333333333"
+	)
+	is := oidctest.New(t)
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	auth, err := New(Config{
+		Issuer: is.URL(), Audience: apiClientID,
+		PrincipalClaim: "oid", RolesClaim: "roles",
+		AdminValues: []string{"ACME.Admin"}, ViewerValues: []string{"ACME.Viewer"},
+		ClockSkew: time.Minute, KeyCache: time.Hour,
+	}, &Options{HTTPClient: is.Srv.Client(), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entra := func() map[string]any {
+		return map[string]any{
+			"aud": apiClientID, "iss": is.URL(), "iat": now.Unix() - 5, "nbf": now.Unix() - 5, "exp": now.Unix() + 3600,
+			"aio": "opaque", "azp": "22222222-2222-2222-2222-222222222222", "azpacr": "0",
+			"name": "Alice Example", "oid": oid, "preferred_username": "alice@example.ac.jp",
+			"rh": "opaque", "roles": []string{"ACME.Admin"}, "scp": "access",
+			"sub": "pairwise-subject", "tid": "00000000-0000-0000-0000-000000000000",
+			"uti": "opaque", "ver": "2.0",
+		}
+	}
+	req := func(token string) *http.Request {
+		r := httptest.NewRequest("GET", "/api/v1alpha1/targets", nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		return r
+	}
+	p, err := auth.Authenticate(req(is.Token(entra())))
+	if err != nil {
+		t.Fatalf("Entra v2 token: %v", err)
+	}
+	if p.Name != oid || p.Role != api.RoleAdmin {
+		t.Fatalf("principal %+v", p)
+	}
+	// A v1-shaped token (aud is the application ID URI) is not for this
+	// audience; the failure names the audience so an operator who set
+	// the URI as the audience sees why every token is refused.
+	c := entra()
+	c["aud"] = "api://" + apiClientID
+	c["ver"] = "1.0"
+	if _, err := auth.Authenticate(req(is.Token(c))); err == nil || !strings.Contains(err.Error(), "audience") {
+		t.Fatalf("v1-shaped token: %v", err)
+	}
+	// The principal is oid: a token without it is refused even though
+	// preferred_username is present.
+	c = entra()
+	delete(c, "oid")
+	if _, err := auth.Authenticate(req(is.Token(c))); err == nil || !strings.Contains(err.Error(), "oid") {
+		t.Fatalf("token without oid: %v", err)
+	}
+	// preferred_username is not consulted for the principal.
+	c = entra()
+	c["preferred_username"] = "mallory@example.ac.jp"
+	if p, err := auth.Authenticate(req(is.Token(c))); err != nil || p.Name != oid {
+		t.Fatalf("principal from oid: %+v, %v", p, err)
+	}
+}
+
+// TestParseJWKSAlgorithms covers what a published "alg" does to a key:
+// it is kept with the key, a key for an algorithm this project does not
+// accept is skipped, and an algorithm that does not fit the key's type
+// makes the set untrusted.
+func TestParseJWKSAlgorithms(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	n := oidctest.B64(key.N.Bytes())
+	rsaKey := func(kid, alg string) string {
+		s := `{"kty":"RSA","kid":"` + kid + `","n":"` + n + `","e":"AQAB"`
+		if alg != "" {
+			s += `,"alg":"` + alg + `"`
+		}
+		return s + `}`
+	}
+	ecKey := func(kid, alg string) string {
+		s := `{"kty":"EC","kid":"` + kid + `","crv":"P-256","x":"` + oidctest.B64(make([]byte, 32)) + `","y":"` + oidctest.B64(make([]byte, 32)) + `"`
+		if alg != "" {
+			s += `,"alg":"` + alg + `"`
+		}
+		return s + `}`
+	}
+	set := `{"keys":[` + rsaKey("a", "RS256") + `,` + rsaKey("b", "PS256") + `,` + rsaKey("c", "") + `,` + rsaKey("d", "RS512") + `]}`
+	keys, err := parseJWKS([]byte(set))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 || keys["a"].alg != "RS256" || keys["b"].alg != "PS256" || keys["c"].alg != "" {
+		t.Fatalf("keys: %+v", keys)
+	}
+	if _, has := keys["d"]; has {
+		t.Fatal("a key published for RS512 was kept")
+	}
+	for name, set := range map[string]string{
+		"rsa-for-es256": `{"keys":[` + rsaKey("a", "ES256") + `]}`,
+		"ec-for-rs256":  `{"keys":[` + ecKey("e", "RS256") + `]}`,
+		"only-rs512":    `{"keys":[` + rsaKey("d", "RS512") + `]}`,
+	} {
+		if _, err := parseJWKS([]byte(set)); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
 }

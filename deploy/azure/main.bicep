@@ -112,11 +112,17 @@ param runnerCronExpression string = '* * * * *'
 @description('OIDC issuer of the API\'s tokens, e.g. https://login.microsoftonline.com/<tenant-id>/v2.0 for Microsoft Entra ID (v2 tokens).')
 param oidcIssuer string
 
-@description('Audience every token must carry: the API app registration\'s application ID URI (api://...) or client ID.')
+@description('Audience every access token must carry, as the provider writes it into the aud claim. Entra ID v2 access tokens carry the API app registration\'s Application (client) ID, a GUID, never its application ID URI. Used for verification only; nothing is derived from it.')
 param oidcAudience string
 
 @description('Client ID of the public client (SPA) the GUI signs in as; empty means the GUI cannot sign in. Its redirect URI is the conductorGuiRedirectUri output.')
 param oidcClientId string = ''
+
+@description('Scopes the GUI requests at sign-in; required when oidcClientId is set (the Conductor refuses to start otherwise) and never derived from oidcAudience. Entra ID: openid, profile and <API application ID URI>/.default, e.g. api://<api-client-id>/.default.')
+param oidcScopes array = []
+
+@description('Token claim recorded as the audit-log actor and requestedBy: a stable identifier of the subject, not a display name. oid for Entra ID (sub is pairwise per client there); sub for most other providers.')
+param oidcPrincipalClaim string = 'oid'
 
 @description('Values of the token roles claim that grant the admin role (every operation).')
 param oidcAdminRoles array
@@ -478,15 +484,19 @@ var conductorConfig = {
     listen: '0.0.0.0:8080'
     auth: {
       mode: 'oidc'
-      oidc: {
-        issuer: oidcIssuer
-        audience: oidcAudience
-        clientId: oidcClientId
-        roles: {
-          admin: oidcAdminRoles
-          viewer: oidcViewerRoles
-        }
-      }
+      oidc: union(
+        {
+          issuer: oidcIssuer
+          audience: oidcAudience
+          clientId: oidcClientId
+          principalClaim: oidcPrincipalClaim
+          roles: {
+            admin: oidcAdminRoles
+            viewer: oidcViewerRoles
+          }
+        },
+        empty(oidcScopes) ? {} : { scopes: oidcScopes }
+      )
     }
     // TLS is terminated by the environment ingress, the only route to
     // the port; peer traffic encryption covers the hop behind it.

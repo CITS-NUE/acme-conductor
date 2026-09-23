@@ -27,12 +27,17 @@ type Issuer struct {
 	T   *testing.T
 	Srv *httptest.Server
 
-	Mu       sync.Mutex
-	RSAKey   *rsa.PrivateKey
-	RSAKid   string
-	ECKey    *ecdsa.PrivateKey
-	ECKid    string
-	ExtraJWK map[string]any
+	Mu     sync.Mutex
+	RSAKey *rsa.PrivateKey
+	// RSAKid is published with "alg": "RS256"; RSAPSKid publishes the
+	// same key for PS256 and RSAAnyKid without an algorithm, as
+	// providers that omit alg do.
+	RSAKid    string
+	RSAPSKid  string
+	RSAAnyKid string
+	ECKey     *ecdsa.PrivateKey
+	ECKid     string
+	ExtraJWK  map[string]any
 	// IssuerName, when set, is what the discovery document claims to be
 	// (to test an issuer mismatch); empty means the server's own URL.
 	IssuerName string
@@ -45,7 +50,7 @@ type Issuer struct {
 // New starts an Issuer; it is closed when the test ends.
 func New(t *testing.T) *Issuer {
 	t.Helper()
-	is := &Issuer{T: t, RSAKid: "rsa-1", ECKid: "ec-1", JWKSStatus: http.StatusOK}
+	is := &Issuer{T: t, RSAKid: "rsa-1", RSAPSKid: "rsa-ps", RSAAnyKid: "rsa-any", ECKid: "ec-1", JWKSStatus: http.StatusOK}
 	var err error
 	if is.RSAKey, err = rsa.GenerateKey(rand.Reader, 2048); err != nil {
 		t.Fatal(err)
@@ -94,14 +99,20 @@ func (is *Issuer) URL() string { return is.Srv.URL }
 // B64 is unpadded base64url.
 func B64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
-// keys renders the key set: the RSA and EC signing keys, an unusable
-// symmetric key, a key without id, an encryption-only key, and any extra
-// key a test injected. The caller holds Mu.
+// keys renders the key set: the RSA key under three ids (published for
+// RS256, for PS256, and without an algorithm), the EC signing key, an
+// unusable symmetric key, a key without id, an encryption-only key, a key
+// for an algorithm this project does not accept, and any extra key a test
+// injected. The caller holds Mu.
 func (is *Issuer) keys() []map[string]any {
 	pub := is.RSAKey.PublicKey
 	ec := is.ECKey.PublicKey
+	n, e := B64(pub.N.Bytes()), B64(big.NewInt(int64(pub.E)).Bytes())
 	out := []map[string]any{
-		{"kty": "RSA", "kid": is.RSAKid, "use": "sig", "alg": "RS256", "n": B64(pub.N.Bytes()), "e": B64(big.NewInt(int64(pub.E)).Bytes()), "x5t": "ignored"},
+		{"kty": "RSA", "kid": is.RSAKid, "use": "sig", "alg": "RS256", "n": n, "e": e, "x5t": "ignored"},
+		{"kty": "RSA", "kid": is.RSAPSKid, "use": "sig", "alg": "PS256", "n": n, "e": e},
+		{"kty": "RSA", "kid": is.RSAAnyKid, "use": "sig", "n": n, "e": e},
+		{"kty": "RSA", "kid": "rsa-512", "use": "sig", "alg": "RS512", "n": n, "e": e},
 		{"kty": "EC", "kid": is.ECKid, "use": "sig", "crv": "P-256", "x": B64(ec.X.FillBytes(make([]byte, 32))), "y": B64(ec.Y.FillBytes(make([]byte, 32)))},
 		{"kty": "oct", "kid": "hmac", "k": B64([]byte("secret"))},
 		{"kty": "RSA", "n": B64(pub.N.Bytes()), "e": B64(big.NewInt(int64(pub.E)).Bytes())},

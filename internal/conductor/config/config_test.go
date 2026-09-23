@@ -383,7 +383,9 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 	}
 }
 
-const oidcServer = `"server": {"listen": "0.0.0.0:8443", "auth": {"mode": "oidc", "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}}, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}},`
+const oidcServer = `"server": {"listen": "0.0.0.0:8443", "auth": {"mode": "oidc", "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", "scopes": ["openid", "profile", "api://acme-conductor/.default"], "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}}, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}},`
+
+const oidcScopes = `"scopes": ["openid", "profile", "api://acme-conductor/.default"], `
 
 func withOIDC(s string) string {
 	return strings.Replace(s, `"database"`, oidcServer+` "database"`, 1)
@@ -401,17 +403,21 @@ func TestOIDCModeAppliesDefaults(t *testing.T) {
 	if o.PrincipalClaim != DefaultOIDCPrincipalClaim || o.RolesClaim != DefaultOIDCRolesClaim || o.ClockSkewSeconds != DefaultOIDCClockSkewSeconds || o.KeyCacheSeconds != DefaultOIDCKeyCacheSeconds {
 		t.Fatalf("oidc defaults: %+v", o)
 	}
+	if o.PrincipalClaim != "sub" {
+		t.Fatalf("the default principal claim must be a stable identifier, got %q", o.PrincipalClaim)
+	}
 	if strings.Join(o.Scopes, " ") != "openid profile api://acme-conductor/.default" {
-		t.Fatalf("default scopes: %v", o.Scopes)
+		t.Fatalf("scopes not kept as given: %v", o.Scopes)
 	}
 	if c.Server.TLS == nil || c.Server.TLS.CertFile != "/etc/acme-conductor/tls.crt" {
 		t.Fatalf("tls: %+v", c.Server.TLS)
 	}
-	// Explicit scopes are kept as given; a loopback listener needs no TLS;
-	// behindTlsProxy replaces TLS on a non-loopback listener.
+	// Scopes are kept as given and never derived from the audience; a
+	// loopback listener needs no TLS; behindTlsProxy replaces TLS on a
+	// non-loopback listener.
 	for name, edit := range map[string]func(string) string{
-		"explicit-scopes": func(s string) string {
-			return strings.Replace(s, `"roles"`, `"scopes": ["openid"], "roles"`, 1)
+		"scopes-without-audience-shape": func(s string) string {
+			return strings.Replace(s, oidcScopes, `"scopes": ["openid"], `, 1)
 		},
 		"loopback-no-tls": func(s string) string {
 			return strings.Replace(strings.Replace(s, `0.0.0.0:8443`, `127.0.0.1:8443`, 1), `, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, ``, 1)
@@ -420,7 +426,7 @@ func TestOIDCModeAppliesDefaults(t *testing.T) {
 			return strings.Replace(s, `"tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, `"behindTlsProxy": true`, 1)
 		},
 		"no-gui-client": func(s string) string {
-			return strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, ``, 1)
+			return strings.Replace(strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, ``, 1), oidcScopes, ``, 1)
 		},
 		"http-loopback-issuer": func(s string) string {
 			return strings.Replace(s, `https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0`, `http://127.0.0.1:9999/issuer`, 1)
@@ -430,11 +436,11 @@ func TestOIDCModeAppliesDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if name == "explicit-scopes" && strings.Join(c.Server.Auth.OIDC.Scopes, " ") != "openid" {
-			t.Fatalf("explicit scopes not kept: %v", c.Server.Auth.OIDC.Scopes)
+		if name == "scopes-without-audience-shape" && strings.Join(c.Server.Auth.OIDC.Scopes, " ") != "openid" {
+			t.Fatalf("scopes not kept as given: %v", c.Server.Auth.OIDC.Scopes)
 		}
 		if name == "no-gui-client" && len(c.Server.Auth.OIDC.Scopes) != 0 {
-			t.Fatalf("scopes defaulted without a client: %v", c.Server.Auth.OIDC.Scopes)
+			t.Fatalf("scopes derived without a client: %v", c.Server.Auth.OIDC.Scopes)
 		}
 	}
 }
@@ -442,9 +448,10 @@ func TestOIDCModeAppliesDefaults(t *testing.T) {
 func TestOIDCModeRejects(t *testing.T) {
 	cases := map[string]func(string) string{
 		"missing-oidc": func(s string) string {
-			return strings.Replace(s, `, "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}`, ``, 1)
+			return strings.Replace(s, `, "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", `+oidcScopes+`"roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}`, ``, 1)
 		},
-		"unknown-mode": func(s string) string { return strings.Replace(s, `"mode": "oidc"`, `"mode": "basic"`, 1) },
+		"client-without-scopes": func(s string) string { return strings.Replace(s, oidcScopes, ``, 1) },
+		"unknown-mode":          func(s string) string { return strings.Replace(s, `"mode": "oidc"`, `"mode": "basic"`, 1) },
 		"non-loopback-plaintext": func(s string) string {
 			return strings.Replace(s, `, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, ``, 1)
 		},
@@ -470,10 +477,10 @@ func TestOIDCModeRejects(t *testing.T) {
 			return strings.Replace(s, `api://acme-conductor`, `api://acmé`, 1)
 		},
 		"scopes-without-client": func(s string) string {
-			return strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, `"scopes": ["openid"], `, 1)
+			return strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, ``, 1)
 		},
 		"duplicate-scope": func(s string) string {
-			return strings.Replace(s, `"roles"`, `"scopes": ["openid", "openid"], "roles"`, 1)
+			return strings.Replace(s, oidcScopes, `"scopes": ["openid", "openid"], `, 1)
 		},
 		"no-admin-role":     func(s string) string { return strings.Replace(s, `["ACME.Admin"]`, `[]`, 1) },
 		"role-listed-twice": func(s string) string { return strings.Replace(s, `["ACME.Viewer"]`, `["ACME.Admin"]`, 1) },

@@ -31,7 +31,7 @@ import (
 func writeOIDCConfig(t *testing.T, dir, issuer string, withTLS bool) (cfgPath string, caPEM []byte) {
 	t.Helper()
 	dbPath := filepath.Join(dir, "conductor.db")
-	server := `"listen": "127.0.0.1:0", "auth": {"mode": "oidc", "oidc": {"issuer": "` + issuer + `", "audience": "api://acme-conductor", "clientId": "gui-client", "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}}`
+	server := `"listen": "127.0.0.1:0", "auth": {"mode": "oidc", "oidc": {"issuer": "` + issuer + `", "audience": "api://acme-conductor", "clientId": "gui-client", "scopes": ["openid", "api://acme-conductor/.default"], "principalClaim": "preferred_username", "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}}`
 	if withTLS {
 		certPath, keyPath := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
 		caPEM = writeSelfSigned(t, certPath, keyPath)

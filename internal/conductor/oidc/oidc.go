@@ -10,11 +10,13 @@
 // audience are the configured ones, its validity window includes now,
 // and its role claim carries a value the configuration maps to a role.
 // The principal recorded in the audit log is the value of one configured
-// claim.
+// claim, which should be a stable identifier of the subject (sub, or oid
+// for Entra ID), not a display name.
 //
 // Verification is deliberately narrow: RS256, PS256 and ES256 only (no
-// "none", no HMAC), one issuer, one audience, key ids required, critical
-// header extensions refused, duplicate claims refused. What the provider
+// "none", no HMAC), one issuer, one audience, key ids required, a key
+// published with an "alg" verifies that algorithm only, critical header
+// extensions refused, duplicate claims refused. What the provider
 // publishes is read with bounded readers and cached; an unknown key id
 // triggers a rate-limited refresh so a key rotation does not lock
 // callers out for the cache time.
@@ -22,7 +24,6 @@ package oidc
 
 import (
 	"context"
-	"crypto"
 	"errors"
 	"fmt"
 	"io"
@@ -74,7 +75,7 @@ type Authenticator struct {
 	// fetchMu serializes refreshes; mu guards the cached state.
 	fetchMu     sync.Mutex
 	mu          sync.Mutex
-	keys        map[string]crypto.PublicKey
+	keys        map[string]signingKey
 	endpoints   Endpoints
 	fetchedAt   time.Time
 	lastAttempt time.Time
@@ -172,7 +173,10 @@ func (a *Authenticator) verify(ctx context.Context, token string) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	if err := verifySignature(hdr.alg, key, signingInput, sig); err != nil {
+	if key.alg != "" && key.alg != hdr.alg {
+		return nil, errors.New("token algorithm is not the one the signing key was published for")
+	}
+	if err := verifySignature(hdr.alg, key.key, signingInput, sig); err != nil {
 		return nil, err
 	}
 	claims, err := decodeClaims(payload)

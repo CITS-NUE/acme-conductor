@@ -12,7 +12,11 @@ name: Release
 #     --format '{{ json .Provenance }}'
 #
 # A tag on a commit that does not pass the CI workflow publishes nothing:
-# the verify job below is the CI workflow itself.
+# the verify job below is the CI workflow itself. A tag on a commit that
+# is not in main's history publishes nothing either (the on-main job): a
+# release is a version tag on main, and tagging a branch commit must not
+# turn it into a published image, whatever the repository's tag rules
+# say.
 
 on:
   push:
@@ -33,9 +37,33 @@ jobs:
     permissions:
       contents: read
 
+  on-main:
+    name: tag is on main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The full history is needed for the ancestry check; a shallow
+      # clone would make every commit look unrelated to main.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that the tagged commit is in main's history
+        run: |
+          git fetch --no-tags origin main
+          commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          if git merge-base --is-ancestor "$commit" origin/main; then
+            echo "$commit (${GITHUB_REF_NAME}) is on origin/main"
+          else
+            echo "::error::${GITHUB_REF_NAME} points at $commit, which is not in origin/main's history; a release is a version tag on main" >&2
+            exit 1
+          fi
+
   images:
     name: image (${{ matrix.component }})
-    needs: verify
+    needs: [verify, on-main]
     runs-on: ubuntu-latest
     permissions:
       contents: read
