@@ -328,6 +328,11 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 		}
 		return false
 	}
+	// The Container Apps shape authenticates with OIDC behind the
+	// platform's TLS ingress, as deploy/azure/main.bicep deploys it.
+	if c.Server.Auth.Mode != AuthOIDC || c.Server.Auth.OIDC == nil || !c.Server.BehindTLSProxy || c.Server.TLS != nil {
+		t.Fatalf("container apps example server: %+v", c.Server)
+	}
 	for _, n := range c.ACMEBindings {
 		if _, ok := r.ACMEBindings[n]; !ok || !allowed(r.Authorization.AllowedACMEBindings, n) {
 			t.Fatalf("acme binding %q is not defined/allowed in the runner example", n)
@@ -375,5 +380,169 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 	}
 	if a.TimeoutSeconds <= r.Lego.TimeoutSeconds {
 		t.Fatalf("conductor timeout %d must exceed the runner lego timeout %d", a.TimeoutSeconds, r.Lego.TimeoutSeconds)
+	}
+}
+
+const oidcServer = `"server": {"listen": "0.0.0.0:8443", "auth": {"mode": "oidc", "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", "scopes": ["openid", "profile", "api://acme-conductor/.default"], "roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}}, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}},`
+
+const oidcScopes = `"scopes": ["openid", "profile", "api://acme-conductor/.default"], `
+
+func withOIDC(s string) string {
+	return strings.Replace(s, `"database"`, oidcServer+` "database"`, 1)
+}
+
+func TestOIDCModeAppliesDefaults(t *testing.T) {
+	c, err := Read(strings.NewReader(withOIDC(minimal)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := c.Server.Auth.OIDC
+	if c.Server.Auth.Mode != AuthOIDC || o == nil {
+		t.Fatalf("auth: %+v", c.Server.Auth)
+	}
+	if o.PrincipalClaim != DefaultOIDCPrincipalClaim || o.RolesClaim != DefaultOIDCRolesClaim || o.ClockSkewSeconds != DefaultOIDCClockSkewSeconds || o.KeyCacheSeconds != DefaultOIDCKeyCacheSeconds {
+		t.Fatalf("oidc defaults: %+v", o)
+	}
+	if o.PrincipalClaim != "sub" {
+		t.Fatalf("the default principal claim must be a stable identifier, got %q", o.PrincipalClaim)
+	}
+	if strings.Join(o.Scopes, " ") != "openid profile api://acme-conductor/.default" {
+		t.Fatalf("scopes not kept as given: %v", o.Scopes)
+	}
+	if c.Server.TLS == nil || c.Server.TLS.CertFile != "/etc/acme-conductor/tls.crt" {
+		t.Fatalf("tls: %+v", c.Server.TLS)
+	}
+	// Scopes are kept as given and never derived from the audience; a
+	// loopback listener needs no TLS; behindTlsProxy replaces TLS on a
+	// non-loopback listener.
+	for name, edit := range map[string]func(string) string{
+		"scopes-without-audience-shape": func(s string) string {
+			return strings.Replace(s, oidcScopes, `"scopes": ["openid"], `, 1)
+		},
+		"loopback-no-tls": func(s string) string {
+			return strings.Replace(strings.Replace(s, `0.0.0.0:8443`, `127.0.0.1:8443`, 1), `, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, ``, 1)
+		},
+		"behind-proxy": func(s string) string {
+			return strings.Replace(s, `"tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, `"behindTlsProxy": true`, 1)
+		},
+		"no-gui-client": func(s string) string {
+			return strings.Replace(strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, ``, 1), oidcScopes, ``, 1)
+		},
+		"http-loopback-issuer": func(s string) string {
+			return strings.Replace(s, `https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0`, `http://127.0.0.1:9999/issuer`, 1)
+		},
+	} {
+		c, err := Read(strings.NewReader(edit(withOIDC(minimal))))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if name == "scopes-without-audience-shape" && strings.Join(c.Server.Auth.OIDC.Scopes, " ") != "openid" {
+			t.Fatalf("scopes not kept as given: %v", c.Server.Auth.OIDC.Scopes)
+		}
+		if name == "no-gui-client" && len(c.Server.Auth.OIDC.Scopes) != 0 {
+			t.Fatalf("scopes derived without a client: %v", c.Server.Auth.OIDC.Scopes)
+		}
+	}
+}
+
+func TestOIDCModeRejects(t *testing.T) {
+	cases := map[string]func(string) string{
+		"missing-oidc": func(s string) string {
+			return strings.Replace(s, `, "oidc": {"issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0", "audience": "api://acme-conductor", "clientId": "11111111-1111-1111-1111-111111111111", `+oidcScopes+`"roles": {"admin": ["ACME.Admin"], "viewer": ["ACME.Viewer"]}}`, ``, 1)
+		},
+		"client-without-scopes": func(s string) string { return strings.Replace(s, oidcScopes, ``, 1) },
+		"unknown-mode":          func(s string) string { return strings.Replace(s, `"mode": "oidc"`, `"mode": "basic"`, 1) },
+		"non-loopback-plaintext": func(s string) string {
+			return strings.Replace(s, `, "tls": {"certFile": "/etc/acme-conductor/tls.crt", "keyFile": "/etc/acme-conductor/tls.key"}`, ``, 1)
+		},
+		"tls-and-proxy": func(s string) string {
+			return strings.Replace(s, `"tls": {`, `"behindTlsProxy": true, "tls": {`, 1)
+		},
+		"relative-cert": func(s string) string { return strings.Replace(s, `/etc/acme-conductor/tls.crt`, `tls.crt`, 1) },
+		"empty-key":     func(s string) string { return strings.Replace(s, `/etc/acme-conductor/tls.key`, ``, 1) },
+		"http-issuer": func(s string) string {
+			return strings.Replace(s, `https://login.microsoftonline.com`, `http://login.microsoftonline.com`, 1)
+		},
+		"issuer-query":    func(s string) string { return strings.Replace(s, `/v2.0"`, `/v2.0?x=1"`, 1) },
+		"issuer-fragment": func(s string) string { return strings.Replace(s, `/v2.0"`, `/v2.0#f"`, 1) },
+		"issuer-userinfo": func(s string) string {
+			return strings.Replace(s, `https://login.microsoftonline.com`, `https://u:p@login.microsoftonline.com`, 1)
+		},
+		"issuer-relative": func(s string) string {
+			return strings.Replace(s, `https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0`, `/v2.0`, 1)
+		},
+		"missing-audience": func(s string) string { return strings.Replace(s, `"audience": "api://acme-conductor", `, ``, 1) },
+		"audience-space":   func(s string) string { return strings.Replace(s, `api://acme-conductor`, `api://acme conductor`, 1) },
+		"audience-nonascii": func(s string) string {
+			return strings.Replace(s, `api://acme-conductor`, `api://acmé`, 1)
+		},
+		"scopes-without-client": func(s string) string {
+			return strings.Replace(s, `"clientId": "11111111-1111-1111-1111-111111111111", `, ``, 1)
+		},
+		"duplicate-scope": func(s string) string {
+			return strings.Replace(s, oidcScopes, `"scopes": ["openid", "openid"], `, 1)
+		},
+		"no-admin-role":     func(s string) string { return strings.Replace(s, `["ACME.Admin"]`, `[]`, 1) },
+		"role-listed-twice": func(s string) string { return strings.Replace(s, `["ACME.Viewer"]`, `["ACME.Admin"]`, 1) },
+		"role-with-space":   func(s string) string { return strings.Replace(s, `ACME.Viewer`, `ACME Viewer`, 1) },
+		"bad-claim-name": func(s string) string {
+			return strings.Replace(s, `"roles"`, `"principalClaim": "9x", "roles"`, 1)
+		},
+		"skew-too-large": func(s string) string {
+			return strings.Replace(s, `"roles"`, `"clockSkewSeconds": 301, "roles"`, 1)
+		},
+		"cache-too-short": func(s string) string {
+			return strings.Replace(s, `"roles"`, `"keyCacheSeconds": 30, "roles"`, 1)
+		},
+		"unknown-oidc-field": func(s string) string {
+			return strings.Replace(s, `"roles"`, `"clientSecret": "x", "roles"`, 1)
+		},
+	}
+	for name, edit := range cases {
+		err := mutate(t, func(s string) string { return edit(withOIDC(s)) })
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: err = %v, want ErrInvalid", name, err)
+		}
+	}
+	// localhost-dev may carry none of the oidc-mode fields.
+	for name, edit := range map[string]func(string) string{
+		"oidc-in-dev": func(s string) string {
+			return strings.Replace(s, `"database"`, `"server": {"auth": {"mode": "localhost-dev", "oidc": {"issuer": "https://x.example", "audience": "a", "roles": {"admin": ["r"]}}}}, "database"`, 1)
+		},
+		"tls-in-dev": func(s string) string {
+			return strings.Replace(s, `"database"`, `"server": {"tls": {"certFile": "/c", "keyFile": "/k"}}, "database"`, 1)
+		},
+		"proxy-in-dev": func(s string) string {
+			return strings.Replace(s, `"database"`, `"server": {"behindTlsProxy": true}, "database"`, 1)
+		},
+	} {
+		if err := mutate(t, edit); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: err = %v, want ErrInvalid", name, err)
+		}
+	}
+}
+
+func TestValidateIssuerURL(t *testing.T) {
+	for _, ok := range []string{"https://issuer.example", "https://issuer.example/tenant/v2.0", "http://localhost:8080/x", "http://[::1]:9/x", "https://issuer.example:8443"} {
+		if err := ValidateIssuerURL(ok); err != nil {
+			t.Fatalf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "issuer.example", "http://issuer.example", "ftp://issuer.example", "https://", "https://issuer.example/?a=b", "https://issuer.example/#f", "https://u@issuer.example", "https://issuer.example/?", "mailto:x@y"} {
+		if err := ValidateIssuerURL(bad); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+}
+
+// TestShippedOIDCExampleLoads keeps the self-hosted oidc example valid:
+// oidc mode with the Conductor's own TLS listener.
+func TestShippedOIDCExampleLoads(t *testing.T) {
+	c, err := Load(filepath.Join("..", "..", "..", "deploy", "examples", "conductor-config.oidc.example.json"))
+	if err != nil {
+		t.Fatalf("oidc example: %v", err)
+	}
+	if c.Server.Auth.Mode != AuthOIDC || c.Server.TLS == nil || c.Server.BehindTLSProxy || c.Server.Auth.OIDC.ClientID == "" {
+		t.Fatalf("oidc example server: %+v", c.Server)
 	}
 }

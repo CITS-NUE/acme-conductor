@@ -21,6 +21,8 @@ Conductor, in the lightweight MADR-like format described in
 | [0013](0013-azure-key-vault-store-adapter.md) | Azure Key Vault store adapter |
 | [0014](0014-azure-container-apps-job-launcher.md) | Azure Container Apps Job launcher |
 | [0015](0015-signed-job-envelope.md) | Signed job envelope and replay ledger |
+| [0016](0016-oidc-bearer-auth-and-gui.md) | OIDC bearer-token authentication, two roles, and a static GUI |
+| [0017](0017-release-pipeline.md) | Release pipeline: GHCR images with SBOM and provenance, digest-pinned bases |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).

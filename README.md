@@ -8,11 +8,13 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 4 (Azure Container Apps Job launcher, Bicep, signed
-jobs).** The `acme-conductor` control plane keeps targets, certificate
-policies, runs and an append-only audit log in a SQLite registry, exposes
-them over a REST API on the local host only (`localhost-dev`
-authentication), decides when a target is due, and launches the Runner —
+**Status: Phase 5 (OIDC authentication, a minimal GUI, GHCR releases
+with SBOM and provenance).** The `acme-conductor` control plane keeps
+targets, certificate policies, runs and an append-only audit log in a
+SQLite registry, exposes them over a REST API and a minimal GUI —
+authenticating operators with OIDC bearer tokens as named principals
+with an admin or viewer role in production, or trusting the local host
+only in development — decides when a target is due, and launches the Runner —
 as a local child process for development, or since Phase 4 by offering
 the job to a scheduled Azure Container Apps Job that runs under its own
 managed identity (the Conductor cannot start executions) — at most one
@@ -24,7 +26,9 @@ against its own trusted configuration, invokes the pinned `lego` CLI, and
 stores certificates either in a filesystem Certificate Store (dev/test
 only) or, since Phase 3, in Azure Key Vault. `deploy/azure` holds the
 Bicep that provisions the environment, both identities and their
-least-privilege roles. See [`docs/conductor.md`](docs/conductor.md),
+least-privilege roles, and the HTTPS ingress the API and GUI answer at.
+A version tag publishes both images to `ghcr.io/cits-nue` with an SBOM
+and provenance. See [`docs/conductor.md`](docs/conductor.md),
 [`docs/runner.md`](docs/runner.md) and
 [`deploy/azure/README.md`](deploy/azure/README.md) for how to run,
 configure and deploy each part, and the

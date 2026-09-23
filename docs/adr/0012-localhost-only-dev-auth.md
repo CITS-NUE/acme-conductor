@@ -1,6 +1,6 @@
 # 0012: Localhost-only development authentication
 
-- Status: Accepted
+- Status: Accepted (since Phase 5 the development mode next to `oidc`, [ADR 0016](0016-oidc-bearer-auth-and-gui.md))
 - Date: 2026-09-22
 
 ## Context

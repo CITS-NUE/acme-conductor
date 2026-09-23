@@ -6,10 +6,12 @@
 //	acme-conductor serve [--config /etc/acme-conductor/config.json] [--log-level LEVEL]
 //	acme-conductor keygen --private FILE --public FILE
 //
-// serve runs the REST API, the SQLite-backed registries (targets,
-// policies, runs, audit) and the scheduler that launches Runner jobs
-// until it receives SIGTERM or SIGINT. It never touches ACME, DNS or
-// certificate material itself; see docs/conductor.md.
+// serve runs the REST API and the GUI, the SQLite-backed registries
+// (targets, policies, runs, audit) and the scheduler that launches
+// Runner jobs until it receives SIGTERM or SIGINT. Callers are
+// authenticated in the configured mode (localhost-dev for one
+// development host, oidc bearer tokens in production). It never touches
+// ACME, DNS or certificate material itself; see docs/conductor.md.
 //
 // keygen generates the Ed25519 key pair with which the Conductor signs
 // the jobs it hands to Runners (docs/conductor.md, "Job signing").

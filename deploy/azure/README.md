@@ -1,7 +1,9 @@
-# Deploying to Azure Container Apps (Phase 4)
+# Deploying to Azure Container Apps (Phase 4, OIDC ingress Phase 5)
 
 `main.bicep` provisions a complete ACME Conductor deployment on Azure
-Container Apps: the Conductor as a single-replica Container App, the
+Container Apps: the Conductor as a single-replica Container App behind
+the environment's HTTPS ingress, authenticating every API and GUI caller
+with an OIDC bearer token, the
 Runner as a *scheduled* Container Apps Job whose executions take the
 jobs the Conductor offers (the Conductor cannot start executions: the
 start operation could replace the Runner's image), two managed
@@ -28,7 +30,7 @@ verified against is listed at the end; read that before relying on it.**
 | `<prefix>-id-conductor` (user-assigned identity) | The Conductor's identity. Granted the **Conductor Job Execution Observer** custom role (read, list and stop executions; no start) on the Runner Job only. |
 | `<prefix>-id-runner` (user-assigned identity) | The Runner's identity. Granted the **Runner DNS TXT Writer** custom role on the challenge zone and the **Runner Key Vault Certificate Writer** custom role on the vault. |
 | `<prefix>-runner` (Container Apps Job) | The Runner image with the Runner configuration and its result-signing private key mounted under `/etc/acme-runner/`, `/exchange`, `/state`, and an ephemeral `/work`. Schedule trigger (`runnerCronExpression`, every minute), one replica per execution (`parallelism: 1`: the launcher's contract is one run per execution), no retries, fixed command `reconcile --exchange /exchange`. |
-| `<prefix>-conductor` (Container App) | The Conductor image with its configuration and the job-signing private key mounted under `/etc/acme-conductor/`, `/var/lib/acme-conductor` and `/mnt/exchange`. One replica, no ingress, optional admin sidecar. |
+| `<prefix>-conductor` (Container App) | The Conductor image with its configuration and the job-signing private key mounted under `/etc/acme-conductor/`, `/var/lib/acme-conductor` and `/mnt/exchange`. One replica behind an HTTPS-only ingress (external by default, optionally restricted to source CIDRs), `oidc` authentication, liveness/readiness probes on `/healthz` and `/readyz`. |
 | Three custom role definitions (subscription scope) | See `modules/roles.bicep`. |
 
 The Conductor's identity holds **no** DNS, Key Vault or storage data
@@ -53,10 +55,26 @@ never enters either container.
   storage account is named from its first 11 characters without hyphens
   plus a 13-character unique suffix, so any accepted prefix yields a
   valid 24-character-bounded name.
-- Container images for both binaries, pinned by digest. Phase 4 has no
-  release workflow; build them with `make images` and push them to a
-  registry the environment can pull from (GHCR public images need no
-  registry credential).
+- Container images for both binaries, pinned by digest. Since Phase 5
+  a version tag publishes `ghcr.io/cits-nue/acme-conductor` and
+  `ghcr.io/cits-nue/acme-runner` for `linux/amd64` and `linux/arm64`
+  with an SBOM and SLSA provenance attached
+  ([ADR 0017](../../docs/adr/0017-release-pipeline.md)). Verify a
+  release and read its digest before pinning it:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:0.5.0 --owner CITS-NUE
+  docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:0.5.0
+  ```
+
+  GHCR public images need no registry credential.
+- **An OpenID Connect provider** and, for Microsoft Entra ID, two app
+  registrations (see [Identity](#identity) below): one that *is* the API
+  (its Application (client) ID is `oidcAudience`, its application ID
+  URI is the prefix of the scope in `oidcScopes`, its app roles are the
+  values in `oidcAdminRoles`/`oidcViewerRoles`) and one *public client*
+  for the GUI (`oidcClientId`, single-page application platform, redirect
+  URI = the `conductorGuiRedirectUri` output).
 - Two signing key pairs, one per direction of the exchange share:
 
   ```sh
@@ -92,8 +110,63 @@ never enters either container.
 
 The `conductorConfig` output shows the Conductor configuration the
 template derived (subscription, resource group, job name, the
-Conductor identity's client ID, the exchange paths); it is what the
-Conductor runs with.
+Conductor identity's client ID, the exchange paths, the OIDC trust); it
+is what the Conductor runs with. `conductorUrl` is where the API and the
+GUI answer; `conductorGuiRedirectUri` is what to register on the GUI's
+public client (it is only known after the first deployment, so register
+it and redeploy nothing — the client registration lives at the
+provider).
+
+### Identity
+
+The Conductor is an OIDC *resource server*
+([ADR 0016](../../docs/adr/0016-oidc-bearer-auth-and-gui.md)): it
+verifies tokens with the provider's published keys and holds no client
+secret. With Microsoft Entra ID:
+
+1. **API app registration** (`acme-conductor-api`): set
+   `requestedAccessTokenVersion` to `2` (the Conductor checks the v2
+   issuer `https://login.microsoftonline.com/<tenant>/v2.0`
+   → `oidcIssuer`), set an application ID URI (the default
+   `api://<client-id>`, or a verified-domain URI), expose one scope
+   (`access`, admin consent) so a client can request
+   `<application ID URI>/.default`, and define two **app roles** for
+   users/groups, for example `ACME.Admin` and `ACME.Viewer`
+   (→ `oidcAdminRoles`, `oidcViewerRoles`). Assign users or groups to
+   the roles on the enterprise application. A token that carries
+   neither role is refused.
+
+   **Two identifiers, two parameters.** A v2 access token's `aud` is the
+   API registration's **Application (client) ID** (a GUID), whatever
+   the application ID URI is and whatever scope the client requested;
+   the application ID URI appears only in the scope the client asks
+   for. So `oidcAudience` is the client ID (`1111…`), and `oidcScopes`
+   is `['openid', 'profile', 'api://1111…/.default']` (or
+   `https://<verified domain>/<name>/.default` with such a URI). Setting
+   the URI as the audience makes the Conductor refuse every correctly
+   issued token with `401 token audience does not include this API`.
+2. **GUI app registration** (`acme-conductor-gui`): platform
+   *Single-page application*, redirect URI `https://<app fqdn>/ui/`
+   (the `conductorGuiRedirectUri` output), no client secret, API
+   permission `acme-conductor-api / access` with admin consent. Its
+   client ID is `oidcClientId`; the GUI requests exactly `oidcScopes`
+   (required with a client ID; the Conductor does not guess them).
+
+For the API from a terminal, obtain a token for the API's scope and
+present it as a bearer token; the provider writes the client ID into
+`aud`:
+
+```sh
+token="$(az account get-access-token --scope api://11111111-1111-1111-1111-111111111111/.default --query accessToken -o tsv)"
+curl -s -H "Authorization: Bearer $token" https://<app fqdn>/api/v1alpha1/targets
+```
+
+The audit log records the token's `oid` (`oidcPrincipalClaim`) as the
+actor: the user's object ID, which does not change when a user is
+renamed, unlike `preferred_username`. Any provider that publishes a
+discovery document and signs RS256/PS256/ES256 tokens works the same
+way; the claim names are configurable
+(`server.auth.oidc.principalClaim`, `rolesClaim`).
 
 ### The Runner's identity inside the Job
 
@@ -119,28 +192,23 @@ the Runner's log like any other passthrough value.
 
 ## Operating the deployment
 
-**The API is reachable from inside the Conductor replica only.** The
-Conductor listens on `127.0.0.1:8080` with `localhost-dev`
-authentication ([ADR 0012](../../docs/adr/0012-localhost-only-dev-auth.md)):
-the app has no ingress, and a request from anywhere but the replica's
-own loopback is refused. Until Phase 5 adds OIDC, administration goes
-through the optional sidecar (`adminSidecarImage`): a second container in
-the same replica shares the loopback interface, so
+**The API and the GUI are reachable at `conductorUrl`.** The ingress
+accepts HTTPS only (plain HTTP is redirected) with the platform's
+certificate for the app's FQDN, and forwards to the Conductor's port
+over the environment's encrypted peer traffic; the Conductor is told so
+by `server.behindTlsProxy: true` and accepts a non-loopback plaintext
+listener on that basis. Every request under `/api/` and every GUI
+action needs a bearer token from `oidcIssuer` for `oidcAudience` that
+carries an admin or viewer role; there is no other way in. `/healthz`
+and `/readyz` (the probes) and the GUI's static files are the only
+unauthenticated paths. `ingressAllowedCidrs` narrows who can reach the
+ingress at all; `ingressExternal: false` keeps it inside the
+environment's virtual network. Neither replaces authentication.
 
-```sh
-az containerapp exec --name acme-conductor --resource-group rg-acme --container admin --command sh
-curl -s -H 'Content-Type: application/json' \
-  -d '{"allowedDnsSuffixes":["example.ac.jp"],"acmeBinding":"letsencrypt-staging","renewBeforeDays":30,"keyType":"ec256"}' \
-  http://127.0.0.1:8080/api/v1alpha1/policies
-```
-
-is an administrator session. Who may run `az containerapp exec` on the
-app is decided by Azure RBAC on the Container App; that is the access
-control of the API in this phase. The audit log records every such
-caller as `localhost-dev`. Pin the sidecar image by digest and give it
-nothing but a shell and `curl`; it needs no identity and no mounts.
-Without a sidecar the deployment runs (scheduled renewals continue) but
-cannot be administered.
+Administration is the GUI (`https://<app fqdn>/ui/`) or the API with a
+token (see [Identity](#identity)); `az containerapp exec` into the
+replica is no longer an administrator session, since the loopback peer
+is not trusted in `oidc` mode.
 
 **Backup.** The registry is `conductor.db` on the `conductor-state`
 share; snapshot the share or copy the file while the app is scaled to
@@ -215,6 +283,11 @@ documented from the platform's reference documentation, not observed:
 - **Result propagation delay.** The Conductor waits
   `resultGraceSeconds` (30 s) for `result.json` to appear on the share
   after the execution ends; SMB caching may need tuning of that value.
+- **Ingress and peer encryption.** `allowInsecure: false` with
+  `transport: http` is documented to redirect HTTP to HTTPS and to
+  forward plaintext to the container; `peerTrafficConfiguration.
+  encryption.enabled` is documented to encrypt that hop. The GUI's
+  redirect URI is the app FQDN the platform assigns.
 - **Managed identity for `lego`.** `AZURE_AUTH_METHOD=msi` with a
   user-assigned identity selected by `AZURE_CLIENT_ID`, through the
   Container Apps identity endpoint (`IDENTITY_ENDPOINT`/`IDENTITY_HEADER`),

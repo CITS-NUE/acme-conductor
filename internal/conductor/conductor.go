@@ -15,6 +15,7 @@ package conductor
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/acajob"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
@@ -126,9 +128,21 @@ func Serve(ctx context.Context, opts Options) int {
 		log.Warn("runs left in flight by a previous process were marked failed", "count", n)
 	}
 
-	// Bind before anything else is started, and verify the bound address
-	// is loopback: config already requires it, this is defense in depth
-	// for the localhost-dev authentication mode.
+	// The TLS certificate and key are read once, before anything listens,
+	// so a wrong path is a startup error and not a first-connection
+	// surprise.
+	var tlsConfig *tls.Config
+	if t := cfg.Server.TLS; t != nil {
+		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+		if err != nil {
+			log.Error("TLS certificate could not be loaded", "certFile", t.CertFile, "keyFile", t.KeyFile, "error", err.Error())
+			return ExitConfig
+		}
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	}
+	// Bind before anything else is started. In localhost-dev mode verify
+	// the bound address is loopback: config already requires it, this is
+	// defense in depth for that authentication mode.
 	ln, err := net.Listen("tcp", cfg.Server.Listen)
 	if err != nil {
 		log.Error("listen failed", "listen", cfg.Server.Listen, "error", err.Error())
@@ -136,8 +150,17 @@ func Serve(ctx context.Context, opts Options) int {
 	}
 	defer ln.Close()
 	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok || !tcpAddr.IP.IsLoopback() {
+	if !ok {
+		log.Error("listener is not TCP", "addr", ln.Addr().String())
+		return ExitFatal
+	}
+	if cfg.Server.Auth.Mode == config.AuthLocalhostDev && !tcpAddr.IP.IsLoopback() {
 		log.Error("refusing to serve on a non-loopback address in localhost-dev mode", "addr", ln.Addr().String())
+		return ExitConfig
+	}
+	auth, uiOpts, err := buildAuth(ctx, cfg, tcpAddr.Port, log)
+	if err != nil {
+		log.Error("authentication could not be configured", "mode", cfg.Server.Auth.Mode, "error", err.Error())
 		return ExitConfig
 	}
 	names := make([]string, 0, len(cfg.ExecutionBindings))
@@ -148,8 +171,9 @@ func Serve(ctx context.Context, opts Options) int {
 		Registry:  reg,
 		Scheduler: sched,
 		Bindings:  api.Bindings{Execution: sortStrings(names), ACME: cfg.ACMEBindings, DNS: cfg.DNSBindings, Store: cfg.StoreBindings},
-		Auth:      api.LocalhostDev{Port: fmt.Sprint(tcpAddr.Port)},
+		Auth:      auth,
 		Logger:    log.With("component", "api"),
+		UI:        uiOpts,
 	})
 	srv := &http.Server{
 		Handler:           handler,
@@ -160,13 +184,18 @@ func Serve(ctx context.Context, opts Options) int {
 		MaxHeaderBytes:    64 * 1024,
 		ErrorLog:          slog.NewLogLogger(log.With("component", "http").Handler(), slog.LevelWarn),
 	}
+	serve := srv.Serve
+	if tlsConfig != nil {
+		srv.TLSConfig = tlsConfig
+		serve = func(l net.Listener) error { return srv.ServeTLS(l, "", "") }
+	}
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- fmt.Errorf("http server: %w", err)
 		}
 	}()
@@ -176,7 +205,7 @@ func Serve(ctx context.Context, opts Options) int {
 		defer wg.Done()
 		_ = sched.Run(loopCtx)
 	}()
-	log.Info("conductor listening", "addr", ln.Addr().String(), "auth", cfg.Server.Auth.Mode, "tickSeconds", cfg.Scheduler.TickSeconds, "maxConcurrentRuns", cfg.Scheduler.MaxConcurrentRuns)
+	log.Info("conductor listening", "addr", ln.Addr().String(), "auth", cfg.Server.Auth.Mode, "tls", cfg.Server.TLS != nil, "behindTlsProxy", cfg.Server.BehindTLSProxy, "tickSeconds", cfg.Scheduler.TickSeconds, "maxConcurrentRuns", cfg.Scheduler.MaxConcurrentRuns)
 	if opts.Listening != nil {
 		opts.Listening(ln.Addr())
 	}
@@ -205,6 +234,46 @@ func Serve(ctx context.Context, opts Options) int {
 	wg.Wait()
 	log.Info("conductor stopped")
 	return code
+}
+
+// buildAuth builds the Authenticator for the configured mode and the
+// options the GUI needs to sign in. In oidc mode the provider's discovery
+// document and keys are fetched once now, so a wrong issuer is reported
+// in the log at start; a provider that is merely unreachable is a
+// warning, and keys are fetched again on demand.
+func buildAuth(ctx context.Context, cfg *config.Config, port int, log *slog.Logger) (api.Authenticator, *api.UIOptions, error) {
+	switch cfg.Server.Auth.Mode {
+	case config.AuthLocalhostDev:
+		return api.LocalhostDev{Port: fmt.Sprint(port)}, &api.UIOptions{AuthMode: config.AuthLocalhostDev}, nil
+	case config.AuthOIDC:
+		o := cfg.Server.Auth.OIDC
+		a, err := oidc.New(oidc.Config{
+			Issuer: o.Issuer, Audience: o.Audience,
+			PrincipalClaim: o.PrincipalClaim, RolesClaim: o.RolesClaim,
+			AdminValues: o.Roles.Admin, ViewerValues: o.Roles.Viewer,
+			ClockSkew: time.Duration(o.ClockSkewSeconds) * time.Second,
+			KeyCache:  time.Duration(o.KeyCacheSeconds) * time.Second,
+		}, &oidc.Options{Logger: log.With("component", "oidc")})
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := a.Prime(ctx); err != nil {
+			log.Warn("identity provider not reachable at start; tokens are refused until it is", "issuer", o.Issuer, "error", err.Error())
+		}
+		ui := &api.UIOptions{
+			AuthMode: config.AuthOIDC, Issuer: o.Issuer, ClientID: o.ClientID, Scopes: o.Scopes,
+			Endpoints: func(ctx context.Context) (api.UIAuthEndpoints, error) {
+				ep, err := a.Endpoints(ctx)
+				if err != nil {
+					return api.UIAuthEndpoints{}, err
+				}
+				return api.UIAuthEndpoints{Authorization: ep.Authorization, Token: ep.Token}, nil
+			},
+		}
+		return a, ui, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported authentication mode %q", cfg.Server.Auth.Mode)
+	}
 }
 
 // buildVerifier builds the Result verifier from the configuration's

@@ -74,6 +74,8 @@ type Options struct {
 	// Ready reports whether the service is ready; nil means "ping the
 	// registry".
 	Ready func(ctx context.Context) error
+	// UI, when set, serves the embedded GUI under /ui/; nil serves none.
+	UI *UIOptions
 }
 
 // Server is the API handler.
@@ -85,6 +87,7 @@ type Server struct {
 	log   *slog.Logger
 	now   func() time.Time
 	ready func(ctx context.Context) error
+	ui    *UIOptions
 	mux   *http.ServeMux
 }
 
@@ -102,7 +105,7 @@ func New(o Options) *Server {
 	if o.Scheduler == nil {
 		o.Scheduler = noScheduler{}
 	}
-	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, mux: http.NewServeMux()}
+	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux()}
 	s.routes()
 	return s
 }
@@ -136,6 +139,9 @@ func (s *Server) routes() {
 	api("GET "+Prefix+"/runs/{id}", s.handleGetRun)
 	api("POST "+Prefix+"/runs/{id}/cancel", s.handleCancelRun)
 	api("GET "+Prefix+"/audit", s.handleListAudit)
+	if s.ui != nil {
+		s.uiRoutes()
+	}
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
 	})
@@ -148,6 +154,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// authenticated wraps an API handler: the caller must be identified by
+// the Authenticator, and a caller whose role is not admin may only read
+// (GET/HEAD). An unidentified caller of a bearer-token Authenticator
+// (one that implements Challenger) gets 401 with a challenge; every
+// other refusal is 403. The handler never runs on a refusal.
 func (s *Server) authenticated(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.auth == nil {
@@ -157,7 +168,17 @@ func (s *Server) authenticated(h http.HandlerFunc) http.Handler {
 		p, err := s.auth.Authenticate(r)
 		if err != nil {
 			s.log.Warn("request refused", "method", r.Method, "path", r.URL.Path, "remoteAddr", r.RemoteAddr, "error", err.Error())
+			if c, ok := s.auth.(Challenger); ok && !errors.Is(err, ErrForbidden) {
+				w.Header().Set("WWW-Authenticate", c.Challenge())
+				writeError(w, http.StatusUnauthorized, "unauthenticated", err.Error(), nil)
+				return
+			}
 			writeError(w, http.StatusForbidden, "forbidden", err.Error(), nil)
+			return
+		}
+		if p.Role != RoleAdmin && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			s.log.Warn("request refused", "method", r.Method, "path", r.URL.Path, "principal", p.Name, "role", string(p.Role), "error", "read-only role")
+			writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("role %q may only read", p.Role), nil)
 			return
 		}
 		h(w, r.WithContext(withPrincipal(r.Context(), p)))
