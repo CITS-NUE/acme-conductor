@@ -1,0 +1,55 @@
+name: Release guard check
+
+# Exercises scripts/release-guard.sh, the rule that a release tag must point
+# at a commit in main's history, against any ref, on demand. It publishes
+# nothing and needs no tag: it exists so the negative case (a branch commit
+# is refused) can be verified without pushing a version tag to a branch,
+# which would run the real release workflow. Record the run URL of each
+# verification in the issue or ADR that asked for it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit SHA, branch or tag to test (nothing is published)"
+        required: true
+        type: string
+      expect:
+        description: "Expected outcome"
+        required: true
+        type: choice
+        options: [on-main, not-on-main]
+        default: on-main
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: release guard (${{ inputs.ref }}, expect ${{ inputs.expect }})
+    runs-on: ubuntu-latest
+    steps:
+      # Full history, all branches and tags: the check needs main's history
+      # and must be able to resolve any ref it is given.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run the release guard against the ref
+        env:
+          REF: ${{ inputs.ref }}
+          EXPECT: ${{ inputs.expect }}
+        run: |
+          set +e
+          scripts/release-guard.sh "$REF"
+          status=$?
+          set -e
+          case "$EXPECT:$status" in
+            on-main:0)     echo "verified: $REF is on main and the guard passed" ;;
+            not-on-main:1) echo "verified: $REF is not on main and the guard refused it" ;;
+            *)
+              echo "::error::guard exited $status for $REF, expected $EXPECT" >&2
+              exit 1
+              ;;
+          esac

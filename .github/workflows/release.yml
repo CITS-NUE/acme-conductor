@@ -50,16 +50,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The same script that release-guard-check.yml exercises on demand,
+      # so what was verified there is what runs here.
       - name: Check that the tagged commit is in main's history
-        run: |
-          git fetch --no-tags origin main
-          commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
-          if git merge-base --is-ancestor "$commit" origin/main; then
-            echo "$commit (${GITHUB_REF_NAME}) is on origin/main"
-          else
-            echo "::error::${GITHUB_REF_NAME} points at $commit, which is not in origin/main's history; a release is a version tag on main" >&2
-            exit 1
-          fi
+        run: scripts/release-guard.sh "$GITHUB_REF"
 
   images:
     name: image (${{ matrix.component }})
