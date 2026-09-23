@@ -173,10 +173,11 @@ Conductor's identity is not allowed to. For a run it:
    minute in the Bicep) to take the job — the Runner moves the directory
    to `<exchangeDir>/claimed/` (exactly one execution wins) and records
    its execution name there — and confirms with the platform that the
-   recorded name is an execution of this Job (a name the platform does
-   not know ends the run; a platform that cannot be asked, after a few
-   attempts, does not — the execution is watched unconfirmed, because a
-   Runner holds the job). If none takes it within `claimTimeoutSeconds`
+   recorded name is an execution of this Job (a name the platform
+   consistently does not know, on every attempt, ends the run; a
+   platform that cannot be asked, or a 404 that does not persist, does
+   not — after a few attempts the execution is watched unconfirmed,
+   because a Runner holds the job). If none takes it within `claimTimeoutSeconds`
    the offer is withdrawn (by the same rename, so a late taker cannot
    race it) and the run fails; a cancelled run is withdrawn the same way
    and ends `cancelled`;

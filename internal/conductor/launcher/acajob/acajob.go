@@ -264,14 +264,17 @@ const confirmAttempts = 5
 
 // confirm checks with the platform that the name a Runner recorded is an
 // execution of this Job. The marker is untrusted content from the share,
-// so a name the platform does not know ends the run at start (nothing of
-// this Job is running under it). Any other failure to read the execution
-// — the platform unreachable, the context cancelled — does not: the
-// Runner may well be running, so the execution is returned unconfirmed
-// and Wait, whose polling retries and whose every non-terminal exit
-// stops the execution, takes it from there.
+// so a name the platform consistently does not know — every attempt
+// answers 404 — ends the run at start (nothing of this Job is running
+// under it). Any other outcome — the platform unreachable, a 404 that
+// does not persist (the control plane may lag the execution's start),
+// the context cancelled — does not: the Runner may well be running, so
+// the execution is returned unconfirmed and Wait, whose polling retries
+// and whose every non-terminal exit stops the execution, takes it from
+// there.
 func (l *Launcher) confirm(ctx context.Context, e *execution) error {
 	var last error
+	notFound := 0
 	for attempt := 1; attempt <= confirmAttempts; attempt++ {
 		_, err := l.api.JobExecution(ctx, l.cfg.ResourceGroup, l.cfg.JobName, e.name, nil)
 		if err == nil {
@@ -279,8 +282,13 @@ func (l *Launcher) confirm(ctx context.Context, e *execution) error {
 		}
 		var re *azcore.ResponseError
 		if errors.As(err, &re) && re.StatusCode == 404 {
-			e.cleanup()
-			return &launcher.Error{Reason: launcher.ReasonStart, Err: describe("confirm execution", err)}
+			notFound++
+			if notFound == confirmAttempts {
+				e.cleanup()
+				return &launcher.Error{Reason: launcher.ReasonStart, Err: describe("confirm execution", err)}
+			}
+		} else {
+			notFound = 0
 		}
 		last = describe("confirm execution", err)
 		e.log.Warn("execution could not be confirmed", "attempt", attempt, "error", last.Error())

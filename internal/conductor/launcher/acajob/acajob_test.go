@@ -100,6 +100,7 @@ type fakeARM struct {
 	execs          map[string]*fakeExec
 	nextID         int
 	getFailures    int    // leading execution reads that fail with 500
+	getNotFound    int    // leading execution reads that answer 404
 	statusOverride string // final status reported regardless of the exit code
 	stopCount      int
 	paused         bool   // the platform starts no executions
@@ -267,6 +268,11 @@ func (f *fakeARM) getExecution(w http.ResponseWriter, name string) {
 	if f.getFailures > 0 {
 		f.getFailures--
 		f.armError(w, http.StatusInternalServerError, "InternalServerError")
+		return
+	}
+	if f.getNotFound > 0 {
+		f.getNotFound--
+		f.armError(w, http.StatusNotFound, "ResourceNotFound")
 		return
 	}
 	e, ok := f.execs[name]
@@ -851,6 +857,32 @@ func TestUnknownExecutionNameIsRefused(t *testing.T) {
 	}
 	if dirs := runDirs(t, f); len(dirs) != 0 {
 		t.Fatalf("run directories left behind: %v", dirs)
+	}
+}
+
+// A 404 that does not persist (the control plane lagging the execution's
+// start) is not taken as "no such execution": the run proceeds normally.
+func TestTransientNotFoundDuringConfirmIsRetried(t *testing.T) {
+	f := newFakeARM(t, "ok")
+	f.set(func(f *fakeARM) { f.getNotFound = confirmAttempts - 1 })
+	l, _, logs := newLauncher(t, f, nil)
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, logs.String())
+	}
+	res, err := ex.Wait()
+	if err != nil || res.Status != v1alpha1.StatusSucceeded {
+		t.Fatalf("result = %+v, %v\n%s", res, err, logs.String())
+	}
+	if dirs := runDirs(t, f); len(dirs) != 0 {
+		t.Fatalf("run directories left behind: %v", dirs)
+	}
+	// A 404 mixed with other errors is not definitive either.
+	f2 := newFakeARM(t, "ok")
+	f2.set(func(f *fakeARM) { f.getNotFound = 1; f.getFailures = 0 })
+	l2, _, logs2 := newLauncher(t, f2, nil)
+	if _, err := l2.Start(context.Background(), specFor("01JRUN000000000000000000B2")); err != nil {
+		t.Fatalf("start: %v\n%s", err, logs2.String())
 	}
 }
 
