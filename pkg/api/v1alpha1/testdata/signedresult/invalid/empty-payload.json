@@ -1,0 +1,7 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "SignedCertificateReconcileResult",
+  "protected": "eyJhbGciOiJFZERTQSIsImtpZCI6IjY1YjYwNjczZDZlZDg4NGIiLCJpc3N1ZWRBdCI6IjIwMjYtMDktMjJUMTI6MDA6MDBaIiwiZXhwaXJlc0F0IjoiMjAyNi0wOS0yMlQxMzowMDowMFoiLCJub25jZSI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUEifQ",
+  "payload": "",
+  "signature": "DR33qmQ8ouMN8eMscS5kzNQyc7tQaGRtq24ATVBIowuQw1KWo21_EfCc3YhRJQVMIKr1Y5AfGK88yCHADQmBDA"
+}

@@ -295,11 +295,18 @@ word "authorize" for the first one:
   any `JobSpec` — see [`docs/runner.md`](runner.md#execution-flow) for the
   exact sequence and `docs/threat-model.md` (T1/T2/T5 and
   "Assurance levels") for what this does and does not close.
-- **Signing's scope.** A signed/authenticated `JobSpec` envelope (planned,
-  Phase 4) protects the document against tampering in transit; it does not
-  by itself address a compromised Conductor that legitimately produces a
-  bad `JobSpec`. Only the Runner-side trusted authorization policy above
-  bounds that case.
+- **Signing's scope.** Since Phase 4 a `JobSpec` can travel inside a
+  `SignedCertificateReconcileJob` envelope (`pkg/api/v1alpha1/signedjob.go`,
+  [ADR 0015](adr/0015-signed-job-envelope.md)): the JWS construction with
+  Ed25519 over the exact JobSpec bytes, a strict protected header with
+  `kid`, `issuedAt`, `expiresAt` and `nonce`, verified by the Runner
+  against public keys in its trusted configuration and backed by a
+  replay ledger in its state directory. It protects the document against
+  tampering in transit and bounds replay; it does not by itself address a
+  compromised Conductor that legitimately produces (and signs) a bad
+  `JobSpec`. Only the Runner-side trusted authorization policy above
+  bounds that case, and it runs on the unwrapped document exactly as
+  before.
 
 ### `CertificateReconcileResult` (`Result`)
 
@@ -430,7 +437,8 @@ internal/
   conductor/            Conductor wiring: config, registry, scheduler, launchers, API (Phase 2)
   conductor/api/        REST API handlers and the localhost-dev authenticator
   conductor/config/     Conductor configuration loading and validation
-  conductor/launcher/   Job Launcher interface and the local-process launcher
+  conductor/launcher/   Job Launcher interface, job signing, and the local-process launcher
+  conductor/launcher/acajob/ Azure Container Apps Job launcher (Phase 4) — the Conductor's only Azure SDK import
   conductor/registry/   domain model (Target, CertificatePolicy, Run, AuditEvent) and Registry interface
   conductor/scheduler/  due decision, per-target exclusion, run execution
   conductor/sqlite/     SQLite implementation of Registry, with migrations
@@ -443,11 +451,12 @@ internal/
   runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
   store/            Certificate Store adapter contract shared by store implementations (Phase 1)
   store/filesystem/ filesystem-backed Certificate Store (dev/test only, Phase 1)
-  store/keyvault/   Azure Key Vault Certificate Store (Phase 3) — the only package importing the Azure SDK
+  store/keyvault/   Azure Key Vault Certificate Store (Phase 3) — the Runner's only Azure SDK import
   version/          build metadata injected via -ldflags
-pkg/api/v1alpha1/   the versioned JobSpec/Result contract (types, validation, strict decoding)
+pkg/api/v1alpha1/   the versioned JobSpec/Result contract and the signed job envelope (types, validation, strict decoding)
 schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
 deploy/examples/    example Conductor and Runner configurations and a JobSpec document
+deploy/azure/       Bicep for the Container Apps deployment: environment, identities, custom roles, Runner Job, Conductor app (Phase 4)
 docs/               this document, the threat model, the Conductor and Runner guides, and ADRs
 Dockerfile.conductor  distroless, non-root image for acme-conductor
 Dockerfile.runner     distroless, non-root image for acme-runner
@@ -525,7 +534,7 @@ These hold across every phase and are traced to concrete mitigations in
 
 ## Roadmap
 
-**Phases 0, 1, 2 and 3** are implemented today. Phases are strictly
+**Phases 0 to 4** are implemented today. Phases are strictly
 sequential; a given pull request implements one phase's scope and no more
 (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
@@ -535,7 +544,7 @@ sequential; a given pull request implements one phase's scope and no more
 | 1 | **Implemented.** Runner + filesystem Certificate Store, with a pinned `lego` CLI. See [`docs/runner.md`](runner.md), [ADR 0009](adr/0009-runner-execution-model.md) and [ADR 0010](adr/0010-pinned-lego-binary.md). |
 | 2 | **Implemented.** Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. See [`docs/conductor.md`](conductor.md), [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and [ADR 0012](adr/0012-localhost-only-dev-auth.md). |
 | 3 | **Implemented.** Azure Key Vault store adapter, authenticated with the platform's managed identity (or the SDK's `DefaultAzureCredential` chain for development). See [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) and [ADR 0013](adr/0013-azure-key-vault-store-adapter.md). |
-| 4 | Azure Container Apps Job launcher, provisioned via Bicep. |
+| 4 | **Implemented.** Azure Container Apps Job launcher (the Runner as a scheduled Job under its own managed identity that takes the jobs the Conductor offers on a shared volume; the Conductor cannot start executions), provisioned via Bicep with disjoint identities and least-privilege custom roles; signed, expiring job envelope with a Runner-side replay ledger, and Runner-signed Results. See [`docs/conductor.md`](conductor.md#execution-binding-azure-container-apps-job), [`deploy/azure/README.md`](../deploy/azure/README.md), [ADR 0014](adr/0014-azure-container-apps-job-launcher.md) and [ADR 0015](adr/0015-signed-job-envelope.md). |
 | 5 | OIDC auth, a minimal GUI, GHCR releases with SBOM and provenance. |
 | 6 | Migration tooling from the existing cert-infra repository (import/diff/shadow mode, feature-flag switch). |
 

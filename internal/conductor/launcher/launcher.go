@@ -13,7 +13,6 @@ package launcher
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -130,7 +129,13 @@ type LocalProcess struct {
 	PassthroughEnv []string
 	// GracePeriod is how long to wait after SIGTERM before SIGKILL.
 	GracePeriod time.Duration
-	Logger      *slog.Logger
+	// Signer, when set, wraps every JobSpec in a signed envelope; the
+	// Runner must then be configured with the matching public key.
+	Signer *Signer
+	// Verifier, when set, makes this launcher accept signed Results only;
+	// the Runner must then be configured with a result signing key.
+	Verifier *Verifier
+	Logger   *slog.Logger
 	// LookupEnv is os.LookupEnv unless a test injects one.
 	LookupEnv func(string) (string, bool)
 }
@@ -148,8 +153,9 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	if err := spec.Validate(); err != nil {
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("job spec: %w", err)}
+	data, err := JobDocument(spec, l.Signer)
+	if err != nil {
+		return nil, &Error{Reason: ReasonStart, Err: err}
 	}
 	if !filepath.IsAbs(l.RunnerBinary) || !filepath.IsAbs(l.RunnerConfig) || !filepath.IsAbs(l.WorkDir) {
 		return nil, &Error{Reason: ReasonStart, Err: errors.New("runner binary, runner config and work directory must be absolute paths")}
@@ -164,14 +170,9 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("create run directory: %w", err)}
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	data, err := json.Marshal(spec)
-	if err != nil {
-		cleanup()
-		return nil, &Error{Reason: ReasonStart, Err: err}
-	}
 	jobPath := filepath.Join(dir, JobFile)
 	resultPath := filepath.Join(dir, ResultFile)
-	if err := os.WriteFile(jobPath, append(data, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(jobPath, data, 0o600); err != nil {
 		cleanup()
 		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("write job spec: %w", err)}
 	}
@@ -217,7 +218,7 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 	logger.Info("runner started", "runId", spec.RunID, "targetId", spec.Target.ID, "pid", cmd.Process.Pid, "binary", l.RunnerBinary)
 	return &localExecution{
 		id: "local-process:" + strconv.Itoa(cmd.Process.Pid), cmd: cmd, parent: ctx, runCtx: runCtx, cancel: cancel,
-		resultPath: resultPath, cleanup: cleanup, stderr: stderr, spec: spec, logger: logger,
+		resultPath: resultPath, cleanup: cleanup, stderr: stderr, spec: spec, logger: logger, verifier: l.Verifier,
 	}, nil
 }
 
@@ -232,6 +233,7 @@ type localExecution struct {
 	stderr     *lineSink
 	spec       *v1alpha1.JobSpec
 	logger     *slog.Logger
+	verifier   *Verifier
 
 	once sync.Once
 	res  *v1alpha1.Result
@@ -262,7 +264,7 @@ func (e *localExecution) wait() (*v1alpha1.Result, error) {
 	}
 	e.logger.Info("runner finished", "runId", e.spec.RunID, "targetId", e.spec.Target.ID, "exitCode", exitCode)
 
-	res, rerr := readResult(e.resultPath)
+	res, rerr := ReadResultFile(e.resultPath, e.verifier)
 	if rerr == nil {
 		if res.RunID != e.spec.RunID || res.TargetID != e.spec.Target.ID {
 			return nil, &Error{Reason: ReasonMismatch, Err: fmt.Errorf("result names run %s target %s", res.RunID, res.TargetID)}
@@ -278,17 +280,19 @@ func (e *localExecution) wait() (*v1alpha1.Result, error) {
 	return nil, &Error{Reason: ReasonNoResult, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
 }
 
-func readResult(path string) (*v1alpha1.Result, error) {
+// ReadResultFile reads a Runner's result document from path and decodes
+// it with ResultDocument.
+func ReadResultFile(path string, v *Verifier) (*v1alpha1.Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, v1alpha1.MaxDocumentSize+1))
+	data, err := io.ReadAll(io.LimitReader(f, v1alpha1.MaxSignedDocumentSize+1))
 	if err != nil {
 		return nil, err
 	}
-	return v1alpha1.DecodeResult(bytes.NewReader(data))
+	return ResultDocument(data, v)
 }
 
 // maxLogLine bounds one relayed Runner log line.

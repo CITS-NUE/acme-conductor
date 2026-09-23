@@ -8,20 +8,27 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 3 (Azure Key Vault Certificate Store).** The
-`acme-conductor` control plane keeps targets, certificate policies, runs
-and an append-only audit log in a SQLite registry, exposes them over a
-REST API on the local host only (`localhost-dev` authentication), decides
-when a target is due, and launches the Runner as a local child process —
-at most one active run per target. The `acme-runner` data-plane binary
-validates and authorizes a `JobSpec` against its own trusted configuration,
-invokes the pinned `lego` CLI, and stores certificates either in a
-filesystem Certificate Store (dev/test only) or, since Phase 3, in Azure
-Key Vault, authenticated with the platform's managed identity. See
-[`docs/conductor.md`](docs/conductor.md) and
-[`docs/runner.md`](docs/runner.md) for how to run and configure each
-binary, and the [roadmap](docs/architecture.md#roadmap) for what each
-phase adds. Automated tests never call a real ACME CA or DNS provider —
+**Status: Phase 4 (Azure Container Apps Job launcher, Bicep, signed
+jobs).** The `acme-conductor` control plane keeps targets, certificate
+policies, runs and an append-only audit log in a SQLite registry, exposes
+them over a REST API on the local host only (`localhost-dev`
+authentication), decides when a target is due, and launches the Runner —
+as a local child process for development, or since Phase 4 by offering
+the job to a scheduled Azure Container Apps Job that runs under its own
+managed identity (the Conductor cannot start executions) — at most one
+active run per target. Jobs travel as signed, expiring envelopes that the
+Runner verifies and refuses to replay, and Results come back signed by
+the Runner. The
+`acme-runner` data-plane binary validates and authorizes a `JobSpec`
+against its own trusted configuration, invokes the pinned `lego` CLI, and
+stores certificates either in a filesystem Certificate Store (dev/test
+only) or, since Phase 3, in Azure Key Vault. `deploy/azure` holds the
+Bicep that provisions the environment, both identities and their
+least-privilege roles. See [`docs/conductor.md`](docs/conductor.md),
+[`docs/runner.md`](docs/runner.md) and
+[`deploy/azure/README.md`](deploy/azure/README.md) for how to run,
+configure and deploy each part, and the
+[roadmap](docs/architecture.md#roadmap) for what each phase adds. Automated tests never call a real ACME CA or DNS provider —
 they run against fake `lego`/`acme-runner` test doubles.
 
 ## Architecture

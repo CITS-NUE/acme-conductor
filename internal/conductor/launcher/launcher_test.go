@@ -3,6 +3,7 @@ package launcher
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -266,5 +267,95 @@ func TestLineSinkBoundsAndSanitizes(t *testing.T) {
 	}
 	if strings.Count(out, "\n") != 2 {
 		t.Fatalf("expected 2 log records, got %d: %s", strings.Count(out, "\n"), out)
+	}
+}
+
+func TestLocalProcessSignsWhenConfigured(t *testing.T) {
+	rec := filepath.Join(t.TempDir(), "record.json")
+	l, _ := newLocal(t, "ok", map[string]string{fakerunner.EnvRecord: rec})
+	_, priv, err := v1alpha1.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Signer, err = NewSigner(priv, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The job file is an envelope while the Runner runs.
+	var seen []byte
+	ex, err := l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ex.Wait()
+	if err != nil || res.Status != v1alpha1.StatusSucceeded {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	data, err := os.ReadFile(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r fakerunner.Record
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.JobKind != v1alpha1.KindSignedCertificateReconcileJob {
+		t.Fatalf("job kind = %q", r.JobKind)
+	}
+	_ = seen
+	// Without a signer the Runner gets a bare JobSpec.
+	l.Signer = nil
+	ex, err = l.Start(context.Background(), spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ex.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(rec)
+	_ = json.Unmarshal(data, &r)
+	if r.JobKind != v1alpha1.KindCertificateReconcileJob {
+		t.Fatalf("job kind = %q", r.JobKind)
+	}
+}
+
+func TestSignerAndJobDocument(t *testing.T) {
+	_, priv, _ := v1alpha1.GenerateSigningKey()
+	if _, err := NewSigner(priv[:5], time.Minute); err == nil {
+		t.Fatal("bad key accepted")
+	}
+	if _, err := NewSigner(priv, 0); err == nil {
+		t.Fatal("zero validity accepted")
+	}
+	s, err := NewSigner(priv, 7*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Validity() != 7*time.Minute || len(s.KeyID()) != v1alpha1.KeyIDLength {
+		t.Fatalf("signer = %+v", s)
+	}
+	doc, err := JobDocument(spec(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	if _, hdr, err := sj.Verify(map[string]ed25519.PublicKey{v1alpha1.KeyID(pub): pub}, v1alpha1.VerifyOptions{}); err != nil || hdr.ExpiresAt.Sub(hdr.IssuedAt) != 7*time.Minute {
+		t.Fatalf("verify: %v", err)
+	}
+	plain, err := JobDocument(spec(), nil)
+	if err != nil || v1alpha1.IsSignedJob(plain) {
+		t.Fatalf("plain: %v", err)
+	}
+	if _, err := v1alpha1.DecodeJobSpec(bytes.NewReader(plain)); err != nil {
+		t.Fatal(err)
+	}
+	bad := spec()
+	bad.Target.FQDN = "Bad.example.ac.jp"
+	if _, err := JobDocument(bad, s); err == nil {
+		t.Fatal("invalid spec signed")
 	}
 }

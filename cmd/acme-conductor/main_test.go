@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"io"
 	"net"
 	"net/http"
@@ -101,10 +102,18 @@ func writeTestConfig(t *testing.T, dir string) (cfgPath, dbPath string) {
 	}
 	cfgPath = filepath.Join(dir, "conductor.json")
 	dbPath = filepath.Join(dir, "conductor.db")
+	// Jobs are signed, so the whole path from key file to fake Runner is
+	// exercised (the fake unwraps the envelope).
+	keyPath := filepath.Join(dir, "job-signing.pem")
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), []string{"keygen", "--private", keyPath, "--public", keyPath + ".pub"}, &out, &errb, noEnv); code != 0 {
+		t.Fatalf("keygen: %d %s", code, errb.String())
+	}
 	cfg := `{
   "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
   "kind": "ConductorConfig",
   "server": {"listen": "127.0.0.1:0", "auth": {"mode": "localhost-dev"}, "shutdownGraceSeconds": 30},
+  "jobSigning": {"privateKeyFile": "` + keyPath + `", "validitySeconds": 60},
   "database": {"path": "` + dbPath + `"},
   "scheduler": {"tickSeconds": 1, "maxConcurrentRuns": 2, "retryBackoffSeconds": 1, "maxRetryBackoffSeconds": 2},
   "executionBindings": {"local": {"type": "local-process", "localProcess": {
@@ -362,4 +371,51 @@ func TestServeRequiresDatabaseOwnership(t *testing.T) {
 		t.Fatalf("lock not released after Serve returned: %v", err)
 	}
 	l.Unlock()
+}
+
+func TestKeygen(t *testing.T) {
+	dir := t.TempDir()
+	priv := filepath.Join(dir, "job-signing.pem")
+	pub := filepath.Join(dir, "job-signing.pub")
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), []string{"keygen", "--private", priv, "--public", pub}, &out, &errb, noEnv); code != 0 {
+		t.Fatalf("exit code = %d: %s", code, errb.String())
+	}
+	info, err := os.Stat(priv)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("private key file: %v %v", err, info)
+	}
+	privPEM, _ := os.ReadFile(priv)
+	key, err := v1alpha1.ParseSigningPrivateKey(privPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM, _ := os.ReadFile(pub)
+	pk, err := v1alpha1.ParseSigningPublicKey(string(pubPEM))
+	if err != nil || !pk.Equal(key.Public()) {
+		t.Fatalf("public key: %v", err)
+	}
+	// The one-line form printed on stdout parses to the same key.
+	var oneLine, kid string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, "publicKey: ") {
+			oneLine = strings.TrimPrefix(line, "publicKey: ")
+		}
+		if strings.HasPrefix(line, "keyId: ") {
+			kid = strings.TrimPrefix(line, "keyId: ")
+		}
+	}
+	pk2, err := v1alpha1.ParseSigningPublicKey(oneLine)
+	if err != nil || !pk2.Equal(pk) || kid != v1alpha1.KeyID(pk) {
+		t.Fatalf("stdout: %q (%v)", out.String(), err)
+	}
+	// Existing files are never overwritten; bad usage exits 2.
+	if code := run(context.Background(), []string{"keygen", "--private", priv, "--public", pub + ".2"}, &out, &errb, noEnv); code != 1 {
+		t.Fatalf("overwrite exit code = %d", code)
+	}
+	for _, args := range [][]string{{"keygen"}, {"keygen", "--private", priv}, {"keygen", "--private", priv, "--public", priv}, {"keygen", "--private", "a", "--public", "b", "extra"}} {
+		if code := run(context.Background(), args, &out, &errb, noEnv); code != 2 {
+			t.Fatalf("args %v: exit code = %d", args, code)
+		}
+	}
 }

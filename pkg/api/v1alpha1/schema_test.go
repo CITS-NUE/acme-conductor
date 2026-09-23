@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	jobSpecSchemaPath = "../../../schemas/v1alpha1/jobspec.schema.json"
-	resultSchemaPath  = "../../../schemas/v1alpha1/result.schema.json"
+	jobSpecSchemaPath      = "../../../schemas/v1alpha1/jobspec.schema.json"
+	resultSchemaPath       = "../../../schemas/v1alpha1/result.schema.json"
+	signedJobSchemaPath    = "../../../schemas/v1alpha1/signedjob.schema.json"
+	signedResultSchemaPath = "../../../schemas/v1alpha1/signedresult.schema.json"
 )
 
 // compileSchemas compiles both schemas with draft 2020-12 semantics and
@@ -217,6 +219,72 @@ func TestResultFixtures(t *testing.T) {
 	})
 }
 
+// TestSignedJobFixtures checks the envelope fixtures against the schema and
+// against DecodeSignedJob (structure only; signatures are verified by
+// signedjob_test.go against generated keys).
+func TestSignedJobFixtures(t *testing.T) {
+	c := jsonschema.NewCompiler()
+	c.DefaultDraft(jsonschema.Draft2020)
+	c.AssertFormat()
+	sch, err := c.Compile(signedJobSchemaPath)
+	if err != nil {
+		t.Fatalf("compile signedjob schema: %v", err)
+	}
+	t.Run("valid", func(t *testing.T) {
+		for _, path := range globJSON(t, "testdata/signedjob/valid") {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if err := schemaValidate(t, sch, data); err != nil {
+				t.Errorf("%s: schema validation failed: %v", filepath.Base(path), err)
+			}
+			sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("%s: DecodeSignedJob failed: %v", filepath.Base(path), err)
+			}
+			// The payload is a valid JobSpec fixture in its own right.
+			if _, err := v1alpha1.DecodeJobSpec(bytes.NewReader(sj.PayloadBytes())); err != nil {
+				t.Errorf("%s: payload: %v", filepath.Base(path), err)
+			}
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		allow := loadAllowlist(t, "testdata/signedjob/invalid/schema-accepts.txt")
+		seen := map[string]bool{}
+		for _, path := range globJSON(t, "testdata/signedjob/invalid") {
+			name := filepath.Base(path)
+			seen[name] = true
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if _, err := v1alpha1.DecodeSignedJob(bytes.NewReader(data)); err == nil {
+				t.Errorf("%s: DecodeSignedJob unexpectedly succeeded", name)
+			}
+			if !json.Valid(data) {
+				if allow[name] {
+					t.Errorf("%s: not valid JSON but allowlisted", name)
+				}
+				continue
+			}
+			schemaErr := schemaValidate(t, sch, data)
+			if allow[name] {
+				if schemaErr != nil {
+					t.Errorf("%s: allowlisted but the schema rejects it: %v", name, schemaErr)
+				}
+			} else if schemaErr == nil {
+				t.Errorf("%s: schema unexpectedly accepts the fixture", name)
+			}
+		}
+		for name := range allow {
+			if !seen[name] {
+				t.Errorf("schema-accepts.txt lists %q which does not exist", name)
+			}
+		}
+	})
+}
+
 // forbiddenPropertyName matches property names that would smuggle secrets,
 // commands, images, environment variables or cloud resource identifiers
 // into the contract.
@@ -225,7 +293,7 @@ var forbiddenPropertyName = regexp.MustCompile(`(?i)(privateKey|secret|password|
 // TestSchemaInvariants walks both schema documents recursively and checks
 // structural invariants that keep the contract minimal and closed.
 func TestSchemaInvariants(t *testing.T) {
-	for _, path := range []string{jobSpecSchemaPath, resultSchemaPath} {
+	for _, path := range []string{jobSpecSchemaPath, resultSchemaPath, signedJobSchemaPath} {
 		path := path
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			data, err := os.ReadFile(path)
@@ -377,4 +445,68 @@ func assertSameSet(t *testing.T, label string, got, want []string) {
 			return
 		}
 	}
+}
+
+// TestSignedResultFixtures checks the result envelope fixtures against the
+// schema and against DecodeSignedResult (structure only).
+func TestSignedResultFixtures(t *testing.T) {
+	c := jsonschema.NewCompiler()
+	c.DefaultDraft(jsonschema.Draft2020)
+	c.AssertFormat()
+	sch, err := c.Compile(signedResultSchemaPath)
+	if err != nil {
+		t.Fatalf("compile signedresult schema: %v", err)
+	}
+	t.Run("valid", func(t *testing.T) {
+		for _, path := range globJSON(t, "testdata/signedresult/valid") {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if err := schemaValidate(t, sch, data); err != nil {
+				t.Errorf("%s: schema validation failed: %v", filepath.Base(path), err)
+			}
+			sr, err := v1alpha1.DecodeSignedResult(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("%s: DecodeSignedResult failed: %v", filepath.Base(path), err)
+			}
+			if _, err := v1alpha1.DecodeResult(bytes.NewReader(sr.PayloadBytes())); err != nil {
+				t.Errorf("%s: payload: %v", filepath.Base(path), err)
+			}
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		allow := loadAllowlist(t, "testdata/signedresult/invalid/schema-accepts.txt")
+		seen := map[string]bool{}
+		for _, path := range globJSON(t, "testdata/signedresult/invalid") {
+			name := filepath.Base(path)
+			seen[name] = true
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if _, err := v1alpha1.DecodeSignedResult(bytes.NewReader(data)); err == nil {
+				t.Errorf("%s: DecodeSignedResult unexpectedly succeeded", name)
+			}
+			if !json.Valid(data) {
+				if allow[name] {
+					t.Errorf("%s: not valid JSON but allowlisted", name)
+				}
+				continue
+			}
+			schemaErr := schemaValidate(t, sch, data)
+			if allow[name] {
+				if schemaErr != nil {
+					t.Errorf("%s: allowlisted but the schema rejects it: %v", name, schemaErr)
+				}
+			} else if schemaErr == nil {
+				t.Errorf("%s: the schema accepts it and it is not allowlisted", name)
+			}
+		}
+		for name := range allow {
+			if !seen[name] {
+				t.Errorf("schema-accepts.txt lists %q which does not exist in testdata/signedresult/invalid", name)
+			}
+		}
+	})
 }

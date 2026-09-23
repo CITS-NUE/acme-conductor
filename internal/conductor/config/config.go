@@ -11,6 +11,7 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,25 @@ const (
 	DefaultLaunchTimeoutSeconds = 1200
 	MaxLaunchTimeoutSeconds     = 86400
 	MaxPassthroughEnv           = 64
+
+	DefaultSigningValiditySeconds = 900
+	MaxSigningValiditySeconds     = 86400
+
+	// MaxSigningKeys bounds resultSigning.publicKeys (a rotation needs
+	// two); DefaultClockSkewSeconds and MaxClockSkewSeconds bound
+	// resultSigning.clockSkewSeconds.
+	MaxSigningKeys          = 8
+	DefaultClockSkewSeconds = 300
+	MaxClockSkewSeconds     = 3600
+
+	DefaultPollIntervalSeconds = 10
+	MaxPollIntervalSeconds     = 300
+	// DefaultClaimTimeoutSeconds covers a scheduled Job's cadence (one
+	// execution per minute) plus its start latency several times over.
+	DefaultClaimTimeoutSeconds = 300
+	MaxClaimTimeoutSeconds     = 86400
+	DefaultResultGraceSeconds  = 30
+	MaxResultGraceSeconds      = 600
 )
 
 // Authentication modes.
@@ -62,6 +82,35 @@ const (
 	// ExecutionLocalProcess runs acme-runner as a child process of the
 	// Conductor (development and tests).
 	ExecutionLocalProcess = "local-process"
+	// ExecutionAzureContainerAppsJob starts an execution of a
+	// pre-provisioned Azure Container Apps Job per run (Phase 4).
+	ExecutionAzureContainerAppsJob = "azure-container-apps-job"
+)
+
+// Azure clouds an Azure execution binding may name.
+const (
+	CloudPublic     = "public"
+	CloudChina      = "china"
+	CloudGovernment = "government"
+)
+
+// Credential kinds an Azure execution binding may select (the same two
+// the Runner's Key Vault store offers, docs/adr/0013).
+const (
+	CredentialDefault         = "default"
+	CredentialManagedIdentity = "managed-identity"
+)
+
+var (
+	guidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	// resourceGroupRe is Azure's rule for resource group names (1-90
+	// characters of letters, digits, '-', '_', '(', ')', '.', not ending
+	// in a period).
+	resourceGroupRe = regexp.MustCompile(`^[-\w._()]{0,89}[-\w_()]$`)
+	// containerAppNameRe is the rule for Container Apps and Jobs names:
+	// 2-32 lower-case alphanumerics and hyphens, starting with a letter,
+	// ending with a letter or digit; "--" is rejected separately.
+	containerAppNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}[a-z0-9]$`)
 )
 
 // Errors.
@@ -95,6 +144,85 @@ type Config struct {
 	ACMEBindings  []string `json:"acmeBindings"`
 	DNSBindings   []string `json:"dnsBindings"`
 	StoreBindings []string `json:"storeBindings"`
+	// JobSigning, when present, makes every launcher hand the Runner a
+	// signed envelope instead of a bare JobSpec. It is required when an
+	// execution binding sends jobs over a transport the Conductor does
+	// not own (azure-container-apps-job).
+	JobSigning *JobSigning `json:"jobSigning,omitempty"`
+	// ResultSigning, when present, makes every launcher accept only
+	// Results wrapped in a SignedCertificateReconcileResult that verifies
+	// against one of these Runner public keys: a bare Result is then an
+	// error, not a Result. It is mandatory for the Container Apps
+	// launcher, whose Results travel over a shared volume.
+	ResultSigning *ResultSigning `json:"resultSigning,omitempty"`
+}
+
+// ResultSigning is the trust configuration for signed Results. It holds
+// public keys only.
+type ResultSigning struct {
+	// PublicKeys are the Runner signing keys this Conductor trusts, each
+	// a PEM "PUBLIC KEY" block or the standard base64 of its DER
+	// SubjectPublicKeyInfo. Several keys let a Runner key rotate.
+	PublicKeys []string `json:"publicKeys"`
+	// ClockSkewSeconds is how far an envelope's issuedAt may lie in the
+	// future of this Conductor's clock before it is refused (default
+	// DefaultClockSkewSeconds). Expiry has no tolerance.
+	ClockSkewSeconds int `json:"clockSkewSeconds,omitempty"`
+
+	keys map[string]ed25519.PublicKey
+}
+
+// Keys returns the trusted Runner public keys indexed by their KeyID.
+func (r *ResultSigning) Keys() map[string]ed25519.PublicKey {
+	if r == nil {
+		return nil
+	}
+	out := make(map[string]ed25519.PublicKey, len(r.keys))
+	for k, v := range r.keys {
+		out[k] = v
+	}
+	return out
+}
+
+func (r *ResultSigning) validate() error {
+	if len(r.PublicKeys) == 0 {
+		return invalid("resultSigning.publicKeys must list at least one key")
+	}
+	if len(r.PublicKeys) > MaxSigningKeys {
+		return invalid("resultSigning.publicKeys: at most %d keys", MaxSigningKeys)
+	}
+	r.keys = map[string]ed25519.PublicKey{}
+	for i, s := range r.PublicKeys {
+		pub, err := v1alpha1.ParseSigningPublicKey(s)
+		if err != nil {
+			return invalid("resultSigning.publicKeys[%d]: %v", i, err)
+		}
+		kid := v1alpha1.KeyID(pub)
+		if _, dup := r.keys[kid]; dup {
+			return invalid("resultSigning.publicKeys[%d]: key %s is listed twice", i, kid)
+		}
+		r.keys[kid] = pub
+	}
+	if r.ClockSkewSeconds == 0 {
+		r.ClockSkewSeconds = DefaultClockSkewSeconds
+	}
+	if r.ClockSkewSeconds < 1 || r.ClockSkewSeconds > MaxClockSkewSeconds {
+		return invalid("resultSigning.clockSkewSeconds must be between 1 and %d", MaxClockSkewSeconds)
+	}
+	return nil
+}
+
+// JobSigning locates the Conductor's job-signing key.
+type JobSigning struct {
+	// PrivateKeyFile is the clean, absolute path of a PEM "PRIVATE KEY"
+	// (PKCS #8) file holding an Ed25519 key. The file is the only secret
+	// the Conductor ever reads; it is the Conductor's own identity towards
+	// Runners, never a DNS, Store or cloud credential.
+	PrivateKeyFile string `json:"privateKeyFile"`
+	// ValiditySeconds is how long a signed job stays acceptable to a
+	// Runner after it is issued. It needs to cover the platform's start
+	// latency only: a Runner checks it before it does anything.
+	ValiditySeconds int `json:"validitySeconds"`
 }
 
 // Server configures the HTTP API.
@@ -132,8 +260,50 @@ type Scheduler struct {
 
 // ExecutionBinding describes one way of running a Runner job.
 type ExecutionBinding struct {
-	Type         string        `json:"type"`
-	LocalProcess *LocalProcess `json:"localProcess,omitempty"`
+	Type                  string                 `json:"type"`
+	LocalProcess          *LocalProcess          `json:"localProcess,omitempty"`
+	AzureContainerAppsJob *AzureContainerAppsJob `json:"azureContainerAppsJob,omitempty"`
+}
+
+// AzureContainerAppsJob starts one execution of an existing Container
+// Apps Job per run. The Job itself — image, identity, volumes, Runner
+// configuration — is provisioned in infrastructure (deploy/azure); the
+// Conductor only starts executions of it with the run's arguments and
+// reads the execution's status. The JobSpec and the Result travel over a
+// file share both containers mount (the exchange volume).
+type AzureContainerAppsJob struct {
+	SubscriptionID string `json:"subscriptionId"`
+	ResourceGroup  string `json:"resourceGroup"`
+	JobName        string `json:"jobName"`
+	// Cloud selects the Azure cloud: public (default), china, government.
+	Cloud string `json:"cloud,omitempty"`
+	// Credential selects how the Conductor authenticates to Azure Resource
+	// Manager: "managed-identity" (the platform's identity, the production
+	// choice) or "default" (DefaultAzureCredential, which also tries
+	// environment variables and developer tooling).
+	Credential string `json:"credential,omitempty"`
+	// ManagedIdentityClientID selects a user-assigned managed identity by
+	// client ID (credential "managed-identity" only).
+	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
+	// ExchangeDir is where the exchange volume is mounted in the
+	// Conductor's own filesystem (the Runner mounts the same volume and
+	// is told its own mount path by its arguments in infrastructure).
+	ExchangeDir string `json:"exchangeDir"`
+	// ClaimTimeoutSeconds is how long the Conductor waits for a scheduled
+	// execution of the Job to take an offered job before it withdraws the
+	// job and fails the run. It must not exceed jobSigning.validitySeconds.
+	ClaimTimeoutSeconds int `json:"claimTimeoutSeconds,omitempty"`
+	// TimeoutSeconds bounds one execution as seen by the Conductor from
+	// the moment it was taken; after it the execution is stopped. It
+	// should exceed the Job's own replicaTimeout.
+	TimeoutSeconds int `json:"timeoutSeconds"`
+	// PollIntervalSeconds is how often the exchange directory and the
+	// execution's status are read.
+	PollIntervalSeconds int `json:"pollIntervalSeconds,omitempty"`
+	// ResultGraceSeconds is how long to wait for result.json to appear on
+	// the exchange volume after the execution has ended (file shares
+	// propagate writes with some delay).
+	ResultGraceSeconds int `json:"resultGraceSeconds,omitempty"`
 }
 
 // LocalProcess runs acme-runner as a child process.
@@ -225,6 +395,43 @@ func (c *Config) Validate() error {
 		if err := validateNames(field, names); err != nil {
 			return err
 		}
+	}
+	if c.JobSigning != nil {
+		if err := c.JobSigning.validate(); err != nil {
+			return err
+		}
+	}
+	if c.ResultSigning != nil {
+		if err := c.ResultSigning.validate(); err != nil {
+			return err
+		}
+	}
+	for name, b := range c.ExecutionBindings {
+		if b.Type != ExecutionAzureContainerAppsJob {
+			continue
+		}
+		if c.JobSigning == nil {
+			return invalid("executionBindings.%s: type %q requires jobSigning to be configured (the job travels over a shared volume)", name, b.Type)
+		}
+		if c.ResultSigning == nil {
+			return invalid("executionBindings.%s: type %q requires resultSigning to be configured (the result travels over a shared volume)", name, b.Type)
+		}
+		if b.AzureContainerAppsJob.ClaimTimeoutSeconds > c.JobSigning.ValiditySeconds {
+			return invalid("executionBindings.%s.azureContainerAppsJob.claimTimeoutSeconds must not exceed jobSigning.validitySeconds (a job claimed after its expiry is refused by the Runner)", name)
+		}
+	}
+	return nil
+}
+
+func (j *JobSigning) validate() error {
+	if j.PrivateKeyFile == "" || !filepath.IsAbs(j.PrivateKeyFile) || filepath.Clean(j.PrivateKeyFile) != j.PrivateKeyFile {
+		return invalid("jobSigning.privateKeyFile must be a clean absolute path")
+	}
+	if j.ValiditySeconds == 0 {
+		j.ValiditySeconds = DefaultSigningValiditySeconds
+	}
+	if j.ValiditySeconds < 1 || j.ValiditySeconds > MaxSigningValiditySeconds {
+		return invalid("jobSigning.validitySeconds must be between 1 and %d", MaxSigningValiditySeconds)
 	}
 	return nil
 }
@@ -327,10 +534,87 @@ func (b *ExecutionBinding) validate(field string) error {
 		if b.LocalProcess == nil {
 			return invalid("%s.localProcess is required for type %q", field, b.Type)
 		}
+		if b.AzureContainerAppsJob != nil {
+			return invalid("%s.azureContainerAppsJob applies to type %q only", field, ExecutionAzureContainerAppsJob)
+		}
 		return b.LocalProcess.validate(field + ".localProcess")
+	case ExecutionAzureContainerAppsJob:
+		if b.AzureContainerAppsJob == nil {
+			return invalid("%s.azureContainerAppsJob is required for type %q", field, b.Type)
+		}
+		if b.LocalProcess != nil {
+			return invalid("%s.localProcess applies to type %q only", field, ExecutionLocalProcess)
+		}
+		return b.AzureContainerAppsJob.validate(field + ".azureContainerAppsJob")
 	default:
-		return invalid("%s.type %q is not supported (only %q)", field, b.Type, ExecutionLocalProcess)
+		return invalid("%s.type %q is not supported (only %q and %q)", field, b.Type, ExecutionLocalProcess, ExecutionAzureContainerAppsJob)
 	}
+}
+
+func (a *AzureContainerAppsJob) validate(field string) error {
+	if !guidRe.MatchString(a.SubscriptionID) {
+		return invalid("%s.subscriptionId must be a GUID", field)
+	}
+	if !resourceGroupRe.MatchString(a.ResourceGroup) {
+		return invalid("%s.resourceGroup is not a valid resource group name", field)
+	}
+	if !containerAppNameRe.MatchString(a.JobName) || strings.Contains(a.JobName, "--") {
+		return invalid("%s.jobName is not a valid Container Apps Job name", field)
+	}
+	if a.Cloud == "" {
+		a.Cloud = CloudPublic
+	}
+	switch a.Cloud {
+	case CloudPublic, CloudChina, CloudGovernment:
+	default:
+		return invalid("%s.cloud must be %q, %q or %q", field, CloudPublic, CloudChina, CloudGovernment)
+	}
+	if a.Credential == "" {
+		a.Credential = CredentialDefault
+	}
+	switch a.Credential {
+	case CredentialDefault:
+		if a.ManagedIdentityClientID != "" {
+			return invalid("%s.managedIdentityClientId applies to credential %q only", field, CredentialManagedIdentity)
+		}
+	case CredentialManagedIdentity:
+		if a.ManagedIdentityClientID != "" && !guidRe.MatchString(a.ManagedIdentityClientID) {
+			return invalid("%s.managedIdentityClientId must be a GUID", field)
+		}
+	default:
+		return invalid("%s.credential must be %q or %q", field, CredentialManagedIdentity, CredentialDefault)
+	}
+	if a.ExchangeDir == "" {
+		return invalid("%s.exchangeDir is required", field)
+	}
+	if !filepath.IsAbs(a.ExchangeDir) || filepath.Clean(a.ExchangeDir) != a.ExchangeDir {
+		return invalid("%s.exchangeDir must be a clean absolute path", field)
+	}
+	if a.ClaimTimeoutSeconds == 0 {
+		a.ClaimTimeoutSeconds = DefaultClaimTimeoutSeconds
+	}
+	if a.ClaimTimeoutSeconds < 1 || a.ClaimTimeoutSeconds > MaxClaimTimeoutSeconds {
+		return invalid("%s.claimTimeoutSeconds must be between 1 and %d", field, MaxClaimTimeoutSeconds)
+	}
+	if a.TimeoutSeconds == 0 {
+		a.TimeoutSeconds = DefaultLaunchTimeoutSeconds
+	}
+	if a.TimeoutSeconds < 1 || a.TimeoutSeconds > MaxLaunchTimeoutSeconds {
+		return invalid("%s.timeoutSeconds must be between 1 and %d", field, MaxLaunchTimeoutSeconds)
+	}
+	if a.PollIntervalSeconds == 0 {
+		a.PollIntervalSeconds = DefaultPollIntervalSeconds
+	}
+	if a.PollIntervalSeconds < 1 || a.PollIntervalSeconds > MaxPollIntervalSeconds {
+		return invalid("%s.pollIntervalSeconds must be between 1 and %d", field, MaxPollIntervalSeconds)
+	}
+	if a.ResultGraceSeconds == 0 {
+		a.ResultGraceSeconds = DefaultResultGraceSeconds
+	}
+	if a.ResultGraceSeconds < 0 || a.ResultGraceSeconds > MaxResultGraceSeconds {
+		return invalid("%s.resultGraceSeconds must be between 0 and %d", field, MaxResultGraceSeconds)
+	}
+	return nil
 }
 
 func (l *LocalProcess) validate(field string) error {

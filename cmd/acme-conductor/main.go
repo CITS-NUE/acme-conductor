@@ -4,11 +4,15 @@
 //
 //	acme-conductor --version
 //	acme-conductor serve [--config /etc/acme-conductor/config.json] [--log-level LEVEL]
+//	acme-conductor keygen --private FILE --public FILE
 //
 // serve runs the REST API, the SQLite-backed registries (targets,
 // policies, runs, audit) and the scheduler that launches Runner jobs
 // until it receives SIGTERM or SIGINT. It never touches ACME, DNS or
 // certificate material itself; see docs/conductor.md.
+//
+// keygen generates the Ed25519 key pair with which the Conductor signs
+// the jobs it hands to Runners (docs/conductor.md, "Job signing").
 package main
 
 import (
@@ -23,6 +27,7 @@ import (
 	"syscall"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor"
+	"github.com/CITS-NUE/acme-conductor/internal/keygen"
 	"github.com/CITS-NUE/acme-conductor/internal/version"
 )
 
@@ -39,7 +44,7 @@ func main() {
 }
 
 func usage(stderr io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s serve [--config FILE] [--log-level LEVEL]\n\n", component, component)
+	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s serve [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component)
 	fmt.Fprintln(stderr, "ACME Conductor control plane (target registry, policy, audit, run scheduling).")
 	fmt.Fprintln(stderr, "\nFlags:")
 	fs.PrintDefaults()
@@ -69,6 +74,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 	switch fs.Arg(0) {
 	case "serve":
 		return runServe(ctx, fs.Args()[1:], stderr, getenv)
+	case "keygen":
+		return runKeygen(fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: unknown command %q\n\n", component, fs.Arg(0))
 		fs.Usage()
@@ -104,6 +111,11 @@ func runServe(ctx context.Context, args []string, stderr io.Writer, getenv func(
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: lvl, ReplaceAttr: utcTime}))
 	logger = logger.With("component", component, "version", version.Version)
 	return conductor.Serve(ctx, conductor.Options{ConfigPath: *cfg, Logger: logger})
+}
+
+// runKeygen generates the job-signing key pair (internal/keygen).
+func runKeygen(args []string, stdout, stderr io.Writer) int {
+	return keygen.Run(component, "job-signing", args, stdout, stderr)
 }
 
 // utcTime forces the time attribute of every log record to UTC RFC 3339.

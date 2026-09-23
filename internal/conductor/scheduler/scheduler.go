@@ -494,6 +494,11 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	}
 	exec, err := l.Start(runCtx, spec)
 	if err != nil {
+		if launcher.ReasonOf(err) == launcher.ReasonCancelled {
+			log.Warn("run cancelled before the runner started", "launcher", l.Type(), "error", err.Error())
+			cancelled("run was cancelled before the runner started")
+			return
+		}
 		log.Error("runner could not be started", "launcher", l.Type(), "error", err.Error())
 		failed(v1alpha1.ErrorCodeInternal, "runner could not be started")
 		return

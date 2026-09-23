@@ -444,14 +444,23 @@ func TestConcurrencyLimitAndCancel(t *testing.T) {
 	if f.s.InFlight() != 1 {
 		t.Fatalf("inflight = %d", f.s.InFlight())
 	}
-	active, _ := f.reg.ListActiveRuns(ctx)
+	// The fake signals from Start, before the scheduler has recorded the
+	// starting -> running transition; wait for the registry to show it.
 	var running, queued *registry.Run
-	for _, r := range active {
-		switch r.Status {
-		case registry.RunRunning:
-			running = r
-		case registry.RunQueued:
-			queued = r
+	var active []*registry.Run
+	for deadline := time.Now().Add(5 * time.Second); running == nil && time.Now().Before(deadline); {
+		active, _ = f.reg.ListActiveRuns(ctx)
+		running, queued = nil, nil
+		for _, r := range active {
+			switch r.Status {
+			case registry.RunRunning:
+				running = r
+			case registry.RunQueued:
+				queued = r
+			}
+		}
+		if running == nil {
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	if running == nil || queued == nil {

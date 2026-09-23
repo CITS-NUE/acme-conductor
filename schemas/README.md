@@ -1,7 +1,10 @@
 # ACME Conductor JSON Schemas
 
 This directory holds JSON Schema (draft 2020-12) documents that describe the
-wire contract defined in Go by `pkg/api/v1alpha1`.
+wire contract defined in Go by `pkg/api/v1alpha1`: the `JobSpec`
+(`jobspec.schema.json`), the `Result` (`result.schema.json`) and, since
+Phase 4, the signed job envelope (`signedjob.schema.json`), whose
+`payload` is a base64url-encoded `JobSpec` document.
 
 ## Version policy
 
@@ -47,6 +50,11 @@ only by Go, not by JSON Schema:
   with raw external output. The real control is that a Runner never copies
   raw external output into a Result at all; `error.summary` must come from
   Runner-owned templates.
+- Everything inside the signed envelope's `protected` header (the fixed
+  `alg`, the `kid` format, the validity window, the nonce), the
+  signature itself, and the decoding of `payload` as a `JobSpec`: the
+  schema sees `protected`, `payload` and `signature` as opaque base64url
+  strings (`TestSignedJobFixtures`, with its own `schema-accepts.txt`).
 - Strict decoding: unknown fields, duplicate JSON object keys and trailing
   data after the document are always rejected by
   `pkg/api/v1alpha1/decode.go`, regardless of what a particular JSON Schema
@@ -73,7 +81,7 @@ drifting apart:
   list above) makes the fixture invalid even though the schema alone would
   accept it. The test fails if an allowlisted fixture is *not* actually
   accepted by the schema (a stale allowlist entry).
-- `TestSchemaInvariants` walks both schema documents and asserts every
+- `TestSchemaInvariants` walks all three schema documents and asserts every
   `object` node sets `additionalProperties: false`, that no property name
   looks like it could carry a secret, a command, an image reference or a
   cloud resource identifier, and that `apiVersion`/`kind` are pinned with

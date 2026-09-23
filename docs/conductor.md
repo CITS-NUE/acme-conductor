@@ -5,15 +5,22 @@ plane described in [`docs/architecture.md`](architecture.md). It covers
 the command line, the configuration file, the REST API, how a `Target`
 becomes a `Run` and how a `Run` is driven to completion, the
 `localhost-dev` authentication mode, the on-disk state and how to back it
-up, and what the Phase 2 Conductor does and does not guarantee.
+up, and what the Conductor does and does not guarantee today.
 
-Phase 2 ships the Conductor MVP: a SQLite-backed registry of targets,
+Phase 2 shipped the Conductor MVP: a SQLite-backed registry of targets,
 policies, runs and audit events, a REST API, a scheduler, and a
 local-process launcher that runs `acme-runner` (see
-[`docs/runner.md`](runner.md)) as a child process. It is a
-**single-host, single-user development and test deployment**: the API is
-reachable from the local host only and authenticates nothing finer than
-"a process on this host" (see [Authentication](#authentication)).
+[`docs/runner.md`](runner.md)) as a child process — a **single-host,
+single-user development and test deployment**. Phase 4 adds a second
+launcher, `azure-container-apps-job`, which starts one execution of a
+separately provisioned Azure Container Apps Job per run (the Runner then
+holds its own managed identity and no credential ever passes through the
+Conductor), and **job signing**: every launcher can hand the Runner a
+signed, expiring envelope instead of a bare `JobSpec`, and the Container
+Apps launcher always does. The API is still reachable from the local
+host only and authenticates nothing finer than "a process on this host"
+(see [Authentication](#authentication)); in Container Apps that host is
+the Conductor's own replica.
 
 ## Overview
 
@@ -27,8 +34,10 @@ reachable from the local host only and authenticates nothing finer than
   changes something) records a queued `Run` for every enabled target that
   is due, and starts queued runs through a launcher up to
   `maxConcurrentRuns` at a time;
-- one **launcher** per configured execution binding — in Phase 2 only
-  `local-process`, which runs `acme-runner reconcile` as a child.
+- one **launcher** per configured execution binding — `local-process`,
+  which runs `acme-runner reconcile` as a child, or
+  `azure-container-apps-job`, which hands a job to the next scheduled
+  execution of a Container Apps Job (see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job)).
 
 The Conductor never talks to an ACME CA, a DNS provider or a Certificate
 Store. It produces a `JobSpec` and consumes a `Result`; everything it
@@ -39,9 +48,17 @@ what the last successful `Result` said.
 
 ```
 acme-conductor serve [--config FILE] [--log-level LEVEL]
+acme-conductor keygen --private FILE --public FILE
 acme-conductor --version
 acme-conductor --help
 ```
+
+`keygen` generates the Ed25519 key pair for [job signing](#jobsigning):
+the private key is written to `--private` (created `0600`; an existing
+file is never overwritten), the public key to `--public` as PEM, and the
+key id plus the one-line form of the public key are printed for pasting
+into the Runner's `jobSigning.publicKeys`. It needs no configuration and
+touches nothing else.
 
 - `--config FILE` — path to the configuration document. Defaults to
   `$ACME_CONDUCTOR_CONFIG` if set, otherwise
@@ -72,7 +89,9 @@ that contains **no secret**. The Conductor knows ACME, DNS and Store
 bindings **by name only**; what a name resolves to is Runner configuration
 (`docs/runner.md`). See
 [`deploy/examples/conductor-config.example.json`](../deploy/examples/conductor-config.example.json)
-for a complete example whose binding names match the Runner example.
+for a complete example whose binding names match the Runner example, and
+[`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json)
+for the Container Apps shape.
 
 Top level:
 
@@ -87,13 +106,14 @@ Top level:
 | `acmeBindings` | []string | Non-empty, distinct binding names a policy may select. |
 | `dnsBindings` | []string | Non-empty, distinct binding names a target may select. |
 | `storeBindings` | []string | Non-empty, distinct binding names a target may select. |
+| `jobSigning` | object | Optional; required when an `azure-container-apps-job` binding exists. See below. |
 
 ### `server`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `listen` | string | `127.0.0.1:8080` | `host:port`. With `auth.mode: localhost-dev` the host must be `localhost` or a loopback IP literal (`127.0.0.1`, `[::1]`); any other name or address is rejected, and a name is never resolved. Port `0` picks a free port (tests). |
-| `auth.mode` | string | `localhost-dev` | The only mode in Phase 2. See [Authentication](#authentication). |
+| `auth.mode` | string | `localhost-dev` | The only mode until Phase 5 (OIDC). See [Authentication](#authentication). |
 | `shutdownGraceSeconds` | int | `900` | How long in-flight runs may continue after a stop signal before they are cancelled. `1`–`86400`. |
 
 ### `scheduler`
@@ -109,8 +129,9 @@ Top level:
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | Only `local-process` in Phase 2. |
+| `type` | string | `local-process` or `azure-container-apps-job`. |
 | `localProcess` | object | Required for `local-process` — see below. |
+| `azureContainerAppsJob` | object | Required for `azure-container-apps-job` — see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job). |
 
 ### `executionBindings.<name>.localProcess`
 
@@ -127,9 +148,124 @@ credential or an EAB secret can reach a Runner started by the local
 launcher, and it means the Conductor process's environment carries that
 credential — the opposite of security principle 2 ("the Conductor holds
 no DNS credential"). That is acceptable on a single-user development host
-and nowhere else; the Azure Container Apps Job launcher (Phase 4) hands
-the Runner a workload identity instead and needs no passthrough at all.
-The threat model records this as T10's Phase 2 residual.
+and nowhere else; the Azure Container Apps Job launcher runs the Runner
+under its own managed identity and has no passthrough at all. The threat
+model records this as T10's local-launcher residual.
+
+### Execution binding: Azure Container Apps Job
+
+`type: azure-container-apps-job` hands each run to an **existing**,
+**scheduled** Container Apps Job — the Runner image with its own managed
+identity, its configuration, its state volume, an exchange volume and a
+fixed command `reconcile --exchange /exchange`, all provisioned in
+infrastructure ([`deploy/azure`](../deploy/azure/README.md),
+[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)). The Conductor
+never creates, changes or **starts** the Job: the platform's start
+operation accepts an execution template that can replace the image,
+command and environment of the Job's containers, so an identity allowed
+to start the Job could run any image under the Runner's identity. The
+Conductor's identity is not allowed to. For a run it:
+
+1. offers the signed job on the exchange volume (a file share both
+   containers mount): it writes `<exchangeDir>/staging/run-<runId>/job.json`
+   and moves the directory to `<exchangeDir>/pending/` in one rename;
+2. waits for the next execution the platform's schedule starts (every
+   minute in the Bicep) to take the job — the Runner moves the directory
+   to `<exchangeDir>/claimed/` (exactly one execution wins) and records
+   its execution name there — and confirms with the platform that the
+   recorded name is an execution of this Job (a name the platform
+   consistently does not know, on every attempt, ends the run; a
+   platform that cannot be asked, or a 404 that does not persist, does
+   not — after a few attempts the execution is watched unconfirmed,
+   because a Runner holds the job). If none takes it within `claimTimeoutSeconds`
+   the offer is withdrawn (by the same rename, so a late taker cannot
+   race it) and the run fails; a cancelled run is withdrawn the same way
+   and ends `cancelled`;
+3. polls the execution's status every `pollIntervalSeconds` until it is
+   terminal (`Succeeded`, `Failed`, `Stopped`, `Degraded`). Whenever
+   polling ends without a terminal status — the run was cancelled,
+   `timeoutSeconds` passed, or the status could not be read any more —
+   the execution is stopped through the platform *before* the run
+   directory is removed, then given a bounded grace to end;
+4. reads `result.json` (waiting up to `resultGraceSeconds` for the share
+   to show it), which must be a `SignedCertificateReconcileResult`
+   verifying against `resultSigning.publicKeys` (see below), checks it
+   names this run and target and that its status agrees with the
+   platform's verdict (`Succeeded` with a failed `Result`, or `Failed`
+   with a succeeded one, is a mismatch → `Internal`), and removes the run
+   directory — only once the execution has been seen to end; an
+   execution whose status stayed unreadable and whose stop could not be
+   confirmed keeps its directory (a Runner may still be writing there),
+   logged as "run directory kept" for an operator to remove.
+
+The run's `externalExecutionId` is `azure-container-apps-job:<execution
+name>`. The Conductor's identity needs, on the Job resource only, the
+three actions the Bicep grants (`jobs/execution/read`,
+`jobs/executions/read`, `jobs/stop/execution/action`) — it cannot start
+or change the Job and holds no DNS, Key Vault or storage data
+permission. A run therefore starts up to one schedule interval plus the
+platform's start latency after it is queued, and at most one run starts
+per schedule tick (each execution runs one replica and takes one job).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `subscriptionId` | string | — (required) | GUID of the subscription holding the Job. |
+| `resourceGroup` | string | — (required) | Resource group of the Job. |
+| `jobName` | string | — (required) | Name of the Container Apps Job (2–32 lower-case letters, digits and hyphens, no `--`). |
+| `cloud` | string | `public` | `public`, `china` or `government`: selects the Resource Manager endpoint and identity authority. |
+| `credential` | string | `default` | How the Conductor authenticates to Resource Manager: `managed-identity` (the platform's identity — use this in production) or `default` (the SDK's `DefaultAzureCredential` chain, for a Conductor run on a developer host with the exchange share mounted). |
+| `managedIdentityClientId` | string | — | `managed-identity` only: the client ID of a user-assigned identity; omitted means system-assigned. |
+| `exchangeDir` | string | — (required) | Clean, absolute path where the exchange volume is mounted in the **Conductor's** filesystem (`/mnt/exchange` in the Bicep). Created if missing. The Runner is told its own mount path by its fixed arguments in infrastructure. |
+| `claimTimeoutSeconds` | int | `300` | How long to wait for a scheduled execution to take an offered job before withdrawing it. Must not exceed `jobSigning.validitySeconds` (a job taken after its expiry is refused by the Runner). `1`–`86400`. |
+| `timeoutSeconds` | int | `1200` | Bounds one execution, from the moment it took the job, as seen by the Conductor; after it the execution is stopped. Set it above the Job's `replicaTimeout`, which is above the Runner's `lego.timeoutSeconds`. `1`–`86400`. |
+| `pollIntervalSeconds` | int | `10` | How often the exchange directory and the execution's status are read. `1`–`300`. |
+| `resultGraceSeconds` | int | `30` | How long to wait for `result.json` after the execution ended (file shares propagate writes with a delay). `0`–`600`. |
+
+A configuration with an `azure-container-apps-job` binding and no
+`jobSigning` or no `resultSigning` is rejected: the exchange volume is
+not a transport the Conductor owns, so every job on it is signed and
+every Result on it must be. See
+[`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json).
+
+### `jobSigning`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `privateKeyFile` | string | — (required) | Clean, absolute path of the PEM `PRIVATE KEY` (PKCS #8, Ed25519) file from `acme-conductor keygen`. Read once at start; an unreadable or wrong-type key is a configuration error (exit 1). |
+| `validitySeconds` | int | `900` | How long a signed job stays acceptable after it is issued; it only needs to cover the platform's start latency, because the Runner checks it before doing anything. `1`–`86400`. |
+
+With `jobSigning` present, **every** launcher hands the Runner a
+`SignedCertificateReconcileJob` ([ADR 0015](adr/0015-signed-job-envelope.md)):
+the exact `JobSpec` bytes, base64url, under a strict header with the key
+id, `issuedAt`, `expiresAt` and a random nonce, signed with Ed25519. The
+Runner must then list the matching public key under its own
+`jobSigning.publicKeys` ([`docs/runner.md`](runner.md#jobsigning)) and
+refuses bare JobSpecs. Without `jobSigning` the local launcher hands over
+a bare `JobSpec` as in Phase 2. The private key is the only secret the
+Conductor ever reads; it is the Conductor's identity towards Runners, not
+a DNS, Store or cloud credential. To rotate it, add the new public key to
+the Runners first, then switch `privateKeyFile`, then remove the old
+public key. The key id appears in the `job signing enabled` log line at
+start.
+
+### `resultSigning`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `publicKeys` | []string | — (required) | 1–8 Runner result-signing public keys (Ed25519), each either a PEM `PUBLIC KEY` block or the standard base64 of its DER SubjectPublicKeyInfo — the one-line `publicKey:` that `acme-runner keygen` prints. Several keys let a Runner key rotate. Duplicates are rejected. |
+| `clockSkewSeconds` | int | `300` | How far a signed Result's `issuedAt` may lie in the future of this Conductor's clock before it is refused. Expiry has no tolerance. `1`–`3600`. |
+
+With `resultSigning` present, **every** launcher accepts only a
+`SignedCertificateReconcileResult` ([ADR 0015](adr/0015-signed-job-envelope.md))
+whose signature verifies against one of these keys and whose payload is
+a valid `Result`; a bare `Result` is then "no result" and the run ends
+`Internal`. The Runner must then be configured with the matching private
+key under its `resultSigning.privateKeyFile`
+([`docs/runner.md`](runner.md#resultsigning)). Without `resultSigning`
+a signed Result is refused the same way, so signing is decided once, by
+configuration, never by the document. The Container Apps launcher
+requires it; the local launcher over a private directory may run either
+way. The Conductor holds public keys only.
 
 ## REST API
 
@@ -379,8 +515,11 @@ curl -s "$C/audit?targetId=$T" | jq '.items[].action'
    the `JobSpec` is built (policy copied by value as a snapshot) and
    validated with the contract's own `Validate`; a rejection ends the run
    as `failed`/`PolicyViolation` and is audited as `policy.rejected`.
-4. **Launch.** The execution binding's launcher starts the Runner; the run
-   becomes `running` with the platform's execution id recorded.
+4. **Launch.** The `JobSpec` is serialized — as a signed envelope when
+   `jobSigning` is configured — and the execution binding's launcher
+   starts the Runner (a child process, or a Container Apps Job
+   execution); the run becomes `running` with the platform's execution
+   id recorded.
 5. **Result.** The Runner's `Result` (strictly decoded, checked to name
    this run and target) sets the terminal status and every certificate
    field. `Cancelled` → `cancelled`; any other error → `failed`. If the
@@ -471,7 +610,9 @@ running it to a network; OIDC with named principals is Phase 5.
 |---|---|
 | `/usr/local/bin/acme-conductor` | The Conductor binary (image entrypoint). |
 | `/etc/acme-conductor/config.json` | The configuration, mounted **read-only**. |
+| `/etc/acme-conductor/job-signing.pem` | The job-signing private key (when `jobSigning` is configured), mounted **read-only** for this container only. |
 | `/var/lib/acme-conductor/` | Writable, **persistent**: `conductor.db` (plus `-wal`/`-shm`) and `runs/` (per-run `job.json`/`result.json`, no certificate material). |
+| `/mnt/exchange` | With the Container Apps launcher: the exchange share, holding per-run `job.json`/`result.json` while an execution is in flight. |
 
 The Conductor image (`Dockerfile.conductor`) contains **no** `acme-runner`
 and no `lego`. The `local-process` launcher therefore only works where
@@ -535,16 +676,37 @@ resolved configuration (it has none), or anything from the Runner's
   and its `Result` is decoded with the strict contract decoder and
   checked to name the run it was started for. Its stderr reaches only the
   debug log, never a record.
+- With `jobSigning`, what leaves the Conductor is a signed, expiring
+  envelope; a Runner detects a job altered on the way (a changed FQDN, a
+  swapped binding, an extended expiry) and refuses to execute the same
+  run twice. Signing authenticates the Conductor; it does not widen what
+  a Runner may do, which its own trusted policy still decides.
+- With the Container Apps launcher the Conductor's identity can start,
+  observe and stop executions of one Job and nothing else; it cannot
+  change what the Runner is, and the Runner's DNS and Key Vault access is
+  its own managed identity, provisioned in Bicep with least-privilege
+  custom roles. Platform errors reach the log as fixed wording (status
+  and error code), never as response bodies.
 
-## Limitations in Phase 2
+## Limitations
 
 - **Development authentication only.** `localhost-dev` authenticates a
-  host, not a person. No roles, no named principals, no remote access.
-- **One execution shape, one host.** The `local-process` launcher needs
-  `acme-runner` (and its `lego`) on the same host, and a credential the
-  Runner needs must be in the Conductor's environment
-  (`passthroughEnv`). The Azure Container Apps Job launcher with workload
-  identity is Phase 4.
+  host, not a person. No roles, no named principals, no remote access —
+  in Container Apps the API is reached through an optional admin sidecar
+  in the Conductor's replica (`az containerapp exec`), gated by Azure
+  RBAC on the app; see [`deploy/azure/README.md`](../deploy/azure/README.md).
+  OIDC is Phase 5.
+- **The local launcher is one host.** It needs `acme-runner` (and its
+  `lego`) on the same host, and a credential the Runner needs must be in
+  the Conductor's environment (`passthroughEnv`). The Container Apps
+  launcher has neither constraint.
+- **The Container Apps launcher is verified against a fake platform.**
+  Its tests exercise the whole exchange against an in-process fake of
+  the Jobs API; the Bicep compiles and lints. The platform's
+  execution-template override inheriting volume mounts, the custom role
+  action names, SQLite and `flock` on an SMB share, and the Result
+  propagation delay are documented expectations until a first real
+  deployment confirms them ([`deploy/azure/README.md`](../deploy/azure/README.md)).
 - **A hard kill can orphan a Runner.** Recovery marks such runs
   `failed`/"outcome unknown"; the Runner may still finish, and the next
   due run then races it (the Store and account state tolerate that; the
@@ -558,9 +720,9 @@ resolved configuration (it has none), or anything from the Runner's
   at each target's next run (see [Policy](#policy)); an `acmeBinding`
   change does not force reissue of current certificates, and there is no
   policy revision on runs, only the snapshot in each `JobSpec`.
-- **No `JobSpec` signing or replay check** (Phase 4); the local launcher
-  hands the document to the Runner over a private directory, but nothing
-  authenticates it end to end.
+- **Signing is optional for the local launcher.** Without `jobSigning`
+  it hands a bare `JobSpec` over a private per-run directory, which
+  nothing authenticates end to end; that is acceptable on one host only.
 - **No metrics endpoint yet**; `/healthz` and `/readyz` exist, Prometheus
   `/metrics` does not.
 - The Runner's `renewBeforeDays`/`keyType` cost levers are still not

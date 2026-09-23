@@ -1,0 +1,7 @@
+# Fixtures the JSON Schema accepts but Go rejects. The schema sees the
+# protected header only as an opaque base64url string; its decoded content
+# (alg, kid, the validity window, the nonce) is checked by Go only.
+header-alg-none.json
+header-unknown-field.json
+header-expiry-before-issue.json
+header-validity-too-long.json
