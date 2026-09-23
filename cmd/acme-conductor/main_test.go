@@ -133,6 +133,12 @@ func writeTestConfig(t *testing.T, dir string) (cfgPath, dbPath string) {
 // returns the exit code.
 func startServe(t *testing.T, cfgPath string) (base string, stop func() int) {
 	t.Helper()
+	return startServeWith(t, cfgPath, "http")
+}
+
+// startServeWith is startServe with the URL scheme the test will use.
+func startServeWith(t *testing.T, cfgPath, scheme string) (base string, stop func() int) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	addrCh := make(chan net.Addr, 1)
 	done := make(chan int, 1)
@@ -146,7 +152,7 @@ func startServe(t *testing.T, cfgPath string) (base string, stop func() int) {
 	}()
 	select {
 	case a := <-addrCh:
-		base = "http://" + a.String()
+		base = scheme + "://" + a.String()
 	case code := <-done:
 		t.Fatalf("Serve exited early with %d: %s", code, logs.String())
 	case <-time.After(20 * time.Second):

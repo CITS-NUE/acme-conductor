@@ -2,10 +2,10 @@
 
 This is the operator-facing reference for `acme-conductor`, the control
 plane described in [`docs/architecture.md`](architecture.md). It covers
-the command line, the configuration file, the REST API, how a `Target`
-becomes a `Run` and how a `Run` is driven to completion, the
-`localhost-dev` authentication mode, the on-disk state and how to back it
-up, and what the Conductor does and does not guarantee today.
+the command line, the configuration file, the REST API and the GUI, how
+a `Target` becomes a `Run` and how a `Run` is driven to completion, the
+two authentication modes, the on-disk state and how to back it up, and
+what the Conductor does and does not guarantee today.
 
 Phase 2 shipped the Conductor MVP: a SQLite-backed registry of targets,
 policies, runs and audit events, a REST API, a scheduler, and a
@@ -17,17 +17,20 @@ separately provisioned Azure Container Apps Job per run (the Runner then
 holds its own managed identity and no credential ever passes through the
 Conductor), and **job signing**: every launcher can hand the Runner a
 signed, expiring envelope instead of a bare `JobSpec`, and the Container
-Apps launcher always does. The API is still reachable from the local
-host only and authenticates nothing finer than "a process on this host"
-(see [Authentication](#authentication)); in Container Apps that host is
-the Conductor's own replica.
+Apps launcher always does. Phase 5 adds the production authentication
+mode, `oidc` — bearer tokens from an OpenID Connect provider, named
+principals, an admin and a viewer role, a TLS listener or a platform
+ingress in front of it — and a minimal **GUI** served by the Conductor
+itself (see [Authentication](#authentication) and [GUI](#gui)). The
+`localhost-dev` mode remains for a single development host.
 
 ## Overview
 
 `acme-conductor serve` runs, in one process:
 
-- the **REST API** on a loopback address (`/api/v1alpha1/...`, plus
-  `/healthz` and `/readyz`);
+- the **REST API** (`/api/v1alpha1/...`, plus `/healthz` and `/readyz`)
+  and the **GUI** (`/ui/`), on a loopback address in `localhost-dev`
+  mode or wherever the configuration says in `oidc` mode;
 - the **registries** — `Target`, `CertificatePolicy`, `Run` and the
   append-only `AuditEvent` log — in one SQLite file;
 - the **scheduler**, which every `tickSeconds` (and whenever the API
@@ -78,7 +81,7 @@ signal kills the process outright; see [Shutdown and recovery](#shutdown-and-rec
 | Code | Meaning |
 |---|---|
 | `0` | Stopped cleanly after a signal. |
-| `1` | The configuration was rejected, or a launcher could not be built from it, or the bound address was not loopback. |
+| `1` | The configuration was rejected, a launcher could not be built from it, the bound address was not loopback in `localhost-dev` mode, or the TLS certificate could not be loaded. |
 | `2` | A fatal runtime error: another Conductor process owns the database (see [Shutdown and recovery](#shutdown-and-recovery)), the registry could not be opened or migrated, in-flight runs could not be recovered, the listener could not be bound, or the HTTP server failed. |
 
 ## Configuration reference
@@ -91,7 +94,9 @@ bindings **by name only**; what a name resolves to is Runner configuration
 [`deploy/examples/conductor-config.example.json`](../deploy/examples/conductor-config.example.json)
 for a complete example whose binding names match the Runner example, and
 [`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json)
-for the Container Apps shape.
+for the Container Apps shape (`oidc` behind the platform's ingress), and
+[`deploy/examples/conductor-config.oidc.example.json`](../deploy/examples/conductor-config.oidc.example.json)
+for a self-hosted `oidc` deployment with the Conductor's own TLS listener.
 
 Top level:
 
@@ -112,9 +117,31 @@ Top level:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `listen` | string | `127.0.0.1:8080` | `host:port`. With `auth.mode: localhost-dev` the host must be `localhost` or a loopback IP literal (`127.0.0.1`, `[::1]`); any other name or address is rejected, and a name is never resolved. Port `0` picks a free port (tests). |
-| `auth.mode` | string | `localhost-dev` | The only mode until Phase 5 (OIDC). See [Authentication](#authentication). |
+| `listen` | string | `127.0.0.1:8080` | `host:port`. With `auth.mode: localhost-dev` the host must be `localhost` or a loopback IP literal (`127.0.0.1`, `[::1]`); any other name or address is rejected, and a name is never resolved. With `oidc` any host is allowed, but a non-loopback one needs `tls` or `behindTlsProxy`. Port `0` picks a free port (tests). |
+| `auth.mode` | string | `localhost-dev` | `localhost-dev` (one development host) or `oidc` (production). See [Authentication](#authentication). |
+| `auth.oidc` | object | — | Required for, and only allowed with, `oidc` — see below. |
+| `tls` | object | — | `oidc` only. `{ "certFile": "...", "keyFile": "..." }`, clean absolute paths of a PEM certificate chain and private key: the listener then speaks HTTPS (TLS 1.2+). Both files are read once at start. Mutually exclusive with `behindTlsProxy`. |
+| `behindTlsProxy` | bool | `false` | `oidc` only. States that a platform ingress or reverse proxy terminates TLS in front of this port and is the only route to it, so a non-loopback plaintext listener is acceptable. Never set it because it is convenient: a bearer token in the clear is a stolen session. |
 | `shutdownGraceSeconds` | int | `900` | How long in-flight runs may continue after a stop signal before they are cancelled. `1`–`86400`. |
+
+### `server.auth.oidc`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `issuer` | string | — (required) | The provider's issuer URL, `https://…` (plain `http://` only to a loopback host, for tests); no user information, query or fragment. Its discovery document is read from `<issuer>/.well-known/openid-configuration` and must name the same issuer; every token's `iss` must equal it exactly. Entra ID v2: `https://login.microsoftonline.com/<tenant-id>/v2.0`. |
+| `audience` | string | — (required) | The value every token's `aud` must contain — the API's own identifier at the provider (Entra ID: the API app registration's application ID URI such as `api://acme-conductor`, or its client ID). Printable ASCII without whitespace, ≤256 bytes. |
+| `clientId` | string | — | The public client the GUI signs in as (Entra ID: a single-page-application registration with redirect URI `https://<host>/ui/`). Without it the GUI cannot sign in; the API still accepts tokens obtained elsewhere. |
+| `scopes` | []string | `openid profile <audience>/.default` | What the GUI requests at sign-in (needs `clientId`). ≤16 distinct values. |
+| `principalClaim` | string | `preferred_username` | The claim whose value is recorded as the audit actor and `requestedBy`. It must be a string of printable characters, ≤256 bytes. |
+| `rolesClaim` | string | `roles` | The claim (a string or an array of strings) whose values are matched against `roles`. |
+| `roles.admin` | []string | — (required, non-empty) | Values that grant the **admin** role: every endpoint. |
+| `roles.viewer` | []string | — | Values that grant the **viewer** role: `GET` only. A value may appear in one list only; a token carrying values from both is an admin. |
+| `clockSkewSeconds` | int | `60` | Tolerance applied to `exp`, `nbf` and `iat`. `1`–`300`. |
+| `keyCacheSeconds` | int | `3600` | How long the discovery document and signing keys are reused before they are fetched again. An unknown key id triggers an earlier refresh, at most once a minute. `60`–`86400`. |
+
+The Conductor holds **no client secret**: it verifies tokens with the
+provider's published keys and performs no sign-in of its own
+([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)).
 
 ### `scheduler`
 
@@ -291,7 +318,8 @@ touching the registry.
 |---|---|---|
 | 400 | `invalid_request` | Malformed body, failed field validation, unknown field, unregistered binding name, invalid FQDN/suffix, bad query parameter. |
 | 400 | `policy_violation` | The target's FQDN is not allowed by the policy it names (label-boundary suffix match, wildcard rule). Audited as `policy.rejected`. |
-| 403 | `forbidden` | Refused by the authentication mode (see [Authentication](#authentication)). |
+| 401 | `unauthenticated` | `oidc` mode: no bearer token, or one that does not verify (signature, issuer, audience, expiry, unknown key). Carries `WWW-Authenticate: Bearer realm="acme-conductor"`. |
+| 403 | `forbidden` | `localhost-dev`: refused by the mode's rules. `oidc`: the token verified but carries no role this API grants, or a viewer called anything but `GET`. |
 | 404 | `not_found` | No such policy, target, run, or endpoint. |
 | 409 | `conflict` | A second target for the same FQDN; a policy edit that would no longer cover an existing target; cancelling a run that is not cancellable. |
 | 409 | `stale_revision` | The `revision` in the request is not the target's current revision. |
@@ -307,6 +335,9 @@ touching the registry.
 |---|---|
 | `GET /healthz` | Liveness: `{"status":"ok"}`. Unauthenticated. |
 | `GET /readyz` | Readiness: pings the registry; `503` `{"status":"unavailable"}` on failure. Unauthenticated. |
+| `GET /` | Redirects to `/ui/`. |
+| `GET /ui/`, `/ui/app.js`, `/ui/app.css` | The GUI's three static files. Unauthenticated (they contain no data). |
+| `GET /ui/config` | How the GUI signs in: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` or `{"auth":{"mode":"localhost-dev"}}`. Unauthenticated; `503` while the provider's discovery document is unavailable. |
 | `GET /api/v1alpha1/bindings` | The registered binding names: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`. |
 | `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`, oldest first. |
 | `POST /api/v1alpha1/policies` | Create a policy → `201` Policy, `Location`. |
@@ -585,7 +616,72 @@ certificate current (`noop`) or renews.
 
 ## Authentication
 
-Phase 2 has one mode, `localhost-dev` ([ADR 0012](adr/0012-localhost-only-dev-auth.md)).
+Two modes, selected by `server.auth.mode`. Both authenticate every
+request under `/api/`; `/healthz`, `/readyz` and the GUI's static files
+need no credential, and every handler under `/api/` runs only behind the
+same middleware, so no endpoint can be added that bypasses it.
+
+### `oidc` (production)
+
+The Conductor is an OpenID Connect **resource server**
+([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)): it accepts an
+`Authorization: Bearer <access token>` header — never a cookie or a
+query parameter — and a token is accepted only if **all** hold:
+
+- it is a compact JWS signed with `RS256`, `PS256` or `ES256` (`none` and
+  HMAC are refused), names a key id, uses no critical extension, and its
+  signature verifies against that key in the set the provider publishes
+  at its discovery document's `jwks_uri` (RSA ≥ 2048 bits or P-256);
+- `iss` equals `server.auth.oidc.issuer`, and `aud` contains
+  `server.auth.oidc.audience`;
+- `exp` is present and not passed (within `clockSkewSeconds`); `nbf` and
+  `iat`, if present, are not in the future;
+- its header and payload decode strictly (a duplicated claim is refused);
+- `principalClaim` is a printable string, which becomes the caller's
+  name in the audit log and in `requestedBy`;
+- `rolesClaim` carries a value in `roles.admin` (→ **admin**, every
+  endpoint) or `roles.viewer` (→ **viewer**, `GET` only). A token with
+  neither verified but is refused with `403`.
+
+Failures answer `401` with a `WWW-Authenticate: Bearer` challenge, or
+`403` when the caller was identified but is not permitted. Error texts
+say why (expired, wrong audience, unknown key) and never echo the token.
+The log records every refusal with the method, path and reason.
+
+The provider's discovery document and keys are read once at start
+(a provider that is unreachable then is a warning; tokens are refused
+until it answers, and scheduled renewals are unaffected) and again every
+`keyCacheSeconds`, or sooner when a token names a key id the cached set
+does not hold (at most once a minute). A refresh that fails keeps the
+previous keys.
+
+**Transport.** A bearer token is a session; it must not travel in the
+clear. With a non-loopback `server.listen` the configuration insists on
+`server.tls` (the Conductor's own certificate and key; TLS 1.2+) or on
+`server.behindTlsProxy: true` — an explicit statement that a platform
+ingress or reverse proxy terminates TLS and is the only route to the
+port. The Container Apps deployment uses the latter with the
+environment's peer-traffic encryption
+([`deploy/azure/README.md`](../deploy/azure/README.md)).
+
+**Obtaining a token.** The GUI does it in the browser (see [GUI](#gui)).
+From a terminal, ask the provider for a token for the API's audience;
+with Microsoft Entra ID and the audience `api://acme-conductor`:
+
+```sh
+token="$(az account get-access-token --scope api://acme-conductor/.default --query accessToken -o tsv)"
+curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1alpha1/targets
+```
+
+The provider-side setup (an API app registration with app roles, a
+public client for the GUI) is described with the Azure deployment; any
+provider that publishes a discovery document and signs tokens with one
+of the three algorithms works the same way, with `principalClaim` and
+`rolesClaim` set to what it issues.
+
+### `localhost-dev` (one development host)
+
+The Phase 2 mode ([ADR 0012](adr/0012-localhost-only-dev-auth.md)).
 A request to anything under `/api/` is accepted only if **all** hold:
 
 - the listener is bound to a loopback address (enforced by configuration
@@ -598,11 +694,41 @@ A request to anything under `/api/` is accepted only if **all** hold:
 - `Sec-Fetch-Site`, if present, is `same-origin` or `none`;
 - a request with a body carries `Content-Type: application/json`.
 
-Every accepted caller is the principal `localhost-dev`; that name is what
-the audit log records. **Any local user who can open a loopback
-connection is an administrator** in this mode. Do not expose it beyond a
-single-user development or test host, and do not publish a container
-running it to a network; OIDC with named principals is Phase 5.
+Every accepted caller is the principal `localhost-dev` with the admin
+role; that name is what the audit log records. **Any local user who can
+open a loopback connection is an administrator** in this mode. Do not
+expose it beyond a single-user development or test host, and do not
+publish a container running it to a network; that is what `oidc` is
+for.
+
+## GUI
+
+`/ui/` is a minimal interface over the same API: targets (list, create,
+edit, enable/disable, request a run), policies (list, create, edit),
+runs (list with a status filter, detail, cancel) and the audit log. It
+is three static files embedded in the binary — one page, one script,
+one stylesheet — with no framework and no build step; everything it
+shows is rendered through DOM methods, never as markup built from data,
+and it calls the API on its own origin only.
+
+In `oidc` mode the page signs the operator in as a **public client**
+(`server.auth.oidc.clientId`) with the authorization code flow and PKCE:
+it reads `/ui/config`, sends the browser to the provider's
+`authorization_endpoint`, exchanges the returned code at the
+`token_endpoint` with the code verifier, and keeps the access token in
+the tab's session storage (gone when the tab closes, never in a URL or a
+cookie). The token is sent as a bearer header, so the API needs no
+cookie and no CSRF token; a `401` sends the operator back to sign-in. A
+viewer sees everything and gets `403` on any change. The page is served
+with a Content-Security-Policy that allows its own script and
+stylesheet, connections to its own origin and to the provider's token
+endpoint origin, and nothing else (`default-src 'none'`, no inline
+script, `frame-ancestors 'none'`), plus `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer`. In `localhost-dev` mode the same page
+works without sign-in, because it is a same-origin caller on loopback.
+
+The GUI shows only what the API returns: never a private key, a
+certificate body or a credential, because the Conductor has none.
 
 ## Directories and container usage
 
@@ -611,6 +737,7 @@ running it to a network; OIDC with named principals is Phase 5.
 | `/usr/local/bin/acme-conductor` | The Conductor binary (image entrypoint). |
 | `/etc/acme-conductor/config.json` | The configuration, mounted **read-only**. |
 | `/etc/acme-conductor/job-signing.pem` | The job-signing private key (when `jobSigning` is configured), mounted **read-only** for this container only. |
+| `/etc/acme-conductor/tls.crt`, `tls.key` | The listener's certificate and key when `server.tls` is configured (a convention; the paths are what the configuration names), mounted **read-only**. |
 | `/var/lib/acme-conductor/` | Writable, **persistent**: `conductor.db` (plus `-wal`/`-shm`) and `runs/` (per-run `job.json`/`result.json`, no certificate material). |
 | `/mnt/exchange` | With the Container Apps launcher: the exchange share, holding per-run `job.json`/`result.json` while an execution is in flight. |
 
@@ -618,13 +745,24 @@ The Conductor image (`Dockerfile.conductor`) contains **no** `acme-runner`
 and no `lego`. The `local-process` launcher therefore only works where
 both binaries are on the same host — a development checkout, or a custom
 image that adds the Runner. In a container the image supports
-`--read-only` as long as `/var/lib/acme-conductor` is a writable mount;
-publish the port to the host's loopback only (`-p 127.0.0.1:8080:8080`)
-and remember that the process inside the container sees the peer as the
-container's loopback only when the client is inside the same network
-namespace (`docker exec`, or `--network host`) — with a published port the
-peer is the bridge gateway, not loopback, and every request is refused,
-which is the intended fail-closed outcome for this phase.
+`--read-only` as long as `/var/lib/acme-conductor` is a writable mount.
+In `localhost-dev` mode publish the port to the host's loopback only
+(`-p 127.0.0.1:8080:8080`) and remember that the process inside the
+container sees the peer as the container's loopback only when the client
+is inside the same network namespace (`docker exec`, or `--network
+host`) — with a published port the peer is the bridge gateway, not
+loopback, and every request is refused, which is the intended
+fail-closed outcome for that mode. In `oidc` mode listen on
+`0.0.0.0:<port>` with `server.tls` (mount the certificate and key
+read-only) or behind an ingress that terminates TLS
+(`server.behindTlsProxy: true`); the peer address does not matter.
+
+Released images are published to `ghcr.io/cits-nue/acme-conductor` and
+`ghcr.io/cits-nue/acme-runner` on a version tag, for `linux/amd64` and
+`linux/arm64`, with an SBOM and provenance attached
+([ADR 0017](adr/0017-release-pipeline.md)); verify one with
+`gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE`
+and pin its digest.
 
 ### Backup, restore, rollback
 
@@ -658,6 +796,13 @@ resolved configuration (it has none), or anything from the Runner's
 - API input can only name administrator-registered bindings; there is no
   field for a command, image, path, environment variable, resource id or
   credential, and unknown fields are rejected, so none can be smuggled in.
+- In `oidc` mode every caller is a named principal with a role, decided
+  from a token the provider signed and checked in one middleware for
+  every endpoint; the Conductor holds no client secret, refuses `none`
+  and HMAC algorithms, and never lets a bearer token onto a non-loopback
+  plaintext listener unless the configuration states that TLS is
+  terminated in front of it. The GUI is static, same-origin, DOM-rendered
+  and served under a strict Content-Security-Policy.
 - FQDNs and suffixes are normalized and checked on a label boundary before
   they are stored; a target that does not satisfy its policy is refused
   and audited, and a policy cannot be edited so that an existing target
@@ -690,12 +835,18 @@ resolved configuration (it has none), or anything from the Runner's
 
 ## Limitations
 
-- **Development authentication only.** `localhost-dev` authenticates a
-  host, not a person. No roles, no named principals, no remote access —
-  in Container Apps the API is reached through an optional admin sidecar
-  in the Conductor's replica (`az containerapp exec`), gated by Azure
-  RBAC on the app; see [`deploy/azure/README.md`](../deploy/azure/README.md).
-  OIDC is Phase 5.
+- **The provider is trusted within the audience.** Whoever the provider
+  issues an admin-role token to, for this audience, is an administrator;
+  role assignment is provider-side administration this project cannot
+  audit. A stolen access token is usable until it expires (the Conductor
+  performs no revocation or introspection check); short provider
+  lifetimes and TLS everywhere bound that. Two roles only, no
+  per-target or per-policy permissions.
+- **`localhost-dev` authenticates a host, not a person**, and is for one
+  development host only.
+- **The GUI is minimal.** Lists and forms over the API, no dashboards,
+  no bulk operations, no state of its own; it needs `clientId` and a
+  public-client registration at the provider to sign in.
 - **The local launcher is one host.** It needs `acme-runner` (and its
   `lego`) on the same host, and a credential the Runner needs must be in
   the Conductor's environment (`passthroughEnv`). The Container Apps

@@ -32,3 +32,14 @@ param resultSigningPublicKey = 'MCowBQYDK2VwAyEA65N/M3oDE8dU2aAKvMDf19gGaRxk3W3g
 param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_PRIVATE_KEY_PEM', '')
 
 param runnerConfigJson = loadTextContent('../examples/runner-config.aca.example.json')
+
+// OIDC: an Entra ID tenant, the API app registration's application ID
+// URI as audience, the GUI's SPA app registration as client, and the app
+// roles that grant each API role (docs/conductor.md, "Authentication").
+param oidcIssuer = 'https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0'
+param oidcAudience = 'api://acme-conductor'
+param oidcClientId = '22222222-2222-2222-2222-222222222222'
+param oidcAdminRoles = ['ACME.Admin']
+param oidcViewerRoles = ['ACME.Viewer']
+param ingressExternal = true
+param ingressAllowedCidrs = []

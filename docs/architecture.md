@@ -81,6 +81,12 @@ below).
   execution somewhere" (`internal/conductor/launcher`: a local process in
   Phase 2, an Azure Container Apps Job from Phase 4). Cloud-specific
   launcher code lives behind this interface, never in Conductor core.
+- **API and GUI** — the REST API (`internal/conductor/api`) is the only
+  boundary that accepts free-form input; since Phase 5 it authenticates
+  callers with OIDC bearer tokens as named principals with an admin or
+  viewer role (`internal/conductor/oidc`, [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md))
+  and serves a minimal static GUI (`internal/conductor/ui`) over the
+  same API. The development mode `localhost-dev` remains for one host.
 
 ### acme-runner (data plane)
 
@@ -435,7 +441,10 @@ cmd/
   acme-runner/      data-plane binary (reconcile, Phase 1)
 internal/
   conductor/            Conductor wiring: config, registry, scheduler, launchers, API (Phase 2)
-  conductor/api/        REST API handlers and the localhost-dev authenticator
+  conductor/api/        REST API handlers, the localhost-dev authenticator, role enforcement, GUI routes
+  conductor/oidc/       OIDC bearer-token authenticator: discovery, key set cache, JWS verification (Phase 5)
+  conductor/oidc/oidctest/ in-process OpenID provider for tests; not compiled into shipped binaries
+  conductor/ui/         the embedded GUI: index.html, app.js, app.css (Phase 5)
   conductor/config/     Conductor configuration loading and validation
   conductor/launcher/   Job Launcher interface, job signing, and the local-process launcher
   conductor/launcher/acajob/ Azure Container Apps Job launcher (Phase 4) — the Conductor's only Azure SDK import
@@ -461,7 +470,7 @@ docs/               this document, the threat model, the Conductor and Runner gu
 Dockerfile.conductor  distroless, non-root image for acme-conductor
 Dockerfile.runner     distroless, non-root image for acme-runner
 Makefile            build / verify / image targets
-.github/workflows/   CI (format, vet, build, test, race, govulncheck, container smoke test)
+.github/workflows/   CI (format, vet, build, test, race, govulncheck, container smoke test) and the release workflow (GHCR images with SBOM and provenance, Phase 5)
 ```
 
 `pkg/` holds code meant to be importable by both binaries and, eventually,
@@ -478,12 +487,21 @@ holds code private to this module.
   AuditEvent) — see [ADR 0011](adr/0011-conductor-storage-and-run-model.md).
   PostgreSQL and multi-replica Conductor are explicitly out of scope for
   now (see [non-goals](#non-goals)).
-- **No SPA framework** before Phase 5; the initial UI is deliberately
-  minimal.
+- **No SPA framework, no build step** for the GUI (Phase 5): three
+  static files embedded in the binary, DOM rendering, a strict
+  Content-Security-Policy, and OIDC authorization code + PKCE in the
+  browser as a public client. The API's token verification is written in
+  the repository on the standard library's `crypto/rsa` and
+  `crypto/ecdsa` rather than taken from a JWT library, so that what is
+  accepted is exactly what the threat model lists
+  ([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)).
 - **Runner image**: multi-stage build, pinned official `lego` binary
   fetched and checksum-verified (Phase 1), distroless static base image.
 - **GHCR** (`ghcr.io/cits-nue/acme-conductor`,
-  `ghcr.io/cits-nue/acme-runner`) is the canonical container registry.
+  `ghcr.io/cits-nue/acme-runner`) is the canonical container registry;
+  a version tag publishes both images for `linux/amd64` and
+  `linux/arm64` with an SBOM and SLSA provenance attached, from
+  digest-pinned base images ([ADR 0017](adr/0017-release-pipeline.md)).
 - **Configuration**: non-secret configuration via environment variables or
   a config file; secrets are never part of Conductor configuration at all,
   by design (the Conductor holds no DNS, Key Vault, or long-lived cloud
@@ -534,7 +552,7 @@ These hold across every phase and are traced to concrete mitigations in
 
 ## Roadmap
 
-**Phases 0 to 4** are implemented today. Phases are strictly
+**Phases 0 to 5** are implemented today. Phases are strictly
 sequential; a given pull request implements one phase's scope and no more
 (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
@@ -545,7 +563,7 @@ sequential; a given pull request implements one phase's scope and no more
 | 2 | **Implemented.** Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. See [`docs/conductor.md`](conductor.md), [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and [ADR 0012](adr/0012-localhost-only-dev-auth.md). |
 | 3 | **Implemented.** Azure Key Vault store adapter, authenticated with the platform's managed identity (or the SDK's `DefaultAzureCredential` chain for development). See [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) and [ADR 0013](adr/0013-azure-key-vault-store-adapter.md). |
 | 4 | **Implemented.** Azure Container Apps Job launcher (the Runner as a scheduled Job under its own managed identity that takes the jobs the Conductor offers on a shared volume; the Conductor cannot start executions), provisioned via Bicep with disjoint identities and least-privilege custom roles; signed, expiring job envelope with a Runner-side replay ledger, and Runner-signed Results. See [`docs/conductor.md`](conductor.md#execution-binding-azure-container-apps-job), [`deploy/azure/README.md`](../deploy/azure/README.md), [ADR 0014](adr/0014-azure-container-apps-job-launcher.md) and [ADR 0015](adr/0015-signed-job-envelope.md). |
-| 5 | OIDC auth, a minimal GUI, GHCR releases with SBOM and provenance. |
+| 5 | **Implemented.** OIDC bearer-token authentication with named principals and admin/viewer roles, a TLS listener or an explicit behind-ingress statement, a minimal static GUI with PKCE sign-in, and a release workflow that publishes both images to GHCR with an SBOM and provenance from digest-pinned bases. The Container Apps deployment gains an HTTPS ingress and loses the admin sidecar. See [`docs/conductor.md`](conductor.md#authentication), [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md) and [ADR 0017](adr/0017-release-pipeline.md). |
 | 6 | Migration tooling from the existing cert-infra repository (import/diff/shadow mode, feature-flag switch). |
 
 ## Non-goals

@@ -16,7 +16,13 @@ and a Runner-side replay ledger, the Azure Container Apps Job launcher
 (the Runner under its own managed identity) and the Bicep that provisions
 both identities with disjoint grants (see
 [ADR 0014](adr/0014-azure-container-apps-job-launcher.md) and
-[ADR 0015](adr/0015-signed-job-envelope.md)). Some mitigations below still
+[ADR 0015](adr/0015-signed-job-envelope.md)); **Phase 5** added OIDC
+bearer-token authentication with named principals and an admin/viewer
+role, a TLS listener or an explicit behind-ingress statement, a minimal
+static GUI, and a release pipeline that publishes both images with an
+SBOM and provenance from digest-pinned bases (see
+[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md) and
+[ADR 0017](adr/0017-release-pipeline.md)). Some mitigations below still
 describe where a control lands once a later phase ships, not what exists today. The
 [residual risks](#residual-risks--not-yet-mitigated) section is explicit
 about that gap.
@@ -92,12 +98,18 @@ Boundaries that matter:
 
 ## Actors / attackers
 
-- **External network attacker** — no credentials, reachable only at the
-  Conductor's UI/API surface (loopback-only in Phase 2, so effectively
-  unreachable from the network) and at CI.
-- **Local user or local web page on the Conductor host** — in Phase 2 the
-  API trusts any loopback peer, so a second user on the same host, or a
-  web page a local browser loads, is a distinct attacker (see T13).
+- **External network attacker** — no credentials, reachable at the
+  Conductor's API/GUI surface (since Phase 5 over a TLS ingress in
+  `oidc` mode; loopback-only in `localhost-dev`), at the identity
+  provider, and at CI. Can present arbitrary tokens and pages.
+- **Local user or local web page on the Conductor host** — in
+  `localhost-dev` mode the API trusts any loopback peer, so a second user
+  on the same host, or a web page a local browser loads, is a distinct
+  attacker (see T13). In `oidc` mode a local peer is nobody without a
+  token.
+- **Holder of a stolen or over-scoped token** — an access token taken
+  from a browser tab, a terminal or a log, or one issued by the
+  provider to a principal that should not hold the admin role (see T14).
 - **Malicious or compromised administrator/API caller** — can submit
   arbitrary `Target`/`CertificatePolicy` values through the API surface the
   Conductor exposes, but only through the schema that surface accepts.
@@ -126,17 +138,19 @@ Boundaries that matter:
 | T5 | FQDN policy bypass | An attacker crafts an FQDN or suffix list to slip past the intended policy: mismatched label boundaries, case differences, a trailing dot, an IDNA/punycode label, an unintended wildcard, or a duplicate JSON key that causes two validators to disagree on which value "wins". | Certificate issued for a domain the operator did not intend to authorize (e.g. `evil-example.ac.jp` treated as under `example.ac.jp`). | **Validation** (implemented, both sides of the boundary): `internal/policy/fqdn.go` normalizes before comparing (lower-case, single trailing dot stripped, ASCII-only) and matches suffixes on whole label boundaries only (`MatchesSuffix`), so `evil-example.ac.jp` is correctly rejected against the suffix `example.ac.jp`. `xn--` (IDNA A-label) input is rejected outright rather than silently accepted (see ADR 0006). Wildcards are accepted only as the whole left-most label. `pkg/api/v1alpha1/decode.go` rejects duplicate JSON keys before any validator sees the document, closing the classic "two parsers disagree" bypass. `JobSpec.Validate` checks that `target.fqdn` is consistent with the `policy` snapshot embedded in the same document — this is a self-consistency check of untrusted input, never authorization (see the doc comment on `JobSpec.Validate` and `TestJobSpecValidateIsSelfConsistencyNotAuthorization`). **Authorization** (implemented and wired, Phase 1): `internal/policy.RunnerAuthorizationPolicy.Authorize` decides, against a trusted allowed-suffix/wildcard/binding-name configuration that is loaded on the execution platform (`internal/runner/config`) and never taken from the JobSpec, whether the Runner may act at all. `Reconcile` calls it — deny-by-default — before resolving any binding or invoking `lego`; see [`docs/runner.md`](runner.md#execution-flow). This closes the gap T1/T2 previously described for a self-consistent-but-malicious document; it does not, and cannot, verify that the *content* behind an allowed binding (e.g. a DNS credential's actual zone scope) is itself correct — see T4. | Validation existing (`internal/policy`, decode/validate); authorization implemented and wired in the Runner (Phase 1) |
 | T6 | Secret leakage into logs/results/errors | A credential, private key, EAB HMAC, access token, or temporary PFX password ends up in a log line, a `Result.error.summary`, or an exception message. | Credential compromise even without direct access to the Conductor or Runner process — e.g. via log aggregation, error trackers, or a leaked `Result` document. | `validate.go`'s `validateOpaqueText` rejects non-printable characters (control characters, Unicode line/paragraph separators, bidi/format characters) and a case-insensitive-where-meaningful set of secret markers (`-----BEGIN`, `private key`, `eyJ` JWT/JWS/EAB-shaped base64, `AKIA`, `ghp_`, `github_pat_`, `bearer `, `basic `, `authorization:`, `password=`, `secret=`, `token=`, `sig=`, `key=`, and similar) in any `Result` free-text field. This is a **defense-in-depth heuristic, not a secret detector**: it catches common accidental leaks by known shape but cannot recognize an arbitrary secret or an unknown format. `storeObjectRef` is now a strict logical name (`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, max 128, `..` rejected) — never a URL, path, query string, or credential-bearing value. `ResultError` is a fixed machine code plus a short summary; the field rules above are a supporting control only — character class, length and known-marker checks cannot, by themselves, keep a raw error, a command line, or environment contents out of a summary. **Implemented (Phase 1) — the real control**: `internal/runner/reconcile.go` never copies a raw external command/SDK error, `lego` stdout, or `lego` stderr into a `Result`; `error.summary` is generated only from a fixed set of Runner-owned safe templates keyed by `error.code` (see [`docs/runner.md`](runner.md#result-and-error-codes)), and if a templated summary would still fail the `Result` contract's own checks, the Runner falls back to a generic, code-specific summary rather than skip producing a `Result`. Raw `lego` output goes only to internal logs, and only after redaction: `internal/runner/lego.Redactor` masks resolved `passthroughEnv`/EAB secret values and PEM-shaped lines before a `lego` output line is logged at debug level. This redaction is **value-based and heuristic** — it masks the specific secret values the Runner itself resolved and known PEM markers, not an arbitrary or unknown-format secret — and it covers `lego` output specifically, not every log statement in the codebase; a dedicated redaction test suite across the rest of the codebase's log statements is still open (Phase 3+). **Phase 2**: the Conductor never copies a Runner's stderr into a run record or an audit event — a run's `error.summary` comes only from the `Result` (contract-validated) or from Conductor-owned templates, and the Runner's stderr is relayed to the debug log only, bounded and with non-printable characters replaced; audit details are Conductor-owned sentences over validated values. | Existing (Result field validation, marker heuristic, Runner-owned safe-summary templates, lego-output redaction, Conductor-owned run/audit text); log-wide redaction test suite Phase 3+ |
 | T7 | Double execution / concurrent reconcile of the same target | Two `Run`s for the same `Target` execute concurrently (e.g. a retried scheduler tick, a re-delivered queue message, or an operator manually triggering a run while one is already in flight). | Wasted ACME rate-limit budget, two ACME orders, or two Runners fighting over the same DNS TXT record. The Certificate Store and the account state themselves are not corrupted by it: writes and reads are serialized by advisory locks (`internal/fslock`), and the last writer wins. | **Existing (Phase 1)**: store/state consistency under concurrent runs (advisory locks, atomic link swaps). **Implemented (Phase 2)**: at most one queued/starting/running run per target, enforced by a partial unique index in the registry so no code path (scheduler tick, operator request, restart) can create a second one; optimistic locking on `Target.revision` (every update names the revision it acts on); each run records the revision it was requested for and is cancelled, not started, if the target was disabled or moved on in the meantime; an operator request may name the revision it acts on and a second request answers `409 run_active`. See [ADR 0011](adr/0011-conductor-storage-and-run-model.md). A second Conductor process on the same database (another port, same `database.path`) is refused at startup by an exclusive `flock` on `<database.path>.lock`, taken before recovery or any other state change, so two schedulers cannot plan against one registry and a newcomer cannot mark the owner's in-flight runs failed. Bookkeeping follows the registry's actual status (each transition is written against the last recorded status, retried on transient failure, reconciled on conflict), and a run whose outcome could not be recorded is closed by the loop's sweep, so a Runner's outcome is not lost to one failed write and a stranded run does not hold the target's slot until a restart. **Residual**: a Runner orphaned by a hard kill of the Conductor (its run is marked failed/"outcome unknown" at the next start) can still be finishing when the next due run starts; and a Runner started by hand or by another launcher is outside the registry entirely. | Store/state consistency (Phase 1); run-level exclusion and single-process ownership implemented (Phase 2); orphaned-Runner residual accepted |
-| T8 | Supply chain | A malicious or vulnerable dependency, base image, GitHub Action, or `lego` release is pulled into a build. | Compromised build output; a vulnerable component shipped in a released image. | `lego` is pinned to a specific, version-checked release (Phase 1) rather than "latest". Both Dockerfiles build from `golang:1.25-bookworm`, and are documented to switch to a digest-pinned base image at release time; runtime images are `gcr.io/distroless/static-debian12:nonroot` (minimal attack surface, no shell). CI runs `govulncheck` on every push/PR (`.github/workflows/ci.yml`). Deployments are required to pin images by commit SHA or digest, never `latest`. SBOM and provenance generation land in Phase 5. | Partial now (govulncheck, distroless, CGO disabled); digest pinning and SBOM/provenance Phase 5 |
+| T8 | Supply chain | A malicious or vulnerable dependency, base image, GitHub Action, or `lego` release is pulled into a build. | Compromised build output; a vulnerable component shipped in a released image. | `lego` is pinned to a specific, version-checked release (Phase 1) rather than "latest". **Implemented (Phase 5)** ([ADR 0017](adr/0017-release-pipeline.md)): both Dockerfiles build from base images pinned by digest (`golang:1.25-bookworm@sha256:…`, `gcr.io/distroless/static-debian12:nonroot@sha256:…` — minimal attack surface, no shell), Dependabot proposes updates to bases, Go modules and Actions as CI-tested pull requests, and a version tag publishes both images to GHCR with a BuildKit SPDX SBOM and SLSA provenance (`mode=max`) attached in the registry plus a GitHub-signed artifact attestation (`gh attestation verify`), after the CI workflow has passed on the same commit. CI runs `govulncheck` on every push/PR. Deployments pin images by digest, never `latest`; the OIDC verifier is written in the repository on the standard library rather than pulling a JWT library. **Residual**: GitHub Actions are pinned by major tag, not by commit digest; the release workflow's first run is its verification. | Implemented (Phase 5): digest-pinned bases, SBOM, provenance, attestation; Actions digest pinning open |
 | T9 | Denial of service via oversized/hostile documents | A very large or deeply-nested `JobSpec`/`Result` document is submitted to exhaust memory or CPU during decoding. | Resource exhaustion on the Conductor or Runner. | `decodeStrict` reads through an `io.LimitReader` capped at `MaxDocumentSize` (64 KiB) and rejects anything larger before decoding. The size cap alone does not bound CPU: a 64 KiB document of nothing but nested brackets can make a naive recursive walker superlinear. The duplicate-key walker therefore also enforces `MaxNestingDepth` (8 levels; the contract needs 3) and renders diagnostic paths only on error, so the cost of any accepted-size document is linear in its length (`TestDecodeRejectsDeepNestingQuickly`). | Existing (`pkg/api/v1alpha1/decode.go`) |
 | T10 | Privilege separation failure between Conductor and Runner identities | The Conductor is accidentally granted DNS write, Certificate Store read, or other Runner-scoped permissions (e.g. through shared service-principal reuse or overly broad IAM at deployment time), collapsing the intended separation. | A Conductor compromise (T1) escalates to full DNS/Store compromise instead of being contained. | Principle 5 is a deployment-time requirement as much as a code-time one: Conductor and Runner identities must be provisioned separately, with the Conductor's identity granted neither DNS write nor Store read. **Implemented (Phase 4)**: Azure resources are declared in Bicep (`deploy/azure`, [ADR 0014](adr/0014-azure-container-apps-job-launcher.md)), so the IAM grants are reviewable, versioned artifacts: two user-assigned identities; the Conductor's holds one custom role on the Runner Job (`jobs/execution/read`, `jobs/executions/read`, `jobs/stop/execution/action` — read, list and stop executions; deliberately not `jobs/start/action`, whose execution template could replace the Runner's image) and no DNS, Key Vault or storage data permission; the Runner's holds one custom role on the DNS zone (zone read, TXT read/write/delete) and one on the vault (`certificates/read`, `certificates/import/action`) and nothing on the Job, the app or storage. The Runner authenticates to DNS and Key Vault with that identity, so no credential exists in either environment. **Residual (local launcher only)**: the local-process launcher's `passthroughEnv` forwards a Runner credential from the Conductor's own environment on a development host; it remains documented as development-only in [`docs/conductor.md`](conductor.md#configuration-reference). What Bicep cannot enforce: that the deployer does not add further grants by hand afterwards. | Enforced in infrastructure (Phase 4); local launcher remains dev only |
 | T11 | Disable vs purge confusion | An operator (or a bug) treats "disable" as if it deletes data, or conversely expects "disable" to also revoke/destroy the certificate. | Either a false sense that sensitive history has been removed, or an unexpected loss of audit trail / certificate availability. | There is no purge operation in the MVP at all (see [ADR 0008](adr/0008-no-purge-in-mvp.md)): `Target.enabled = false` stops future issuance/renewal but leaves the `Target`, its `Run` history, and its `AuditEvent`s intact. A future purge is scoped to be a separate, explicitly audited operation, never a side effect of disable. **Implemented (Phase 2)**: `enabled` on targets and policies, `POST …/disable` and `…/enable` endpoints (each audited), and schema triggers that abort any `DELETE` on targets, runs or policies and any `UPDATE`/`DELETE` on audit events. | Existing (design and schema, Phase 2) |
 | T12 | Production CA misuse from tests | An automated test accidentally issues a real certificate against a production ACME CA (e.g. Let's Encrypt production), burning rate limits or leaving orphaned certificates. | Rate-limit exhaustion affecting real issuance; unintended public certificates for test domains. | Principle 8: production ACME CAs are never called from automated tests. **Implemented (Phase 1)**: `internal/runner/config` allows an `ACMEBinding.directoryURL` without `allowProductionCA` only when it is explicitly recognized as a staging/test/local directory (a loopback, private or link-local IP literal, or a host with a whole label such as `staging`, `test`, `sandbox`, `pebble`, `localhost`, `dev`, `local`, `internal`); every other directory is treated as production and refused unless `allowProductionCA: true` is set explicitly. This is a fail-closed allow-rule, not a denylist of known CAs, so an unknown production CA cannot be reached by accident either; Runner tests exercise `reconcile` against `internal/runner/fakelego`, a test double that imitates `lego`'s file/exit-code behavior with no network access at all, never a real or staging ACME server. This is also a per-PR review checklist item (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)). | Enforced (Phase 1): fail-closed staging/test allow-rule plus a fake `lego` in tests |
-| T13 | API reached by an unintended local caller | The Phase 2 API authenticates nothing finer than "a loopback peer": another user on the same host, or a web page loaded in a local browser (DNS rebinding to a name that resolves to `127.0.0.1`, cross-site `fetch`/form posts), reaches the API. | Full administrative control of targets and policies (issuance requests for any name the Runner's policy allows), and reading of audit data. Never key material or credentials (T1). | `internal/conductor/api.LocalhostDev` ([ADR 0012](adr/0012-localhost-only-dev-auth.md)): configuration refuses a non-loopback `server.listen` host (names are rejected, not resolved) and `Serve` re-checks the bound address; the TCP peer must be loopback; the `Host` header must be a loopback name on the listener's port (defeats DNS rebinding); an `Origin` header must be the API's own loopback origin (`null` and foreign origins refused); `Sec-Fetch-Site` must be `same-origin`/`none`; a request with a body must be `application/json` (a simple-request form post cannot be); every request body is strictly decoded and capped at 64 KiB (T9). Each rule has a test. **Residual**: a local user with loopback access is an administrator; there is no principal finer than `localhost-dev` in the audit log. | Implemented (Phase 2) as a development mode; OIDC with named principals Phase 5 |
+| T13 | API reached by an unintended caller | `localhost-dev` authenticates nothing finer than "a loopback peer": another user on the same host, or a web page loaded in a local browser (DNS rebinding to a name that resolves to `127.0.0.1`, cross-site `fetch`/form posts), reaches the API. In `oidc` mode: a network caller without a token, with a forged, expired, replayed-from-elsewhere (other issuer or audience) or algorithm-confused token, or with a valid token that carries no role. | Full administrative control of targets and policies (issuance requests for any name the Runner's policy allows), and reading of audit data. Never key material or credentials (T1). | `internal/conductor/api.LocalhostDev` ([ADR 0012](adr/0012-localhost-only-dev-auth.md)): configuration refuses a non-loopback `server.listen` host (names are rejected, not resolved) and `Serve` re-checks the bound address; the TCP peer must be loopback; the `Host` header must be a loopback name on the listener's port (defeats DNS rebinding); an `Origin` header must be the API's own loopback origin (`null` and foreign origins refused); `Sec-Fetch-Site` must be `same-origin`/`none`; a request with a body must be `application/json` (a simple-request form post cannot be); every request body is strictly decoded and capped at 64 KiB (T9). Each rule has a test. **Implemented (Phase 5)** ([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)): mode `oidc` (`internal/conductor/oidc`) accepts only an `Authorization: Bearer` token (never a cookie or query parameter) that is a compact JWS signed with RS256/PS256/ES256 (`none` and HMAC refused; the key's type must match the algorithm) by a key id in the provider's published set (RSA ≥ 2048 bits, P-256; discovery document must name the configured issuer; bounded reads; cached, refreshed on age or unknown key id at most once a minute), whose `iss` equals the configured issuer, `aud` contains the configured audience, `exp`/`nbf`/`iat` admit now within a bounded skew, whose header and claims decode strictly (duplicates refused, `crit` refused), whose principal claim is a bounded printable string, and whose roles claim maps to admin or viewer; a viewer's non-`GET` request and a role-less token are `403`, everything else `401` with a challenge, enforced in the one middleware every API endpoint sits behind. Every rule has a test against an in-process provider. **Residual**: in `localhost-dev` a local user with loopback access is an administrator and the audit log's actor is `localhost-dev`; the mode is for one development host and is named in configuration. | Implemented: `oidc` (Phase 5) for production, `localhost-dev` (Phase 2) for development |
+| T14 | Stolen, leaked or over-granted bearer token | An access token is taken from a browser tab, a terminal history, a proxy log or a pasted command, or the provider issues an admin-role token to a principal that should not hold it (misassigned app role, compromised provider account). | Whatever the token's role allows until it expires: administration of targets and policies (admin) or reading of the registry and audit log (viewer). Never key material (T1). | The token is accepted only over TLS unless the configuration states that a platform ingress terminates it (`server.tls` or `server.behindTlsProxy`; a non-loopback plaintext listener is refused), so it does not travel in the clear; the GUI keeps it in the tab's session storage (gone with the tab, never in a URL or a cookie) under a Content-Security-Policy that admits no foreign script; the Conductor never logs a token or echoes one in an error; expiry is enforced with a small skew and the Conductor adds no lifetime of its own; the audience check keeps a token issued for another API out; the audit log names the principal, so misuse is attributable. **Residual**: no revocation or introspection check — a stolen token is valid until the provider's expiry (about an hour for Entra ID); role assignment is provider-side administration this project cannot audit; the session-storage copy is readable by script on the page's origin, which the CSP confines to the page's own script. | Implemented (Phase 5); revocation not modelled |
+| T15 | The GUI as an attack surface | A page served by the Conductor is used against its operator: markup injected through an FQDN, owner, error summary or audit detail (XSS), a cross-site request that rides the operator's session (CSRF), the page framed by another site (clickjacking), or a sign-in response forged or replayed (authorization code injection). | With XSS, the operator's token and therefore their role; with CSRF, an action in the operator's name; with a forged sign-in, a session under an attacker's account. | The GUI renders everything through DOM methods (`textContent`, `createElement`) — nothing from the API or the URL becomes markup — and ships under `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' <token endpoint origin>; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` with `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, so injected markup cannot execute and no third-party asset loads; the API is called with a bearer header and no cookie, so a cross-site request carries no credential (in `localhost-dev` the `Origin`/`Sec-Fetch-Site`/content-type rules of T13 apply); the sign-in is the authorization code flow with PKCE (S256) and a random `state` bound to the tab, so a code cannot be injected or replayed into another tab's flow; the code exchange goes only to the token endpoint the Conductor read from the provider's discovery document. **Residual**: the GUI trusts `/ui/config`, which is the Conductor's own, unauthenticated statement of the provider; a Conductor compromise (T1) could point the page at another provider — and already holds everything the page can reach. | Implemented (Phase 5) |
 
 ## Assurance levels
 
 A single "is it secure" question does not fit this system; these three
-lists say precisely what today's code (Phases 0–2) guarantees, what it
+lists say precisely what today's code (Phases 0–5) guarantees, what it
 does not, and what closes the gap.
 
 **Guaranteed today:**
@@ -188,8 +202,24 @@ does not, and what closes the gap.
 - **API input is shape-limited (Phase 2)**: strictly decoded, capped,
   identifiers and binding names syntax-checked, FQDNs and suffixes
   normalized and label-boundary matched before storage, no field for a
-  command/image/path/credential; and the API is reachable only from a
-  loopback peer with a loopback `Host`/`Origin`.
+  command/image/path/credential; and in `localhost-dev` the API is
+  reachable only from a loopback peer with a loopback `Host`/`Origin`.
+- **Named, role-bound callers in `oidc` mode (Phase 5)**: every API
+  request carries a bearer token that verified against the provider's
+  published key for the configured issuer and audience within its
+  validity window, with `none`/HMAC refused, duplicate claims refused
+  and an unknown key id refreshed at most once a minute; the caller's
+  name is the configured claim, its role is admin or viewer, and a
+  viewer cannot write — enforced in one middleware for every endpoint.
+  A bearer token never travels on a non-loopback plaintext listener
+  unless the configuration states TLS is terminated in front of it.
+- **The GUI executes nothing but its own script (Phase 5)**: static,
+  embedded, DOM-rendered, under a CSP that admits no inline or foreign
+  script and no framing; sign-in is PKCE with a tab-bound state.
+- **What a release is built from is fixed (Phase 5)**: base images by
+  digest, `lego` by checksum, Go modules by `go.sum`; a published image
+  carries an SBOM and provenance and a GitHub-signed attestation, and is
+  published only after the CI workflow passed on its commit.
 
 - **Job authenticity, integrity and expiry (Phase 4)**: with
   `jobSigning` configured, a Runner acts only on a
@@ -229,15 +259,16 @@ does not, and what closes the gap.
   writers and readers, so neither is corrupted or observed half-swapped
   by it, but the double issuance itself is not prevented in those cases.)
 - Any identity finer than "a process on the Conductor host" for API
-  callers (T13); the audit log's actor is `localhost-dev` for every API
-  action.
+  callers in `localhost-dev` mode (T13); in `oidc` mode, that the
+  provider assigned the admin role to the right people, or that a
+  stolen token is refused before it expires (T14).
 - That a Runner started by the local-process launcher holds a credential
   the Conductor's environment does not also hold (T10, `passthroughEnv`).
 
 **Planned:**
 
 - Log redaction tests across the codebase (Phase 3+).
-- OIDC authentication with named principals for the API (Phase 5).
+- GitHub Actions pinned by commit digest (T8, [ADR 0017](adr/0017-release-pipeline.md)).
 
 ## Residual risks / not yet mitigated
 
@@ -245,7 +276,8 @@ Phase 0 shipped the contract, the FQDN policy engine, and CI. Phase 1 added
 the Runner runtime, its trusted configuration, authorization wiring, the
 bundled `lego` CLI, and the filesystem Certificate Store. Phase 2 added the
 Conductor MVP: registries, audit log, scheduler, local launcher and the
-loopback-only API. Being explicit about what remains open:
+loopback-only API. Phase 5 added OIDC authentication, the GUI and the
+release pipeline. Being explicit about what remains open:
 
 - **Signing authenticates the producer, not the decision (T1, T2, T3).**
   Since Phase 4 a `JobSpec` can travel as a signed, expiring envelope and
@@ -327,15 +359,22 @@ loopback-only API. Being explicit about what remains open:
   stdout/stderr (code-enforced, value-based redaction) but not every log
   statement elsewhere in the codebase; that relies on code review and the
   per-PR checklist until a dedicated test exists (Phase 3+).
-- **No SBOM/provenance, no digest pinning at build time.** T8 is partially
-  mitigated (govulncheck, pinned Go toolchain by tag, distroless runtime);
-  digest pinning and SBOM/provenance are explicitly Phase 5 work.
-- **The API's authentication is a development mode (T13).** `localhost-dev`
-  trusts every loopback peer: any local user is an administrator, and the
-  audit log cannot tell two of them apart. The loopback/`Host`/`Origin`/
-  `Sec-Fetch-Site`/content-type rules keep a local browser and a rebound
-  DNS name out, nothing more. The mode is named in configuration so a
-  deployment cannot be in it silently; OIDC is Phase 5.
+- **GitHub Actions are pinned by tag, not digest; the release workflow
+  has not run yet (T8).** Base images, `lego` and Go modules are pinned
+  by digest or checksum and releases carry an SBOM, provenance and a
+  signed attestation, but the Actions a build runs are selected by major
+  version tag (kept current by Dependabot), and the first version tag
+  is what verifies the workflow end to end.
+- **`localhost-dev` is still a development mode (T13).** It trusts every
+  loopback peer: any local user is an administrator, and the audit log
+  cannot tell two of them apart. It is for one development host; the
+  mode is named in configuration so a deployment cannot be in it
+  silently, and `oidc` is the production mode.
+- **A bearer token is valid until it expires (T14).** The Conductor
+  checks signature, issuer, audience, validity window and role; it does
+  not consult the provider about revocation, and it cannot see whether
+  the provider assigned a role to the right person. Role assignment and
+  token lifetime are provider-side controls.
 - **The local-process launcher puts a Runner credential in the
   Conductor's environment (T10).** `passthroughEnv` is the only way a DNS
   credential or EAB secret reaches a Runner started by the local
@@ -350,10 +389,12 @@ loopback-only API. Being explicit about what remains open:
   action names, SQLite and `flock` on an SMB share, and the Result
   propagation delay are documented expectations until a first deployment
   confirms them (`deploy/azure/README.md`).
-- **API administration in Container Apps goes through a sidecar (T13).**
-  Until Phase 5, the loopback-only API is reached with `az containerapp
-  exec` into an optional admin sidecar; Azure RBAC on the Container App
-  is the access control, and the audit log still records `localhost-dev`.
+- **The Container Apps ingress and peer encryption are documented, not
+  observed (T14).** The Bicep sets `allowInsecure: false` and enables
+  the environment's peer-traffic encryption so the hop from the ingress
+  to the replica is not plaintext; `server.behindTlsProxy: true` in the
+  Conductor's configuration is the operator's statement that this holds.
+  A first deployment should confirm it before an admin token is used.
 - **A hard kill leaves the outcome of in-flight runs unknown.** They are
   recorded as `failed`/`Internal` at the next start, never resumed or
   guessed; an orphaned Runner may still have finished its work in the

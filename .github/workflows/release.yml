@@ -1,0 +1,139 @@
+name: Release
+
+# Publishes both container images to GHCR when a version tag is pushed
+# (docs/adr/0017). Every image is built for linux/amd64 and linux/arm64,
+# carries a BuildKit SBOM and SLSA provenance attestation in the registry,
+# and is attested again as a GitHub artifact attestation, so an operator
+# can verify where an image came from before pinning its digest in
+# deploy/azure/main.bicepparam:
+#
+#   gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:v0.5.0 --owner CITS-NUE
+#   docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:v0.5.0 \
+#     --format '{{ json .Provenance }}'
+#
+# A tag on a commit that does not pass the CI workflow publishes nothing:
+# the verify job below is the CI workflow itself.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  images:
+    name: image (${{ matrix.component }})
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [conductor, runner]
+    env:
+      IMAGE: ghcr.io/cits-nue/acme-${{ matrix.component }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # v1.2.3 -> 1.2.3, 1.2 and (for a non-prerelease) latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=acme-${{ matrix.component }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Compute build date
+        id: build_date
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # sbom: true attaches an SPDX SBOM of the image contents; provenance
+      # mode=max attaches SLSA provenance including the full build
+      # definition. Both live in the registry next to the image index.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.build_date.outputs.value }}
+          sbom: true
+          provenance: mode=max
+
+      # A second, GitHub-signed provenance statement, stored in the
+      # registry under the image digest and verifiable with `gh
+      # attestation verify`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Smoke test the published image
+        run: |
+          out="$(docker run --rm --read-only --user 65532:65532 \
+            "${IMAGE}@${{ steps.build.outputs.digest }}" --version)"
+          echo "$out"
+          case "$out" in
+            acme-${{ matrix.component }}\ ${{ github.ref_name }}*) ;;
+            *)
+              echo "unexpected --version output: $out" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Record the digest
+        run: |
+          {
+            echo "## ${IMAGE}"
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Tags: ${{ steps.meta.outputs.tags }}" | tr '\n' ' '
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"

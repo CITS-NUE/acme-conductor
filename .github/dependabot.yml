@@ -1,0 +1,17 @@
+# Keeps the pinned inputs of the build current: GitHub Actions, Go
+# modules and the digest-pinned container base images. Each update is a
+# reviewable pull request that CI builds and tests; nothing floats.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

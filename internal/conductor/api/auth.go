@@ -13,21 +13,49 @@ import (
 )
 
 // Principal is the authenticated caller of a request. Name is recorded as
-// the actor of audit events and the requestedBy of runs.
+// the actor of audit events and the requestedBy of runs; Role decides
+// what the caller may do.
 type Principal struct {
 	Name string
+	Role Role
 }
 
-// Authenticator decides who a request comes from. Phase 2 ships only
-// LocalhostDev; later phases add OIDC behind the same interface.
+// Role is what a principal may do. There are two: an admin may call
+// every endpoint, a viewer only the read-only ones (GET). Authorization
+// is by HTTP method, enforced in the authentication middleware for every
+// endpoint under the API prefix, so no handler can forget it.
+type Role string
+
+// Roles.
+const (
+	RoleAdmin  Role = "admin"
+	RoleViewer Role = "viewer"
+)
+
+// Authenticator decides who a request comes from. LocalhostDev (Phase 2)
+// and the OIDC bearer-token authenticator (Phase 5,
+// internal/conductor/oidc) implement it.
 type Authenticator interface {
 	// Authenticate returns the caller or an error describing why the
-	// request is refused. The error text is sent to the client.
+	// request is refused. The error text is sent to the client; it must
+	// never contain the credential that was presented. An error wrapping
+	// ErrForbidden means the caller was identified but is not permitted;
+	// anything else means it was not identified.
 	Authenticate(r *http.Request) (Principal, error)
+}
+
+// Challenger is implemented by an Authenticator whose failures should be
+// answered with 401 and a WWW-Authenticate challenge (bearer tokens).
+// Without it a refusal is a plain 403.
+type Challenger interface {
+	Challenge() string
 }
 
 // ErrUnauthenticated is wrapped by every authentication failure.
 var ErrUnauthenticated = errors.New("unauthenticated")
+
+// ErrForbidden is wrapped when the caller is identified but not permitted.
+var ErrForbidden = errors.New("forbidden")
 
 // LocalhostDevPrincipal is the name every caller gets under LocalhostDev.
 const LocalhostDevPrincipal = "localhost-dev"
@@ -71,7 +99,7 @@ func (a LocalhostDev) Authenticate(r *http.Request) (Principal, error) {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return Principal{}, fmt.Errorf("%w: Sec-Fetch-Site %q is not accepted", ErrUnauthenticated, site)
 	}
-	return Principal{Name: LocalhostDevPrincipal}, nil
+	return Principal{Name: LocalhostDevPrincipal, Role: RoleAdmin}, nil
 }
 
 func (a LocalhostDev) checkHost(hostport, header string) error {

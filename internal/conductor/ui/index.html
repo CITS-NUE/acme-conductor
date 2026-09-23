@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>ACME Conductor</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/targets">ACME Conductor</a>
+    <nav id="nav">
+      <a href="#/targets" data-nav="targets">Targets</a>
+      <a href="#/policies" data-nav="policies">Policies</a>
+      <a href="#/runs" data-nav="runs">Runs</a>
+      <a href="#/audit" data-nav="audit">Audit</a>
+    </nav>
+    <div id="session" class="session"></div>
+  </header>
+  <main id="main">
+    <noscript><p class="notice error">This interface needs JavaScript.</p></noscript>
+  </main>
+  <footer class="foot">
+    <span>The Conductor never holds a private key; nothing here can show one.</span>
+    <a href="/api/v1alpha1/bindings">API</a>
+  </footer>
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 # Contributing to ACME Conductor
 
 Thanks for your interest in ACME Conductor. This project is early
-(Phase 4 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
+(Phase 5 — see [`docs/architecture.md`](docs/architecture.md#roadmap)) and
 its security properties depend on a strict, boundary-respecting design;
 please read this document before opening a pull request.
 
@@ -39,8 +39,25 @@ Changes under `deploy/azure` should also compile and lint with the Bicep
 CLI (`bicep build deploy/azure/main.bicep`, `bicep lint
 deploy/azure/main.bicep`); CI does not run it yet.
 
+## Releases
+
+A release is a version tag on `main` (`git tag v0.5.0 && git push origin
+v0.5.0`). The release workflow (`.github/workflows/release.yml`) runs
+the CI workflow first and then publishes both images to GHCR for
+`linux/amd64` and `linux/arm64` with an SBOM and provenance attached
+([ADR 0017](docs/adr/0017-release-pipeline.md)); the image digests are
+in the run's summary. Nothing is published from a branch or a pull
+request. Dependabot proposes updates to the digest-pinned base images,
+Go modules and GitHub Actions; treat those pull requests like any other
+(CI must pass, read what changed).
+
 ## Coding rules
 
+- **No inline script or third-party asset in the GUI.** The page is
+  served under `default-src 'none'`; everything it renders goes through
+  DOM methods (`textContent`, `createElement`), never through markup
+  built from API data or the URL. A change that needs `unsafe-inline` or
+  an external origin is a design change, not a tweak.
 - **No secrets in logs, config, the database, or `Result` documents.**
   Credentials, private keys, the ACME EAB HMAC, access tokens, and
   temporary PFX passwords must never appear in a log line, a config file

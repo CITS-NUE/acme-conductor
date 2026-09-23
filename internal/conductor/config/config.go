@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,20 @@ const (
 	MaxClaimTimeoutSeconds     = 86400
 	DefaultResultGraceSeconds  = 30
 	MaxResultGraceSeconds      = 600
+
+	// OIDC bounds. DefaultOIDCClockSkewSeconds is the tolerance applied
+	// to a token's exp/nbf/iat; DefaultOIDCKeyCacheSeconds is how long
+	// the issuer's discovery document and signing keys are reused before
+	// they are fetched again.
+	DefaultOIDCClockSkewSeconds = 60
+	MaxOIDCClockSkewSeconds     = 300
+	DefaultOIDCKeyCacheSeconds  = 3600
+	MinOIDCKeyCacheSeconds      = 60
+	MaxOIDCKeyCacheSeconds      = 86400
+	MaxOIDCRoleValues           = 32
+	MaxOIDCScopes               = 16
+	MaxOIDCValueLength          = 256
+	MaxOIDCIssuerLength         = 512
 )
 
 // Authentication modes.
@@ -75,6 +90,18 @@ const (
 	// mode: it authenticates "whoever can reach this host's loopback
 	// interface", nothing finer. See docs/adr/0012.
 	AuthLocalhostDev = "localhost-dev"
+	// AuthOIDC accepts a bearer access token issued by one OpenID Connect
+	// provider for one audience, and maps a claim of it to a named
+	// principal and a role. It is the production mode (docs/adr/0016).
+	AuthOIDC = "oidc"
+)
+
+// Default OIDC claim names: the token claim that names the principal and
+// the one that lists its roles (both are what Microsoft Entra ID v2
+// access tokens carry; other providers are configured explicitly).
+const (
+	DefaultOIDCPrincipalClaim = "preferred_username"
+	DefaultOIDCRolesClaim     = "roles"
 )
 
 // Execution binding types.
@@ -120,6 +147,9 @@ var (
 )
 
 var envNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+// claimNameRe bounds the JWT claim names an OIDC configuration may select.
+var claimNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.:/-]{0,63}$`)
 
 // Environment variables the local launcher sets itself or that would change
 // how the child process is loaded; a binding may not pass them through.
@@ -231,14 +261,80 @@ type Server struct {
 	// authentication mode the host must be a loopback address.
 	Listen string `json:"listen"`
 	Auth   Auth   `json:"auth"`
+	// TLS, when present, makes the listener speak HTTPS with the named
+	// certificate and key (oidc mode only). A bearer token must never
+	// travel in the clear.
+	TLS *TLS `json:"tls,omitempty"`
+	// BehindTLSProxy states that TLS is terminated in front of this
+	// process by a platform ingress or reverse proxy that is the only
+	// route to the listener (Azure Container Apps ingress, for example),
+	// so that a non-loopback plaintext listener is acceptable in oidc
+	// mode. It is an explicit operator statement, never a default.
+	BehindTLSProxy bool `json:"behindTlsProxy,omitempty"`
 	// ShutdownGraceSeconds bounds how long in-flight runs may continue
 	// after the process is asked to stop; after that they are cancelled.
 	ShutdownGraceSeconds int `json:"shutdownGraceSeconds"`
 }
 
+// TLS names the listener's certificate and private key, both PEM files.
+// The key is the Conductor's own server identity, not a credential for
+// any other system.
+type TLS struct {
+	CertFile string `json:"certFile"`
+	KeyFile  string `json:"keyFile"`
+}
+
 // Auth selects the authentication mode of the API.
 type Auth struct {
 	Mode string `json:"mode"`
+	// OIDC configures mode "oidc"; it must be absent in any other mode.
+	OIDC *OIDC `json:"oidc,omitempty"`
+}
+
+// OIDC configures bearer-token authentication against one OpenID Connect
+// provider. It holds no secret: the Conductor is a resource server that
+// verifies tokens with the provider's published public keys, and the
+// optional GUI client is a public client (authorization code + PKCE).
+type OIDC struct {
+	// Issuer is the provider's issuer URL (https, or http to a loopback
+	// host for tests). Its discovery document is read from
+	// <issuer>/.well-known/openid-configuration and must name the same
+	// issuer; every token's iss must equal it exactly.
+	Issuer string `json:"issuer"`
+	// Audience is the value every token's aud must contain: the API's
+	// own identifier at the provider (an application ID URI or client
+	// ID). A token issued for anything else is refused.
+	Audience string `json:"audience"`
+	// ClientID is the public client the GUI signs in as. Without it the
+	// GUI cannot sign in (the API still accepts tokens obtained by other
+	// means).
+	ClientID string `json:"clientId,omitempty"`
+	// Scopes are what the GUI requests at sign-in. Default: "openid",
+	// "profile" and "<audience>/.default" (the Entra ID shape).
+	Scopes []string `json:"scopes,omitempty"`
+	// PrincipalClaim names the claim recorded as the actor of audit events
+	// and the requestedBy of runs (default preferred_username).
+	PrincipalClaim string `json:"principalClaim,omitempty"`
+	// RolesClaim names the claim (a string or an array of strings) whose
+	// values are matched against Roles (default roles).
+	RolesClaim string `json:"rolesClaim,omitempty"`
+	// Roles maps values of RolesClaim to the two API roles. A token that
+	// carries none of them is refused even though it verified.
+	Roles OIDCRoles `json:"roles"`
+	// ClockSkewSeconds is the tolerance applied to exp, nbf and iat.
+	ClockSkewSeconds int `json:"clockSkewSeconds,omitempty"`
+	// KeyCacheSeconds is how long the discovery document and the signing
+	// keys are reused before they are fetched again (an unknown key id
+	// triggers an earlier, rate-limited refresh).
+	KeyCacheSeconds int `json:"keyCacheSeconds,omitempty"`
+}
+
+// OIDCRoles lists the role-claim values that grant each API role.
+type OIDCRoles struct {
+	// Admin values grant every operation.
+	Admin []string `json:"admin"`
+	// Viewer values grant read-only access (GET only).
+	Viewer []string `json:"viewer,omitempty"`
 }
 
 // Database locates the SQLite registry.
@@ -469,14 +565,172 @@ func (s *Server) validate() error {
 		if !IsLoopbackHost(host) {
 			return invalid("server.listen host %q must be a loopback address in authentication mode %q", host, AuthLocalhostDev)
 		}
+		if s.Auth.OIDC != nil {
+			return invalid("server.auth.oidc applies to mode %q only", AuthOIDC)
+		}
+		if s.TLS != nil {
+			return invalid("server.tls applies to mode %q only", AuthOIDC)
+		}
+		if s.BehindTLSProxy {
+			return invalid("server.behindTlsProxy applies to mode %q only", AuthOIDC)
+		}
+	case AuthOIDC:
+		if s.Auth.OIDC == nil {
+			return invalid("server.auth.oidc is required for mode %q", AuthOIDC)
+		}
+		if err := s.Auth.OIDC.validate(); err != nil {
+			return err
+		}
+		if s.TLS != nil {
+			if s.BehindTLSProxy {
+				return invalid("server.tls and server.behindTlsProxy are mutually exclusive")
+			}
+			if err := s.TLS.validate(); err != nil {
+				return err
+			}
+		}
+		if !IsLoopbackHost(host) && s.TLS == nil && !s.BehindTLSProxy {
+			return invalid("server.listen host %q is not a loopback address: in mode %q the listener needs server.tls, or server.behindTlsProxy when a platform ingress terminates TLS in front of it", host, AuthOIDC)
+		}
 	default:
-		return invalid("server.auth.mode %q is not supported (only %q)", s.Auth.Mode, AuthLocalhostDev)
+		return invalid("server.auth.mode %q is not supported (only %q and %q)", s.Auth.Mode, AuthLocalhostDev, AuthOIDC)
 	}
 	if s.ShutdownGraceSeconds == 0 {
 		s.ShutdownGraceSeconds = DefaultShutdownGraceSeconds
 	}
 	if s.ShutdownGraceSeconds < 1 || s.ShutdownGraceSeconds > MaxShutdownGraceSeconds {
 		return invalid("server.shutdownGraceSeconds must be between 1 and %d", MaxShutdownGraceSeconds)
+	}
+	return nil
+}
+
+func (t *TLS) validate() error {
+	for name, v := range map[string]string{"certFile": t.CertFile, "keyFile": t.KeyFile} {
+		if v == "" || !filepath.IsAbs(v) || filepath.Clean(v) != v {
+			return invalid("server.tls.%s must be a clean absolute path", name)
+		}
+	}
+	return nil
+}
+
+func (o *OIDC) validate() error {
+	if len(o.Issuer) > MaxOIDCIssuerLength {
+		return invalid("server.auth.oidc.issuer must be at most %d bytes", MaxOIDCIssuerLength)
+	}
+	if err := ValidateIssuerURL(o.Issuer); err != nil {
+		return invalid("server.auth.oidc.issuer: %v", err)
+	}
+	if err := oidcValue("server.auth.oidc.audience", o.Audience, true); err != nil {
+		return err
+	}
+	if err := oidcValue("server.auth.oidc.clientId", o.ClientID, false); err != nil {
+		return err
+	}
+	if len(o.Scopes) > MaxOIDCScopes {
+		return invalid("server.auth.oidc.scopes: at most %d entries", MaxOIDCScopes)
+	}
+	if len(o.Scopes) > 0 && o.ClientID == "" {
+		return invalid("server.auth.oidc.scopes applies to the GUI client and needs clientId")
+	}
+	seenScope := map[string]struct{}{}
+	for i, sc := range o.Scopes {
+		if err := oidcValue(fmt.Sprintf("server.auth.oidc.scopes[%d]", i), sc, true); err != nil {
+			return err
+		}
+		if _, dup := seenScope[sc]; dup {
+			return invalid("server.auth.oidc.scopes[%d]: %q is listed twice", i, sc)
+		}
+		seenScope[sc] = struct{}{}
+	}
+	if o.ClientID != "" && len(o.Scopes) == 0 {
+		o.Scopes = []string{"openid", "profile", o.Audience + "/.default"}
+	}
+	if o.PrincipalClaim == "" {
+		o.PrincipalClaim = DefaultOIDCPrincipalClaim
+	}
+	if o.RolesClaim == "" {
+		o.RolesClaim = DefaultOIDCRolesClaim
+	}
+	for name, v := range map[string]string{"principalClaim": o.PrincipalClaim, "rolesClaim": o.RolesClaim} {
+		if !claimNameRe.MatchString(v) {
+			return invalid("server.auth.oidc.%s must match %s", name, claimNameRe)
+		}
+	}
+	if len(o.Roles.Admin) == 0 {
+		return invalid("server.auth.oidc.roles.admin must list at least one value")
+	}
+	if len(o.Roles.Admin) > MaxOIDCRoleValues || len(o.Roles.Viewer) > MaxOIDCRoleValues {
+		return invalid("server.auth.oidc.roles: at most %d values per role", MaxOIDCRoleValues)
+	}
+	seen := map[string]struct{}{}
+	for role, values := range map[string][]string{"admin": o.Roles.Admin, "viewer": o.Roles.Viewer} {
+		for i, v := range values {
+			if err := oidcValue(fmt.Sprintf("server.auth.oidc.roles.%s[%d]", role, i), v, true); err != nil {
+				return err
+			}
+			if _, dup := seen[v]; dup {
+				return invalid("server.auth.oidc.roles: value %q is listed twice", v)
+			}
+			seen[v] = struct{}{}
+		}
+	}
+	if o.ClockSkewSeconds == 0 {
+		o.ClockSkewSeconds = DefaultOIDCClockSkewSeconds
+	}
+	if o.ClockSkewSeconds < 1 || o.ClockSkewSeconds > MaxOIDCClockSkewSeconds {
+		return invalid("server.auth.oidc.clockSkewSeconds must be between 1 and %d", MaxOIDCClockSkewSeconds)
+	}
+	if o.KeyCacheSeconds == 0 {
+		o.KeyCacheSeconds = DefaultOIDCKeyCacheSeconds
+	}
+	if o.KeyCacheSeconds < MinOIDCKeyCacheSeconds || o.KeyCacheSeconds > MaxOIDCKeyCacheSeconds {
+		return invalid("server.auth.oidc.keyCacheSeconds must be between %d and %d", MinOIDCKeyCacheSeconds, MaxOIDCKeyCacheSeconds)
+	}
+	return nil
+}
+
+// oidcValue checks an audience, client id, scope or role value: printable
+// ASCII without whitespace, bounded. Such values are compared byte for
+// byte with token claims, so nothing that could look like something else
+// is accepted.
+func oidcValue(field, v string, required bool) error {
+	if v == "" {
+		if required {
+			return invalid("%s is required", field)
+		}
+		return nil
+	}
+	if len(v) > MaxOIDCValueLength {
+		return invalid("%s must be at most %d bytes", field, MaxOIDCValueLength)
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] <= ' ' || v[i] >= 0x7f {
+			return invalid("%s must be printable ASCII without whitespace", field)
+		}
+	}
+	return nil
+}
+
+// ValidateIssuerURL checks the shape of an OIDC issuer or endpoint URL:
+// absolute, https (http only to a loopback host, for tests), a host, no
+// user information, query or fragment. The same rule applies to the
+// endpoints a discovery document names.
+func ValidateIssuerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("not a URL")
+	}
+	if u.Host == "" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return fmt.Errorf("must be an absolute URL with a host and no user information, query or fragment")
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !IsLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("must use https (http is accepted for a loopback host only)")
+		}
+	default:
+		return fmt.Errorf("must use https")
 	}
 	return nil
 }

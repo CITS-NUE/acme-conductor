@@ -1,4 +1,4 @@
-// ACME Conductor on Azure Container Apps (Phase 4).
+// ACME Conductor on Azure Container Apps (Phase 4, OIDC and ingress Phase 5).
 //
 // Deploys, in one resource group:
 //   - a Container Apps environment with a Log Analytics workspace;
@@ -14,7 +14,10 @@
 //     nothing else;
 //   - the Runner as a scheduled Container Apps Job whose executions take
 //     the jobs the Conductor offers on the exchange share;
-//   - the Conductor as a single-replica Container App without ingress.
+//   - the Conductor as a single-replica Container App behind the
+//     environment's HTTPS ingress, authenticating API and GUI callers
+//     with OIDC bearer tokens (docs/adr/0016); the platform terminates
+//     TLS and the hop from ingress to replica is encrypted.
 //
 // Nothing here is a secret except the two signing private keys (the
 // Conductor's job-signing key, the Runner's result-signing key), each a
@@ -106,8 +109,26 @@ param claimTimeoutSeconds int = 300
 param runnerCronExpression string = '* * * * *'
 
 
-@description('Optional image for an administration sidecar in the Conductor replica (a shell with curl reaches the loopback-only API through `az containerapp exec`). Empty deploys no sidecar. Pin by digest.')
-param adminSidecarImage string = ''
+@description('OIDC issuer of the API\'s tokens, e.g. https://login.microsoftonline.com/<tenant-id>/v2.0 for Microsoft Entra ID (v2 tokens).')
+param oidcIssuer string
+
+@description('Audience every token must carry: the API app registration\'s application ID URI (api://...) or client ID.')
+param oidcAudience string
+
+@description('Client ID of the public client (SPA) the GUI signs in as; empty means the GUI cannot sign in. Its redirect URI is the conductorGuiRedirectUri output.')
+param oidcClientId string = ''
+
+@description('Values of the token roles claim that grant the admin role (every operation).')
+param oidcAdminRoles array
+
+@description('Values of the token roles claim that grant the viewer role (read only).')
+param oidcViewerRoles array = []
+
+@description('Whether the Conductor ingress is reachable from outside the environment. false keeps it internal to the environment\'s virtual network.')
+param ingressExternal bool = true
+
+@description('CIDR ranges allowed to reach the ingress; empty allows every source. Authentication does not depend on this list, it only narrows the exposure.')
+param ingressAllowedCidrs array = []
 
 @description('Scheduler settings copied into the Conductor configuration.')
 param schedulerTickSeconds int = 60
@@ -179,6 +200,14 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
       logAnalyticsConfiguration: {
         customerId: workspace.properties.customerId
         sharedKey: workspace.listKeys().primarySharedKey
+      }
+    }
+    // The ingress terminates TLS; this encrypts the hop from the ingress
+    // to the Conductor replica, which otherwise carries bearer tokens in
+    // the clear inside the environment (server.behindTlsProxy below).
+    peerTrafficConfiguration: {
+      encryption: {
+        enabled: true
       }
     }
     zoneRedundant: false
@@ -440,16 +469,28 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
   }
 }
 
-// --- the Conductor: a single-replica app without ingress ---------------------
+// --- the Conductor: a single-replica app behind the HTTPS ingress ------------
 
 var conductorConfig = {
   apiVersion: 'acme-conductor.cits-nue.github.io/v1alpha1'
   kind: 'ConductorConfig'
   server: {
-    listen: '127.0.0.1:8080'
+    listen: '0.0.0.0:8080'
     auth: {
-      mode: 'localhost-dev'
+      mode: 'oidc'
+      oidc: {
+        issuer: oidcIssuer
+        audience: oidcAudience
+        clientId: oidcClientId
+        roles: {
+          admin: oidcAdminRoles
+          viewer: oidcViewerRoles
+        }
+      }
     }
+    // TLS is terminated by the environment ingress, the only route to
+    // the port; peer traffic encryption covers the hop behind it.
+    behindTlsProxy: true
     shutdownGraceSeconds: conductorLaunchTimeoutSeconds
   }
   database: {
@@ -504,6 +545,24 @@ var conductorContainer = {
     cpu: json('0.25')
     memory: '0.5Gi'
   }
+  probes: [
+    {
+      type: 'Liveness'
+      httpGet: {
+        path: '/healthz'
+        port: 8080
+      }
+      periodSeconds: 30
+    }
+    {
+      type: 'Readiness'
+      httpGet: {
+        path: '/readyz'
+        port: 8080
+      }
+      periodSeconds: 10
+    }
+  ]
   volumeMounts: [
     {
       volumeName: 'conductor-config'
@@ -520,23 +579,12 @@ var conductorContainer = {
   ]
 }
 
-// An optional sidecar in the same replica: it shares the loopback
-// interface with the Conductor, so a shell obtained with
-// `az containerapp exec --container admin` is a loopback peer of the API
-// and therefore an administrator under localhost-dev (docs/adr/0012).
-// Access to that command is what RBAC on the Container App gates.
-var adminContainer = {
-  name: 'admin'
-  image: adminSidecarImage
-  command: [
-    'sleep'
-    'infinity'
-  ]
-  resources: {
-    cpu: json('0.25')
-    memory: '0.5Gi'
-  }
-}
+// Source restrictions on the ingress, when any are given.
+var ingressRestrictions = [for (cidr, i) in ingressAllowedCidrs: {
+  name: 'allow-${i}'
+  ipAddressRange: cidr
+  action: 'Allow'
+}]
 
 resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: conductorAppName
@@ -552,7 +600,16 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
     environmentId: environment.id
     configuration: {
       activeRevisionsMode: 'Single'
-      // No ingress: the API listens on the replica's loopback only.
+      // HTTPS only: the platform redirects plain HTTP and terminates TLS
+      // with its own certificate for the app's FQDN. Nothing but a valid
+      // bearer token is accepted behind it (docs/adr/0016).
+      ingress: {
+        external: ingressExternal
+        targetPort: 8080
+        transport: 'http'
+        allowInsecure: false
+        ipSecurityRestrictions: ingressRestrictions
+      }
       secrets: [
         {
           name: 'conductor-config'
@@ -567,7 +624,7 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
-      containers: empty(adminSidecarImage) ? [conductorContainer] : [conductorContainer, adminContainer]
+      containers: [conductorContainer]
       scale: {
         minReplicas: 1
         maxReplicas: 1
@@ -648,5 +705,9 @@ output conductorAppName string = conductorApp.name
 output conductorIdentityClientId string = conductorIdentity.properties.clientId
 output runnerIdentityClientId string = runnerIdentity.properties.clientId
 output storageAccountName string = storage.name
+@description('Where the API and the GUI answer.')
+output conductorUrl string = 'https://${conductorApp.properties.configuration.ingress.fqdn}'
+@description('The redirect URI to register on the GUI\'s public client (SPA platform).')
+output conductorGuiRedirectUri string = 'https://${conductorApp.properties.configuration.ingress.fqdn}/ui/'
 @description('The Conductor configuration as deployed, for review.')
 output conductorConfig object = conductorConfig

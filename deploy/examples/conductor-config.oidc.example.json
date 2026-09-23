@@ -2,21 +2,29 @@
   "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
   "kind": "ConductorConfig",
   "server": {
-    "listen": "0.0.0.0:8080",
+    "listen": "0.0.0.0:8443",
     "auth": {
       "mode": "oidc",
       "oidc": {
         "issuer": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0",
         "audience": "api://acme-conductor",
         "clientId": "22222222-2222-2222-2222-222222222222",
+        "scopes": ["openid", "profile", "api://acme-conductor/.default"],
+        "principalClaim": "preferred_username",
+        "rolesClaim": "roles",
         "roles": {
           "admin": ["ACME.Admin"],
           "viewer": ["ACME.Viewer"]
-        }
+        },
+        "clockSkewSeconds": 60,
+        "keyCacheSeconds": 3600
       }
     },
-    "behindTlsProxy": true,
-    "shutdownGraceSeconds": 1800
+    "tls": {
+      "certFile": "/etc/acme-conductor/tls.crt",
+      "keyFile": "/etc/acme-conductor/tls.key"
+    },
+    "shutdownGraceSeconds": 900
   },
   "database": {
     "path": "/var/lib/acme-conductor/conductor.db"
@@ -31,26 +39,14 @@
     "privateKeyFile": "/etc/acme-conductor/job-signing.pem",
     "validitySeconds": 900
   },
-  "resultSigning": {
-    "publicKeys": [
-      "MCowBQYDK2VwAyEA65N/M3oDE8dU2aAKvMDf19gGaRxk3W3gRWTKAj2DPOM="
-    ]
-  },
   "executionBindings": {
-    "azure": {
-      "type": "azure-container-apps-job",
-      "azureContainerAppsJob": {
-        "subscriptionId": "00000000-0000-0000-0000-000000000000",
-        "resourceGroup": "rg-acme",
-        "jobName": "acme-runner",
-        "cloud": "public",
-        "credential": "managed-identity",
-        "managedIdentityClientId": "11111111-1111-1111-1111-111111111111",
-        "exchangeDir": "/mnt/exchange",
-        "claimTimeoutSeconds": 300,
-        "timeoutSeconds": 1800,
-        "pollIntervalSeconds": 10,
-        "resultGraceSeconds": 30
+    "local": {
+      "type": "local-process",
+      "localProcess": {
+        "runnerBinary": "/usr/local/bin/acme-runner",
+        "runnerConfig": "/etc/acme-runner/config.json",
+        "workDir": "/var/lib/acme-conductor/runs",
+        "timeoutSeconds": 1200
       }
     }
   },
@@ -61,6 +57,6 @@
     "azure-dns-staging"
   ],
   "storeBindings": [
-    "keyvault-staging"
+    "filesystem-dev"
   ]
 }

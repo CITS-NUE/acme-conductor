@@ -1,0 +1,114 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1c1c1c;
+  --muted: #5f6368;
+  --line: #d9dbe0;
+  --panel: #f5f6f8;
+  --accent: #0b5fb0;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --bad: #b3261e;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131417;
+    --fg: #e8e9ec;
+    --muted: #a0a4ad;
+    --line: #33363d;
+    --panel: #1c1e23;
+    --accent: #6cb1ff;
+    --ok: #57c26b;
+    --warn: #e2b23f;
+    --bad: #ff7b72;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.brand { font-weight: 600; color: var(--fg); }
+#nav { display: flex; gap: 16px; }
+#nav a { color: var(--muted); padding: 4px 0; border-bottom: 2px solid transparent; }
+#nav a.active { color: var(--fg); border-bottom-color: var(--accent); }
+.session { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); }
+main { flex: 1; padding: 16px; max-width: 1200px; width: 100%; margin: 0 auto; }
+.foot {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 16px; margin: 20px 0 8px; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.toolbar .spacer { flex: 1; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.empty { color: var(--muted); padding: 24px 0; }
+.notice { padding: 10px 12px; border-radius: 6px; margin: 0 0 12px; border: 1px solid var(--line); background: var(--panel); }
+.notice.error { border-color: var(--bad); color: var(--bad); }
+.notice.ok { border-color: var(--ok); color: var(--ok); }
+.status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.status.succeeded, .status.enabled { color: var(--ok); border-color: var(--ok); }
+.status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
+.status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
+.status.cancelled { color: var(--muted); }
+button, .button {
+  font: inherit;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: default; }
+form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); max-width: 640px; }
+.field { display: grid; grid-template-columns: 180px 1fr; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+.field label { color: var(--muted); }
+.field input[type=text], .field input[type=number], .field select, .field textarea {
+  font: inherit;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  width: 100%;
+}
+.field .hint { grid-column: 2; color: var(--muted); font-size: 12px; }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+dl.props { display: grid; grid-template-columns: 200px 1fr; gap: 6px 12px; margin: 0 0 16px; }
+dl.props dt { color: var(--muted); }
+dl.props dd { margin: 0; }
+.signin { text-align: center; padding: 60px 0; }
+.signin p { color: var(--muted); }
+@media (max-width: 700px) {
+  .field { grid-template-columns: 1fr; }
+  .field .hint { grid-column: 1; }
+  dl.props { grid-template-columns: 1fr; }
+  .topbar { flex-wrap: wrap; gap: 12px; }
+  .session { margin-left: 0; }
+}

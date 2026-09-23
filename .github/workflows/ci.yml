@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The release workflow runs this one first, so a tag never publishes
+  # an image from a commit that does not pass.
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,8 +22,9 @@ jobs:
     name: verify
     runs-on: ubuntu-latest
     steps:
-      # Actions are pinned by major version tag for Phase 0; pinning by
-      # commit digest is a follow-up (see docs/adr).
+      # Actions are pinned by major version tag and kept current by
+      # Dependabot (.github/dependabot.yml); see docs/adr/0017 for why
+      # they are not pinned by commit digest yet.
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -92,8 +96,8 @@ jobs:
         id: build_date
         run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      # Build only — this workflow never pushes images. Phase 5 adds a
-      # separate release workflow that pushes to ghcr.io.
+      # Build only — this workflow never pushes images. The release
+      # workflow (release.yml) pushes to ghcr.io on a version tag.
       - name: Build image
         uses: docker/build-push-action@v6
         with:

@@ -1,6 +1,6 @@
 # 0014: Azure Container Apps Job launcher
 
-- Status: Accepted
+- Status: Accepted (the administration sidecar described below was replaced by the OIDC ingress in Phase 5, [ADR 0016](0016-oidc-bearer-auth-and-gui.md))
 - Date: 2026-09-22
 
 ## Context

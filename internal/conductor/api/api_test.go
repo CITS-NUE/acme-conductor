@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -578,5 +580,183 @@ func TestReadyzReportsRegistryFailure(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("readyz = %d", rec.Code)
+	}
+}
+
+// bearerFake is a Challenger authenticator driven by the test: the
+// Authorization header value selects the outcome.
+type bearerFake struct{}
+
+func (bearerFake) Challenge() string { return `Bearer realm="test"` }
+
+func (bearerFake) Authenticate(r *http.Request) (Principal, error) {
+	switch r.Header.Get("Authorization") {
+	case "Bearer admin":
+		return Principal{Name: "alice@example.ac.jp", Role: RoleAdmin}, nil
+	case "Bearer viewer":
+		return Principal{Name: "bob@example.ac.jp", Role: RoleViewer}, nil
+	case "Bearer norole":
+		return Principal{}, fmt.Errorf("%w: no role", ErrForbidden)
+	default:
+		return Principal{}, fmt.Errorf("%w: bad token", ErrUnauthenticated)
+	}
+}
+
+func TestRolesAndBearerChallenge(t *testing.T) {
+	e := newEnv(t)
+	h := New(Options{Registry: e.reg, Scheduler: e.sched, Bindings: Bindings{Execution: []string{"local"}, ACME: []string{"letsencrypt-staging"}, DNS: []string{"azure-dns-staging"}, Store: []string{"filesystem-dev"}}, Auth: bearerFake{}})
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	call := func(method, path, token string, body any) (int, string, http.Header) {
+		t.Helper()
+		var rd io.Reader
+		if body != nil {
+			data, _ := json.Marshal(body)
+			rd = bytes.NewReader(data)
+		}
+		req, _ := http.NewRequest(method, srv.URL+path, rd)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		res, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		var out map[string]any
+		_ = json.Unmarshal(raw, &out)
+		code := ""
+		if ed, ok := out["error"].(map[string]any); ok {
+			code, _ = ed["code"].(string)
+		}
+		return res.StatusCode, code, res.Header
+	}
+	policy := map[string]any{"allowedDnsSuffixes": []string{"example.ac.jp"}, "acmeBinding": "letsencrypt-staging", "renewBeforeDays": 30, "keyType": "ec256"}
+	// No token, a bad token: 401 with a challenge, whatever the method.
+	for _, token := range []string{"", "bad"} {
+		for _, m := range []struct{ method, path string }{{"GET", "/bindings"}, {"POST", "/policies"}} {
+			st, code, hdr := call(m.method, Prefix+m.path, token, policy)
+			if st != http.StatusUnauthorized || code != "unauthenticated" || hdr.Get("WWW-Authenticate") != `Bearer realm="test"` {
+				t.Fatalf("%s %s token %q: %d %s %q", m.method, m.path, token, st, code, hdr.Get("WWW-Authenticate"))
+			}
+		}
+	}
+	// Identified without a role: 403, no challenge.
+	if st, code, hdr := call("GET", Prefix+"/bindings", "norole", nil); st != http.StatusForbidden || code != "forbidden" || hdr.Get("WWW-Authenticate") != "" {
+		t.Fatalf("norole: %d %s %q", st, code, hdr.Get("WWW-Authenticate"))
+	}
+	// A viewer reads; every write is refused before it reaches a handler.
+	if st, _, _ := call("GET", Prefix+"/policies", "viewer", nil); st != 200 {
+		t.Fatalf("viewer GET: %d", st)
+	}
+	if st, code, _ := call("POST", Prefix+"/policies", "viewer", policy); st != http.StatusForbidden || code != "forbidden" {
+		t.Fatalf("viewer POST: %d %s", st, code)
+	}
+	if st, code, _ := call("PUT", Prefix+"/targets/01ARZ3NDEKTSV4RRFFQ69G5FAV", "viewer", map[string]any{"revision": 1}); st != http.StatusForbidden || code != "forbidden" {
+		t.Fatalf("viewer PUT: %d %s", st, code)
+	}
+	// An admin writes, and the audit log names the principal from the token.
+	if st, _, _ := call("POST", Prefix+"/policies", "admin", policy); st != 201 {
+		t.Fatalf("admin POST: %d", st)
+	}
+	req, _ := http.NewRequest("GET", srv.URL+Prefix+"/audit", nil)
+	req.Header.Set("Authorization", "Bearer viewer")
+	res, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var audit struct {
+		Items []struct{ Actor, Action string }
+	}
+	if err := json.NewDecoder(res.Body).Decode(&audit); err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.Items) != 1 || audit.Items[0].Actor != "alice@example.ac.jp" || audit.Items[0].Action != "policy.created" {
+		t.Fatalf("audit: %+v", audit.Items)
+	}
+	// Health stays unauthenticated.
+	if st, _, _ := call("GET", "/healthz", "", nil); st != 200 {
+		t.Fatalf("healthz: %d", st)
+	}
+}
+
+func TestUIRoutes(t *testing.T) {
+	e := newEnv(t)
+	// Without UI options nothing is served under /ui/ and / is a 404.
+	if r := e.do("GET", "/ui/", nil, nil); r.status != 404 {
+		t.Fatalf("ui without options: %d", r.status)
+	}
+	endpoints := func(context.Context) (UIAuthEndpoints, error) {
+		return UIAuthEndpoints{Authorization: "https://idp.example/authorize", Token: "https://idp.example/oauth2/token"}, nil
+	}
+	h := New(Options{Registry: e.reg, Auth: LocalhostDev{}, UI: &UIOptions{AuthMode: "oidc", Issuer: "https://idp.example", ClientID: "client-1", Scopes: []string{"openid", "api://acme/.default"}, Endpoints: endpoints}})
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	get := func(path string) (*http.Response, []byte) {
+		t.Helper()
+		client := srv.Client()
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		res, err := client.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		return res, raw
+	}
+	res, _ := get("/")
+	if res.StatusCode != http.StatusFound || res.Header.Get("Location") != "/ui/" {
+		t.Fatalf("root: %d %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	res, body := get("/ui/")
+	csp := res.Header.Get("Content-Security-Policy")
+	if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "text/html") || !bytes.Contains(body, []byte("<title>ACME Conductor</title>")) {
+		t.Fatalf("index: %d %s", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "connect-src 'self' https://idp.example") || !strings.Contains(csp, "frame-ancestors 'none'") || res.Header.Get("X-Frame-Options") != "DENY" || res.Header.Get("Referrer-Policy") != "no-referrer" || res.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("index headers: csp %q, %v", csp, res.Header)
+	}
+	if bytes.Contains(body, []byte("<script>")) || bytes.Contains(body, []byte("onclick=")) {
+		t.Fatal("index carries inline script, which the policy forbids")
+	}
+	for path, ct := range map[string]string{"/ui/app.js": "text/javascript", "/ui/app.css": "text/css"} {
+		res, body := get(path)
+		if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), ct) || len(body) == 0 {
+			t.Fatalf("%s: %d %s", path, res.StatusCode, res.Header.Get("Content-Type"))
+		}
+	}
+	for _, path := range []string{"/ui/ui.go", "/ui/../index.html", "/ui/app.js/", "/ui/other", "/ui"} {
+		if res, _ := get(path); res.StatusCode == 200 && path != "/ui" {
+			t.Fatalf("%s served", path)
+		}
+	}
+	res, body = get("/ui/config")
+	var cfg UIConfig
+	if res.StatusCode != 200 || json.Unmarshal(body, &cfg) != nil {
+		t.Fatalf("config: %d %s", res.StatusCode, body)
+	}
+	if cfg.Auth.Mode != "oidc" || cfg.Auth.Issuer != "https://idp.example" || cfg.Auth.ClientID != "client-1" || cfg.Auth.AuthorizationEndpoint != "https://idp.example/authorize" || cfg.Auth.TokenEndpoint != "https://idp.example/oauth2/token" || strings.Join(cfg.Auth.Scopes, " ") != "openid api://acme/.default" {
+		t.Fatalf("config: %+v", cfg)
+	}
+	// Discovery unavailable: the config is a 503 and the page's policy
+	// allows connections to the page's own origin only.
+	h.ui.Endpoints = func(context.Context) (UIAuthEndpoints, error) { return UIAuthEndpoints{}, errors.New("down") }
+	if res, _ := get("/ui/config"); res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("config while discovery is down: %d", res.StatusCode)
+	}
+	if res, _ := get("/ui/"); !strings.Contains(res.Header.Get("Content-Security-Policy"), "connect-src 'self';") {
+		t.Fatalf("csp while discovery is down: %q", res.Header.Get("Content-Security-Policy"))
+	}
+	// localhost-dev: the config says so and names no provider.
+	h2 := New(Options{Registry: e.reg, Auth: LocalhostDev{}, UI: &UIOptions{AuthMode: "localhost-dev"}})
+	rec := httptest.NewRecorder()
+	h2.ServeHTTP(rec, httptest.NewRequest("GET", "/ui/config", nil))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"mode":"localhost-dev"`) || strings.Contains(rec.Body.String(), "issuer") {
+		t.Fatalf("dev config: %d %s", rec.Code, rec.Body.String())
 	}
 }
