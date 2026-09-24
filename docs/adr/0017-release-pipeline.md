@@ -71,10 +71,26 @@ keep the property that a published image is exactly what CI verified.
   refused) can be verified on demand without a tag and without a
   publish. A version tag on a branch is never the way to test it: that
   runs the real release workflow.
-- The pipeline is not verified by a run from this repository yet: it
-  needs a tag on `main` and the repository's packages permission. Its
-  first run is the verification, and the smoke test fails the release if
-  the published image does not answer.
+- The pipeline was verified by the first release, `v0.5.0`
+  (2026-09-24, [issue #19](https://github.com/CITS-NUE/acme-conductor/issues/19)).
+  Observed as designed: the guard passed for a tag on `main` and, in
+  the dispatch-only check, refused a branch commit; both images were
+  published for `linux/amd64` and `linux/arm64` with an SPDX SBOM and
+  SLSA provenance attestation manifest per platform in the index; the
+  GitHub attestation was created, recorded in Rekor, pushed to the
+  registry under a `sha256-<digest>` tag, and verified with
+  `gh attestation verify`; the images ran by digest and reported the
+  tag. Observed and not designed: (1) GitHub created both packages
+  **private** on the first push, whatever the repository's visibility,
+  so anonymous pulls and `gh attestation verify` against the registry
+  failed until an organization owner set them public, a one-time step
+  per package that the workflow cannot perform; (2) the first tag,
+  pushed before a date-dependent test fix reached `main`, failed the
+  CI gate and published nothing, exactly the property the gate exists
+  for, and the tag was deleted and re-created on the fixed commit.
 - Rollback of a release is deleting or re-tagging in GHCR by hand; a
   digest that was published stays valid and verifiable, so a deployer
-  pinned to it is unaffected either way.
+  pinned to it is unaffected either way. A version tag is re-pointed
+  only while nothing has been published under it (the image jobs were
+  skipped); once an image carries the version, the next version is the
+  only way forward.

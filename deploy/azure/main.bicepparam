@@ -10,8 +10,10 @@
 using 'main.bicep'
 
 param namePrefix = 'acme'
-param conductorImage = 'ghcr.io/cits-nue/acme-conductor@sha256:0000000000000000000000000000000000000000000000000000000000000000'
-param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+// v0.5.0 (https://github.com/CITS-NUE/acme-conductor/actions/runs/35945554057);
+// verify before trusting: gh attestation verify oci://<image>:0.5.0 --owner CITS-NUE
+param conductorImage = 'ghcr.io/cits-nue/acme-conductor@sha256:97198bc1d338ec0ce9748120b4b2b9645b881c40b58d40920f11781fa4558ed3'
+param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:760a2e9f906b4b85ec5fe92c34e2f13c1fdf61abef2ea48504de70e511c1a6d2'
 
 param acmeBindings = ['letsencrypt-staging']
 param dnsBindings = ['azure-dns-staging']

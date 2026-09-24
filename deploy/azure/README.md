@@ -67,7 +67,13 @@ never enters either container.
   docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:0.5.0
   ```
 
-  GHCR public images need no registry credential.
+  GHCR public images need no registry credential. The packages are
+  public since the first release; a package that GitHub creates on a
+  first push is private whatever the repository's visibility, so a new
+  package (a renamed image, a new binary) needs an organization owner
+  to set it public once before it can be pulled without a credential.
+  Every release also tags `latest`; it exists for convenience and is
+  never what a deployment pins.
 - **An OpenID Connect provider** and, for Microsoft Entra ID, two app
   registrations (see [Identity](#identity) below): one that *is* the API
   (its Application (client) ID is `oidcAudience`, its application ID

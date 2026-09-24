@@ -51,7 +51,10 @@ both images to GHCR for
 `linux/amd64` and `linux/arm64` with an SBOM and provenance attached
 ([ADR 0017](docs/adr/0017-release-pipeline.md)); the image digests are
 in the run's summary. Nothing is published from a branch or a pull
-request. Dependabot proposes updates to the digest-pinned base images,
+request. Re-point a version tag only while its run published nothing
+(the image jobs were skipped); once an image carries the version, cut
+the next one. A package GitHub creates on a first push is private; an
+organization owner sets it public once. Dependabot proposes updates to the digest-pinned base images,
 Go modules and GitHub Actions; treat those pull requests like any other
 (CI must pass, read what changed).
 
