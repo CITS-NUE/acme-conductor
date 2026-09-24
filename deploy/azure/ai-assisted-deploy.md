@@ -111,7 +111,7 @@ AI がすること（読み取り）:
 - 有効な割り当てと条件（`roleAssignmentScheduleInstances`）を取得する．
 - PIM で有効化できるロール（`roleEligibilityScheduleInstances`）を取得する．
 - Entra のディレクトリロールと，一般ユーザーがアプリを作れるかを確認する．
-- 不足を表にする．例: 「`roleDefinitions/write` がない → PIM の `User Access Administrator`」「アプリ作成不可 → `Application Administrator`」．
+- 不足を表にする．例: 「`roleDefinitions/write` がない → PIM の `User Access Administrator`」「サブスクリプションで `Microsoft.Resources/deployments/*` がない（RG の `Contributor` だけ）→ サブスクリプションスコープの `roles` デプロイが開始できない」「アプリ作成不可 → `Application Administrator`」．
 
 人が確認すること: PIM の有効化は **人がポータルで** 行う．AI には「有効化した」と伝える．
 

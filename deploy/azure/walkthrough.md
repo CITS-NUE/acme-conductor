@@ -35,11 +35,18 @@ Container Apps 環境の作成（5〜10 分）が占める．
 
 | 作業 | 必要な権限 | 備考 |
 |---|---|---|
-| リソースの作成（手順 4, 8） | サブスクリプション（または RG）の `Contributor` | |
+| Azure リソースの作成（手順 4, 8） | デプロイ先 RG の `Contributor` | |
+| サブスクリプションスコープのネストしたデプロイ（手順 8） | サブスクリプションの `Microsoft.Resources/deployments/*`（サブスクリプションの `Contributor` や `Owner` に含まれる） | `main.bicep` はカスタムロールを `scope: subscription()` の module（`modules/roles.bicep`）で作るため，**RG の `Contributor` だけでは足りない**．`User Access Administrator` にも含まれない |
 | カスタムロール定義の作成（手順 8） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`） | `Contributor` と `Role Based Access Control Administrator` には **含まれない** |
-| ロール割り当て（手順 8） | 割り当て先スコープの `roleAssignments/write` | 条件（ABAC）付きの委任では事前検証で落ちる．[手順 8](#8-デプロイ) を参照 |
+| ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任では事前検証で落ちる．[手順 8](#8-デプロイ) を参照 |
 | アプリ登録の作成（手順 5） | Entra の `Application Developer` 以上 | テナント設定で一般ユーザーのアプリ作成が禁止されている場合 |
 | 管理者の同意，アプリロールの割り当て（手順 5） | Entra の `Application Administrator` / `Cloud Application Administrator` | 自テナントの API への委任許可の同意ならこれで足りる |
+
+たとえば「RG の `Contributor`＋サブスクリプションの `User Access Administrator`」の
+組み合わせは十分に見えるが，サブスクリプションスコープのネストしたデプロイを
+開始できないため失敗する．実施した環境では，サブスクリプションの `Contributor`
+（常設）と `User Access Administrator`（PIM で有効化）の組み合わせでこの要件を
+満たした．
 
 権限を確認するコマンドを示す（読み取りのみ）:
 
@@ -383,6 +390,7 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 |---|---|---|
 | preflight で `roleAssignments/write` が拒否される | ABAC 条件付きの RBAC 委任．事前検証では条件を評価できない | `what-if` で確認後，`--validation-level Template`（#34） |
 | デプロイ時にロール定義の作成で失敗する（想定） | `roleDefinitions/write` がない | PIM で `User Access Administrator` などを有効化する |
+| サブスクリプションスコープの `roles` デプロイで失敗する（想定） | RG の `Contributor` だけで，サブスクリプションで `Microsoft.Resources/deployments/*` を持たない | サブスクリプションの `Contributor` などを用意する |
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |
