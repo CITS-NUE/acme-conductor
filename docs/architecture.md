@@ -196,6 +196,11 @@ binding that an administrator registered ahead of time:
 
 In the MVP, all four binding types are loaded from Runner/Conductor startup
 configuration; there is no admin API to create or modify them at runtime.
+An `ExecutionBinding` or `StoreBinding` is `{ "type", "config" }`: the
+generic configuration knows the type name's shape and that `config` is
+an object, and the provider registered for that type in the binary
+(`cmd/<binary>/providers.go`) decodes and validates the object itself
+([ADR 0019](adr/0019-provider-boundary.md)).
 The Conductor's configuration (`internal/conductor/config`) defines
 `ExecutionBinding`s and lists the ACME/DNS/Store binding **names** a policy
 or target may select — names only; what a name resolves to is Runner
@@ -517,7 +522,15 @@ holds code private to this module.
   by design (the Conductor holds no DNS, Key Vault, or long-lived cloud
   credential — see [security principles](#security-principles)).
 - Cloud SDKs (Azure, later AWS/GCP if ever added) live only inside launcher
-  and store adapter implementations, never in Conductor core.
+  and store adapter implementations, never in Conductor core. The
+  boundary is structural: adapters implement the public contracts
+  `pkg/store` and `pkg/launcher`, the core reaches them only through the
+  registries in `internal/runner/stores` and `internal/conductor/launchers`,
+  and the Runner core consumes a job through `internal/runner/transport`
+  without reading any platform's environment. One Go module holds all
+  of it until a second platform exists; `deploy/azure` is the reference
+  infrastructure of the Azure adapters and stays alongside them
+  ([ADR 0019](adr/0019-provider-boundary.md)).
 
 ## Security principles
 
@@ -587,8 +600,9 @@ Explicitly out of scope until a future phase or ADR says otherwise:
 - A Kubernetes operator or CRDs.
 - Multi-replica / highly-available Conductor.
 - PostgreSQL (SQLite is the store for the foreseeable future).
-- AWS or GCP providers (the binding model anticipates them; nothing is
-  implemented yet).
+- AWS or GCP providers (the binding model anticipates them, and a
+  provider is now a package plus a registration line — [ADR 0019](adr/0019-provider-boundary.md);
+  nothing is implemented yet).
 - Delivering certificates to Arc-managed hosts.
 - Automatic purge of any kind (see
   [ADR 0008](adr/0008-no-purge-in-mvp.md)).

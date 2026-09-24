@@ -19,6 +19,9 @@ for how the launcher works and
 [`docs/adr/0014-azure-container-apps-job-launcher.md`](../../docs/adr/0014-azure-container-apps-job-launcher.md)
 for why it is shaped this way. **What this template has not been
 verified against is listed at the end; read that before relying on it.**
+This directory is the reference infrastructure of the Azure adapters and
+stays in this repository with them ([ADR 0019](../../docs/adr/0019-provider-boundary.md));
+it is not a general-purpose deployment framework.
 
 ## What gets deployed
 

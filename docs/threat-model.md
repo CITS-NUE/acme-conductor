@@ -204,6 +204,14 @@ does not, and what closes the gap.
   normalized and label-boundary matched before storage, no field for a
   command/image/path/credential; and in `localhost-dev` the API is
   reachable only from a loopback peer with a loopback `Host`/`Origin`.
+- **Provider code depends inward (post-Phase 5 hardening, issue #17, [ADR 0019](adr/0019-provider-boundary.md))**:
+  cloud SDKs and platform environment are reachable from the core only
+  through the store and launcher registries and the job transport, the
+  generic configuration carries no provider field, and the contracts
+  test plus a dependency listing make a regression visible; so a
+  provider's code cannot widen what the Conductor holds (principle 2)
+  or what the Runner reads from its platform without a change to a
+  composition file that review sees.
 - **Named, role-bound callers in `oidc` mode (Phase 5)**: every API
   request carries a bearer token that verified against the provider's
   published key for the configured issuer and audience within its
