@@ -1,41 +1,39 @@
-# Runner operator guide
+# Runner 運用ガイド
 
-This is the operator-facing reference for `acme-runner`, the one-shot
-data-plane job described in [`docs/architecture.md`](architecture.md). It
-covers the command line, the configuration file format, what one
-`reconcile` invocation actually does, the two Certificate Stores (the
-filesystem store for development and tests, Azure Key Vault for real
-deployments), how to run the container, the `Result`/error-code
-contract, and what the Runner does and does not guarantee today.
+これは，[`docs/architecture.md`](architecture.md) で説明するワンショットの
+データプレーンジョブ `acme-runner` の，操作者向けリファレンスである．
+コマンドライン，設定ファイルの形式，1 回の `reconcile` 起動が実際に何を行うか，
+2 つの Certificate Store（開発・テスト用のファイルシステム store と，
+実際のデプロイ向けの Azure Key Vault），コンテナの動かし方，`Result` と
+エラーコードのコントラクト，そして Runner が現時点で保証すること・しないことを
+扱う．
 
-Phase 1 ships a one-shot Runner that bundles the official `lego` CLI and a
-filesystem Certificate Store. Since Phase 2 the Conductor schedules
-targets and launches the Runner as a local child process (see
-[`docs/conductor.md`](conductor.md)); the Runner itself is unchanged by
-that and can still be invoked by hand exactly as described here. Phase 3
-adds the Azure Key Vault Certificate Store, authenticated with the
-execution platform's managed identity — see
-[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault).
-Phase 4 adds the signed job envelope: with [`jobSigning`](#jobsigning)
-configured, the Runner accepts only jobs the Conductor signed, within
-their validity window, once — and it runs as an Azure Container Apps Job
-under its own managed identity (see
-[Running as a Container Apps Job](#running-as-a-container-apps-job) and
-the [roadmap](architecture.md#roadmap)).
+Phase 1 では，公式の `lego` CLI とファイルシステムの Certificate Store を同梱した
+ワンショットの Runner を提供する．Phase 2 以降は Conductor が target を
+スケジュールし，Runner をローカルの子プロセスとして起動する
+（[`docs/conductor.md`](conductor.md) を参照）．Runner 自体はそれによって
+変わらず，ここで説明する通りに手動で起動することもできる．Phase 3 では
+実行基盤のマネージド ID で認証する Azure Key Vault の Certificate Store が
+加わる．[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault)
+を参照．Phase 4 では署名付きジョブエンベロープが加わる．[`jobSigning`](#jobsigning)
+を設定すると，Runner は Conductor が署名したジョブだけを，その有効期間内に，
+1 度だけ受け付ける．さらに Runner は自身のマネージド ID の下で
+Azure Container Apps Job として動く
+（[Container Apps Job として動かす](#container-apps-job-として動かす) と
+[ロードマップ](architecture.md#ロードマップ) を参照）．
 
-## Overview
+## 概要
 
-`acme-runner` handles exactly one `JobSpec` (a `CertificateReconcileJob`,
-`pkg/api/v1alpha1`) per process invocation: it validates the document,
-authorizes it against its own trusted configuration, asks the configured
-Certificate Store whether the certificate needs to be issued or renewed,
-runs the bundled `lego` CLI once if so, verifies what `lego` produced,
-stores the certificate, and writes a `Result` (a
-`CertificateReconcileResult`). It has no HTTP server, no scheduler, no
-database and no cron; the execution platform is expected to start one
-process per run.
+`acme-runner` はプロセス起動 1 回につき，ちょうど 1 つの `JobSpec`
+（`CertificateReconcileJob`，`pkg/api/v1alpha1`）を処理する．文書を検証し，
+自身の信頼された設定に照らして認可し，設定された Certificate Store に
+証明書の発行または更新が必要かを問い合わせ，必要なら同梱の `lego` CLI を
+1 度だけ実行し，`lego` が生成したものを検証し，証明書を格納し，`Result`
+（`CertificateReconcileResult`）を書き出す．HTTP サーバも，スケジューラも，
+データベースも，cron も持たない．実行基盤が run ごとに 1 つのプロセスを
+開始することを想定している．
 
-## Command line
+## コマンドライン
 
 ```
 acme-runner reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]
@@ -45,169 +43,168 @@ acme-runner --version
 acme-runner --help
 ```
 
-- `--exchange DIR` — the *claim transport*, instead of `--job`/`--result`:
-  take the oldest job a Conductor has offered under `DIR/pending/`, move
-  it to `DIR/claimed/`, record this process's **execution identity**
-  next to it, and write the Result next to the job. With nothing pending
-  the process logs so and exits `0` without a Result. It cannot be
-  combined with `--job`/`--result`. The transport is shared with other
-  writers, so it requires [`resultSigning`](#resultsigning) in the
-  configuration: without it the process takes no job and exits `2`,
-  since the Conductor on the other side accepts signed Results only.
-- `--execution-name NAME` — with `--exchange`: the identity recorded for
-  the claimed job, the name under which the Conductor can observe and
-  stop this process on its platform. When omitted it is read from the
-  platform: the official binary knows one platform that starts Runners
-  on its own, Azure Container Apps, whose `CONTAINER_APP_JOB_EXECUTION_NAME`
-  names the execution ([Running as a Container Apps Job](#running-as-a-container-apps-job)).
-  Without any identity the job is left taken with no Result and the
-  process exits `2`, because the Conductor could neither observe nor
-  stop that execution. The transport (`internal/runner/transport/claim`)
-  and the platform (`internal/runner/platform/azurecontainerapps`) are
-  separate pieces composed by the command; the reconciliation core knows
-  neither.
-- `keygen` — generate the Ed25519 result-signing key pair
-  ([`resultSigning`](#resultsigning)); the private key file is created
-  `0600` and never overwritten, and the one-line public key for the
-  Conductor's `resultSigning.publicKeys` is printed.
-- `--job FILE` (required) — path to the `CertificateReconcileJob` document.
-- `--result FILE` (required) — path the `CertificateReconcileResult` is
-  written to atomically (temporary file in the same directory, `fsync`,
-  `rename`). The Result is also always printed as a single line of JSON on
-  stdout, independent of `--result`.
-- `--config FILE` (optional) — path to the Runner configuration document.
-  Defaults to the `$ACME_RUNNER_CONFIG` environment variable if set,
-  otherwise `/etc/acme-runner/config.json`.
-- `--log-level LEVEL` (optional, default `info`) — one of `debug`, `info`,
-  `warn`, `error` (case-insensitive). Logs are structured JSON written to
-  stderr, always in UTC, and carry `runId`/`targetId` once they are known.
+- `--exchange DIR` — `--job`/`--result` の代わりとなる *claim トランスポート*．
+  Conductor が `DIR/pending/` に差し出した最も古いジョブを取り，
+  `DIR/claimed/` に移動し，このプロセスの **実行 ID** をその隣に記録し，
+  Result をジョブの隣に書く．pending が何もなければ，その旨をログに出して
+  Result なしで `0` で終了する．`--job`/`--result` と組み合わせることは
+  できない．トランスポートは他の書き手と共有されるため，設定に
+  [`resultSigning`](#resultsigning) が必要である．それがなければプロセスは
+  ジョブを取らずに `2` で終了する．反対側の Conductor は署名付きの Result
+  しか受け付けないからである．
+- `--execution-name NAME` — `--exchange` と併用: claim したジョブに記録する
+  ID であり，Conductor がそのプラットフォーム上でこのプロセスを観測・停止
+  するための名前である．省略時はプラットフォームから読み取る．公式バイナリが
+  知っている，自律的に Runner を開始するプラットフォームは Azure Container
+  Apps の 1 つであり，その `CONTAINER_APP_JOB_EXECUTION_NAME` が実行を
+  命名する（[Container Apps Job として動かす](#container-apps-job-として動かす)）．
+  ID が一切得られない場合，ジョブは Result なしで取られたままとなり，
+  プロセスは `2` で終了する．Conductor がその実行を観測も停止もできない
+  からである．トランスポート（`internal/runner/transport/claim`）と
+  プラットフォーム（`internal/runner/platform/azurecontainerapps`）は
+  コマンドが合成する別々の部品であり，reconcile 処理のコアはどちらも
+  知らない．
+- `keygen` — Ed25519 の Result 署名鍵ペアを生成する
+  （[`resultSigning`](#resultsigning)）．秘密鍵ファイルは `0600` で作成され
+  決して上書きされず，Conductor の `resultSigning.publicKeys` 用の 1 行の
+  公開鍵が表示される．
+- `--job FILE`（必須）— `CertificateReconcileJob` 文書のパス．
+- `--result FILE`（必須）— `CertificateReconcileResult` をアトミックに
+  書き出すパス（同じディレクトリ内の一時ファイル，`fsync`，`rename`）．
+  Result は `--result` とは無関係に，常に 1 行の JSON として stdout にも
+  表示される．
+- `--config FILE`（任意）— Runner 設定文書のパス．環境変数
+  `$ACME_RUNNER_CONFIG` が設定されていればそれが既定値，なければ
+  `/etc/acme-runner/config.json`．
+- `--log-level LEVEL`（任意，既定 `info`）— `debug`，`info`，`warn`，`error`
+  のいずれか（大文字小文字を区別しない）．ログは stderr に書かれる構造化
+  JSON で，常に UTC であり，判明した時点から `runId`/`targetId` を持つ．
 
-### Exit codes
+### 終了コード
 
-| Code | Meaning |
+| コード | 意味 |
 |---|---|
-| `0` | A `Result` with `status: succeeded` was written (to stdout and, if given, `--result`). |
-| `1` | A `Result` with `status: failed` was written. |
-| `2` | No `Result` could be delivered at all — the job file could not be read, or it failed strict validation and no run identity (`runId`/`target.id`) could be recovered even leniently. Details are on stderr only. |
+| `0` | `status: succeeded` の `Result` が書き出された（stdout と，指定があれば `--result` に）． |
+| `1` | `status: failed` の `Result` が書き出された． |
+| `2` | `Result` をまったく届けられなかった．ジョブファイルを読めなかったか，厳密な検証に失敗し，かつ緩い読み取りでも run の ID（`runId`/`target.id`）を復元できなかった．詳細は stderr のみにある． |
 
-The exit code follows the `Result` printed on stdout. If the `--result`
-file cannot be written (for example the path is a directory or its parent
-does not exist) the failure is logged at error level, but the exit code
-is still `0`/`1` because the `Result` was delivered on stdout; consumers
-that rely on the file must treat a missing file as "check stdout".
+終了コードは stdout に表示された `Result` に従う．`--result` ファイルを
+書けない場合（たとえばパスがディレクトリである，親ディレクトリが存在しない）
+はエラーレベルでログに記録されるが，`Result` は stdout に届けられているので
+終了コードは依然 `0`/`1` である．ファイルに依存する利用者は，ファイルの欠落を
+「stdout を確認せよ」と扱わなければならない．
 
-## Configuration reference
+## 設定リファレンス
 
-The configuration file is the Runner's **trusted** input: an
-administrator-controlled, read-only JSON document, distinct from and never
-derived from the `JobSpec`. It is decoded strictly (unknown fields and
-trailing data are rejected) and capped at 256 KiB. It contains **no secret
-values** — where a binding needs a credential (a DNS provider token, an
-ACME External Account Binding HMAC), the configuration only names the
-environment variable the execution platform is expected to provide to the
-Runner process; the Runner passes that value through to `lego` and never
-logs or reports it.
+設定ファイルは Runner の **信頼された** 入力である．管理者が管理する読み取り
+専用の JSON 文書で，`JobSpec` とは別物であり，決して `JobSpec` から派生しない．
+厳密にデコードされ（未知のフィールドと末尾の余分なデータは拒否される），
+256 KiB を上限とする．**シークレットの値は含まない**．バインディングが
+資格情報（DNS プロバイダのトークン，ACME External Account Binding の HMAC）
+を必要とする場合，設定はその値を Runner プロセスに提供することを実行基盤に
+期待する環境変数の名前だけを記す．Runner はその値を `lego` に受け渡すだけで，
+決してログにも報告にも出さない．
 
-Top level:
+トップレベル:
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `apiVersion` | string | Must equal `acme-conductor.cits-nue.github.io/v1alpha1`. |
-| `kind` | string | Must equal `RunnerConfig`. |
-| `authorization` | object | The Runner's trusted `RunnerAuthorizationPolicy` — see below. |
-| `lego` | object | Binary path and directories — see below. |
-| `acmeBindings` | map | At least one entry. Keys are binding names (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, ≤63 chars). |
-| `dnsBindings` | map | At least one entry, same key rules. |
-| `storeBindings` | map | At least one entry, same key rules. |
-| `jobSigning` | object | Optional. When present, only signed job envelopes are accepted — see below. |
+| `apiVersion` | string | `acme-conductor.cits-nue.github.io/v1alpha1` と一致しなければならない． |
+| `kind` | string | `RunnerConfig` と一致しなければならない． |
+| `authorization` | object | Runner の信頼された `RunnerAuthorizationPolicy`．後述． |
+| `lego` | object | バイナリのパスとディレクトリ．後述． |
+| `acmeBindings` | map | 1 件以上必要．キーはバインディング名（`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`，63 文字以下）． |
+| `dnsBindings` | map | 1 件以上必要．キーの規則は同じ． |
+| `storeBindings` | map | 1 件以上必要．キーの規則は同じ． |
+| `jobSigning` | object | 任意．存在する場合，署名付きジョブエンベロープだけを受け付ける．後述． |
 
 ### `authorization`
 
-This is `policy.RunnerAuthorizationPolicy` — the boundary that bounds what
-any `JobSpec` (forged or not) can make this Runner do, independent of
-anything the `JobSpec` itself claims. Every list is **deny by default**: an
-empty or missing required list authorizes nothing.
+これは `policy.RunnerAuthorizationPolicy` である．`JobSpec`（偽造であれ
+なかれ）が `JobSpec` 自身の主張とは無関係に，この Runner に何をさせられるかを
+限定する境界である．すべてのリストは **既定で拒否** であり，必須リストが
+空または欠けていれば何も認可しない．
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `allowedDnsSuffixes` | []string | — (required, non-empty) | Each entry must already be in normalized form (`internal/policy.NormalizeSuffix`). A target FQDN is matched on a whole label boundary, so `evil-example.ac.jp` is never matched by `example.ac.jp`. |
-| `allowWildcard` | bool | `false` | Whether a wildcard target (`*.example.ac.jp`) is permitted under an allowed suffix. |
-| `allowedAcmeBindings` | []string | — (required, non-empty) | Names must be well-formed binding names **and** defined in `acmeBindings`. |
-| `allowedDnsBindings` | []string | — (required, non-empty) | Same, against `dnsBindings`. |
-| `allowedStoreBindings` | []string | — (required, non-empty) | Same, against `storeBindings`. |
+| `allowedDnsSuffixes` | []string | —（必須，空でないこと） | 各エントリはあらかじめ正規化された形（`internal/policy.NormalizeSuffix`）でなければならない．target の FQDN はラベル境界全体で照合されるため，`evil-example.ac.jp` が `example.ac.jp` に一致することは決してない． |
+| `allowWildcard` | bool | `false` | 許可されたサフィックスの下でワイルドカードの target（`*.example.ac.jp`）を許すかどうか． |
+| `allowedAcmeBindings` | []string | —（必須，空でないこと） | 名前は整形式のバインディング名であり，**かつ** `acmeBindings` に定義されていなければならない． |
+| `allowedDnsBindings` | []string | —（必須，空でないこと） | 同上．`dnsBindings` に対して． |
+| `allowedStoreBindings` | []string | —（必須，空でないこと） | 同上．`storeBindings` に対して． |
 
 ### `lego`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `binary` | string | — (required) | Clean, absolute path to the pinned `lego` executable. |
-| `stateDir` | string | — (required) | Clean, absolute path. Persists ACME account state (account key + registration) between runs. **Never** holds a certificate private key. Must differ from `workDir`. |
-| `workDir` | string | — (required) | Clean, absolute path; parent of the per-run temporary directory `lego` executes in and where a certificate private key exists transiently. Should be a `tmpfs` or an `emptyDir`. |
-| `timeoutSeconds` | int | `900` (applied when `0`) | Bounds one `lego` invocation. Must be between `1` and `86400`. |
+| `binary` | string | —（必須） | バージョン固定した `lego` 実行ファイルへの，クリーンな絶対パス． |
+| `stateDir` | string | —（必須） | クリーンな絶対パス．ACME アカウントの状態（アカウント鍵と登録）を run をまたいで永続化する．証明書の秘密鍵を **決して** 保持しない．`workDir` と異なっていなければならない． |
+| `workDir` | string | —（必須） | クリーンな絶対パス．`lego` が実行される run ごとの一時ディレクトリの親で，証明書の秘密鍵が一時的に存在する場所．`tmpfs` か `emptyDir` にすべきである． |
+| `timeoutSeconds` | int | `900`（`0` のとき適用） | 1 回の `lego` 起動の上限．`1` 以上 `86400` 以下でなければならない． |
 
 ### `acmeBindings.<name>`
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `directoryURL` | string | Must be an `https://` URL with no userinfo and no fragment. |
-| `email` | string | A single mailbox address (no whitespace/quotes/slashes, exactly one `@`, not leading/trailing `@`). |
-| `eab` | object, optional | `{ "kidEnv": "...", "hmacEnv": "..." }` — the **names** of the environment variables that carry the EAB key ID and HMAC at run time (never the values). `kidEnv` and `hmacEnv` must be valid env names and must differ. |
-| `allowProductionCA` | bool, default `false` | Must be set explicitly to use any directory that is not recognized as a staging/test/local one (see below). |
+| `directoryURL` | string | userinfo もフラグメントも持たない `https://` URL でなければならない． |
+| `email` | string | 1 つのメールボックスアドレス（空白・引用符・スラッシュを含まず，`@` はちょうど 1 つで，先頭・末尾が `@` でない）． |
+| `eab` | object，任意 | `{ "kidEnv": "...", "hmacEnv": "..." }` — 実行時に EAB のキー ID と HMAC を運ぶ環境変数の **名前**（決して値ではない）．`kidEnv` と `hmacEnv` は有効な環境変数名で，互いに異なっていなければならない． |
+| `allowProductionCA` | bool，既定 `false` | ステージング／テスト／ローカルと認識されないディレクトリを使うには明示的に設定しなければならない（後述）． |
 
-A directory is recognized as **non-production** when its host is a
-loopback, private or link-local IP literal, or when one of the host's
-labels (split on `.` and `-`) is one of `staging`, `stage`, `test`,
-`testing`, `sandbox`, `pebble`, `localhost`, `dev`, `local`, `internal`
-(for example `acme-staging-v02.api.letsencrypt.org`, `pebble.internal`,
-`ca-test.example.ac.jp`). **Every other directory is treated as
-production** and is refused unless `allowProductionCA: true`. This is
-deliberately an allow-rule for test-looking hosts rather than a denylist
-of known CAs, so an unknown production CA (SSL.com, Sectigo, a
-university's own ACME service, …) can never be reached by accident; a
-private CA whose host name carries none of these labels must set the flag
-explicitly. Labels are matched whole: `attestation.example` or
-`devices.example` do not count as test hosts.
+ディレクトリは，そのホストがループバック・プライベート・リンクローカルの
+IP リテラルであるか，ホストのラベル（`.` と `-` で分割）のいずれかが
+`staging`，`stage`，`test`，`testing`，`sandbox`，`pebble`，`localhost`，
+`dev`，`local`，`internal` のいずれかであるとき，**非本番** と認識される
+（たとえば `acme-staging-v02.api.letsencrypt.org`，`pebble.internal`，
+`ca-test.example.ac.jp`）．**それ以外のディレクトリはすべて本番として扱われ**，
+`allowProductionCA: true` がなければ拒否される．これは既知の CA の拒否リスト
+ではなく，テストらしく見えるホストに対する許可規則として意図的に設計されて
+いる．未知の本番 CA（SSL.com，Sectigo，大学独自の ACME サービスなど）に
+誤って到達することが決してないようにするためである．ホスト名にこれらの
+ラベルを 1 つも含まないプライベート CA は，明示的にフラグを設定しなければ
+ならない．ラベルは全体で照合される．`attestation.example` や
+`devices.example` はテストホストとはみなされない．
 
 ### `dnsBindings.<name>`
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `provider` | string | A `lego` DNS provider name (`^[a-z0-9]{1,32}$`, e.g. `azuredns`). `exec` and `manual` are rejected outright: `exec` runs an arbitrary program, `manual` requires interactive input, and both are explicit non-goals. |
-| `env` | map[string]string, optional | Non-secret provider settings passed to `lego` as environment variables (e.g. `AZURE_ZONE_NAME`). Each value is a single line (no `\0`, `\r`, `\n`) of at most 4096 bytes. |
-| `passthroughEnv` | []string, optional | Names of environment variables of the **Runner process** that are forwarded to `lego` unchanged at run time. This is how a platform-provided credential (a mounted secret exported as an env var) reaches the DNS provider without ever appearing in this file. A missing passthrough variable fails the run closed (`DnsFailure`) rather than starting `lego` half-configured. |
-| `propagationWaitSeconds` | int, `0`-`3600` | When set (`> 0`), disables `lego`'s own authoritative-nameserver propagation check in favor of a fixed wait. |
-| `resolvers` | []string, optional | Overrides the recursive resolvers `lego` uses for propagation checks, each `"host:port"`. |
+| `provider` | string | `lego` の DNS プロバイダ名（`^[a-z0-9]{1,32}$`，例: `azuredns`）．`exec` と `manual` は即座に拒否される．`exec` は任意のプログラムを実行し，`manual` は対話的な入力を必要とし，どちらも明示的な非目標である． |
+| `env` | map[string]string，任意 | 環境変数として `lego` に渡す，シークレットでないプロバイダ設定（例: `AZURE_ZONE_NAME`）．各値は 1 行（`\0`，`\r`，`\n` を含まない）で 4096 バイト以下． |
+| `passthroughEnv` | []string，任意 | 実行時にそのまま `lego` に転送する **Runner プロセス** の環境変数の名前．プラットフォームが提供する資格情報（環境変数として公開されたマウント済みシークレット）が，このファイルに一切現れずに DNS プロバイダに届く仕組みである．パススルー変数が欠けている場合，`lego` を中途半端な設定で起動するのではなく，run を閉じた側に倒して失敗させる（`DnsFailure`）． |
+| `propagationWaitSeconds` | int，`0`〜`3600` | 設定時（`> 0`），`lego` 自身の権威ネームサーバによる伝播確認を無効化し，固定の待機に置き換える． |
+| `resolvers` | []string，任意 | `lego` が伝播確認に使う再帰リゾルバを上書きする．各要素は `"host:port"`． |
 
-`env` and `passthroughEnv` together are capped at 64 entries. An
-environment variable name (in either `env` or `passthroughEnv`) must match
-`^[A-Z][A-Z0-9_]{0,63}$` and must not be one of the **reserved** names:
-anything starting with `LEGO_` or `LD_`, or exactly `PATH`, `HOME`,
-`TMPDIR` — these would change how `lego` itself is configured or how the
-process is loaded, so a binding may neither set nor pass them through. The
-same name cannot appear in both `env` and `passthroughEnv`.
+`env` と `passthroughEnv` は合わせて 64 エントリが上限である．環境変数名
+（`env` と `passthroughEnv` のいずれでも）は `^[A-Z][A-Z0-9_]{0,63}$` に
+一致しなければならず，**予約済み** の名前であってはならない．すなわち
+`LEGO_` または `LD_` で始まるもの，あるいはちょうど `PATH`，`HOME`，`TMPDIR`
+である．これらは `lego` 自身の設定やプロセスのロード方法を変えてしまうため，
+バインディングは設定もパススルーもできない．同じ名前を `env` と
+`passthroughEnv` の両方に置くことはできない．
 
 ### `storeBindings.<name>`
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `type` | string | The store type name (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). The Runner binary decides which types it provides: the official binary provides `filesystem` (development and tests) and `azure-keyvault`. A type this binary does not provide is refused when the configuration is loaded, before any job is handled. |
-| `config` | object | The configuration of that type, decoded strictly by the type's provider (unknown fields are refused, duplicate keys are refused, nothing else is accepted). Its content is opaque to the generic configuration: adding a store type adds nothing here. |
+| `type` | string | store の種別名（`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`）．どの種別を提供するかは Runner バイナリが決める．公式バイナリは `filesystem`（開発・テスト用）と `azure-keyvault` を提供する．このバイナリが提供しない種別は，ジョブを処理する前の設定読み込み時に拒否される． |
+| `config` | object | その種別の設定で，種別のプロバイダが厳密にデコードする（未知のフィールドは拒否，重複キーは拒否，それ以外は受け付けない）．内容は汎用の設定からは不透明であり，store の種別を追加してもここには何も加わらない． |
 
-The provider configurations of the official binary:
+公式バイナリのプロバイダ設定:
 
 **`type: filesystem`** — `config`:
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `directory` | string | Clean, absolute path — the filesystem store root. Required. |
+| `directory` | string | クリーンな絶対パス．ファイルシステム store のルート．必須． |
 
 **`type: azure-keyvault`** — `config`:
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `vaultURL` | string | The vault's base URL, `https://<vault-name>.vault.azure.net` (or the equivalent under `.vault.azure.cn` / `.vault.usgovcloudapi.net`, which also selects the identity endpoint of that cloud). Nothing else: no port, path, query, fragment or credentials, and the host must be under one of those three suffixes with a well-formed vault name. Required. |
-| `credential` | string | How the Runner authenticates to Azure: `managed-identity` (the platform's managed identity and nothing else — use this in production) or `default` (the SDK's `DefaultAzureCredential`, which tries environment variables, workload identity, managed identity and then the developer tools `az`/`azd`/Azure PowerShell in that order — for development). Defaults to `default` when omitted. No credential value is ever in this file. |
-| `managedIdentityClientId` | string | With `credential: managed-identity` only. The client ID (GUID) of a user-assigned managed identity; omitted means the system-assigned identity. |
+| `vaultURL` | string | vault のベース URL．`https://<vault-name>.vault.azure.net`（または `.vault.azure.cn` / `.vault.usgovcloudapi.net` 配下の同等のもの．これはそのクラウドの ID エンドポイントの選択も兼ねる）．それ以外は不可: ポート・パス・クエリ・フラグメント・資格情報を含まず，ホストはこれら 3 つのサフィックスのいずれかの下にあり，整形式の vault 名でなければならない．必須． |
+| `credential` | string | Runner が Azure に認証する方法: `managed-identity`（プラットフォームのマネージド ID のみ．本番ではこれを使う）または `default`（SDK の `DefaultAzureCredential`．環境変数，ワークロード ID，マネージド ID，その後に開発者ツール `az`/`azd`/Azure PowerShell をこの順に試す．開発用）．省略時の既定値は `default`．資格情報の値がこのファイルに置かれることは決してない． |
+| `managedIdentityClientId` | string | `credential: managed-identity` のときのみ．ユーザー割り当てマネージド ID のクライアント ID（GUID）．省略時はシステム割り当て ID を意味する． |
 
 ```json
 "storeBindings": {
@@ -220,58 +217,57 @@ The provider configurations of the official binary:
 
 ### `jobSigning`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `publicKeys` | []string | — (required) | 1–8 Conductor signing public keys (Ed25519), each either a PEM `PUBLIC KEY` block or the standard base64 of its DER SubjectPublicKeyInfo — the one-line `publicKey:` that `acme-conductor keygen` prints. Several keys let the Conductor rotate its key without a simultaneous change here. Duplicates are rejected. |
-| `clockSkewSeconds` | int | `300` | How far an envelope's `issuedAt` may lie in the future of this Runner's clock before it is refused. Expiry has no tolerance. `1`–`3600`. |
+| `publicKeys` | []string | —（必須） | 1〜8 個の Conductor 署名用公開鍵（Ed25519）．各要素は PEM の `PUBLIC KEY` ブロックか，その DER SubjectPublicKeyInfo の標準 base64（`acme-conductor keygen` が表示する 1 行の `publicKey:`）のいずれか．複数の鍵を置けるため，Conductor はここを同時に変更することなく鍵をローテーションできる．重複は拒否される． |
+| `clockSkewSeconds` | int | `300` | エンベロープの `issuedAt` が，この Runner の時計よりどれだけ未来にあっても拒否しないか．有効期限には猶予がない．`1`〜`3600`． |
 
-When `jobSigning` is present the Runner is **strict in both directions**:
-a bare `CertificateReconcileJob` is refused (`InvalidJobSpec`, "signed
-job envelopes only"), and a `SignedCertificateReconcileJob` is acted upon
-only if its signature verifies against one of these keys, its validity
-window includes now, and its `runId` has not been accepted before (see
-[Execution flow](#execution-flow)). When `jobSigning` is absent, only
-bare JobSpecs are accepted and an envelope is refused — the Runner never
-ignores a signature it cannot check. Which to use is a deployment
-decision: the local launcher over a private directory on one host may
-run unsigned; anything that hands jobs over a shared volume or a
-platform must sign ([ADR 0015](adr/0015-signed-job-envelope.md)).
+`jobSigning` が存在するとき，Runner は **両方向に厳密** である．素の
+`CertificateReconcileJob` は拒否され（`InvalidJobSpec`，"signed job envelopes
+only"），`SignedCertificateReconcileJob` は，その署名がこれらの鍵のいずれかで
+検証でき，有効期間が現在を含み，かつその `runId` が過去に受け付けられて
+いない場合にのみ処理される（[実行フロー](#実行フロー) を参照）．
+`jobSigning` がないときは素の JobSpec だけを受け付け，エンベロープは
+拒否される．Runner は検証できない署名を決して無視しない．どちらを使うかは
+デプロイ上の判断である．1 台のホスト上でプライベートなディレクトリを介する
+ローカルランチャーは未署名で動かしてもよい．共有ボリュームやプラットフォームを
+介してジョブを渡すものはすべて署名しなければならない
+（[ADR 0015](adr/0015-signed-job-envelope.md)）．
 
 ### `resultSigning`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `privateKeyFile` | string | — (required) | Clean, absolute path of the PEM `PRIVATE KEY` (PKCS #8, Ed25519) file from `acme-runner keygen`. The Runner's identity towards the Conductor, never a DNS, Store or cloud credential. |
-| `validitySeconds` | int | `3600` | How long a signed Result stays acceptable to the Conductor after it is issued. `1`–`86400`. |
+| `privateKeyFile` | string | —（必須） | `acme-runner keygen` で作った PEM の `PRIVATE KEY`（PKCS #8，Ed25519）ファイルのクリーンな絶対パス．Conductor に対する Runner の ID であり，DNS・Store・クラウドの資格情報では決してない． |
+| `validitySeconds` | int | `3600` | 署名付き Result が発行後どれだけの間 Conductor に受け付けられるか．`1`〜`86400`． |
 
-With `resultSigning` present the Runner wraps every Result — success or
-failure — in a `SignedCertificateReconcileResult`
-([ADR 0015](adr/0015-signed-job-envelope.md)): the exact `Result` bytes
-under a strict signed header, on stdout and in the result file alike.
-A Conductor configured with the matching public key
-([`docs/conductor.md`](conductor.md#resultsigning)) accepts nothing
-else, which is what keeps another writer to a shared exchange volume
-from substituting or altering a Result. The Runner fails closed: when
-the key cannot be read, the run fails (`Internal`, "result signing key
-could not be loaded") and `lego` does not run, rather than a bare
-success being reported. The Phase 4 deployment requires it; the local
-launcher over a private directory may run without.
+`resultSigning` が存在するとき，Runner はすべての Result（成功も失敗も）を
+`SignedCertificateReconcileResult`
+（[ADR 0015](adr/0015-signed-job-envelope.md)）で包む．厳密な署名付き
+ヘッダの下に `Result` のバイト列そのものを置いたもので，stdout にも
+Result ファイルにも同じものが出る．対応する公開鍵を設定した Conductor
+（[`docs/conductor.md`](conductor.md#resultsigning)）はそれ以外を
+受け付けず，これによって共有の交換用ボリュームへの別の書き手が Result を
+すり替えたり改変したりできなくなる．Runner は閉じた側に倒れる．鍵を読めない
+場合，素の成功を報告するのではなく run が失敗し（`Internal`，"result signing
+key could not be loaded"），`lego` は実行されない．Phase 4 のデプロイでは
+必須である．プライベートなディレクトリを介するローカルランチャーは
+これなしで動かしてもよい．
 
-### Running as a Container Apps Job
+### Container Apps Job として動かす
 
-In the Phase 4 deployment ([`deploy/azure`](../deploy/azure/README.md))
-the Runner is a Container Apps Job with a user-assigned managed
-identity, and both DNS and Key Vault authenticate with it: the store
-binding says `credential: managed-identity` **with
-`managedIdentityClientId` set to that identity's client ID** (the Bicep
-injects it; a managed-identity credential without a client ID asks for
-a system-assigned identity, which the Job does not have), and the
-`azuredns` DNS binding says `AZURE_AUTH_METHOD=msi` in its `env`. Container Apps
-exposes the identity to the container through the `IDENTITY_ENDPOINT`
-and `IDENTITY_HEADER` environment variables (and the Job template sets
-`AZURE_CLIENT_ID` to the identity's client ID); because the Runner builds
-`lego`'s environment from scratch, the DNS binding must forward exactly
-those names:
+Phase 4 のデプロイ（[`deploy/azure`](../deploy/azure/README.md)）では，
+Runner はユーザー割り当てマネージド ID を持つ Container Apps Job であり，
+DNS と Key Vault の両方がこの ID で認証する．store バインディングは
+`credential: managed-identity` を **その ID のクライアント ID を
+`managedIdentityClientId` に設定した上で** 指定し（Bicep が注入する．
+クライアント ID のないマネージド ID 資格情報はシステム割り当て ID を
+要求するが，Job はそれを持たない），`azuredns` の DNS バインディングは
+`env` で `AZURE_AUTH_METHOD=msi` を指定する．Container Apps は
+`IDENTITY_ENDPOINT` と `IDENTITY_HEADER` の環境変数を通じて ID をコンテナに
+公開する（また Job テンプレートは `AZURE_CLIENT_ID` に ID のクライアント ID
+を設定する）．Runner は `lego` の環境をゼロから組み立てるため，DNS
+バインディングはちょうどこれらの名前を転送しなければならない:
 
 ```json
 "azure-dns-staging": {
@@ -286,129 +282,125 @@ those names:
 }
 ```
 
-No credential value is in the file; `IDENTITY_HEADER` is the
-per-container token of the local identity endpoint and is redacted from
-the Runner's log like every passthrough value.
+ファイルに資格情報の値はない．`IDENTITY_HEADER` はローカル ID
+エンドポイントのコンテナごとのトークンであり，他のすべてのパススルー値と
+同様に Runner のログから秘匿される．
 
-The Job is **scheduled** (every minute) with the fixed command
-`reconcile --exchange /exchange`, never started by the Conductor
-([ADR 0014](adr/0014-azure-container-apps-job-launcher.md)): each
-execution takes at most one offered job or exits at once, records its
-execution identity (the platform's execution name) for the Conductor,
-and signs its Result with the
-result-signing key mounted at `/etc/acme-runner/result-signing.pem`.
+Job は固定コマンド `reconcile --exchange /exchange` で **スケジュール実行**
+（毎分）され，Conductor から開始されることは決してない
+（[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)）．各実行は
+差し出されたジョブを最大 1 つ取るか即座に終了し，Conductor のために
+実行 ID（プラットフォームの実行名）を記録し，
+`/etc/acme-runner/result-signing.pem` にマウントされた Result 署名鍵で
+Result に署名する．
 [`deploy/examples/runner-config.aca.example.json`](../deploy/examples/runner-config.aca.example.json)
-is the complete, validated example for that deployment (paths `/state`
-and `/work`, `jobSigning` and `resultSigning` required).
+がそのデプロイ向けの完全で検証済みの例である（パスは `/state` と `/work`，
+`jobSigning` と `resultSigning` は必須）．
 
-### Example
+### 例
 
-See [`deploy/examples/runner-config.example.json`](../deploy/examples/runner-config.example.json)
-for a complete, validated example (Let's Encrypt **staging**, an
-`azuredns` DNS binding with non-secret `env` only — no `passthroughEnv`,
-since Managed Identity is assumed from Phase 3+; for local development
-against a service principal instead, add `AZURE_CLIENT_SECRET` to
-`passthroughEnv` and export it in the Runner's own environment — and a
-`filesystem` store rooted at `/store` plus an `azure-keyvault` store
-authenticated with the system-assigned managed identity). A matching
-example `JobSpec` is at
-[`deploy/examples/job.example.json`](../deploy/examples/job.example.json).
+完全で検証済みの例は
+[`deploy/examples/runner-config.example.json`](../deploy/examples/runner-config.example.json)
+を参照（Let's Encrypt の **ステージング**，シークレットでない `env` だけを
+持つ `azuredns` の DNS バインディング — Phase 3 以降はマネージド ID を
+前提とするため `passthroughEnv` はない．代わりにサービスプリンシパルに対して
+ローカル開発する場合は，`passthroughEnv` に `AZURE_CLIENT_SECRET` を加え，
+Runner 自身の環境でそれを export する — さらに `/store` をルートとする
+`filesystem` store と，システム割り当てマネージド ID で認証する
+`azure-keyvault` store）．対応する `JobSpec` の例は
+[`deploy/examples/job.example.json`](../deploy/examples/job.example.json)
+にある．
 
-## Execution flow
+## 実行フロー
 
-One `reconcile` invocation:
+1 回の `reconcile` 起動:
 
-1. Read the job file (capped at 128 KiB, the size of a signed envelope
-   around a 64 KiB JobSpec). If the document is a
-   `SignedCertificateReconcileJob`, decode the envelope's structure
-   strictly and take the JobSpec bytes from its payload — unverified for
-   now. Leniently peek `runId` and `target.id` out of those bytes first,
-   so that a `Result` can still be produced for a `runId` even if the
-   document goes on to fail verification or strict validation.
-2. Load the Runner configuration (strict JSON: unknown fields, duplicate
-   keys, trailing data and over-deep nesting rejected, 256 KiB cap — the
-   same decoder as the JobSpec, `internal/strictjson`).
-3. **Signed envelope** (Phase 4, [`jobSigning`](#jobsigning)): verify the
-   Ed25519 signature over the exact `protected.payload` bytes against the
-   trusted public keys (`kid` selects the key), check `expiresAt` is not
-   past and `issuedAt` is not more than `clockSkewSeconds` ahead, then
-   record the `runId` in the replay ledger — one marker file per run
-   under `stateDir/jobs.d/`, created exclusively under a lock on
-   `stateDir/.jobs.lock`, holding the envelope's expiry; markers whose
-   expiry plus skew has passed are pruned on the way. A run already in
-   the ledger is refused ("already executed"). Every failure here is
-   `InvalidJobSpec`; a ledger I/O problem is `Internal`. With
-   `jobSigning` configured a bare JobSpec is refused at this step;
-   without it, an envelope is. Only then strictly decode and validate the
-   `JobSpec` (`v1alpha1.DecodeJobSpec` / `JobSpec.Validate`) — unknown
-   fields, duplicate keys and trailing data are all rejected; this is a
-   self-consistency check of the document, not authorization.
-4. Authorize the request with `RunnerAuthorizationPolicy` built from that
-   configuration — deny by default, suffix matched on a label boundary,
-   wildcard gated by `allowWildcard`, and all three binding names checked
-   against their allow-lists.
-5. Resolve the three binding names (`acme`, `dns`, `store`) against
-   `acmeBindings`/`dnsBindings`/`storeBindings`; an authorized name that is
-   not defined fails with `BindingNotFound`.
-6. Open the Certificate Store for the resolved store binding.
-7. Ask the store for the current certificate (`Store.Current`) for the
-   store's object name of the FQDN (`Store.ObjectName`; see the naming
-   rules under each store below).
-8. Decide whether anything needs to happen: if a certificate is stored,
-   its SAN list covers the target FQDN, it is already valid (`NotBefore`
-   within clock-skew tolerance), its public key is of the policy's
-   `keyType`, and its `NotAfter` is still after `now + renewBeforeDays`,
-   the run stops here as a **noop** — `lego` is never invoked. Otherwise
-   (no stored certificate, its SANs don't cover the FQDN, it is not yet
-   valid, its key type differs from `policy.keyType` — a policy change
-   applied at this run — or it is due within `renewBeforeDays`) the Runner
-   proceeds to issue.
-9. Create a private per-run work directory `<workDir>/run-<runId>-<rand>`
-   (mode `0700`).
-10. Copy the `accounts` subtree of `stateDir` into the work directory, so
-    `lego` reuses the existing ACME account registration if there is one.
-11. Build the `lego` argument vector and a from-scratch environment (see
-    below).
-12. Run `lego` once, under a timeout, in its own process group; on
-    timeout or cancellation `SIGTERM` is sent to the whole group, followed
-    by `SIGKILL` after a grace period if it has not exited. Output is
-    consumed through writer sinks driven by `os/exec`, so the same grace
-    period also bounds how long a descendant that inherited `lego`'s
-    output pipes (a detached helper) can delay the return: after it the
-    pipes are closed forcibly and the real exit status is used.
-13. Publish the (possibly updated) `accounts` subtree into `stateDir` as a
-    new version and re-point the `accounts` link (see Crash safety),
-    regardless of whether `lego` succeeded — so account continuity across
-    runs does not depend on this run's outcome.
-14. Verify what `lego` wrote: the certificate parses, it carries exactly
-    one subject alternative name and that name is the target FQDN (no
-    wildcard-aware matching — a job for `*.example.ac.jp` must produce a
-    certificate whose SAN is literally `*.example.ac.jp`), the private key
-    matches the certificate's public key, the key algorithm and size match
-    the requested `keyType`, the certificate is not already expired, and
-    its `NotBefore` is not more than 5 minutes in the future.
-15. `Put` the verified bundle (certificate, chain, private key) into the
-    Certificate Store.
-16. Destroy the work directory (`defer`, so this always runs, on every
-    return path) — this is what destroys the only local copy of the
-    private key.
-17. Emit the `Result`.
+1. ジョブファイルを読む（上限 128 KiB．64 KiB の JobSpec を包む署名付き
+   エンベロープの大きさ）．文書が `SignedCertificateReconcileJob` なら，
+   エンベロープの構造を厳密にデコードし，そのペイロードから JobSpec の
+   バイト列を取り出す．この時点ではまだ未検証である．まずそのバイト列から
+   `runId` と `target.id` を緩く覗き見ておき，文書がこの後の検証や厳密な
+   検証に失敗しても，その `runId` に対する `Result` を生成できるようにする．
+2. Runner の設定を読み込む（厳密な JSON: 未知のフィールド，重複キー，末尾の
+   余分なデータ，深すぎるネストは拒否．上限 256 KiB．JobSpec と同じデコーダ
+   `internal/strictjson`）．
+3. **署名付きエンベロープ**（Phase 4，[`jobSigning`](#jobsigning)）:
+   `protected.payload` のバイト列そのものに対する Ed25519 署名を信頼された
+   公開鍵（`kid` で鍵を選ぶ）で検証し，`expiresAt` が過ぎていないこと，
+   `issuedAt` が `clockSkewSeconds` 以上先でないことを確認してから，
+   `runId` をリプレイ台帳に記録する．台帳は `stateDir/jobs.d/` 配下の
+   run ごとのマーカーファイルで，`stateDir/.jobs.lock` のロックの下で
+   排他的に作成され，エンベロープの有効期限を保持する．有効期限に猶予を
+   足した時刻を過ぎたマーカーは，その過程で削除される．すでに台帳にある
+   run は拒否される（"already executed"）．ここでの失敗はすべて
+   `InvalidJobSpec` であり，台帳の I/O の問題は `Internal` である．
+   `jobSigning` が設定されていれば素の JobSpec はこのステップで拒否され，
+   なければエンベロープが拒否される．その後にはじめて `JobSpec` を厳密に
+   デコードして検証する（`v1alpha1.DecodeJobSpec` / `JobSpec.Validate`）．
+   未知のフィールド，重複キー，末尾の余分なデータはすべて拒否される．
+   これは文書の自己整合性の検査であり，認可ではない．
+4. その設定から組み立てた `RunnerAuthorizationPolicy` で要求を認可する．
+   既定で拒否，サフィックスはラベル境界で照合，ワイルドカードは
+   `allowWildcard` で制御，3 つのバインディング名はすべて許可リストに
+   照らして検査する．
+5. 3 つのバインディング名（`acme`，`dns`，`store`）を
+   `acmeBindings`/`dnsBindings`/`storeBindings` に対して解決する．認可された
+   名前が定義されていなければ `BindingNotFound` で失敗する．
+6. 解決した store バインディングの Certificate Store を開く．
+7. FQDN に対する store のオブジェクト名（`Store.ObjectName`．命名規則は
+   後述の各 store を参照）について，現在の証明書を store に問い合わせる
+   （`Store.Current`）．
+8. 何かする必要があるかを判断する．証明書が格納されており，その SAN
+   リストが target の FQDN を含み，すでに有効で（`NotBefore` が時計のずれの
+   許容範囲内），公開鍵がポリシーの `keyType` であり，`NotAfter` が依然として
+   `now + renewBeforeDays` より後であれば，run はここで **noop** として
+   停止する．`lego` は決して起動されない．そうでなければ（格納済みの
+   証明書がない，SAN が FQDN を含まない，まだ有効でない，鍵の種別が
+   `policy.keyType` と異なる — この run で適用されるポリシー変更 — または
+   `renewBeforeDays` 以内に期限が来る）Runner は発行に進む．
+9. run ごとのプライベートな作業ディレクトリ `<workDir>/run-<runId>-<rand>`
+   を作成する（モード `0700`）．
+10. `stateDir` の `accounts` サブツリーを作業ディレクトリにコピーし，
+    既存の ACME アカウント登録があれば `lego` がそれを再利用できるように
+    する．
+11. `lego` の引数ベクトルと，ゼロから組み立てた環境を構築する（後述）．
+12. `lego` を 1 度だけ，タイムアウト付きで，独自のプロセスグループで実行する．
+    タイムアウトまたはキャンセル時にはグループ全体に `SIGTERM` を送り，
+    猶予期間内に終了しなければ `SIGKILL` を続けて送る．出力は `os/exec` が
+    駆動する writer シンクを通じて消費されるため，`lego` の出力パイプを
+    継承した子孫（切り離されたヘルパー）が復帰を遅らせられる時間も同じ
+    猶予期間で抑えられる．猶予期間の後はパイプを強制的に閉じ，実際の
+    終了ステータスを使う．
+13. （更新された可能性のある）`accounts` サブツリーを新しいバージョンとして
+    `stateDir` に公開し，`accounts` リンクを付け替える（クラッシュ安全性を
+    参照）．これは `lego` の成否にかかわらず行い，run をまたぐアカウントの
+    継続性がこの run の結果に依存しないようにする．
+14. `lego` が書いたものを検証する．証明書がパースでき，subject alternative
+    name をちょうど 1 つ持ち，それが target の FQDN であること
+    （ワイルドカードを考慮した照合はしない．`*.example.ac.jp` のジョブは
+    SAN が文字通り `*.example.ac.jp` である証明書を生成しなければならない），
+    秘密鍵が証明書の公開鍵と一致すること，鍵のアルゴリズムとサイズが
+    要求された `keyType` と一致すること，証明書がすでに失効していないこと，
+    `NotBefore` が 5 分以上未来でないこと．
+15. 検証済みのバンドル（証明書，チェーン，秘密鍵）を Certificate Store に
+    `Put` する．
+16. 作業ディレクトリを破棄する（`defer` により，どの復帰経路でも常に
+    実行される）．これが秘密鍵の唯一のローカルコピーを破棄する処理である．
+17. `Result` を出力する．
 
-The reported `action` is:
+報告される `action` は次の通り:
 
-- **`issued`** — no certificate previously existed in the store for this
-  object.
-- **`renewed`** — a certificate previously existed and the newly stored
-  certificate's fingerprint differs from it.
-- **`noop`** — either the early-exit case in step 8 (no `lego` invocation
-  at all), or, in principle, a case where `lego` was invoked but produced
-  a certificate whose fingerprint is unchanged from what was already
-  stored (in practice this does not happen, since `lego` generates a
-  fresh key on every issuance, but the Runner does not assume that).
+- **`issued`** — このオブジェクトについて store に証明書が以前存在しなかった．
+- **`renewed`** — 証明書が以前存在し，新たに格納された証明書のフィンガー
+  プリントがそれと異なる．
+- **`noop`** — ステップ 8 の早期終了の場合（`lego` の起動なし），または
+  原理的には，`lego` が起動されたが生成された証明書のフィンガープリントが
+  格納済みのものと変わらなかった場合（実際には `lego` は発行のたびに新しい
+  鍵を生成するのでこれは起きないが，Runner はそれを前提にしない）．
 
-### `lego` invocation
+### `lego` の起動
 
-Argument vector, built exactly in this order (`internal/runner/lego`):
+引数ベクトルは，正確にこの順序で構築される（`internal/runner/lego`）:
 
 ```
 <binary> --accept-tos \
@@ -424,231 +416,222 @@ Argument vector, built exactly in this order (`internal/runner/lego`):
   run
 ```
 
-`--dns.propagation-wait` and `--dns.resolvers` are only present when the
-DNS binding sets `propagationWaitSeconds`/`resolvers`. `--eab` is only
-present when the ACME binding has an `eab` section. Nothing from the
-`JobSpec` is ever interpolated into a shell string; the Runner never
-invokes a shell.
+`--dns.propagation-wait` と `--dns.resolvers` は DNS バインディングが
+`propagationWaitSeconds`/`resolvers` を設定している場合にのみ現れる．
+`--eab` は ACME バインディングが `eab` セクションを持つ場合にのみ現れる．
+`JobSpec` の内容がシェル文字列に補間されることは決してなく，Runner は
+決してシェルを起動しない．
 
-Environment, built from scratch (nothing is inherited from the Runner
-process except what a binding explicitly names):
+環境はゼロから構築される（バインディングが明示的に名指ししたもの以外，
+Runner プロセスから何も継承しない）:
 
 ```
 HOME=<workDir>
 TMPDIR=<workDir>
 PATH=/usr/local/bin:/usr/bin:/bin
-<dns.env, sorted by key>
-<one entry per dns.passthroughEnv name, value looked up from the Runner's own environment>
-LEGO_EAB_KID=<value of acme.eab.kidEnv>        (only if eab is set)
-LEGO_EAB_HMAC=<value of acme.eab.hmacEnv>      (only if eab is set)
+<dns.env，キー順にソート>
+<dns.passthroughEnv の名前ごとに 1 エントリ，値は Runner 自身の環境から引く>
+LEGO_EAB_KID=<acme.eab.kidEnv の値>        (eab が設定されている場合のみ)
+LEGO_EAB_HMAC=<acme.eab.hmacEnv の値>      (eab が設定されている場合のみ)
 ```
 
-EAB material travels through `lego`'s own environment variables
-(`LEGO_EAB_KID`/`LEGO_EAB_HMAC`), **never** through `argv`, so it is not
-visible in a process listing.
+EAB の素材は `lego` 自身の環境変数（`LEGO_EAB_KID`/`LEGO_EAB_HMAC`）を通じて
+運ばれ，**決して** `argv` を通らないため，プロセス一覧には見えない．
 
-## Certificate Store (filesystem)
+## Certificate Store (ファイルシステム)
 
-The filesystem Certificate Store (`internal/store/filesystem`) is backed
-by a local directory. **It is for local development and tests only** —
-see [Limitations](#limitations).
+ファイルシステムの Certificate Store（`internal/store/filesystem`）は
+ローカルディレクトリを後ろ盾とする．**ローカル開発とテスト専用である**．
+[制限事項](#制限事項) を参照．
 
-Layout under the store's `directory`:
+store の `directory` 配下のレイアウト:
 
 ```
 <root>/<object>/versions/<fp16>-<nanos>/cert.pem
 <root>/<object>/versions/<fp16>-<nanos>/chain.pem
 <root>/<object>/versions/<fp16>-<nanos>/fullchain.pem
 <root>/<object>/versions/<fp16>-<nanos>/privkey.pem
-<root>/<object>/current -> versions/<fp16>-<nanos>        (symlink)
+<root>/<object>/current -> versions/<fp16>-<nanos>        (シンボリックリンク)
 ```
 
-`<fp16>` is the first 16 hex characters of the certificate's SHA-256
-fingerprint and `<nanos>` a Unix-nanosecond timestamp, so version
-directories sort and are unique. A `Put` writes a complete new version
-directory (mode `0700`, files mode `0600`, all fsynced) and only then
-swaps the `current` symlink into place with a single `rename`, so a reader
-always observes either the complete previous version or the complete new
-one, never a partial write. `Put` holds an exclusive advisory lock
-(`<object>/.lock`, `flock`) for the whole operation, so writers on the
-same object are serialized: the last writer to take the lock wins, and
-the pruning of older version directories that follows the swap can never
-remove a version a concurrent writer has just published. `Current` holds
-the same lock shared, resolves the `current` link once and reads both
-files from that one version, so a reader never straddles a swap or
-observes a half-pruned version. `Current` returns `ErrNotFound` only when
-no `current` link exists; a link whose target or files are missing, a
-link pointing outside the object directory, or a `privkey.pem` that is
-missing or does not match `cert.pem` is reported as an error, not as an
-empty or healthy store. `Put` refuses a bundle whose key does not match
-its certificate.
+`<fp16>` は証明書の SHA-256 フィンガープリントの先頭 16 桁の 16 進文字，
+`<nanos>` は Unix ナノ秒のタイムスタンプであり，バージョンディレクトリは
+整列可能で一意になる．`Put` は完全な新しいバージョンディレクトリ
+（モード `0700`，ファイルはモード `0600`，すべて fsync 済み）を書き，その後に
+はじめて 1 回の `rename` で `current` シンボリックリンクを差し替える．
+そのため読み手は常に完全な旧バージョンか完全な新バージョンのどちらかを観測し，
+書きかけを見ることは決してない．`Put` は操作全体にわたって排他的な
+アドバイザリロック（`<object>/.lock`，`flock`）を保持するので，同じ
+オブジェクトへの書き手は直列化される．最後にロックを取った書き手が勝ち，
+差し替えの後に続く古いバージョンディレクトリの削除が，並行する書き手が
+公開したばかりのバージョンを消すことは決してない．`Current` は同じロックを
+共有モードで保持し，`current` リンクを 1 度だけ解決してその 1 つの
+バージョンから両ファイルを読むため，読み手が差し替えをまたいだり，削除
+途中のバージョンを観測したりすることはない．`Current` が `ErrNotFound` を
+返すのは `current` リンクが存在しない場合だけである．リンク先やファイルが
+欠けているリンク，オブジェクトディレクトリの外を指すリンク，欠けているか
+`cert.pem` と一致しない `privkey.pem` は，空または健全な store としてではなく
+エラーとして報告される．`Put` は鍵が証明書と一致しないバンドルを拒否する．
 
-Durability: file data is fsynced, then the version directory, then the
-`versions` directory after the rename that publishes the version, then
-the object directory after the `current` swap. On a filesystem that
-honours fsync this means a power loss, like a process crash, leaves either
-the previous complete version or the new one referenced.
+耐久性: ファイルデータを fsync し，次にバージョンディレクトリ，次に
+バージョンを公開する rename の後に `versions` ディレクトリ，次に `current`
+の差し替えの後にオブジェクトディレクトリを fsync する．fsync を尊重する
+ファイルシステムでは，これによりプロセスのクラッシュと同様に電源断でも，
+以前の完全なバージョンか新しいバージョンのどちらかが参照された状態が残る．
 
-`<object>` is derived from the target FQDN by `store.ObjectName`: a
-human-readable prefix (`wiki.example.ac.jp`, or `wildcard.example.ac.jp`
-for a wildcard name) plus a 16-hex-character suffix that is the first 8
-bytes (64 bits) of the SHA-256 of the exact FQDN. The suffix is what keeps
-a wildcard name apart from a host literally called `wildcard`, and two
-long names that truncate to the same readable prefix apart from each
-other; a collision between two registered names is not a practical
-concern at 64 bits, but it is not impossible, and its effect would be two
-targets sharing one store object (an availability fault, never a key
-disclosure).
+`<object>` は `store.ObjectName` により target の FQDN から導かれる．
+人間が読める接頭辞（`wiki.example.ac.jp`，ワイルドカード名なら
+`wildcard.example.ac.jp`）に，FQDN そのものの SHA-256 の先頭 8 バイト
+（64 ビット）である 16 桁の 16 進文字の接尾辞を付けたものである．この接尾辞が，
+ワイルドカード名と文字通り `wildcard` というホストとを区別し，同じ可読接頭辞に
+切り詰められる 2 つの長い名前を互いに区別する．登録された 2 つの名前の衝突は
+64 ビットでは実用上の懸念にならないが，不可能ではなく，その影響は 2 つの
+target が 1 つの store オブジェクトを共有することである（可用性の障害であり，
+鍵の漏洩では決してない）．
 
 ## Certificate Store (Azure Key Vault)
 
-The Azure Key Vault Certificate Store (`internal/store/keyvault`, binding
-type `azure-keyvault`, [ADR 0013](adr/0013-azure-key-vault-store-adapter.md))
-keeps one Key Vault **certificate** per target. It is the store for real
-deployments: the vault is where a consumer reads the certificate from
-(through the certificate's secret), with its own access control and
-audit, and the Runner's own access to it is narrow and short-lived. What
-this store writes is a **PEM** certificate; which consumers can use that
-is set out under [Consumers and content type](#consumers-and-content-type)
-below.
+Azure Key Vault の Certificate Store（`internal/store/keyvault`，
+バインディング種別 `azure-keyvault`，
+[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)）は，target ごとに
+1 つの Key Vault **証明書** を保持する．実際のデプロイ向けの store である．
+vault は利用者が（証明書のシークレットを通じて）証明書を読み出す場所であり，
+独自のアクセス制御と監査を持ち，Runner 自身の vault へのアクセスは狭く
+短命である．この store が書くのは **PEM** の証明書であり，どの利用者がそれを
+使えるかは後述の [利用者とコンテンツタイプ](#利用者とコンテンツタイプ) に
+まとめる．
 
-**Object name.** The Result's `storeObjectRef` is the Key Vault
-certificate name. Key Vault allows only letters, digits and hyphens (at
-most 127 characters) in a certificate name, so the logical
-`store.ObjectName` is derived with that bound and every `.` or `_` becomes
-a `-`: `wiki.example.ac.jp` is stored as `wiki-example-ac-jp-<16 hex>`,
-`*.example.ac.jp` as `wildcard-example-ac-jp-<16 hex>`. The 16-hex-character
-suffix is the same SHA-256 prefix of the exact FQDN as for the filesystem
-store, so two names that differ only in the readable part still map to
-different certificates.
+**オブジェクト名．** Result の `storeObjectRef` は Key Vault の証明書名である．
+Key Vault は証明書名に英字・数字・ハイフンのみ（127 文字以下）を許すため，
+論理的な `store.ObjectName` はその制約の下で導かれ，`.` と `_` はすべて `-`
+になる．`wiki.example.ac.jp` は `wiki-example-ac-jp-<16 hex>` として，
+`*.example.ac.jp` は `wildcard-example-ac-jp-<16 hex>` として格納される．
+16 桁の 16 進文字の接尾辞はファイルシステム store と同じ，FQDN そのものの
+SHA-256 の接頭部分であるため，可読部分だけが異なる 2 つの名前も別々の
+証明書に対応する．
 
-**What `Put` does.** After verifying the bundle locally (the certificate
-parses, the private key matches it, the chain holds only certificates),
-the Runner re-encodes the private key as unencrypted PKCS #8 (`lego`
-writes SEC 1 for EC keys), concatenates leaf + chain + key into one PEM
-document and calls the vault's *import certificate* operation
-(`POST /certificates/<name>/import`, content type
-`application/x-pem-file`, tag `managed-by=acme-conductor`, enabled). Key
-Vault keeps the key in its own key store, creates a new *version* of the
-certificate — an existing certificate of that name is never overwritten,
-its previous versions remain readable — and exposes the certificate to
-consumers through the certificate's secret. The Runner then checks that the certificate the
-vault reports back is the one it imported (same SHA-256 fingerprint,
-same name) and fails the run otherwise. No PFX and no PFX password are
-involved at any point.
+**`Put` が行うこと．** バンドルをローカルで検証した後（証明書がパースでき，
+秘密鍵がそれと一致し，チェーンが証明書のみを含む），Runner は秘密鍵を
+暗号化なしの PKCS #8 に再エンコードし（`lego` は EC 鍵を SEC 1 で書く），
+リーフ + チェーン + 鍵を 1 つの PEM 文書に連結して，vault の
+*import certificate* 操作を呼ぶ（`POST /certificates/<name>/import`，
+コンテンツタイプ `application/x-pem-file`，タグ `managed-by=acme-conductor`，
+有効化済み）．Key Vault は鍵を自身の鍵ストアに保持し，証明書の新しい
+*バージョン* を作成し（その名前の既存の証明書は決して上書きされず，以前の
+バージョンは読み取り可能なまま残る），証明書のシークレットを通じて利用者に
+証明書を公開する．続いて Runner は vault が報告する証明書が取り込んだもの
+（同じ SHA-256 フィンガープリント，同じ名前）であることを確認し，そうで
+なければ run を失敗させる．PFX も PFX パスワードもどの時点でも関与しない．
 
-**Consumers and content type.** The store imports with content type
-`application/x-pem-file` only, so the certificate's secret holds the
-certificate chain and the private key as PEM. That serves consumers that
-read the secret with `secrets/get` and accept PEM content: an application
-or sidecar that fetches the secret itself, a virtual machine or container
-that receives the secret through a Key Vault reference, and any service
-whose Key Vault integration accepts PEM. It does **not** serve the
-built-in Key Vault integrations that require PKCS #12
-(`application/x-pkcs12`): [App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
-imports only PKCS #12 certificates from a vault, and
+**利用者とコンテンツタイプ．** この store はコンテンツタイプ
+`application/x-pem-file` でのみ取り込むため，証明書のシークレットは証明書
+チェーンと秘密鍵を PEM として保持する．これは `secrets/get` でシークレットを
+読み，PEM の内容を受け付ける利用者に役立つ．自らシークレットを取得する
+アプリケーションやサイドカー，Key Vault 参照を通じてシークレットを受け取る
+仮想マシンやコンテナ，そして Key Vault 連携が PEM を受け付けるあらゆる
+サービスである．PKCS #12（`application/x-pkcs12`）を必要とする組み込みの
+Key Vault 連携には役立た **ない**．
+[App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
+は vault から PKCS #12 の証明書だけを取り込み，
 [Azure Front Door](https://learn.microsoft.com/en-us/azure/frontdoor/domain#certificate-requirements)
-requires PFX (and does not accept EC certificates at all). A target whose
-certificate must reach one of those services needs a PKCS #12 import,
-which Phase 3 does not implement (no PFX and no PFX password exist in the
-system; [ADR 0013](adr/0013-azure-key-vault-store-adapter.md)). Check the
-consumer's own documentation for its content-type and key-type
-requirements before pointing it at a certificate this store manages;
-Application Gateway is not verified either way.
+は PFX を必要とする（そして EC 証明書をまったく受け付けない）．証明書を
+これらのサービスに届けなければならない target には PKCS #12 での取り込みが
+必要だが，Phase 3 では実装していない（システム内に PFX も PFX パスワードも
+存在しない．[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)）．
+この store が管理する証明書を利用者に向ける前に，その利用者自身の文書で
+コンテンツタイプと鍵種別の要件を確認すること．Application Gateway は
+どちらとも検証していない．
 
-**What `Current` does.** `GET /certificates/<name>/` — the current version
-of the certificate, *public part only* (`cer`, attributes). Key Vault
-answers that call with the `certificates/get` permission; the private key
-lives behind `secrets/get`, which the Runner never calls and must not be
-granted. A missing certificate (HTTP 404, which is also what a
-soft-deleted certificate returns) is "nothing stored" and leads to
-issuance. A certificate that exists but is *disabled*, has no body, or
-is not the one asked for is an error (`StoreFailure`), never treated as
-absent: disabling a certificate in the vault is an operator decision the
-Runner must not paper over by issuing a new one.
+**`Current` が行うこと．** `GET /certificates/<name>/` — 証明書の現在の
+バージョンで，*公開部分のみ*（`cer`，属性）．Key Vault はこの呼び出しに
+`certificates/get` 権限で応答する．秘密鍵は `secrets/get` の背後にあり，
+Runner はこれを決して呼ばず，付与してはならない．証明書がない場合
+（HTTP 404．論理削除された証明書も同じ応答を返す）は「何も格納されていない」
+であり，発行に進む．存在するが *無効化されている*，本体がない，あるいは
+要求したものと異なる証明書はエラー（`StoreFailure`）であり，決して不在とは
+扱わない．vault で証明書を無効化するのは操作者の判断であり，Runner が新しい
+証明書を発行してそれを覆い隠してはならない．
 
-**Permissions.** The Runner's identity needs exactly `certificates/get`
-and `certificates/import` on the vault — with Azure RBAC that is the
-built-in *Key Vault Certificates Officer* role (it carries more than
-needed; a custom role with just those two data actions is tighter). It
-does not need, and should not have, `secrets/*`, `keys/*`, or any purge
-permission (the Runner never deletes — [ADR 0008](adr/0008-no-purge-in-mvp.md)).
-Consumers read the certificate with `secrets/get` on the certificate's
-secret. The Conductor's identity is granted nothing on the vault at all
-([ADR 0005](adr/0005-conductor-never-touches-secrets.md)).
+**権限．** Runner の ID に必要なのは vault に対する `certificates/get` と
+`certificates/import` のちょうど 2 つである．Azure RBAC では組み込みの
+*Key Vault Certificates Officer* ロールがこれにあたる（必要以上の権限を
+含むため，この 2 つのデータアクションだけを持つカスタムロールのほうが
+厳密である）．`secrets/*`，`keys/*`，およびいかなる purge 権限も必要なく，
+持つべきでない（Runner は決して削除しない．
+[ADR 0008](adr/0008-no-purge-in-mvp.md)）．利用者は証明書のシークレットに
+対する `secrets/get` で証明書を読む．Conductor の ID には vault に対して
+何も付与しない（[ADR 0005](adr/0005-conductor-never-touches-secrets.md)）．
 
-**Soft delete.** Key Vault soft-deletes by default. If a certificate of
-the same name has been deleted but not yet purged, the vault refuses the
-import (`HTTP 409 Conflict`, code `Conflict` /
-`ObjectIsDeletedButRecoverable`); the run fails with `StoreFailure` and
-the operator recovers or purges the deleted certificate. The Runner
-never does either.
+**論理削除．** Key Vault は既定で論理削除する．同じ名前の証明書が削除され
+まだ purge されていない場合，vault は取り込みを拒否する（`HTTP 409 Conflict`，
+コード `Conflict` / `ObjectIsDeletedButRecoverable`）．run は `StoreFailure`
+で失敗し，操作者が削除済みの証明書を復旧するか purge する．Runner は
+どちらも決して行わない．
 
-**Authentication and network.** Every request goes over TLS to the vault's
-own host, which the configuration requires to be under one of the known
-Key Vault DNS suffixes; the SDK's authentication-challenge policy also
-verifies that the resource the vault asks a token for matches that host
-before a token is ever sent. Tokens come from the selected `credential`
-(see [`storeBindings.<name>`](#storebindingsname)): with
-`managed-identity` the Runner talks only to the vault and to the
-platform's identity endpoint (IMDS, or the identity endpoint the platform
-injects into the environment); with `default` the `DefaultAzureCredential`
-chain additionally reads the `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
-`AZURE_CLIENT_SECRET` / `AZURE_FEDERATED_TOKEN_FILE` variables of the
-Runner's own environment, contacts `login.microsoftonline.com` (or the
-selected cloud's authority), and may run `az`, `azd` or `pwsh` from the
-Runner's `PATH` — the Runner container image carries none of those
-programs, and a production binding should say `managed-identity` so that
-none of that is even tried. The vault's error responses are reduced to
-their HTTP status and error code before they reach a log line
-(`key vault get: HTTP 403 (Forbidden)`), and an identity endpoint's error
-response is reduced to its status the same way (see **Errors** below);
-response bodies, headers and tokens are never logged, and as with every
-other failure only a fixed template reaches the `Result`.
+**認証とネットワーク．** すべての要求は TLS で vault 自身のホストへ送られる．
+設定はそのホストが既知の Key Vault DNS サフィックスのいずれかの下にあることを
+要求し，SDK の認証チャレンジポリシーも，トークンを送る前に vault がトークンを
+要求するリソースがそのホストと一致することを検証する．トークンは選択した
+`credential`（[`storeBindings.<name>`](#storebindingsname) を参照）から
+得る．`managed-identity` では Runner は vault とプラットフォームの ID
+エンドポイント（IMDS，またはプラットフォームが環境に注入する ID エンド
+ポイント）だけと通信する．`default` では `DefaultAzureCredential` チェーンが
+さらに Runner 自身の環境の `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
+`AZURE_CLIENT_SECRET` / `AZURE_FEDERATED_TOKEN_FILE` 変数を読み，
+`login.microsoftonline.com`（または選択したクラウドの authority）に接続し，
+Runner の `PATH` から `az`，`azd`，`pwsh` を実行することがある．Runner の
+コンテナイメージにはこれらのプログラムは 1 つも含まれておらず，本番の
+バインディングはそのどれも試みられないよう `managed-identity` を指定すべき
+である．vault のエラー応答はログ行に達する前に HTTP ステータスとエラー
+コードに切り詰められ（`key vault get: HTTP 403 (Forbidden)`），ID エンド
+ポイントのエラー応答も同様にステータスに切り詰められる（後述の **エラー**
+を参照）．応答本文・ヘッダ・トークンは決してログに出ず，他のすべての失敗と
+同様に固定のテンプレートだけが `Result` に達する．
 
-**Exportable keys.** An imported certificate's key is exportable through
-its secret — that is how consumers obtain the certificate and it is the
-point of using the vault as the store. Whoever holds `secrets/get` on the
-vault can read the private key, so the vault's access policy / role
-assignments, not this code, decide who that is.
+**エクスポート可能な鍵．** 取り込まれた証明書の鍵は，そのシークレットを
+通じてエクスポート可能である．これが利用者が証明書を得る方法であり，vault を
+store として使う目的である．vault に対する `secrets/get` を持つ者は誰でも
+秘密鍵を読めるため，それが誰かを決めるのは vault のアクセスポリシー／ロール
+割り当てであって，このコードではない．
 
-**Errors.** Whatever the SDK or the transport produced, the store reduces
-it to fixed wording before it can reach a log line or a `Result` cause: a
-vault response becomes `key vault <op>: HTTP <status> (<code>)`; a
-failure to obtain a token becomes `key vault <op>: authentication failed
-(identity endpoint HTTP <status>)` or `(credential unavailable)`, never
-the identity endpoint's response body that the SDK's own error prints; a
-transport failure becomes `request timed out` or `connection failed`
-(no URL); anything else names only the Go type of the error. A cancelled
-or expired run is still recognized by the Runner (`Cancelled`/`Timeout`).
+**エラー．** SDK やトランスポートが何を生成しようと，store はそれがログ行や
+`Result` の cause に達する前に固定の文言に切り詰める．vault の応答は
+`key vault <op>: HTTP <status> (<code>)` に，トークン取得の失敗は
+`key vault <op>: authentication failed (identity endpoint HTTP <status>)`
+または `(credential unavailable)` になり，SDK 自身のエラーが表示する ID
+エンドポイントの応答本文は決して含まない．トランスポートの失敗は
+`request timed out` または `connection failed`（URL なし）になり，それ以外は
+エラーの Go の型名だけを示す．キャンセルまたは期限切れの run は依然として
+Runner が認識する（`Cancelled`/`Timeout`）．
 
-**Not covered by automated tests.** The store is exercised against a fake
-in-process vault that imitates the REST API's shapes (bearer-challenge
-authentication, PEM import validation, get, error bodies) — never against
-a real vault, in line with principle 8. The exact acceptance rules of the
-real import operation (PEM layout, PKCS #8 key, chain handling) are
-therefore documented from the service's documentation, not verified by
-CI; the first run against a real vault is the verification.
+**自動テストで扱わないこと．** この store は REST API の形を模倣する
+プロセス内の偽物の vault（ベアラーチャレンジ認証，PEM 取り込みの検証，get，
+エラー本文）に対して試験され，原則 8 に従い本物の vault に対しては決して
+試験されない．したがって実際の取り込み操作の正確な受け入れ規則（PEM の
+レイアウト，PKCS #8 の鍵，チェーンの扱い）はサービスの文書に基づいて記述
+されているのであって，CI で検証されたものではない．本物の vault に対する
+最初の実行がその検証となる．
 
-## Directories and container usage
+## ディレクトリとコンテナでの利用
 
-Inside `Dockerfile.runner`'s runtime image
-(`gcr.io/distroless/static-debian12:nonroot`, uid/gid `65532`, no shell):
+`Dockerfile.runner` の実行時イメージ
+（`gcr.io/distroless/static-debian12:nonroot`，uid/gid `65532`，シェルなし）
+の内部:
 
-| Path | Purpose |
+| パス | 用途 |
 |---|---|
-| `/usr/local/bin/acme-runner` | The Runner binary (entrypoint). |
-| `/usr/local/bin/lego` | The pinned, checksum-verified `lego` v4.35.2 binary (see [ADR 0010](adr/0010-pinned-lego-binary.md)). |
-| `/etc/acme-runner/config.json` | The Runner configuration, mounted **read-only**. |
-| `/work` | The `lego.workDir`. Must be a writable `tmpfs`/`emptyDir`; a certificate private key exists here only transiently, for the duration of one run. |
-| `/state` | The `lego.stateDir`. Must be a writable, **persistent** volume; holds only the ACME account key and registration and, since Phase 4, the replay ledger (`jobs.d/`) — never a certificate private key. |
-| `/store` | An example `filesystem` store root (dev/test only). |
+| `/usr/local/bin/acme-runner` | Runner のバイナリ（エントリポイント）． |
+| `/usr/local/bin/lego` | バージョン固定しチェックサム検証済みの `lego` v4.35.2 バイナリ（[ADR 0010](adr/0010-pinned-lego-binary.md) を参照）． |
+| `/etc/acme-runner/config.json` | Runner の設定．**読み取り専用** でマウントする． |
+| `/work` | `lego.workDir`．書き込み可能な `tmpfs`/`emptyDir` でなければならない．証明書の秘密鍵はここに 1 回の run の間だけ一時的に存在する． |
+| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録，および Phase 4 以降はリプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
+| `/store` | `filesystem` store のルートの例（開発・テスト専用）． |
 
-The image supports `--read-only` / Kubernetes `readOnlyRootFilesystem:
-true`; every writable path above is supplied by the caller as an explicit
-mount, not baked into the image.
+イメージは `--read-only` / Kubernetes の `readOnlyRootFilesystem: true` に
+対応する．上記の書き込み可能なパスはすべて呼び出し側が明示的なマウントとして
+供給するもので，イメージには焼き込まれていない．
 
-Example:
+例:
 
 ```sh
 docker run --rm \
@@ -663,245 +646,247 @@ docker run --rm \
   reconcile --job /input/job.json --result /output/result.json
 ```
 
-## Result and error codes
+## Result とエラーコード
 
-A `Result` (`CertificateReconcileResult`) is always printed as a single
-line of JSON on stdout and, when `--result` is given, written atomically
-to that path. On success it carries `action` (`issued`/`renewed`/`noop`),
-`expiresAt`, `fingerprintSha256` and `storeObjectRef`; on failure it
-carries `error: { code, summary }` and `error` is `null` otherwise. See
-[the contract](architecture.md#certificatereconcileresult-result) for the
-full field list.
+`Result`（`CertificateReconcileResult`）は常に 1 行の JSON として stdout に
+表示され，`--result` が指定されていればそのパスにアトミックに書き出される．
+成功時は `action`（`issued`/`renewed`/`noop`），`expiresAt`，
+`fingerprintSha256`，`storeObjectRef` を持つ．失敗時は
+`error: { code, summary }` を持ち，それ以外では `error` は `null` である．
+フィールドの全一覧は
+[コントラクト](architecture.md#certificatereconcileresult-result) を参照．
 
-`error.summary` is **never** raw output from `lego`, a command line, or an
-environment dump — it is generated only from a small set of Runner-owned
-templates. If a templated summary would itself violate the `Result`
-contract (for example because an attacker-controlled FQDN happens to
-contain a secret-marker-shaped substring), the Runner falls back to a
-generic, code-specific summary so a `Result` is always produced.
+`error.summary` は `lego` の生の出力，コマンドライン，環境変数のダンプでは
+**決して** なく，Runner が所有する少数のテンプレートからのみ生成される．
+テンプレート化された要約自体が `Result` のコントラクトに違反する場合
+（たとえば攻撃者が制御する FQDN がたまたまシークレットのマーカーに似た
+部分文字列を含む場合），Runner はコード固有の汎用的な要約にフォールバック
+し，`Result` は常に生成される．
 
-| `error.code` | When | Summary template (abbreviated) |
+| `error.code` | 条件 | 要約テンプレート（省略形） |
 |---|---|---|
-| `InvalidJobSpec` | The job document failed strict decoding/validation. | `job spec rejected: <validation error>` |
-| `PolicyViolation` | `RunnerAuthorizationPolicy.Authorize` rejected the request. | `runner authorization policy rejected the job: <reason>` |
-| `BindingNotFound` | An authorized binding name is not defined in the Runner configuration. | `<kind> binding "<name>" is not defined in runner configuration` |
-| `DnsFailure` | A DNS binding's `passthroughEnv` variable is not set in the Runner's own environment. | `dns binding "<name>" requires an environment variable that is not set` |
-| `AcmeFailure` | An ACME binding's EAB `kidEnv`/`hmacEnv` variable is not set. | `acme binding "<name>" requires EAB credentials that are not set` |
-| `AcmeFailure` | `lego` exited with a non-zero status. | `lego exited with status <n>` |
-| `AcmeFailure` | `lego` exited `0` but wrote no readable certificate/key file. | `lego exited successfully but produced no usable certificate` |
-| `AcmeFailure` | The certificate `lego` wrote could not be parsed. | `lego produced an unreadable certificate` |
-| `AcmeFailure` | The issued certificate's SAN list does not cover the target FQDN exactly. | `issued certificate does not cover the target fqdn` |
-| `AcmeFailure` | The issued certificate and the private key `lego` wrote do not match. | `issued certificate and private key do not match` |
-| `AcmeFailure` | The issued certificate is already expired. | `issued certificate is already expired` |
-| `StoreFailure` | The Certificate Store could not be opened, read (`Current`) or written (`Put`). | `certificate store could not be opened` / `... read failed` / `... write failed` |
-| `Timeout` | `lego` did not finish within `lego.timeoutSeconds`. | `lego did not finish within <n> seconds` |
-| `Cancelled` | The run was cancelled by signal before or during the `lego` invocation, or while waiting for a store/state lock. | `run was cancelled before lego started` / `... while lego was running` / `run was cancelled by signal while waiting for …` |
-| `Internal` | Configuration could not be loaded, the work directory could not be prepared, ACME account state could not be read, the `lego` invocation could not be built for a reason other than a missing env var, or `lego` could not even be started. | e.g. `runner configuration could not be loaded` |
+| `InvalidJobSpec` | ジョブ文書が厳密なデコード／検証に失敗した． | `job spec rejected: <validation error>` |
+| `PolicyViolation` | `RunnerAuthorizationPolicy.Authorize` が要求を拒否した． | `runner authorization policy rejected the job: <reason>` |
+| `BindingNotFound` | 認可されたバインディング名が Runner の設定に定義されていない． | `<kind> binding "<name>" is not defined in runner configuration` |
+| `DnsFailure` | DNS バインディングの `passthroughEnv` 変数が Runner 自身の環境に設定されていない． | `dns binding "<name>" requires an environment variable that is not set` |
+| `AcmeFailure` | ACME バインディングの EAB の `kidEnv`/`hmacEnv` 変数が設定されていない． | `acme binding "<name>" requires EAB credentials that are not set` |
+| `AcmeFailure` | `lego` が非ゼロのステータスで終了した． | `lego exited with status <n>` |
+| `AcmeFailure` | `lego` が `0` で終了したが，読める証明書／鍵ファイルを書かなかった． | `lego exited successfully but produced no usable certificate` |
+| `AcmeFailure` | `lego` が書いた証明書をパースできなかった． | `lego produced an unreadable certificate` |
+| `AcmeFailure` | 発行された証明書の SAN リストが target の FQDN を正確に含んでいない． | `issued certificate does not cover the target fqdn` |
+| `AcmeFailure` | 発行された証明書と `lego` が書いた秘密鍵が一致しない． | `issued certificate and private key do not match` |
+| `AcmeFailure` | 発行された証明書がすでに失効している． | `issued certificate is already expired` |
+| `StoreFailure` | Certificate Store を開けなかった，読めなかった（`Current`），または書けなかった（`Put`）． | `certificate store could not be opened` / `... read failed` / `... write failed` |
+| `Timeout` | `lego` が `lego.timeoutSeconds` 以内に終わらなかった． | `lego did not finish within <n> seconds` |
+| `Cancelled` | `lego` の起動前または実行中，あるいは store／状態のロック待ちの間に，run がシグナルでキャンセルされた． | `run was cancelled before lego started` / `... while lego was running` / `run was cancelled by signal while waiting for …` |
+| `Internal` | 設定を読み込めなかった，作業ディレクトリを準備できなかった，ACME アカウントの状態を読めなかった，環境変数の欠落以外の理由で `lego` の起動を組み立てられなかった，または `lego` を開始すらできなかった． | 例: `runner configuration could not be loaded` |
 
-## Logging and redaction
+## ログと秘匿
 
-Logs are structured JSON on stderr, always UTC, and carry `runId` /
-`targetId` once known. Every line of `lego`'s stdout/stderr is logged at
-**debug** level, per stream, after redaction:
+ログは stderr への構造化 JSON で，常に UTC であり，判明した時点から
+`runId` / `targetId` を持つ．`lego` の stdout/stderr の各行は，秘匿処理の
+後，ストリームごとに **debug** レベルでログに記録される:
 
-- Any value the Runner considers a secret (a resolved `passthroughEnv`
-  value or an EAB `kid`/`hmac` value, whatever its length) is replaced
-  with `[REDACTED]` wherever it appears in the line; longer values are
-  masked before shorter ones they contain. A very short value costs
-  readability of the debug-level lego output, never a leak.
-- PEM blocks are suppressed statefully, per stream: the `-----BEGIN ...-----`
-  line is replaced with `[REDACTED PEM]`, and every following line up to and
-  including the `-----END ...-----` line is dropped, so the base64 body of a
-  key can never reach the log. A line containing the text `PRIVATE KEY` is
-  replaced entirely as well.
-- Any remaining non-printable character (including the Unicode line/
-  paragraph separators) is replaced with `?`, so a hostile line from
-  `lego` cannot inject additional log records or terminal escapes.
-- Lines longer than 8 KiB are logged truncated (with `"truncated":true`);
-  the rest of the line is read and discarded, so `lego` can never block on
-  a full pipe however much it prints.
+- Runner がシークレットとみなす値（解決済みの `passthroughEnv` の値，または
+  EAB の `kid`/`hmac` の値．長さを問わない）は，行中に現れるすべての箇所で
+  `[REDACTED]` に置き換えられる．長い値は，それに含まれる短い値より先に
+  マスクされる．非常に短い値は debug レベルの lego 出力の可読性を損なうが，
+  漏洩には決してならない．
+- PEM ブロックはストリームごとに状態を持って抑制される．`-----BEGIN ...-----`
+  行は `[REDACTED PEM]` に置き換えられ，それに続く `-----END ...-----` 行
+  までの各行（その行を含む）は捨てられるため，鍵の base64 本体がログに
+  達することは決してない．`PRIVATE KEY` という文字列を含む行も丸ごと
+  置き換えられる．
+- 残りの表示不能文字（Unicode の行区切り／段落区切りを含む）は `?` に
+  置き換えられ，`lego` からの悪意ある行が追加のログレコードやターミナル
+  エスケープを注入できないようにする．
+- 8 KiB を超える行は切り詰めて記録される（`"truncated":true` 付き）．
+  行の残りは読んで捨てられるため，`lego` がどれだけ出力しようとパイプが
+  満杯になってブロックすることは決してない．
 
-A one-line summary (`exitCode`, `durationMs`, `timedOut`, `cancelled`) is
-logged at info/error level after `lego` finishes. **Raw `lego` output
-never reaches a `Result`** — only the fixed templates above do.
+`lego` の終了後，1 行の要約（`exitCode`，`durationMs`，`timedOut`，
+`cancelled`）が info/error レベルで記録される．**`lego` の生の出力が
+`Result` に達することは決してない**．上記の固定テンプレートだけが達する．
 
-This redaction is **value-based and heuristic**: it masks the specific
-secret values the Runner itself resolved and known PEM markers, not an
-arbitrary or unknown-format secret. A dedicated redaction test suite
-across the rest of the codebase's log statements is still Phase 3+ work
-(see [`docs/threat-model.md`](threat-model.md)).
+この秘匿は **値ベースかつヒューリスティック** である．Runner 自身が解決した
+特定のシークレット値と既知の PEM マーカーをマスクするのであって，任意の，
+あるいは未知の形式のシークレットをマスクするのではない．コードベースの
+残りのログ文にわたる専用の秘匿テストスイートは依然として Phase 3 以降の
+作業である（[`docs/threat-model.md`](threat-model.md) を参照）．
 
-## Security boundaries
+## セキュリティ境界
 
-- No HTTP server, no cron, no database: one job, one process, one exit.
-- **A signed job proves who produced it, not that it should run.** With
-  `jobSigning` the Runner refuses tampered, expired and replayed
-  envelopes before it resolves a binding; the unwrapped `JobSpec` is then
-  validated and authorized against the trusted configuration exactly as
-  an unsigned one would be. The Runner holds public keys only; it cannot
-  produce a job another Runner would trust.
-- The Runner needs store **read** (for the renewal decision) and **write**
-  (to store a new bundle) on exactly the one store binding a `JobSpec`
-  selects and that binding names — nothing else. For Key Vault that is
-  `certificates/get` and `certificates/import`; the Runner never reads a
-  private key back (`secrets/get`) and never deletes.
-- `lego` is always invoked through an explicit `argv`, never a shell
-  string; its environment is built from scratch, never inherited from the
-  Runner process except through a binding's declared `env`/`passthroughEnv`.
-- The `lego` subprocess runs in its own process group under a timeout;
-  `SIGTERM` is sent to the whole group first, `SIGKILL` follows after a
-  grace period (10s by default) if needed, and the group is killed again
-  when the run ends, so helper processes that stay in the group cannot
-  outlive the run. A descendant that leaves the group (`setsid`) is out
-  of reach of a process-group kill; the grace period still bounds how long
-  it can delay the Runner, but only a PID namespace (one container per
-  run) actually contains it.
-- Any ACME directory not recognized as staging/test/local is refused
-  unless the ACME binding sets `allowProductionCA: true` (see the rule
-  above).
-- `RunnerAuthorizationPolicy` is deny-by-default: an empty or unset
-  allow-list authorizes nothing.
-- Automated tests never call a real ACME CA or a real DNS provider: they
-  run against `internal/runner/fakelego`, a test double that imitates
-  `lego`'s observable file/exit-code behavior without any network access
-  (Phase 1 enforces principle 8 in [`docs/architecture.md`](architecture.md#security-principles)).
-- **Concurrency, precisely.** The two on-disk stores are
-  concurrency-safe on one host: account state publication and the
-  copy-in at run start are serialized by an advisory `flock` on
-  `stateDir/.lock` (publisher exclusive, reader shared), and the
-  filesystem Certificate Store does the same per object. What is *not*
-  provided *by the Runner* is run-level exclusion: two Runner processes
-  for the same target can still both execute `lego`, place two ACME
-  orders and race on the DNS challenge. The Conductor's run registry and
-  scheduler provide that exclusion for the runs they launch (Phase 2, see
-  [`docs/conductor.md`](conductor.md#run-lifecycle-and-scheduling)); it
-  is not a property of these stores, and a Runner started by other means
-  is not covered by it.
-- **Locks and cancellation.** Lock acquisition never blocks in the
-  kernel: it retries non-blocking `flock` with a 10–100 ms backoff while
-  honouring the run's context, so a SIGTERM/SIGINT received while
-  another Runner holds a lock ends the run promptly with a `Cancelled`
-  Result (or `Timeout`, if the caller's deadline passed) rather than
-  hanging or reporting `Internal`/`StoreFailure`. Account state is still
-  published after a cancelled run, under its own 30-second bound, so an
-  account that the killed `lego` registered is not lost.
-- **Lock semantics** (`internal/fslock`): advisory, host-local, held on a
-  0600 lock file opened with `O_NOFOLLOW` (a pre-planted symbolic link is
-  refused); released by the kernel when the holder exits or closes the
-  descriptor, so a crashed holder leaves no stale lock; one lock per open
-  file description; a shared lock is never upgraded to exclusive. `flock`
-  behaviour on network filesystems (NFS, SMB) varies, so these stores are
-  for local filesystems; a deployment that places `stateDir` on a network
-  mount must verify `flock` semantics there first.
-- **Account state layout is strict and confined to `stateDir`.** The
-  invariant every reader and writer checks first (`validateAccountsLayout`,
-  with `Lstat`, so a link is seen as a link and never followed):
+- HTTP サーバも cron もデータベースもない．1 つのジョブ，1 つのプロセス，
+  1 回の終了．
+- **署名付きジョブが証明するのは誰が作ったかであって，実行すべきかでは
+  ない．** `jobSigning` があれば，Runner はバインディングを解決する前に
+  改竄・期限切れ・リプレイされたエンベロープを拒否する．取り出された
+  `JobSpec` はその後，未署名のものとまったく同様に信頼された設定に照らして
+  検証・認可される．Runner が持つのは公開鍵だけであり，別の Runner が
+  信頼するジョブを作ることはできない．
+- Runner に必要なのは，`JobSpec` が選択しそのバインディングが名指しする
+  ちょうど 1 つの store バインディングに対する store の **読み取り**
+  （更新判断のため）と **書き込み**（新しいバンドルの格納のため）だけである．
+  それ以外は不要である．Key Vault ではそれは `certificates/get` と
+  `certificates/import` であり，Runner は秘密鍵を決して読み戻さず
+  （`secrets/get`），決して削除しない．
+- `lego` は常に明示的な `argv` で起動され，シェル文字列は決して使わない．
+  その環境はゼロから構築され，バインディングが宣言した `env`/`passthroughEnv`
+  を通じる以外に Runner プロセスから継承されることは決してない．
+- `lego` サブプロセスはタイムアウト付きで独自のプロセスグループで動く．
+  まずグループ全体に `SIGTERM` を送り，必要なら猶予期間（既定 10 秒）の後に
+  `SIGKILL` が続き，run の終了時にグループを再度 kill するため，グループに
+  留まるヘルパープロセスが run より長生きすることはできない．グループを
+  離脱した子孫（`setsid`）はプロセスグループの kill の届く範囲外である．
+  猶予期間はそれが Runner を遅らせられる時間を依然として抑えるが，実際に
+  それを封じ込めるのは PID 名前空間（run ごとに 1 コンテナ）だけである．
+- ステージング／テスト／ローカルと認識されない ACME ディレクトリは，ACME
+  バインディングが `allowProductionCA: true` を設定しない限り拒否される
+  （上記の規則を参照）．
+- `RunnerAuthorizationPolicy` は既定で拒否である．空または未設定の許可
+  リストは何も認可しない．
+- 自動テストは本物の ACME CA や本物の DNS プロバイダを決して呼ばない．
+  テストは `internal/runner/fakelego` に対して実行される．これは `lego` の
+  観測可能なファイル／終了コードの振る舞いをネットワークアクセスなしで
+  模倣するテストダブルである（Phase 1 は
+  [`docs/architecture.md`](architecture.md#セキュリティ原則) の原則 8 を
+  強制する）．
+- **並行性について正確に．** ディスク上の 2 つの store は 1 台のホスト上で
+  並行安全である．アカウント状態の公開と run 開始時のコピーインは
+  `stateDir/.lock` のアドバイザリ `flock` で直列化され（公開側は排他，
+  読み手は共有），ファイルシステムの Certificate Store もオブジェクトごとに
+  同じことを行う．*Runner が* 提供し *ない* のは run レベルの排他である．
+  同じ target に対する 2 つの Runner プロセスは依然として両方とも `lego` を
+  実行し，2 つの ACME オーダーを出し，DNS チャレンジで競合しうる．
+  Conductor の run レジストリとスケジューラは，自身が起動する run について
+  その排他を提供する（Phase 2．
+  [`docs/conductor.md`](conductor.md#run-のライフサイクルとスケジューリング)
+  を参照）．それはこれらの store の性質ではなく，他の手段で開始された
+  Runner はその対象外である．
+- **ロックとキャンセル．** ロックの取得はカーネル内で決してブロックしない．
+  run のコンテキストを尊重しつつ，10〜100 ms のバックオフで非ブロッキングの
+  `flock` を再試行する．そのため別の Runner がロックを保持している間に
+  受け取った SIGTERM/SIGINT は，ハングしたり `Internal`/`StoreFailure` を
+  報告したりするのではなく，`Cancelled` の Result（呼び出し側の期限が過ぎて
+  いれば `Timeout`）で run を速やかに終わらせる．キャンセルされた run の
+  後もアカウント状態は独自の 30 秒の上限の下で公開されるため，kill された
+  `lego` が登録したアカウントは失われない．
+- **ロックの意味論**（`internal/fslock`）: アドバイザリ，ホストローカル，
+  `O_NOFOLLOW` で開いた 0600 のロックファイル上で保持（あらかじめ仕込まれた
+  シンボリックリンクは拒否される）．保持者が終了するか記述子を閉じるとカーネルが
+  解放するため，クラッシュした保持者が古いロックを残すことはない．開いた
+  ファイル記述ごとに 1 つのロック．共有ロックが排他に昇格されることは
+  決してない．ネットワークファイルシステム（NFS，SMB）での `flock` の
+  振る舞いはさまざまなので，これらの store はローカルファイルシステム向け
+  である．`stateDir` をネットワークマウントに置くデプロイは，まずそこでの
+  `flock` の意味論を検証しなければならない．
+- **アカウント状態のレイアウトは厳密で，`stateDir` に閉じている．**
+  すべての読み手と書き手が最初に検査する不変条件（`validateAccountsLayout`．
+  `Lstat` を使うのでリンクはリンクとして見え，決して辿られない）:
 
   ```
-  stateDir/accounts.d/        absent, or a real directory (never a link)
-  stateDir/accounts.d/<v>/    a real directory; <v> is <unix-nanos>-<8 hex>
-  stateDir/accounts           absent, or a symbolic link whose target is
-                              exactly the relative path accounts.d/<v>
+  stateDir/accounts.d/        存在しないか，実ディレクトリ (決してリンクではない)
+  stateDir/accounts.d/<v>/    実ディレクトリ．<v> は <unix-nanos>-<8 hex>
+  stateDir/accounts           存在しないか，リンク先が正確に相対パス
+                              accounts.d/<v> であるシンボリックリンク
   ```
 
-  `accounts.d` being a link or a file, `accounts` being a plain directory
-  (`ErrLegacyAccountsLayout`; no in-place migration is attempted because
-  none can be made crash-safe with `rename` alone), and an absolute,
-  escaping (`../outside`), dangling, oddly named or link-typed `accounts`
-  target are all refused (`ErrAccountsCorrupt`). The run then fails with
-  `Internal` before `lego` starts, nothing is copied into the work
-  directory, and nothing is written to or pruned from any path outside
-  `stateDir`: `accounts.d` is created with a plain `Mkdir` after the
-  check, and pruning only removes real directories whose names match the
-  version format. A corrupted state never looks like a first run, which
-  would silently register a new ACME account.
-- **What the layout check does not cover.** It is a check at a point in
-  time by the same user that owns `stateDir`; a process with the same UID
-  that races it (replacing `accounts.d` with a link between the check and
-  the write) is outside the Phase 1 threat model, which assumes a local
-  filesystem owned by the Runner's user.
+  `accounts.d` がリンクやファイルであること，`accounts` が通常のディレクトリ
+  であること（`ErrLegacyAccountsLayout`．`rename` だけではクラッシュ安全に
+  できないため，その場での移行は試みない），そして `accounts` のリンク先が
+  絶対パス，外へ抜ける（`../outside`），宙ぶらりん，奇妙な名前，または
+  リンク型であることは，すべて拒否される（`ErrAccountsCorrupt`）．その場合
+  run は `lego` の開始前に `Internal` で失敗し，作業ディレクトリには何も
+  コピーされず，`stateDir` の外のいかなるパスにも書き込みも削除も行われない．
+  `accounts.d` は検査の後に通常の `Mkdir` で作成され，削除はバージョン形式に
+  名前が一致する実ディレクトリだけを対象とする．壊れた状態が初回実行のように
+  見えることは決してない．そうなれば新しい ACME アカウントを黙って登録して
+  しまうからである．
+- **レイアウト検査が扱わないこと．** これは `stateDir` を所有するのと同じ
+  ユーザーによる，ある時点での検査である．同じ UID を持つプロセスがこれと
+  競合する（検査と書き込みの間に `accounts.d` をリンクに置き換える）ことは
+  Phase 1 の脅威モデルの範囲外であり，脅威モデルは Runner のユーザーが
+  所有するローカルファイルシステムを前提とする．
 
-## Crash safety
+## クラッシュ安全性
 
-- The per-run work directory is removed by a deferred cleanup on every
-  normal exit path. A Runner killed with an uncatchable signal (SIGKILL,
-  OOM) cannot run it, so every start also sweeps `run-*` directories under
-  `workDir` that are past their deadline. Each run records its own
-  deadline (now + 2 × `lego.timeoutSeconds` + the termination grace
-  period + a 5-minute margin) in a `.sweep-after` file
-  inside the directory when it is created, and the sweep honours that
-  file, so Runners with different timeouts sharing one `workDir` never
-  sweep each other's live runs; a directory without the file falls back
-  to its modification time plus the sweeping Runner's own threshold.
-  Mount `workDir` as a tmpfs/emptyDir that dies with the container so
-  nothing survives at all.
-- ACME account state is published as a versioned directory under
-  `stateDir/accounts.d/` and `stateDir/accounts` is a symbolic link that
-  is swapped with one `rename`; older versions are pruned afterwards. The
-  files, the version directory, `accounts.d` and finally `stateDir` are
-  fsynced in that order, so neither a process crash nor a power loss
-  leaves `accounts` absent or pointing at an incomplete version. Publishing
-  runs under an exclusive lock on `stateDir/.lock` and the copy-in at run
-  start holds it shared, so concurrent Runners sharing a `stateDir` are
-  serialized on the state itself (last publisher wins) and a reader never
-  copies a version that is being pruned.
-- The filesystem store refuses to write through a symbolic link at the
-  object or `versions` level, serializes `Put` per object with an
-  advisory lock, and prunes only under that lock, so concurrent writers
-  cannot leave `current` dangling (see Certificate Store above).
-- A certificate whose `NotBefore` lies more than 5 minutes in the future
-  is rejected when lego produces it (`AcmeFailure`) and, when found in
-  the store, is treated as unusable and reissued.
+- run ごとの作業ディレクトリは，すべての通常の終了経路で遅延クリーンアップ
+  により削除される．捕捉不能なシグナル（SIGKILL，OOM）で kill された
+  Runner はそれを実行できないため，各起動時にも `workDir` 配下の期限を
+  過ぎた `run-*` ディレクトリを掃除する．各 run は作成時に自身の期限
+  （now + 2 × `lego.timeoutSeconds` + 終了猶予期間 + 5 分の余裕）を
+  ディレクトリ内の `.sweep-after` ファイルに記録し，掃除はそのファイルを
+  尊重するため，1 つの `workDir` を共有する異なるタイムアウトの Runner が
+  互いの生きている run を掃除することは決してない．ファイルのない
+  ディレクトリは，その更新時刻に掃除する Runner 自身の閾値を足した時刻に
+  フォールバックする．`workDir` はコンテナと共に消える tmpfs/emptyDir として
+  マウントし，何も残らないようにすること．
+- ACME アカウントの状態は `stateDir/accounts.d/` 配下のバージョン付き
+  ディレクトリとして公開され，`stateDir/accounts` は 1 回の `rename` で
+  差し替えられるシンボリックリンクである．古いバージョンはその後に削除
+  される．ファイル，バージョンディレクトリ，`accounts.d`，最後に `stateDir`
+  の順に fsync されるため，プロセスのクラッシュでも電源断でも，`accounts` が
+  存在しなかったり不完全なバージョンを指したりすることはない．公開は
+  `stateDir/.lock` の排他ロックの下で行われ，run 開始時のコピーインはそれを
+  共有モードで保持するため，`stateDir` を共有する並行 Runner は状態そのもの
+  について直列化され（最後の公開者が勝つ），読み手が削除中のバージョンを
+  コピーすることはない．
+- ファイルシステム store は，オブジェクトまたは `versions` の階層で
+  シンボリックリンクを通じた書き込みを拒否し，オブジェクトごとに
+  アドバイザリロックで `Put` を直列化し，そのロックの下でのみ削除を行うため，
+  並行する書き手が `current` を宙ぶらりんにすることはできない（上記の
+  Certificate Store を参照）．
+- `NotBefore` が 5 分以上未来にある証明書は，lego が生成した時点で拒否され
+  （`AcmeFailure`），store で見つかった場合は使用不能として扱われ再発行される．
 
-## Limitations
+## 制限事項
 
-- The filesystem Certificate Store is for **local development and tests
-  only** — it has no access control of its own beyond filesystem
-  permissions and is not a substitute for a real secrets store. Use the
-  Azure Key Vault store for anything else.
-- The Key Vault store is tested against an in-process fake of the vault
-  API, not a real vault (principle 8); its behavior against the real
-  import operation is documented, not CI-verified. It never recovers or
-  purges a soft-deleted certificate that blocks an import, and it cannot
-  verify that its identity's role assignment is as narrow as documented.
-- The Key Vault store writes PEM only. The built-in Key Vault
-  integrations of App Service and Azure Front Door require PKCS #12 and
-  are not served by it; a PKCS #12 import is not part of Phase 3 (see
-  [Consumers and content type](#consumers-and-content-type)).
-- With `credential: default`, the SDK's `DefaultAzureCredential` chain
-  reads service-principal variables from the Runner's environment and may
-  execute developer tooling from `PATH`; that is a development
-  convenience, not a production posture — say `managed-identity`.
-- In claim mode the atomicity of taking a job rests on directory rename
-  being atomic on the exchange volume; on an SMB share that is expected
-  but verified only by a first real deployment
-  ([`deploy/azure/README.md`](../deploy/azure/README.md)).
-- No run-level concurrency control in the Runner itself: two Runner
-  processes for the same target can both issue (double issuance, ACME
-  rate-limit cost). The filesystem store and the account state survive
-  that (last writer wins). The Conductor (Phase 2) prevents it for the
-  runs it launches — at most one active run per target — but not for a
-  Runner started by hand or by another launcher.
-- The replay ledger is per `stateDir`: Runners with separate state
-  directories do not see each other's accepted runs, and a Runner
-  without `jobSigning` has no expiry or replay check at all (a bare
-  JobSpec carries neither). The ledger's lock has the same
-  network-filesystem caveat as the account state's.
-- Signing does not verify the producer's *decisions*: a Conductor that
-  holds the signing key can sign a job for any name; the trusted
-  authorization policy is what bounds that (`docs/threat-model.md`, T1).
-- The Runner has no way to verify that a DNS credential/workload identity
-  it is handed is actually scoped to the challenge zone it needs; that
-  scoping is an operational requirement on how each `DnsBinding` is
-  provisioned, not something this code can check.
-- Log redaction of `lego` output is value-based and heuristic (known
-  secret values, known PEM markers), not a general secret detector, and
-  has no dedicated test suite yet outside this package.
-- The Container Apps deployment (Phase 4) is tested against fakes and
-  compiled Bicep, not a real subscription: managed-identity
-  authentication of `lego`'s `azuredns` provider through the Container
-  Apps identity endpoint, and the platform's execution-template
-  override, are documented expectations until a first deployment
-  confirms them (`deploy/azure/README.md`). A `JobSpec` can still be
-  produced and a `Result` consumed by hand, as the command line above
-  shows.
+- ファイルシステムの Certificate Store は **ローカル開発とテスト専用** である．
+  ファイルシステムの権限以外に独自のアクセス制御を持たず，本物のシークレット
+  ストアの代替にはならない．それ以外の用途には Azure Key Vault store を使う
+  こと．
+- Key Vault store は本物の vault ではなく，vault API のプロセス内の偽物に
+  対して試験されている（原則 8）．実際の取り込み操作に対する振る舞いは
+  文書化されているが，CI で検証されてはいない．取り込みを妨げる論理削除
+  済みの証明書を復旧も purge も決して行わず，自身の ID のロール割り当てが
+  文書通りに狭いことを検証することもできない．
+- Key Vault store は PEM のみを書く．App Service と Azure Front Door の
+  組み込みの Key Vault 連携は PKCS #12 を必要とし，この store では役立たない．
+  PKCS #12 での取り込みは Phase 3 の範囲外である
+  （[利用者とコンテンツタイプ](#利用者とコンテンツタイプ) を参照）．
+- `credential: default` では，SDK の `DefaultAzureCredential` チェーンが
+  Runner の環境からサービスプリンシパルの変数を読み，`PATH` から開発者
+  ツールを実行することがある．これは開発上の利便性であって本番の姿勢では
+  ない．`managed-identity` を指定すること．
+- claim モードでジョブを取る操作のアトミック性は，交換用ボリューム上で
+  ディレクトリの rename がアトミックであることに依存する．SMB 共有では
+  そうであると期待されるが，最初の実際のデプロイでしか検証されない
+  （[`deploy/azure/README.md`](../deploy/azure/README.md)）．
+- Runner 自体には run レベルの並行制御がない．同じ target に対する 2 つの
+  Runner プロセスは両方とも発行しうる（二重発行，ACME レート制限の消費）．
+  ファイルシステム store とアカウント状態はそれに耐える（最後の書き手が
+  勝つ）．Conductor（Phase 2）は自身が起動する run についてはこれを防ぐ
+  （target ごとにアクティブな run は最大 1 つ）が，手動や別のランチャーで
+  開始された Runner については防がない．
+- リプレイ台帳は `stateDir` ごとである．別々の状態ディレクトリを持つ
+  Runner は互いに受け付けた run を見ず，`jobSigning` のない Runner には
+  有効期限やリプレイの検査がまったくない（素の JobSpec はどちらも持たない）．
+  台帳のロックにはアカウント状態と同じネットワークファイルシステムの注意
+  事項がある．
+- 署名は生成者の *判断* を検証しない．署名鍵を持つ Conductor はどんな名前の
+  ジョブにも署名できる．それを限定するのは信頼された認可ポリシーである
+  （`docs/threat-model.md`，T1）．
+- Runner には，渡された DNS の資格情報／ワークロード ID が実際に必要な
+  チャレンジゾーンに限定されているかを検証する手段がない．その限定は各
+  `DnsBinding` をどうプロビジョニングするかという運用上の要件であり，
+  このコードが検査できるものではない．
+- `lego` 出力のログ秘匿は値ベースかつヒューリスティック（既知のシークレット
+  値，既知の PEM マーカー）であり，汎用のシークレット検出器ではなく，この
+  パッケージの外にはまだ専用のテストスイートがない．
+- Container Apps のデプロイ（Phase 4）は偽物とコンパイル済み Bicep に対して
+  試験されており，本物のサブスクリプションに対してではない．Container Apps
+  の ID エンドポイントを通じた `lego` の `azuredns` プロバイダのマネージド
+  ID 認証と，プラットフォームの実行テンプレート上書きは，最初のデプロイが
+  確認するまでは文書上の期待である（`deploy/azure/README.md`）．上記の
+  コマンドラインが示すように，`JobSpec` を手動で生成し `Result` を手動で
+  消費することは依然として可能である．
