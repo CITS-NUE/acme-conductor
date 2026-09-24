@@ -140,6 +140,9 @@ param ingressAllowedCidrs array = []
 param schedulerTickSeconds int = 60
 param schedulerMaxConcurrentRuns int = 2
 
+@description('The migration section of the Conductor configuration, verbatim (docs/migration.md): the targetSource flag (registry, shadow or iac), the infrastructure host list (source.fqdns can be pasted from the existing cert-infra targetDomains parameter) and the import profile. Empty means target source registry and no list.')
+param migration object = {}
+
 @description('Tags applied to every resource.')
 param tags object = {}
 
@@ -477,7 +480,9 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
 
 // --- the Conductor: a single-replica app behind the HTTPS ingress ------------
 
-var conductorConfig = {
+var conductorConfig = union(conductorConfigBase, empty(migration) ? {} : { migration: migration })
+
+var conductorConfigBase = {
   apiVersion: 'acme-conductor.cits-nue.github.io/v1alpha1'
   kind: 'ConductorConfig'
   server: {

@@ -427,3 +427,65 @@ func TestShippedOIDCExampleLoads(t *testing.T) {
 		t.Fatalf("oidc example server: %+v", c.Server)
 	}
 }
+
+func withMigration(section string) func(string) string {
+	return func(s string) string {
+		return strings.Replace(s, `"acmeBindings"`, `"migration": `+section+`, "acmeBindings"`, 1)
+	}
+}
+
+const profile = `{"policyRef": "pol", "executionBinding": "local", "dnsBinding": "azure-dns-staging", "storeBinding": "filesystem-dev", "owner": "cert-infra migration"}`
+
+func TestMigrationDefaultsAndFlag(t *testing.T) {
+	c, err := Read(strings.NewReader(minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Migration == nil || c.Migration.TargetSource != TargetSourceRegistry || c.Migration.CompareIntervalSeconds != DefaultCompareIntervalSeconds || !c.IssuanceEnabled() {
+		t.Fatalf("migration defaults: %+v", c.Migration)
+	}
+	for _, src := range []string{TargetSourceShadow, TargetSourceIaC} {
+		c, err := Read(strings.NewReader(withMigration(`{"targetSource": "` + src + `", "source": {"fqdns": ["A.example.ac.jp."]}, "profile": ` + profile + `}`)(minimal)))
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		if c.IssuanceEnabled() || c.Migration.TargetSource != src || c.Migration.Source.Kind() != "inline" || c.Migration.Profile.Owner != "cert-infra migration" {
+			t.Fatalf("%s: %+v", src, c.Migration)
+		}
+	}
+	c, err = Read(strings.NewReader(withMigration(`{"targetSource": "iac"}`)(minimal)))
+	if err != nil || c.IssuanceEnabled() || c.Migration.Source != nil || c.Migration.Profile != nil {
+		t.Fatalf("iac without a list: %v %+v", err, c.Migration)
+	}
+	c, err = Read(strings.NewReader(withMigration(`{"source": {"bicepParamFile": "/srv/cert-infra/infra/main.bicepparam", "parameter": "targetDomains"}, "profile": ` + profile + `, "compareIntervalSeconds": 60}`)(minimal)))
+	if err != nil || !c.IssuanceEnabled() || c.Migration.Source.Kind() != "bicepparam" || c.Migration.CompareIntervalSeconds != 60 {
+		t.Fatalf("registry with a list: %v %+v", err, c.Migration)
+	}
+}
+
+func TestMigrationRejects(t *testing.T) {
+	cases := map[string]string{
+		"unknown flag":           `{"targetSource": "legacy"}`,
+		"shadow without source":  `{"targetSource": "shadow", "profile": ` + profile + `}`,
+		"source without profile": `{"source": {"fqdns": []}}`,
+		"two sources":            `{"source": {"fqdns": [], "jsonFile": "/x.json"}, "profile": ` + profile + `}`,
+		"relative file":          `{"source": {"bicepParamFile": "infra/main.bicepparam"}, "profile": ` + profile + `}`,
+		"unclean file":           `{"source": {"jsonFile": "/srv/../x.json"}, "profile": ` + profile + `}`,
+		"parameter without file": `{"source": {"jsonFile": "/x.json", "parameter": "targetDomains"}, "profile": ` + profile + `}`,
+		"bad parameter":          `{"source": {"bicepParamFile": "/x.bicepparam", "parameter": "target-domains"}, "profile": ` + profile + `}`,
+		"unknown execution":      `{"profile": {"policyRef": "pol", "executionBinding": "aca", "dnsBinding": "azure-dns-staging", "storeBinding": "filesystem-dev", "owner": "x"}}`,
+		"unknown dns":            `{"profile": {"policyRef": "pol", "executionBinding": "local", "dnsBinding": "other", "storeBinding": "filesystem-dev", "owner": "x"}}`,
+		"unknown store":          `{"profile": {"policyRef": "pol", "executionBinding": "local", "dnsBinding": "azure-dns-staging", "storeBinding": "other", "owner": "x"}}`,
+		"bad policy id":          `{"profile": {"policyRef": "not valid", "executionBinding": "local", "dnsBinding": "azure-dns-staging", "storeBinding": "filesystem-dev", "owner": "x"}}`,
+		"empty owner":            `{"profile": {"policyRef": "pol", "executionBinding": "local", "dnsBinding": "azure-dns-staging", "storeBinding": "filesystem-dev", "owner": " "}}`,
+		"unknown profile field":  `{"profile": {"policyRef": "pol", "executionBinding": "local", "dnsBinding": "azure-dns-staging", "storeBinding": "filesystem-dev", "owner": "x", "image": "evil"}}`,
+		"interval too small":     `{"compareIntervalSeconds": 1}`,
+		"interval too large":     `{"compareIntervalSeconds": 86401}`,
+		"unknown field":          `{"command": "x"}`,
+	}
+	for name, section := range cases {
+		if err := mutate(t, withMigration(section)); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: err = %v, want ErrInvalid", name, err)
+		}
+	}
+}

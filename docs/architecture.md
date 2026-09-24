@@ -460,6 +460,7 @@ internal/
   conductor/scheduler/  due decision, per-target exclusion, run execution
   conductor/sqlite/     SQLite implementation of Registry, with migrations
   conductor/fakerunner/ test double for acme-runner used by Conductor tests; not compiled into shipped binaries
+  conductor/migration/  migration from an infrastructure-defined host list: Bicep parameter/TargetList readers, diff, idempotent import, shadow comparison (Phase 6)
   fslock/           advisory file locks shared by the Runner's on-disk stores
   policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
   runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
@@ -575,7 +576,7 @@ These hold across every phase and are traced to concrete mitigations in
 
 ## Roadmap
 
-**Phases 0 to 5** are implemented today. Phases are strictly
+**Phases 0 to 6** are implemented today. Phases are strictly
 sequential; a given pull request implements one phase's scope and no more
 (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
@@ -587,7 +588,7 @@ sequential; a given pull request implements one phase's scope and no more
 | 3 | **Implemented.** Azure Key Vault store adapter, authenticated with the platform's managed identity (or the SDK's `DefaultAzureCredential` chain for development). See [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) and [ADR 0013](adr/0013-azure-key-vault-store-adapter.md). |
 | 4 | **Implemented.** Azure Container Apps Job launcher (the Runner as a scheduled Job under its own managed identity that takes the jobs the Conductor offers on a shared volume; the Conductor cannot start executions), provisioned via Bicep with disjoint identities and least-privilege custom roles; signed, expiring job envelope with a Runner-side replay ledger, and Runner-signed Results. See [`docs/conductor.md`](conductor.md#execution-binding-azure-container-apps-job), [`deploy/azure/README.md`](../deploy/azure/README.md), [ADR 0014](adr/0014-azure-container-apps-job-launcher.md) and [ADR 0015](adr/0015-signed-job-envelope.md). |
 | 5 | **Implemented.** OIDC bearer-token authentication with named principals and admin/viewer roles, a TLS listener or an explicit behind-ingress statement, a minimal static GUI with PKCE sign-in, and a release workflow that publishes both images to GHCR with an SBOM and provenance from digest-pinned bases. The Container Apps deployment gains an HTTPS ingress and loses the admin sidecar. See [`docs/conductor.md`](conductor.md#authentication), [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md) and [ADR 0017](adr/0017-release-pipeline.md). |
-| 6 | Migration tooling from the existing cert-infra repository (import/diff/shadow mode, feature-flag switch). |
+| 6 | **Implemented.** Migration tooling from the existing cert-infra repository: the host list is read from its Bicep parameter file (or a TargetList document), compared with the registry (`added`/`changed`/`missing`/`unchanged`/`rejected`) and imported idempotently (dry run by default, never an update or a delete); a `migration.targetSource` flag (`iac`/`shadow`/`registry`) keeps the Conductor from issuing until the switch, with a shadow mode that records comparisons; rollback is the flag. See [`docs/migration.md`](migration.md) and [ADR 0020](adr/0020-migration-from-cert-infra.md). |
 
 ## Non-goals
 

@@ -951,3 +951,42 @@ func TestConflictRereadsAreBounded(t *testing.T) {
 		t.Fatalf("run = %+v, want left active for the sweep", run)
 	}
 }
+
+func TestIssuanceDisabledPlansAndStartsNothing(t *testing.T) {
+	f := setup(t, 2)
+	ctx := context.Background()
+	// A run queued by an operator before the flag was set stays queued.
+	queued := &registry.Run{TargetID: f.target.ID, TargetRevision: f.target.Revision, RequestedBy: "admin", RequestedByAuthority: "localhost-dev"}
+	if err := f.reg.CreateRun(ctx, queued, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.s = New(Options{
+		Registry: f.reg, Launchers: map[string]launcher.Launcher{"local": f.fake},
+		Tick: 10 * time.Millisecond, MaxConcurrentRuns: 2, Now: f.clock, IssuanceDisabled: true,
+	})
+	if planned, started := f.cycle(t); planned != 0 || started != 0 {
+		t.Fatalf("planned %d, started %d with issuance disabled", planned, started)
+	}
+	run, err := f.reg.GetRun(ctx, queued.ID)
+	if err != nil || run.Status != registry.RunQueued {
+		t.Fatalf("queued run: %+v %v", run, err)
+	}
+	f.fake.mu.Lock()
+	calls := len(f.fake.specs)
+	f.fake.mu.Unlock()
+	if calls != 0 {
+		t.Fatal("a launcher was called")
+	}
+	// The other target, never reconciled, is due; still nothing.
+	other := &registry.Target{FQDN: "other.example.ac.jp", Enabled: true, Owner: "web", PolicyRef: f.policy.ID, ExecutionBinding: "local", DNSBinding: "fake-dns", StoreBinding: "filesystem-dev"}
+	if err := f.reg.CreateTarget(ctx, other, nil); err != nil {
+		t.Fatal(err)
+	}
+	if planned, started := f.cycle(t); planned != 0 || started != 0 {
+		t.Fatalf("planned %d, started %d with issuance disabled", planned, started)
+	}
+	runs, err := f.reg.ListRuns(ctx, registry.ListRunsOptions{Limit: 10})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs: %d %v", len(runs), err)
+	}
+}

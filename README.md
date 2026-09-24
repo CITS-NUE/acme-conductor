@@ -8,8 +8,8 @@ registry, certificate policy, an append-only audit log, run scheduling, and
 a pluggable job launcher; it never holds a private key, a DNS credential, or
 a Certificate Store credential.
 
-**Status: Phase 5 (OIDC authentication, a minimal GUI, GHCR releases
-with SBOM and provenance).** The `acme-conductor` control plane keeps
+**Status: Phase 6 (migration tooling from the existing `cert-infra`
+deployment).** The `acme-conductor` control plane keeps
 targets, certificate policies, runs and an append-only audit log in a
 SQLite registry, exposes them over a REST API and a minimal GUI —
 authenticating operators with OIDC bearer tokens as named principals
@@ -28,10 +28,16 @@ only) or, since Phase 3, in Azure Key Vault. `deploy/azure` holds the
 Bicep that provisions the environment, both identities and their
 least-privilege roles, and the HTTPS ingress the API and GUI answer at.
 A version tag publishes both images to `ghcr.io/cits-nue` with an SBOM
-and provenance. See [`docs/conductor.md`](docs/conductor.md),
-[`docs/runner.md`](docs/runner.md) and
-[`deploy/azure/README.md`](deploy/azure/README.md) for how to run,
-configure and deploy each part, and the
+and provenance. Since Phase 6, `acme-conductor migrate` reads the host
+list of an existing infrastructure definition, compares it with the
+registry and imports it (a dry run by default, never an update or a
+delete), and a `migration.targetSource` flag keeps the Conductor from
+issuing until the operator switches it — and switches it back to roll
+back. See [`docs/conductor.md`](docs/conductor.md),
+[`docs/runner.md`](docs/runner.md),
+[`deploy/azure/README.md`](deploy/azure/README.md) and
+[`docs/migration.md`](docs/migration.md) for how to run,
+configure, deploy and migrate to each part, and the
 [roadmap](docs/architecture.md#roadmap) for what each phase adds. Automated tests never call a real ACME CA or DNS provider —
 they run against fake `lego`/`acme-runner` test doubles.
 

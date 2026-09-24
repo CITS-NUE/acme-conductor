@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -110,5 +112,26 @@ func TestShippedContainerAppsExamplesAgree(t *testing.T) {
 	}
 	if a.TimeoutSeconds <= r.Lego.TimeoutSeconds {
 		t.Fatalf("conductor timeout %d must exceed the runner lego timeout %d", a.TimeoutSeconds, r.Lego.TimeoutSeconds)
+	}
+}
+
+// TestShippedMigrationExamplesLoad checks the migration example
+// configuration (shadow mode, a Bicep parameter file as the list) and the
+// TargetList example, and that `migrate list` reads the latter.
+func TestShippedMigrationExamplesLoad(t *testing.T) {
+	root := filepath.Join("..", "..", "deploy", "examples")
+	c, err := config.Load(filepath.Join(root, "conductor-config.migration.example.json"))
+	if err != nil {
+		t.Fatalf("migration example: %v", err)
+	}
+	if c.Migration.TargetSource != config.TargetSourceShadow || c.IssuanceEnabled() || c.Migration.Source == nil || c.Migration.Source.Kind() != "bicepparam" || c.Migration.Profile == nil {
+		t.Fatalf("migration example: %+v", c.Migration)
+	}
+	if !c.HasExecutionBinding(c.Migration.Profile.ExecutionBinding) || !c.HasDNSBinding(c.Migration.Profile.DNSBinding) || !c.HasStoreBinding(c.Migration.Profile.StoreBinding) {
+		t.Fatalf("migration example profile names an unregistered binding: %+v", c.Migration.Profile)
+	}
+	var out, errb bytes.Buffer
+	if code := run(context.Background(), []string{"migrate", "list", "--json", filepath.Join(root, "targets.example.json")}, &out, &errb, noEnv); code != 0 || out.String() != "leaf.cerdad.example.ac.jp\nwww.example.ac.jp\n" {
+		t.Fatalf("targets example: %d %q %s", code, out.String(), errb.String())
 	}
 }

@@ -25,6 +25,7 @@ Conductor, in the lightweight MADR-like format described in
 | [0017](0017-release-pipeline.md) | Release pipeline: GHCR images with SBOM and provenance, digest-pinned bases |
 | [0018](0018-authority-qualified-principals.md) | Audit principals are qualified by their authority (issuer, `localhost-dev`, `scheduler`) |
 | [0019](0019-provider-boundary.md) | Provider boundary: public contracts, composition-layer registries, one module, `deploy/azure` stays |
+| [0020](0020-migration-from-cert-infra.md) | Migration from cert-infra: list import, shadow comparison, target-source flag |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).

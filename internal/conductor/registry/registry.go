@@ -133,14 +133,20 @@ const (
 	AuditTargetUpdated  AuditAction = "target.updated"
 	AuditTargetEnabled  AuditAction = "target.enabled"
 	AuditTargetDisabled AuditAction = "target.disabled"
-	AuditPolicyCreated  AuditAction = "policy.created"
-	AuditPolicyUpdated  AuditAction = "policy.updated"
-	AuditPolicyRejected AuditAction = "policy.rejected"
-	AuditRunRequested   AuditAction = "run.requested"
-	AuditRunStarted     AuditAction = "run.started"
-	AuditRunSucceeded   AuditAction = "run.succeeded"
-	AuditRunFailed      AuditAction = "run.failed"
-	AuditRunCancelled   AuditAction = "run.cancelled"
+	// AuditTargetImported records a target created by the migration
+	// import from an infrastructure list (docs/migration.md).
+	AuditTargetImported AuditAction = "target.imported"
+	// AuditMigrationCompared records a shadow-mode comparison of the
+	// infrastructure list with the registry whose outcome changed.
+	AuditMigrationCompared AuditAction = "migration.compared"
+	AuditPolicyCreated     AuditAction = "policy.created"
+	AuditPolicyUpdated     AuditAction = "policy.updated"
+	AuditPolicyRejected    AuditAction = "policy.rejected"
+	AuditRunRequested      AuditAction = "run.requested"
+	AuditRunStarted        AuditAction = "run.started"
+	AuditRunSucceeded      AuditAction = "run.succeeded"
+	AuditRunFailed         AuditAction = "run.failed"
+	AuditRunCancelled      AuditAction = "run.cancelled"
 )
 
 // MaxAuditDetailLength bounds the free-text detail of an audit event.

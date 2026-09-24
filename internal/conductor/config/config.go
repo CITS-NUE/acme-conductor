@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/migration"
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -70,6 +71,28 @@ const (
 	MaxOIDCScopes               = 16
 	MaxOIDCValueLength          = 256
 	MaxOIDCIssuerLength         = 512
+
+	// Shadow-mode comparison pacing (migration.compareIntervalSeconds).
+	DefaultCompareIntervalSeconds = 300
+	MinCompareIntervalSeconds     = 10
+	MaxCompareIntervalSeconds     = 86400
+)
+
+// Target sources (migration.targetSource): the feature flag of the
+// migration from an infrastructure-defined host list (docs/migration.md).
+const (
+	// TargetSourceRegistry: the registry is the source of truth and the
+	// Conductor issues for its targets. The default, and the state after
+	// the migration.
+	TargetSourceRegistry = "registry"
+	// TargetSourceShadow: the infrastructure list still drives issuance
+	// elsewhere; the Conductor issues nothing, and compares the list
+	// with the registry at an interval, recording the outcome.
+	TargetSourceShadow = "shadow"
+	// TargetSourceIaC: the infrastructure list drives issuance elsewhere
+	// and the Conductor issues nothing. The fallback: the state before
+	// the migration and the one a rollback returns to.
+	TargetSourceIaC = "iac"
 )
 
 // Authentication modes.
@@ -143,6 +166,29 @@ type Config struct {
 	// error, not a Result. It is mandatory for the Container Apps
 	// launcher, whose Results travel over a shared volume.
 	ResultSigning *ResultSigning `json:"resultSigning,omitempty"`
+	// Migration, when present, configures the migration from an
+	// infrastructure-defined host list: the target source flag, the
+	// list, and the profile imported targets get. Absent means
+	// targetSource registry with no list to compare or import from.
+	Migration *Migration `json:"migration,omitempty"`
+}
+
+// Migration configures the migration tooling (docs/migration.md).
+type Migration struct {
+	// TargetSource is the feature flag: registry (default), shadow or
+	// iac. The Conductor plans and starts runs only under registry.
+	TargetSource string `json:"targetSource,omitempty"`
+	// Source is where the infrastructure list is read from: a Bicep
+	// parameter file, a TargetList JSON file, or the list inline. It is
+	// required under shadow (there is nothing to compare otherwise) and
+	// serves as the default list of the migration API and CLI.
+	Source *migration.Source `json:"source,omitempty"`
+	// Profile is what every imported target is made of, besides its
+	// FQDN: the policy, the bindings and the owner. Required whenever
+	// a Source is given or the migration API is to import anything.
+	Profile *migration.Profile `json:"profile,omitempty"`
+	// CompareIntervalSeconds paces the shadow comparison.
+	CompareIntervalSeconds int `json:"compareIntervalSeconds,omitempty"`
 }
 
 // ResultSigning is the trust configuration for signed Results. It holds
@@ -412,6 +458,66 @@ func (c *Config) Validate() error {
 		if err := c.ResultSigning.validate(); err != nil {
 			return err
 		}
+	}
+	if c.Migration == nil {
+		c.Migration = &Migration{}
+	}
+	if err := c.Migration.validate(c); err != nil {
+		return err
+	}
+	return nil
+}
+
+// IssuanceEnabled reports whether the Conductor plans and starts runs:
+// only under the registry target source.
+func (c *Config) IssuanceEnabled() bool {
+	return c.Migration == nil || c.Migration.TargetSource == TargetSourceRegistry
+}
+
+func (m *Migration) validate(c *Config) error {
+	if m.TargetSource == "" {
+		m.TargetSource = TargetSourceRegistry
+	}
+	switch m.TargetSource {
+	case TargetSourceRegistry, TargetSourceShadow, TargetSourceIaC:
+	default:
+		return invalid("migration.targetSource %q is not supported (only %q, %q and %q)", m.TargetSource, TargetSourceRegistry, TargetSourceShadow, TargetSourceIaC)
+	}
+	if m.Source != nil {
+		if err := m.Source.Validate(); err != nil {
+			return invalid("migration.source: %v", err)
+		}
+		for name, v := range map[string]string{"bicepParamFile": m.Source.BicepParamFile, "jsonFile": m.Source.JSONFile} {
+			if v != "" && (!filepath.IsAbs(v) || filepath.Clean(v) != v) {
+				return invalid("migration.source.%s must be a clean absolute path", name)
+			}
+		}
+		if len(m.Source.FQDNs) > migration.MaxEntries {
+			return invalid("migration.source.fqdns: at most %d entries", migration.MaxEntries)
+		}
+		if m.Profile == nil {
+			return invalid("migration.profile is required with migration.source")
+		}
+	}
+	if m.Profile != nil {
+		names := make([]string, 0, len(c.ExecutionBindings))
+		for n := range c.ExecutionBindings {
+			names = append(names, n)
+		}
+		np, err := m.Profile.Normalized(migration.Bindings{Execution: names, DNS: c.DNSBindings, Store: c.StoreBindings})
+		if err != nil {
+			return invalid("migration.profile: %v", err)
+		}
+		*m.Profile = np
+	}
+	if m.TargetSource == TargetSourceShadow && m.Source == nil {
+		return invalid("migration.source is required under targetSource %q", TargetSourceShadow)
+	}
+	if m.CompareIntervalSeconds == 0 {
+		m.CompareIntervalSeconds = DefaultCompareIntervalSeconds
+	}
+	if m.CompareIntervalSeconds < MinCompareIntervalSeconds || m.CompareIntervalSeconds > MaxCompareIntervalSeconds {
+		return invalid("migration.compareIntervalSeconds must be between %d and %d", MinCompareIntervalSeconds, MaxCompareIntervalSeconds)
 	}
 	return nil
 }

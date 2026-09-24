@@ -1,0 +1,8 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "TargetList",
+  "fqdns": [
+    "leaf.cerdad.example.ac.jp",
+    "www.example.ac.jp"
+  ]
+}
