@@ -1,5 +1,7 @@
 # ACME Conductor
 
+*日本語版: [`README.ja.md`](README.ja.md)*
+
 ACME Conductor is a cloud-agnostic certificate-management control plane. It
 is not a new ACME client: ACME issuance itself is delegated to the existing,
 version-pinned [go-acme/lego](https://github.com/go-acme/lego) CLI, invoked
