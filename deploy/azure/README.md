@@ -128,6 +128,19 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
 
    イメージをローカルでビルドする必要も，GHCR の資格情報も要らない．Container
    Apps は公開イメージをダイジェストでそのまま pull する．
+4. Runner の最初の実行を確認する．Runner の設定はデプロイ時には検証されず，
+   各実行の開始時に読み込まれる．誤り（たとえば予約済みの環境変数名．
+   [`docs/runner.md`](../../docs/runner.md#dnsbindingsname) を参照）があっても
+   デプロイは成功し，その後の実行が毎分 `Failed` になるだけである．
+   ジョブがなくても実行は毎分動くので，1〜2 分待てば判定できる．待機中のジョブがなければ
+   `no pending job; nothing to do` で `Succeeded` になるのが正常である:
+
+   ```sh
+   az containerapp job execution list -g rg-acme -n <prefix>-runner \
+     --query "[0:3].{name:name,status:properties.status}" -o table
+   az containerapp job logs show -g rg-acme -n <prefix>-runner \
+     --execution <execution name> --container runner --format text
+   ```
 
 `conductorConfig` 出力は，テンプレートが導出した Conductor の設定
 （サブスクリプション，リソースグループ，ジョブ名，Conductor の ID のクライアント
