@@ -96,10 +96,14 @@ type fakeARM struct {
 	record        string
 	resultKey     string
 
-	mu             sync.Mutex
-	execs          map[string]*fakeExec
-	nextID         int
-	getFailures    int    // leading execution reads that fail with 500
+	mu          sync.Mutex
+	execs       map[string]*fakeExec
+	nextID      int
+	getFailures int // leading execution reads that fail with 500
+	// firstGet is closed when the Conductor first reads an execution,
+	// i.e. when it has moved from awaiting the claim to confirming.
+	firstGet       chan struct{}
+	firstGetOnce   sync.Once
 	getNotFound    int    // leading execution reads that answer 404
 	statusOverride string // final status reported regardless of the exit code
 	stopCount      int
@@ -128,7 +132,7 @@ func newFakeARM(t *testing.T, mode string) *fakeARM {
 	f := &fakeARM{
 		t: t, self: self, mode: mode, execs: map[string]*fakeExec{},
 		exchangeLocal: filepath.Join(dir, "exchange"), record: filepath.Join(dir, "record.json"),
-		resultKey: keyPath, stopScheduler: make(chan struct{}),
+		resultKey: keyPath, stopScheduler: make(chan struct{}), firstGet: make(chan struct{}),
 	}
 	f.srv = httptest.NewTLSServer(http.HandlerFunc(f.handle))
 	go f.schedule()
@@ -265,6 +269,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (f *fakeARM) getExecution(w http.ResponseWriter, name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.firstGetOnce.Do(func() { close(f.firstGet) })
 	if f.getFailures > 0 {
 		f.getFailures--
 		f.armError(w, http.StatusInternalServerError, "InternalServerError")
@@ -530,15 +535,14 @@ func TestCancelDuringConfirmStopsExecution(t *testing.T) {
 	f.set(func(f *fakeARM) { f.getFailures = 2 })
 	l, _, logs := newLauncher(t, f, nil)
 	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel as soon as the job has been taken (the marker exists).
+	// Cancel once the launcher is confirming: its first read of the
+	// execution (which fails, so confirmation is still in progress when
+	// the cancellation lands). Cancelling on the marker file instead
+	// raced the launcher's own read of it and sometimes cancelled the
+	// wait for the claim, which is another test.
 	go func() {
-		for {
-			if _, err := exchange.ReadExecution(f.exchangeLocal, spec().RunID); err == nil {
-				cancel()
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
+		<-f.firstGet
+		cancel()
 	}()
 	ex, err := l.Start(ctx, spec())
 	if err != nil {

@@ -44,7 +44,9 @@ deploy/azure/main.bicep`); CI does not run it yet.
 A release is a version tag on `main` (`git tag v0.5.0 && git push origin
 v0.5.0`). The release workflow (`.github/workflows/release.yml`) runs
 the CI workflow and checks that the tagged commit is in `origin/main`'s
-history (a tag on any other commit publishes nothing), then publishes
+history (`scripts/release-guard.sh`; a tag on any other commit publishes
+nothing; the `Release guard check` workflow exercises the same script
+against any ref without publishing), then publishes
 both images to GHCR for
 `linux/amd64` and `linux/arm64` with an SBOM and provenance attached
 ([ADR 0017](docs/adr/0017-release-pipeline.md)); the image digests are

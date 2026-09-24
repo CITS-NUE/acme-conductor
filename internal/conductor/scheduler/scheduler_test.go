@@ -52,8 +52,13 @@ func (e *fakeExec) Wait() (*v1alpha1.Result, error) {
 	return e.respond(e.ctx, e.spec)
 }
 
-func okResult(spec *v1alpha1.JobSpec, action v1alpha1.ResultAction, days int) *v1alpha1.Result {
-	now := time.Now().UTC()
+// okResult is a successful Result whose certificate expires days after
+// now. now must be the fixture's clock, not the wall clock: the scheduler
+// decides "due" on the fixture's clock, and an expiry stamped from the
+// wall clock drifts away from it by however far the test date is from
+// today (this test suite turned red on 2026-09-23 for exactly that
+// reason).
+func okResult(now time.Time, spec *v1alpha1.JobSpec, action v1alpha1.ResultAction, days int) *v1alpha1.Result {
 	exp := now.Add(time.Duration(days) * 24 * time.Hour)
 	return &v1alpha1.Result{
 		APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindCertificateReconcileResult,
@@ -103,7 +108,7 @@ func setup(t *testing.T, maxRuns int) *fixture {
 	t.Cleanup(func() { reg.Close() })
 	f := &fixture{reg: reg, fake: &fakeLauncher{}, now: time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)}
 	f.fake.respond = func(ctx context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
-		return okResult(spec, v1alpha1.ActionIssued, 90), nil
+		return okResult(f.clock(), spec, v1alpha1.ActionIssued, 90), nil
 	}
 	f.s = New(Options{
 		Registry: reg, Launchers: map[string]launcher.Launcher{"local": f.fake},
@@ -651,12 +656,14 @@ func (f *fixture) assertNextRunRegistrable(t *testing.T) {
 func TestStartRecordFailureOnceStillFinalizes(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		result func(spec *v1alpha1.JobSpec) *v1alpha1.Result
+		result func(now time.Time, spec *v1alpha1.JobSpec) *v1alpha1.Result
 		status registry.RunStatus
 		audit  registry.AuditAction
 	}{
-		{"runner succeeds", func(spec *v1alpha1.JobSpec) *v1alpha1.Result { return okResult(spec, v1alpha1.ActionIssued, 90) }, registry.RunSucceeded, registry.AuditRunSucceeded},
-		{"runner fails", func(spec *v1alpha1.JobSpec) *v1alpha1.Result {
+		{"runner succeeds", func(now time.Time, spec *v1alpha1.JobSpec) *v1alpha1.Result {
+			return okResult(now, spec, v1alpha1.ActionIssued, 90)
+		}, registry.RunSucceeded, registry.AuditRunSucceeded},
+		{"runner fails", func(_ time.Time, spec *v1alpha1.JobSpec) *v1alpha1.Result {
 			return failResult(spec, v1alpha1.ErrorCodeACMEFailure, "order failed")
 		}, registry.RunFailed, registry.AuditRunFailed},
 	} {
@@ -672,7 +679,7 @@ func TestStartRecordFailureOnceStillFinalizes(t *testing.T) {
 				return nil
 			})
 			f.fake.respond = func(ctx context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
-				return tc.result(spec), nil
+				return tc.result(f.clock(), spec), nil
 			}
 			if planned, started := f.cycle(t); planned != 1 || started != 1 {
 				t.Fatalf("planned %d started %d", planned, started)

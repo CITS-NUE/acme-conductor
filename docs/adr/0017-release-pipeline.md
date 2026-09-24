@@ -64,7 +64,13 @@ keep the property that a published image is exactly what CI verified.
 - The `main` check is enforced in the workflow, where the invariant is
   reviewed with the code; a repository ruleset restricting who may
   create `v*` tags is a second layer an administrator can add, not a
-  substitute.
+  substitute. The check is `scripts/release-guard.sh`, and the
+  dispatch-only workflow `release-guard-check.yml` runs the same script
+  against any ref with an expected outcome, so both the positive case
+  (a `main` commit passes) and the negative case (a branch commit is
+  refused) can be verified on demand without a tag and without a
+  publish. A version tag on a branch is never the way to test it: that
+  runs the real release workflow.
 - The pipeline is not verified by a run from this repository yet: it
   needs a tag on `main` and the repository's packages permission. Its
   first run is the verification, and the smoke test fails the release if
