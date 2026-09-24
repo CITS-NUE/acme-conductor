@@ -1,17 +1,32 @@
-// Example parameters for deploy/azure/main.bicep. Copy, edit, deploy:
+// Example parameters for deploy/azure/main.bicep. Copy it next to
+// main.bicep (loadTextContent below resolves relative to this file), fill
+// in the deployment-specific values, and deploy:
 //
+//   cp main.bicepparam my.bicepparam
+//   export ACME_JOB_SIGNING_PRIVATE_KEY_PEM="$(cat job-signing.pem)"
+//   export ACME_RESULT_SIGNING_PRIVATE_KEY_PEM="$(cat result-signing.pem)"
 //   az deployment group create --resource-group rg-acme \
-//     --template-file main.bicep --parameters main.bicepparam \
-//     --parameters jobSigningPrivateKeyPem=@job-signing.pem \
-//     --parameters resultSigningPrivateKeyPem=@result-signing.pem
+//     --template-file main.bicep --parameters my.bicepparam
 //
 // The runner configuration below is deploy/examples/runner-config.aca.example.json
 // with the paths this template mounts (/state, /work, /usr/local/bin/lego).
+// The template adds jobSigning.publicKeys from jobSigningPublicKey and the
+// Runner identity's client ID to the config of every managed-identity Key
+// Vault store binding (cmd/acme-runner/deploy_azure_test.go checks that
+// what it emits loads).
 using 'main.bicep'
 
 param namePrefix = 'acme'
-// v0.5.0 (https://github.com/CITS-NUE/acme-conductor/actions/runs/35945554057);
-// verify before trusting: gh attestation verify oci://<image>:0.5.0 --owner CITS-NUE
+// Pin both images by digest to one release. The digests below are v0.5.0
+// (https://github.com/CITS-NUE/acme-conductor/actions/runs/35945554057),
+// the last release before the {type, config} binding format this template
+// emits, so they do not run with the configuration this template produces.
+// Replace them with the digests of the first release cut after this
+// template (CITS-NUE/acme-conductor#30), read from that release run's
+// summary and verified before trusting:
+//   gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE
+//   gh attestation verify oci://ghcr.io/cits-nue/acme-runner:<version> --owner CITS-NUE
+//   docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:<version>
 param conductorImage = 'ghcr.io/cits-nue/acme-conductor@sha256:97198bc1d338ec0ce9748120b4b2b9645b881c40b58d40920f11781fa4558ed3'
 param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:760a2e9f906b4b85ec5fe92c34e2f13c1fdf61abef2ea48504de70e511c1a6d2'
 

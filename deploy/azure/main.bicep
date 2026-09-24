@@ -326,12 +326,24 @@ resource exchangeStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01'
 // authenticates with a managed identity: the Job carries a user-assigned
 // identity only, and a managed-identity credential that names no client
 // ID asks for the system-assigned one, which this Job does not have.
+//
+// A store binding is a {type, config} envelope (docs/runner.md): the
+// Runner's configuration knows no store type, and everything a provider
+// reads — here the Key Vault adapter's credential and
+// managedIdentityClientId — lives in its config object. The template
+// therefore reads the credential from, and merges the client ID into,
+// binding.config, and leaves the envelope itself as the operator wrote
+// it; a field added at the binding root would be refused by the Runner
+// as unknown. cmd/acme-runner's TestAzureTemplateRunnerConfigLoads holds
+// this expression and the example configuration to that shape.
 var runnerConfigInput = json(runnerConfigJson)
 var runnerStoreBindings = toObject(
   items(runnerConfigInput.storeBindings),
   b => b.key,
-  b => (b.value.type == 'azure-keyvault' && (b.value.?credential ?? 'default') == 'managed-identity')
-    ? union(b.value, { managedIdentityClientId: runnerIdentity.properties.clientId })
+  b => (b.value.type == 'azure-keyvault' && (b.value.config.?credential ?? 'default') == 'managed-identity')
+    ? union(b.value, {
+        config: union(b.value.config, { managedIdentityClientId: runnerIdentity.properties.clientId })
+      })
     : b.value
 )
 var runnerConfig = union(runnerConfigInput, {
