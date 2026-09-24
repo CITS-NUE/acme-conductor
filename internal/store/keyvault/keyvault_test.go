@@ -31,8 +31,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
 
-	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
 
 // --- test certificates ---------------------------------------------------------

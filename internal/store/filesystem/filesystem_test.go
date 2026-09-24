@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
-	"github.com/CITS-NUE/acme-conductor/internal/store"
+	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
 
 // genCert returns a self-signed EC P-256 certificate (PEM) and its SEC1

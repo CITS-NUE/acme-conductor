@@ -78,9 +78,11 @@ below).
 - **Scheduler** — decides when a `Target` is due for issuance or renewal and
   produces a `JobSpec` for it.
 - **Job Launcher interface** — an abstraction over "start a Runner
-  execution somewhere" (`internal/conductor/launcher`: a local process in
-  Phase 2, an Azure Container Apps Job from Phase 4). Cloud-specific
-  launcher code lives behind this interface, never in Conductor core.
+  execution somewhere" (the contract is `pkg/launcher`; the
+  implementations are `internal/conductor/launcher/localprocess`, a local
+  process since Phase 2, and `internal/conductor/launcher/acajob`, an
+  Azure Container Apps Job since Phase 4). Cloud-specific launcher code
+  lives behind this interface, never in Conductor core.
 - **API and GUI** — the REST API (`internal/conductor/api`) is the only
   boundary that accepts free-form input; since Phase 5 it authenticates
   callers with OIDC bearer tokens as named principals with an admin or
@@ -446,7 +448,7 @@ internal/
   conductor/oidc/oidctest/ in-process OpenID provider for tests; not compiled into shipped binaries
   conductor/ui/         the embedded GUI: index.html, app.js, app.css (Phase 5)
   conductor/config/     Conductor configuration loading and validation
-  conductor/launcher/   Job Launcher interface, job signing, and the local-process launcher
+  conductor/launcher/localprocess/ the local-process launcher (development and tests)
   conductor/launcher/acajob/ Azure Container Apps Job launcher (Phase 4) — the Conductor's only Azure SDK import
   conductor/registry/   domain model (Target, CertificatePolicy, Run, AuditEvent) and Registry interface
   conductor/scheduler/  due decision, per-target exclusion, run execution
@@ -458,11 +460,14 @@ internal/
   runner/config/    Runner configuration loading and validation (Phase 1)
   runner/lego/      lego argv/env construction, subprocess execution, output redaction (Phase 1)
   runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
-  store/            Certificate Store adapter contract shared by store implementations (Phase 1)
+  store/            Certificate Store implementations; the contract itself is pkg/store
   store/filesystem/ filesystem-backed Certificate Store (dev/test only, Phase 1)
   store/keyvault/   Azure Key Vault Certificate Store (Phase 3) — the Runner's only Azure SDK import
   version/          build metadata injected via -ldflags
 pkg/api/v1alpha1/   the versioned JobSpec/Result contract and the signed job envelope (types, validation, strict decoding)
+pkg/store/          the Certificate Store contract (Store, Bundle, Info) and the certificate helpers every store shares
+pkg/launcher/       the Job Launcher contract (Launcher, Execution, Error/Reason), job signing and result verification
+                    — pkg/ is what a provider adapter in another module imports (pkg/contracts_test.go keeps it so)
 schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
 deploy/examples/    example Conductor and Runner configurations and a JobSpec document
 deploy/azure/       Bicep for the Container Apps deployment: environment, identities, custom roles, Runner Job, Conductor app (Phase 4)

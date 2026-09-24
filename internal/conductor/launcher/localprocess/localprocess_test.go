@@ -1,9 +1,8 @@
-package launcher
+package localprocess
 
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/fakerunner"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 func TestMain(m *testing.M) {
@@ -142,14 +142,14 @@ func TestLocalProcessEnvironmentIsExplicit(t *testing.T) {
 func TestLocalProcessFailureModes(t *testing.T) {
 	cases := []struct {
 		mode   string
-		reason Reason
+		reason launcher.Reason
 		status v1alpha1.ResultStatus
 		code   v1alpha1.ErrorCode
 	}{
 		{mode: "fail", status: v1alpha1.StatusFailed, code: v1alpha1.ErrorCodeACMEFailure},
-		{mode: "noresult", reason: ReasonNoResult},
-		{mode: "garbage", reason: ReasonNoResult},
-		{mode: "mismatch", reason: ReasonMismatch},
+		{mode: "noresult", reason: launcher.ReasonNoResult},
+		{mode: "garbage", reason: launcher.ReasonNoResult},
+		{mode: "mismatch", reason: launcher.ReasonMismatch},
 	}
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -160,7 +160,7 @@ func TestLocalProcessFailureModes(t *testing.T) {
 			}
 			res, err := ex.Wait()
 			if tc.reason != "" {
-				if err == nil || ReasonOf(err) != tc.reason || res != nil {
+				if err == nil || launcher.ReasonOf(err) != tc.reason || res != nil {
 					t.Fatalf("Wait = %v, %v; want reason %s", res, err, tc.reason)
 				}
 				return
@@ -202,7 +202,7 @@ func TestLocalProcessTimeoutWithoutResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := ex.Wait()
-	if res != nil || ReasonOf(err) != ReasonTimeout {
+	if res != nil || launcher.ReasonOf(err) != launcher.ReasonTimeout {
 		t.Fatalf("Wait = %v, %v; want timeout", res, err)
 	}
 	if d := time.Since(start); d > 10*time.Second {
@@ -217,7 +217,7 @@ func TestLocalProcessTimeoutWithoutResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.AfterFunc(200*time.Millisecond, cancel)
-	if res, err := ex2.Wait(); res != nil || ReasonOf(err) != ReasonCancelled {
+	if res, err := ex2.Wait(); res != nil || launcher.ReasonOf(err) != launcher.ReasonCancelled {
 		t.Fatalf("Wait = %v, %v; want cancelled", res, err)
 	}
 }
@@ -226,28 +226,28 @@ func TestLocalProcessStartFailures(t *testing.T) {
 	l, _ := newLocal(t, "ok", nil)
 	bad := spec()
 	bad.Target.FQDN = "Bad.Example.AC.JP"
-	if _, err := l.Start(context.Background(), bad); ReasonOf(err) != ReasonStart {
+	if _, err := l.Start(context.Background(), bad); launcher.ReasonOf(err) != launcher.ReasonStart {
 		t.Fatalf("invalid spec: %v", err)
 	}
 	// A leftover run directory is refused, not reused.
 	if err := os.MkdirAll(filepath.Join(l.WorkDir, "run-"+spec().RunID), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.Start(context.Background(), spec()); ReasonOf(err) != ReasonStart {
+	if _, err := l.Start(context.Background(), spec()); launcher.ReasonOf(err) != launcher.ReasonStart {
 		t.Fatalf("leftover dir: %v", err)
 	}
 	l.RunnerBinary = filepath.Join(t.TempDir(), "missing")
 	other := spec()
 	other.RunID = "01JRUN000000000000000000A2"
-	if _, err := l.Start(context.Background(), other); ReasonOf(err) != ReasonStart {
+	if _, err := l.Start(context.Background(), other); launcher.ReasonOf(err) != launcher.ReasonStart {
 		t.Fatalf("missing binary: %v", err)
 	}
 	l.RunnerBinary = "relative"
-	if _, err := l.Start(context.Background(), other); ReasonOf(err) != ReasonStart {
+	if _, err := l.Start(context.Background(), other); launcher.ReasonOf(err) != launcher.ReasonStart {
 		t.Fatalf("relative binary: %v", err)
 	}
-	if ReasonOf(errors.New("plain")) != ReasonNoResult {
-		t.Fatal("ReasonOf(plain error)")
+	if launcher.ReasonOf(errors.New("plain")) != launcher.ReasonNoResult {
+		t.Fatal("launcher.ReasonOf(plain error)")
 	}
 }
 
@@ -277,7 +277,7 @@ func TestLocalProcessSignsWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.Signer, err = NewSigner(priv, 10*time.Minute)
+	l.Signer, err = launcher.NewSigner(priv, 10*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,46 +316,5 @@ func TestLocalProcessSignsWhenConfigured(t *testing.T) {
 	_ = json.Unmarshal(data, &r)
 	if r.JobKind != v1alpha1.KindCertificateReconcileJob {
 		t.Fatalf("job kind = %q", r.JobKind)
-	}
-}
-
-func TestSignerAndJobDocument(t *testing.T) {
-	_, priv, _ := v1alpha1.GenerateSigningKey()
-	if _, err := NewSigner(priv[:5], time.Minute); err == nil {
-		t.Fatal("bad key accepted")
-	}
-	if _, err := NewSigner(priv, 0); err == nil {
-		t.Fatal("zero validity accepted")
-	}
-	s, err := NewSigner(priv, 7*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Validity() != 7*time.Minute || len(s.KeyID()) != v1alpha1.KeyIDLength {
-		t.Fatalf("signer = %+v", s)
-	}
-	doc, err := JobDocument(spec(), s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sj, err := v1alpha1.DecodeSignedJob(bytes.NewReader(doc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub := priv.Public().(ed25519.PublicKey)
-	if _, hdr, err := sj.Verify(map[string]ed25519.PublicKey{v1alpha1.KeyID(pub): pub}, v1alpha1.VerifyOptions{}); err != nil || hdr.ExpiresAt.Sub(hdr.IssuedAt) != 7*time.Minute {
-		t.Fatalf("verify: %v", err)
-	}
-	plain, err := JobDocument(spec(), nil)
-	if err != nil || v1alpha1.IsSignedJob(plain) {
-		t.Fatalf("plain: %v", err)
-	}
-	if _, err := v1alpha1.DecodeJobSpec(bytes.NewReader(plain)); err != nil {
-		t.Fatal(err)
-	}
-	bad := spec()
-	bad.Target.FQDN = "Bad.example.ac.jp"
-	if _, err := JobDocument(bad, s); err == nil {
-		t.Fatal("invalid spec signed")
 	}
 }

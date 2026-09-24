@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/exchange"
-	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
 
 // Environment variables that steer the fake.

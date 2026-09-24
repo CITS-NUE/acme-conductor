@@ -87,10 +87,12 @@ cmd/acme-conductor/   control-plane binary
 cmd/acme-runner/      data-plane binary
 internal/conductor/   Conductor: config, registry (SQLite), scheduler, launchers, REST API
 internal/runner/      Runner: config, reconcile loop, lego invocation
-internal/store/       Certificate Store contract, the filesystem store and the Azure Key Vault store
+internal/store/       the filesystem store and the Azure Key Vault store
 internal/policy/      FQDN normalization and suffix-matching
 internal/version/     build metadata (injected via -ldflags)
 pkg/api/v1alpha1/     the versioned JobSpec/Result contract
+pkg/store/            the Certificate Store contract every store adapter implements
+pkg/launcher/         the Job Launcher contract every launcher adapter implements
 schemas/v1alpha1/     JSON Schema mirror of the contract
 docs/                 architecture, threat model, ADRs
 ```
