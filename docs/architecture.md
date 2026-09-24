@@ -439,15 +439,16 @@ gets matched against the suffix list.
 
 ```
 cmd/
-  acme-conductor/   control-plane binary (serve, Phase 2)
-  acme-runner/      data-plane binary (reconcile, Phase 1)
+  acme-conductor/   control-plane binary (serve, Phase 2); providers.go registers the launcher types it ships
+  acme-runner/      data-plane binary (reconcile, Phase 1); providers.go registers the store types it ships
 internal/
   conductor/            Conductor wiring: config, registry, scheduler, launchers, API (Phase 2)
   conductor/api/        REST API handlers, the localhost-dev authenticator, role enforcement, GUI routes
   conductor/oidc/       OIDC bearer-token authenticator: discovery, key set cache, JWS verification (Phase 5)
   conductor/oidc/oidctest/ in-process OpenID provider for tests; not compiled into shipped binaries
   conductor/ui/         the embedded GUI: index.html, app.js, app.css (Phase 5)
-  conductor/config/     Conductor configuration loading and validation
+  conductor/config/     Conductor configuration loading and validation; knows no launcher type
+  conductor/launchers/  composition layer: the launcher provider registry the Conductor core builds launchers through
   conductor/launcher/localprocess/ the local-process launcher (development and tests)
   conductor/launcher/acajob/ Azure Container Apps Job launcher (Phase 4) — the Conductor's only Azure SDK import
   conductor/registry/   domain model (Target, CertificatePolicy, Run, AuditEvent) and Registry interface
@@ -457,7 +458,8 @@ internal/
   fslock/           advisory file locks shared by the Runner's on-disk stores
   policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
   runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
-  runner/config/    Runner configuration loading and validation (Phase 1)
+  runner/config/    Runner configuration loading and validation (Phase 1); knows no store type
+  runner/stores/    composition layer: the store provider registry the Runner core opens stores through
   runner/lego/      lego argv/env construction, subprocess execution, output redaction (Phase 1)
   runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
   store/            Certificate Store implementations; the contract itself is pkg/store

@@ -156,11 +156,19 @@ provider's published keys and performs no sign-in of its own
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | `local-process` or `azure-container-apps-job`. |
-| `localProcess` | object | Required for `local-process` — see below. |
-| `azureContainerAppsJob` | object | Required for `azure-container-apps-job` — see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job). |
+| `type` | string | The launcher type name (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). The Conductor binary decides which types it provides: the official binary provides `local-process` and `azure-container-apps-job`. A type this binary does not provide is refused at start, before anything else happens. |
+| `config` | object | The configuration of that type, decoded strictly by the type's provider (unknown fields are refused, duplicate keys are refused, nothing else is accepted). Its content is opaque to the generic configuration: adding a launcher type adds nothing here. Whether a type needs `jobSigning`/`resultSigning` is also the provider's rule, checked when the launcher is built. |
 
-### `executionBindings.<name>.localProcess`
+```json
+"executionBindings": {
+  "local": {
+    "type": "local-process",
+    "config": { "runnerBinary": "/usr/local/bin/acme-runner", "runnerConfig": "/etc/acme-runner/config.json", "workDir": "/var/lib/acme-conductor/runs" }
+  }
+}
+```
+
+### `type: local-process` — `config`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

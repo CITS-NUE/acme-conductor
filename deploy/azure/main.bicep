@@ -522,7 +522,7 @@ var conductorConfig = {
   executionBindings: {
     azure: {
       type: 'azure-container-apps-job'
-      azureContainerAppsJob: {
+      config: {
         subscriptionId: subscription().subscriptionId
         resourceGroup: resourceGroup().name
         jobName: runnerJob.name

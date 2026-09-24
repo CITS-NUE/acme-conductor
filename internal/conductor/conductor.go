@@ -28,8 +28,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/acajob"
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/localprocess"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/launchers"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
@@ -52,8 +51,10 @@ type Options struct {
 	// Listening, when set, is called with the bound address once the API
 	// accepts connections (tests use it to learn an ephemeral port).
 	Listening func(addr net.Addr)
-	// LookupEnv is passed to the local-process launcher.
-	LookupEnv func(string) (string, bool)
+	// Launchers provides the execution binding types this Conductor can
+	// build (internal/conductor/launchers). Required: a configuration
+	// naming a type the registry does not provide is refused at start.
+	Launchers *launchers.Registry
 }
 
 // LockPath returns the path of the ownership lock Serve holds for the
@@ -68,6 +69,14 @@ func Serve(ctx context.Context, opts Options) int {
 	}
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
+		log.Error("configuration rejected", "path", opts.ConfigPath, "error", err.Error())
+		return ExitConfig
+	}
+	if opts.Launchers == nil {
+		log.Error("no launcher registry: the binary registers no execution binding types")
+		return ExitConfig
+	}
+	if err := opts.Launchers.Validate(cfg); err != nil {
 		log.Error("configuration rejected", "path", opts.ConfigPath, "error", err.Error())
 		return ExitConfig
 	}
@@ -108,14 +117,14 @@ func Serve(ctx context.Context, opts Options) int {
 	if signer != nil {
 		log.Info("job signing enabled", "keyId", signer.KeyID(), "validitySeconds", cfg.JobSigning.ValiditySeconds)
 	}
-	launchers, err := buildLaunchers(cfg, signer, verifier, log, opts.LookupEnv)
+	built, err := opts.Launchers.Build(cfg, launchers.BuildDeps{Signer: signer, Verifier: verifier, Logger: log})
 	if err != nil {
 		log.Error("launchers could not be built", "error", err.Error())
 		return ExitConfig
 	}
 	sched := scheduler.New(scheduler.Options{
 		Registry:          reg,
-		Launchers:         launchers,
+		Launchers:         built,
 		Tick:              time.Duration(cfg.Scheduler.TickSeconds) * time.Second,
 		MaxConcurrentRuns: cfg.Scheduler.MaxConcurrentRuns,
 		RetryBackoff:      time.Duration(cfg.Scheduler.RetryBackoffSeconds) * time.Second,
@@ -307,48 +316,6 @@ func loadSigner(cfg *config.Config) (*launcher.Signer, error) {
 		return nil, fmt.Errorf("%s: %w", cfg.JobSigning.PrivateKeyFile, err)
 	}
 	return launcher.NewSigner(key, time.Duration(cfg.JobSigning.ValiditySeconds)*time.Second)
-}
-
-func buildLaunchers(cfg *config.Config, signer *launcher.Signer, verifier *launcher.Verifier, log *slog.Logger, lookup func(string) (string, bool)) (map[string]launcher.Launcher, error) {
-	if lookup == nil {
-		lookup = os.LookupEnv
-	}
-	out := map[string]launcher.Launcher{}
-	for name, b := range cfg.ExecutionBindings {
-		switch b.Type {
-		case config.ExecutionLocalProcess:
-			lp := b.LocalProcess
-			if err := os.MkdirAll(lp.WorkDir, 0o700); err != nil {
-				return nil, fmt.Errorf("execution binding %q: work directory: %w", name, err)
-			}
-			out[name] = &localprocess.LocalProcess{
-				RunnerBinary: lp.RunnerBinary, RunnerConfig: lp.RunnerConfig, WorkDir: lp.WorkDir,
-				Timeout: time.Duration(lp.TimeoutSeconds) * time.Second, PassthroughEnv: lp.PassthroughEnv,
-				Signer: signer, Verifier: verifier, Logger: log.With("component", "launcher", "executionBinding", name), LookupEnv: lookup,
-			}
-		case config.ExecutionAzureContainerAppsJob:
-			a := b.AzureContainerAppsJob
-			if err := os.MkdirAll(a.ExchangeDir, 0o700); err != nil {
-				return nil, fmt.Errorf("execution binding %q: exchange directory: %w", name, err)
-			}
-			l, err := acajob.New(acajob.Config{
-				SubscriptionID: a.SubscriptionID, ResourceGroup: a.ResourceGroup, JobName: a.JobName,
-				Cloud: a.Cloud, Credential: a.Credential, ManagedIdentityClientID: a.ManagedIdentityClientID,
-				ExchangeDir:  a.ExchangeDir,
-				ClaimTimeout: time.Duration(a.ClaimTimeoutSeconds) * time.Second,
-				Timeout:      time.Duration(a.TimeoutSeconds) * time.Second,
-				PollInterval: time.Duration(a.PollIntervalSeconds) * time.Second,
-				ResultGrace:  time.Duration(a.ResultGraceSeconds) * time.Second,
-			}, signer, verifier, &acajob.Options{Logger: log.With("component", "launcher", "executionBinding", name)})
-			if err != nil {
-				return nil, fmt.Errorf("execution binding %q: %w", name, err)
-			}
-			out[name] = l
-		default:
-			return nil, fmt.Errorf("execution binding %q: unsupported type %q", name, b.Type)
-		}
-	}
-	return out, nil
 }
 
 func sortStrings(s []string) []string {

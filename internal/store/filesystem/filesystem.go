@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +35,7 @@ import (
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
+	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
@@ -59,6 +61,29 @@ type Store struct {
 
 // New returns a store rooted at root. The directory is created (0700) if it
 // does not exist.
+// Config is the binding configuration object of type "filesystem".
+type Config struct {
+	// Directory is the store root: a clean absolute path.
+	Directory string `json:"directory"`
+}
+
+// ParseConfig strictly decodes and validates a binding's configuration
+// object (unknown fields are refused).
+func ParseConfig(raw json.RawMessage) (Config, error) {
+	var c Config
+	if err := strictjson.Unmarshal(raw, &c); err != nil {
+		return Config{}, err
+	}
+	if c.Directory == "" || !filepath.IsAbs(c.Directory) || filepath.Clean(c.Directory) != c.Directory {
+		return Config{}, errors.New("directory must be a clean absolute path")
+	}
+	return c, nil
+}
+
+// Open returns the store a parsed configuration describes.
+func Open(c Config) (store.Store, error) { return New(c.Directory) }
+
+// New returns a store rooted at root, creating the directory if needed.
 func New(root string) (*Store, error) {
 	if !filepath.IsAbs(root) {
 		return nil, fmt.Errorf("filesystem store root must be absolute: %q", root)

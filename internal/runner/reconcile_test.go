@@ -26,9 +26,9 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
-	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/stores"
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
@@ -105,7 +105,7 @@ func newHarness(t *testing.T, mode string, extraEnv map[string]string) *harness 
 			"fake-dns": map[string]any{"provider": "fakedns", "env": env, "passthroughEnv": []string{"FAKE_TOKEN"}},
 		},
 		"storeBindings": map[string]any{
-			"filesystem-dev": map[string]any{"type": "filesystem", "directory": h.storeDir},
+			"filesystem-dev": map[string]any{"type": "filesystem", "config": map[string]any{"directory": h.storeDir}},
 		},
 	}
 	h.writeJSON(h.cfgPath, cfg)
@@ -150,6 +150,7 @@ func (h *harness) run(ctx context.Context) (int, *v1alpha1.Result) {
 		ConfigPath:  h.cfgPath,
 		JobPath:     h.jobPath,
 		ResultPath:  h.resPath,
+		Stores:      testStores(),
 		Stdout:      &h.stdout,
 		Logger:      logger,
 		Now:         func() time.Time { return h.now },
@@ -825,7 +826,7 @@ func TestResultDeliveredOnStdoutWhenFileUnwritable(t *testing.T) {
 	}
 	logger := slog.New(slog.NewJSONHandler(&h.logs, nil))
 	code := Reconcile(context.Background(), Options{
-		ConfigPath: h.cfgPath, JobPath: h.jobPath, ResultPath: h.resPath, Stdout: &h.stdout, Logger: logger,
+		ConfigPath: h.cfgPath, JobPath: h.jobPath, ResultPath: h.resPath, Stores: testStores(), Stdout: &h.stdout, Logger: logger,
 		Now: func() time.Time { return h.now }, LookupEnv: func(k string) (string, bool) { v, ok := h.env[k]; return v, ok },
 	})
 	if code != ExitSucceeded {
@@ -1050,22 +1051,39 @@ func TestReconcileRefusesEscapingAccountsLink(t *testing.T) {
 	}
 }
 
-func TestOpenStoreByType(t *testing.T) {
-	st, err := openStore(config.StoreBinding{Type: config.StoreTypeFilesystem, Directory: t.TempDir()})
-	if err != nil || st.Type() != "filesystem" {
-		t.Fatalf("filesystem: %v, %v", st, err)
+// testStores is the registry every test Runner gets: the filesystem
+// store only, which is what the fixture configures.
+func testStores() *stores.Registry {
+	r := stores.New()
+	r.Register(stores.Adapt(filesystem.Type, filesystem.ParseConfig, filesystem.Open))
+	return r
+}
+
+// TestStoreTypeNotProvidedIsAConfigurationError: a binding of a type the
+// registry does not provide fails the run as a configuration error
+// before the job is looked at, and the log names the type.
+func TestStoreTypeNotProvidedIsAConfigurationError(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	data, err := os.ReadFile(h.cfgPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Opening a Key Vault store must not touch the network: the credential
-	// and client are built lazily, so this works offline.
-	st, err = openStore(config.StoreBinding{Type: config.StoreTypeAzureKeyVault, VaultURL: "https://kv-acme-dev.vault.azure.net", Credential: "managed-identity"})
-	if err != nil || st.Type() != "azure-keyvault" {
-		t.Fatalf("azure-keyvault: %v, %v", st, err)
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
 	}
-	if got := st.ObjectName("wiki.example.ac.jp"); !strings.HasPrefix(got, "wiki-example-ac-jp-") {
-		t.Fatalf("azure-keyvault ObjectName = %q", got)
+	cfg["storeBindings"].(map[string]any)["filesystem-dev"] = map[string]any{"type": "aws-secretsmanager", "config": map[string]any{}}
+	h.writeJSON(h.cfgPath, cfg)
+	h.job(nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res == nil || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInternal || !strings.Contains(res.Error.Summary, "configuration") {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
 	}
-	if _, err := openStore(config.StoreBinding{Type: "aws-secretsmanager"}); err == nil {
-		t.Fatalf("unknown store type accepted")
+	if !strings.Contains(h.logs.String(), "aws-secretsmanager") {
+		t.Fatalf("log does not name the type:\n%s", h.logs.String())
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run on a configuration error")
 	}
 }
 
@@ -1348,7 +1366,7 @@ func TestReconcileClaimMode(t *testing.T) {
 		h.stdout.Reset()
 		h.logs.Reset()
 		logger := slog.New(slog.NewJSONHandler(&h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		return Reconcile(context.Background(), Options{
+		return Reconcile(context.Background(), Options{Stores: testStores(),
 			ConfigPath: h.cfgPath, ExchangeDir: root, ExecutionName: execName, Stdout: &h.stdout, Logger: logger,
 			Now: func() time.Time { return h.now }, LookupEnv: func(k string) (string, bool) { v, ok := h.env[k]; return v, ok },
 			GracePeriod: 300 * time.Millisecond,

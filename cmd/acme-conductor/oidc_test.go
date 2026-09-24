@@ -43,7 +43,7 @@ func writeOIDCConfig(t *testing.T, dir, issuer string, withTLS bool) (cfgPath st
   "server": {` + server + `},
   "database": {"path": "` + dbPath + `"},
   "scheduler": {"tickSeconds": 3600},
-  "executionBindings": {"local": {"type": "local-process", "localProcess": {
+  "executionBindings": {"local": {"type": "local-process", "config": {
     "runnerBinary": "/usr/local/bin/acme-runner", "runnerConfig": "/etc/acme-runner/config.json", "workDir": "` + filepath.Join(dir, "runs") + `"}}},
   "acmeBindings": ["fake-ca"],
   "dnsBindings": ["fake-dns"],
@@ -213,7 +213,7 @@ func TestServeRejectsBadTLSFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	if code := conductor.Serve(context.Background(), conductor.Options{ConfigPath: cfgPath, Logger: newTestLogger(&logs)}); code != conductor.ExitConfig {
+	if code := conductor.Serve(context.Background(), conductor.Options{ConfigPath: cfgPath, Logger: newTestLogger(&logs), Launchers: officialLaunchers()}); code != conductor.ExitConfig {
 		t.Fatalf("exit = %d, want %d: %s", code, conductor.ExitConfig, logs.String())
 	}
 }

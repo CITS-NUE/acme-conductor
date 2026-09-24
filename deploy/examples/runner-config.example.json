@@ -42,12 +42,16 @@
   "storeBindings": {
     "filesystem-dev": {
       "type": "filesystem",
-      "directory": "/store"
+      "config": {
+        "directory": "/store"
+      }
     },
     "keyvault-staging": {
       "type": "azure-keyvault",
-      "vaultURL": "https://kv-acme-staging.vault.azure.net",
-      "credential": "managed-identity"
+      "config": {
+        "vaultURL": "https://kv-acme-staging.vault.azure.net",
+        "credential": "managed-identity"
+      }
     }
   }
 }

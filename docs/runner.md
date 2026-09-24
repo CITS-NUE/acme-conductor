@@ -183,11 +183,33 @@ same name cannot appear in both `env` and `passthroughEnv`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `type` | string | `"filesystem"` (development and tests) or `"azure-keyvault"`. Exactly the fields of the chosen type may be set; a field of the other type is rejected, not ignored. |
-| `directory` | string | `filesystem` only. Clean, absolute path — the filesystem store root. Required. |
-| `vaultURL` | string | `azure-keyvault` only. The vault's base URL, `https://<vault-name>.vault.azure.net` (or the equivalent under `.vault.azure.cn` / `.vault.usgovcloudapi.net`, which also selects the identity endpoint of that cloud). Nothing else: no port, path, query, fragment or credentials, and the host must be under one of those three suffixes with a well-formed vault name. Required. |
-| `credential` | string | `azure-keyvault` only. How the Runner authenticates to Azure: `managed-identity` (the platform's managed identity and nothing else — use this in production) or `default` (the SDK's `DefaultAzureCredential`, which tries environment variables, workload identity, managed identity and then the developer tools `az`/`azd`/Azure PowerShell in that order — for development). Defaults to `default` when omitted. No credential value is ever in this file. |
-| `managedIdentityClientId` | string | `azure-keyvault` with `credential: managed-identity` only. The client ID (GUID) of a user-assigned managed identity; omitted means the system-assigned identity. |
+| `type` | string | The store type name (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). The Runner binary decides which types it provides: the official binary provides `filesystem` (development and tests) and `azure-keyvault`. A type this binary does not provide is refused when the configuration is loaded, before any job is handled. |
+| `config` | object | The configuration of that type, decoded strictly by the type's provider (unknown fields are refused, duplicate keys are refused, nothing else is accepted). Its content is opaque to the generic configuration: adding a store type adds nothing here. |
+
+The provider configurations of the official binary:
+
+**`type: filesystem`** — `config`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `directory` | string | Clean, absolute path — the filesystem store root. Required. |
+
+**`type: azure-keyvault`** — `config`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `vaultURL` | string | The vault's base URL, `https://<vault-name>.vault.azure.net` (or the equivalent under `.vault.azure.cn` / `.vault.usgovcloudapi.net`, which also selects the identity endpoint of that cloud). Nothing else: no port, path, query, fragment or credentials, and the host must be under one of those three suffixes with a well-formed vault name. Required. |
+| `credential` | string | How the Runner authenticates to Azure: `managed-identity` (the platform's managed identity and nothing else — use this in production) or `default` (the SDK's `DefaultAzureCredential`, which tries environment variables, workload identity, managed identity and then the developer tools `az`/`azd`/Azure PowerShell in that order — for development). Defaults to `default` when omitted. No credential value is ever in this file. |
+| `managedIdentityClientId` | string | With `credential: managed-identity` only. The client ID (GUID) of a user-assigned managed identity; omitted means the system-assigned identity. |
+
+```json
+"storeBindings": {
+  "keyvault-prod": {
+    "type": "azure-keyvault",
+    "config": { "vaultURL": "https://kv-acme.vault.azure.net", "credential": "managed-identity" }
+  }
+}
+```
 
 ### `jobSigning`
 

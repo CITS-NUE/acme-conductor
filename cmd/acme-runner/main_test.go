@@ -76,7 +76,7 @@ func TestReconcileEndToEnd(t *testing.T) {
   "lego": {"binary": "` + self + `", "stateDir": "` + filepath.Join(dir, "state") + `", "workDir": "` + filepath.Join(dir, "work") + `", "timeoutSeconds": 30},
   "acmeBindings": {"fake-ca": {"directoryURL": "https://acme.test.invalid/directory", "email": "certs@example.ac.jp"}},
   "dnsBindings": {"fake-dns": {"provider": "fakedns", "env": {"ACME_RUNNER_FAKE_LEGO": "1", "FAKE_LEGO_MODE": "ok"}}},
-  "storeBindings": {"filesystem-dev": {"type": "filesystem", "directory": "` + filepath.Join(dir, "store") + `"}}
+  "storeBindings": {"filesystem-dev": {"type": "filesystem", "config": {"directory": "` + filepath.Join(dir, "store") + `"}}}
 }`
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -143,7 +143,7 @@ func TestReconcileFailureExitCodeAndSingleLine(t *testing.T) {
   "lego": {"binary": "` + self + `", "stateDir": "` + filepath.Join(dir, "state") + `", "workDir": "` + filepath.Join(dir, "work") + `", "timeoutSeconds": 30},
   "acmeBindings": {"fake-ca": {"directoryURL": "https://acme.test.invalid/directory", "email": "certs@example.ac.jp"}},
   "dnsBindings": {"fake-dns": {"provider": "fakedns", "env": {"ACME_RUNNER_FAKE_LEGO": "1", "FAKE_LEGO_MODE": "fail"}}},
-  "storeBindings": {"filesystem-dev": {"type": "filesystem", "directory": "` + filepath.Join(dir, "store") + `"}}
+  "storeBindings": {"filesystem-dev": {"type": "filesystem", "config": {"directory": "` + filepath.Join(dir, "store") + `"}}}
 }`
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
