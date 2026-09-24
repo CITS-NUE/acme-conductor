@@ -35,8 +35,13 @@ import (
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
-// Actor is the audit actor and requestedBy value of automatic runs.
-const Actor = "scheduler"
+// Actor is the audit actor and requestedBy value of automatic runs, and
+// Authority its namespace: the scheduler is its own authority, distinct
+// from any identity provider and from localhost-dev.
+const (
+	Actor     = "scheduler"
+	Authority = "scheduler"
+)
 
 // Options configure a Scheduler.
 type Options struct {
@@ -248,7 +253,7 @@ func (s *Scheduler) sweep(ctx context.Context, summary, detailPrefix string) (in
 		r.Action = v1alpha1.ActionFailed
 		r.ErrorCode = v1alpha1.ErrorCodeInternal
 		r.ErrorSummary = summary
-		ev := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunFailed, Detail: detailPrefix + summary}
+		ev := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditRunFailed, Detail: detailPrefix + summary}
 		err := s.reg.UpdateRun(ctx, r, prev, ev)
 		if errors.Is(err, registry.ErrConflict) {
 			continue
@@ -299,8 +304,8 @@ func (s *Scheduler) Plan(ctx context.Context) (int, error) {
 		if !due {
 			continue
 		}
-		run := &registry.Run{TargetID: t.ID, TargetRevision: t.Revision, RequestedBy: Actor}
-		ev := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunRequested, Detail: "run requested by scheduler: " + why}
+		run := &registry.Run{TargetID: t.ID, TargetRevision: t.Revision, RequestedBy: Actor, RequestedByAuthority: Authority}
+		ev := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditRunRequested, Detail: "run requested by scheduler: " + why}
 		err = s.reg.CreateRun(ctx, run, ev)
 		switch {
 		case errors.Is(err, registry.ErrRunActive):
@@ -425,7 +430,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		now := s.now().UTC()
 		run.Status = status
 		run.FinishedAt = &now
-		ev := &registry.AuditEvent{Actor: Actor, Action: action, Detail: detail}
+		ev := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: action, Detail: detail}
 		if err := s.record(ctx, log, run, &recorded, ev, s.recordWindow); err != nil {
 			log.Error("run outcome could not be recorded; the sweep will close the run with an unknown outcome", "status", string(status), "error", err.Error())
 			return
@@ -476,7 +481,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	spec := BuildJobSpec(run, target, policy)
 	if err := spec.Validate(); err != nil {
 		summary := sanitize("job spec rejected: " + err.Error())
-		rej := &registry.AuditEvent{Actor: Actor, Action: registry.AuditPolicyRejected, TargetID: target.ID, RunID: run.ID, PolicyID: policy.ID, Detail: summary}
+		rej := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditPolicyRejected, TargetID: target.ID, RunID: run.ID, PolicyID: policy.ID, Detail: summary}
 		if aerr := s.reg.AppendAudit(ctx, rej); aerr != nil {
 			log.Error("policy rejection could not be audited", "error", aerr.Error())
 		}
@@ -507,7 +512,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	run.Status = registry.RunRunning
 	run.StartedAt = &now
 	run.ExternalExecutionID = exec.ID()
-	started := &registry.AuditEvent{Actor: Actor, Action: registry.AuditRunStarted, Detail: "runner started via " + l.Type() + " (" + exec.ID() + ")"}
+	started := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditRunStarted, Detail: "runner started via " + l.Type() + " (" + exec.ID() + ")"}
 	// The Runner is already executing, so the start is recorded without
 	// retrying (a wait here would only delay collecting the outcome). If
 	// it fails, recorded stays starting: the outcome below is then

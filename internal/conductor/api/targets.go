@@ -148,7 +148,8 @@ func (s *Server) checkPolicy(r *http.Request, t *registry.Target) (*registry.Pol
 	}
 	if _, err := policy.Evaluate(t.FQDN, policy.Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}); err != nil {
 		detail := fmt.Sprintf("target %s rejected by policy %s: %v", t.FQDN, p.ID, err)
-		ev := &registry.AuditEvent{Actor: PrincipalFrom(r.Context()).Name, Action: registry.AuditPolicyRejected, TargetID: t.ID, PolicyID: p.ID, Detail: detail}
+		caller := PrincipalFrom(r.Context())
+		ev := &registry.AuditEvent{Actor: caller.Name, ActorAuthority: caller.Authority, Action: registry.AuditPolicyRejected, TargetID: t.ID, PolicyID: p.ID, Detail: detail}
 		if aerr := s.reg.AppendAudit(r.Context(), ev); aerr != nil {
 			return nil, aerr
 		}
@@ -220,8 +221,9 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
-	ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditTargetCreated, Detail: "target created: " + targetDetail(t)}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditTargetCreated, Detail: "target created: " + targetDetail(t)}
 	if err := s.reg.CreateTarget(r.Context(), t, ev); err != nil {
 		s.fail(w, r, err)
 		return
@@ -322,8 +324,9 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
-	ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditTargetUpdated, Detail: fmt.Sprintf("target updated (%s): %s", strings.Join(changed, ","), targetDetail(t))}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditTargetUpdated, Detail: fmt.Sprintf("target updated (%s): %s", strings.Join(changed, ","), targetDetail(t))}
 	if err := s.reg.UpdateTarget(r.Context(), t, in.Revision, ev); err != nil {
 		s.fail(w, r, err)
 		return
@@ -353,14 +356,15 @@ func (s *Server) handleSetTargetEnabled(enabled bool) http.HandlerFunc {
 			s.fail(w, r, err)
 			return
 		}
-		actor := PrincipalFrom(r.Context()).Name
+		caller := PrincipalFrom(r.Context())
+		actor := caller.Name
 		if t.Enabled != enabled {
 			t.Enabled = enabled
 			action, verb := registry.AuditTargetDisabled, "disabled"
 			if enabled {
 				action, verb = registry.AuditTargetEnabled, "enabled"
 			}
-			ev := &registry.AuditEvent{Actor: actor, Action: action, Detail: "target " + verb + ": fqdn=" + t.FQDN}
+			ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: action, Detail: "target " + verb + ": fqdn=" + t.FQDN}
 			if err := s.reg.UpdateTarget(r.Context(), t, t.Revision, ev); err != nil {
 				s.fail(w, r, err)
 				return

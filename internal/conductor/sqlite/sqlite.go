@@ -158,6 +158,14 @@ CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs
 CREATE TRIGGER policies_no_delete BEFORE DELETE ON policies
   BEGIN SELECT RAISE(ABORT, 'policies cannot be deleted'); END;
 `,
+	// 2: authority-qualified principals (docs/adr/0018). Rows written
+	// before this version keep '' — they are not rewritten (audit_events
+	// is append-only) and '' is documented as "recorded before the
+	// authority was known".
+	`
+ALTER TABLE audit_events ADD COLUMN actor_authority TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN requested_by_authority TEXT NOT NULL DEFAULT '';
+`,
 }
 
 // SchemaVersion is the schema version this binary expects.
@@ -287,8 +295,8 @@ func insertAudit(ctx context.Context, tx *sql.Tx, ev *registry.AuditEvent) error
 	if len(ev.Detail) > registry.MaxAuditDetailLength {
 		ev.Detail = ev.Detail[:registry.MaxAuditDetailLength]
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO audit_events (id, time, actor, action, target_id, run_id, policy_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, fmtTime(ev.Time), ev.Actor, string(ev.Action), ev.TargetID, ev.RunID, ev.PolicyID, ev.Detail)
+	_, err := tx.ExecContext(ctx, `INSERT INTO audit_events (id, time, actor, actor_authority, action, target_id, run_id, policy_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.ID, fmtTime(ev.Time), ev.Actor, ev.ActorAuthority, string(ev.Action), ev.TargetID, ev.RunID, ev.PolicyID, ev.Detail)
 	if err != nil {
 		return fmt.Errorf("append audit event: %w", err)
 	}
@@ -302,7 +310,7 @@ func (d *DB) AppendAudit(ctx context.Context, ev *registry.AuditEvent) error {
 
 // ListAudit returns events newest first.
 func (d *DB) ListAudit(ctx context.Context, opts registry.ListAuditOptions) ([]*registry.AuditEvent, error) {
-	q := `SELECT id, time, actor, action, target_id, run_id, policy_id, detail FROM audit_events WHERE 1=1`
+	q := `SELECT id, time, actor, actor_authority, action, target_id, run_id, policy_id, detail FROM audit_events WHERE 1=1`
 	var args []any
 	if opts.TargetID != "" {
 		q += ` AND target_id = ?`
@@ -331,7 +339,7 @@ func (d *DB) ListAudit(ctx context.Context, opts registry.ListAuditOptions) ([]*
 	for rows.Next() {
 		var ev registry.AuditEvent
 		var ts, action string
-		if err := rows.Scan(&ev.ID, &ts, &ev.Actor, &action, &ev.TargetID, &ev.RunID, &ev.PolicyID, &ev.Detail); err != nil {
+		if err := rows.Scan(&ev.ID, &ts, &ev.Actor, &ev.ActorAuthority, &action, &ev.TargetID, &ev.RunID, &ev.PolicyID, &ev.Detail); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
 		}
 		if ev.Time, err = parseTime(ts); err != nil {
@@ -591,13 +599,13 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 
 // ---- runs -------------------------------------------------------------
 
-const runCols = `id, target_id, target_revision, status, requested_by, requested_at, started_at, finished_at, action, expires_at, fingerprint_sha256, store_object_ref, error_code, error_summary, external_execution_id`
+const runCols = `id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at, started_at, finished_at, action, expires_at, fingerprint_sha256, store_object_ref, error_code, error_summary, external_execution_id`
 
 func scanRun(sc interface{ Scan(...any) error }) (*registry.Run, error) {
 	var r registry.Run
 	var status, requested, action, code string
 	var started, finished, expires sql.NullString
-	if err := sc.Scan(&r.ID, &r.TargetID, &r.TargetRevision, &status, &r.RequestedBy, &requested, &started, &finished, &action, &expires, &r.FingerprintSha256, &r.StoreObjectRef, &code, &r.ErrorSummary, &r.ExternalExecutionID); err != nil {
+	if err := sc.Scan(&r.ID, &r.TargetID, &r.TargetRevision, &status, &r.RequestedBy, &r.RequestedByAuthority, &requested, &started, &finished, &action, &expires, &r.FingerprintSha256, &r.StoreObjectRef, &code, &r.ErrorSummary, &r.ExternalExecutionID); err != nil {
 		return nil, err
 	}
 	r.Status = registry.RunStatus(status)
@@ -633,8 +641,8 @@ func (d *DB) CreateRun(ctx context.Context, r *registry.Run, ev *registry.AuditE
 		ev.TargetID = r.TargetID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			r.ID, r.TargetID, r.TargetRevision, string(r.Status), r.RequestedBy, fmtTime(r.RequestedAt))
+		_, err := tx.ExecContext(ctx, `INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, r.TargetID, r.TargetRevision, string(r.Status), r.RequestedBy, r.RequestedByAuthority, fmtTime(r.RequestedAt))
 		if err != nil {
 			switch {
 			case isUnique(err):

@@ -474,7 +474,7 @@ run failed.
 ```json
 {
   "id": "01JRUN…", "targetId": "01JTARGET…", "targetRevision": 1,
-  "status": "succeeded", "requestedBy": "scheduler",
+  "status": "succeeded", "requestedBy": "scheduler", "requestedByAuthority": "scheduler",
   "requestedAt": "…", "startedAt": "…", "finishedAt": "…",
   "action": "issued", "expiresAt": "…", "fingerprintSha256": "…", "storeObjectRef": "…",
   "error": null, "externalExecutionId": "local-process:12345"
@@ -487,14 +487,29 @@ run failed.
 ([contract](architecture.md#certificatereconcileresult-result)); `error`
 is `{ "code", "summary" }` on failure or cancellation. `requestedBy` is
 `scheduler` or the API principal (`localhost-dev`, or in `oidc` mode the
-value of `principalClaim`, an identifier such as an Entra ID `oid`).
+value of `principalClaim`, an identifier such as an Entra ID `oid`), and
+`requestedByAuthority` is the namespace that value is unique in:
+`scheduler`, `localhost-dev`, or the OIDC issuer URL
+(`server.auth.oidc.issuer` at the time of the run). The pair is the
+durable identity ([ADR 0018](adr/0018-authority-qualified-principals.md));
+`requestedByAuthority` is `""` on runs recorded before the Conductor
+stored it (schema version 1).
 
 ### Audit event
 
 ```json
-{ "id": "01JEVENT…", "time": "…", "actor": "localhost-dev", "action": "target.created",
-  "targetId": "01JTARGET…", "runId": "", "policyId": "", "detail": "target created: fqdn=… policy=… …" }
+{ "id": "01JEVENT…", "time": "…", "actor": "localhost-dev", "actorAuthority": "localhost-dev",
+  "action": "target.created", "targetId": "01JTARGET…", "runId": "", "policyId": "",
+  "detail": "target created: fqdn=… policy=… …" }
 ```
+
+`actor` and `actorAuthority` identify who acted the same way
+`requestedBy` and `requestedByAuthority` do on a run: the actor value is
+unique only within its authority (an OIDC issuer URL, `localhost-dev` or
+`scheduler`), so the pair, not the actor alone, names a principal across
+a change of identity provider. `actorAuthority` is `""` on events
+recorded before the Conductor stored it; such rows are never rewritten
+(the audit log is append-only).
 
 Actions: `policy.created`, `policy.updated`, `policy.rejected`,
 `target.created`, `target.updated`, `target.enabled`, `target.disabled`,
@@ -775,7 +790,9 @@ process stopped (copy the file; the `-wal` file is folded in on the next
 open) or online with `sqlite3 conductor.db ".backup out.db"`. Restore by
 stopping the process and putting the file back. A newer binary migrates
 the schema forward at start (versions are recorded in
-`schema_migrations`); an older binary refuses a database written by a
+`schema_migrations`; version 2 added the `actorAuthority` and
+`requestedByAuthority` columns, leaving existing rows empty); an older
+binary refuses a database written by a
 newer schema, so rolling back a deployment means restoring the matching
 backup as well. Runs that were in flight at backup time are recovered as
 `failed`/"outcome unknown" on the next start.

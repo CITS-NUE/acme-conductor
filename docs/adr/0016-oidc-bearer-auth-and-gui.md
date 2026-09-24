@@ -122,7 +122,9 @@ keep secure ([architecture, technology choices](../architecture.md#technology-ch
 - A deployment names its principals: the audit log's actor is the
   operator's stable identifier at the provider (an Entra ID `oid`, a
   `sub`), which an administrator resolves to a person at the provider,
-  and a read-only role exists.
+  and a read-only role exists. Since [ADR 0018](0018-authority-qualified-principals.md)
+  the actor is recorded together with its authority (the issuer), because
+  a subject is unique only within the provider that asserted it.
   Threat T13's residual (a local user is an administrator) is closed for
   `oidc` deployments; `localhost-dev` stays what it was, for one host.
 - The trust the Conductor places in the provider is total within the

@@ -571,7 +571,7 @@
       props([
         ['Target', link('#/targets/' + encodeURIComponent(r.targetId), r.targetId, 'mono')],
         ['Target revision', String(r.targetRevision)],
-        ['Requested by', r.requestedBy],
+        ['Requested by', el('span', null, el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
         ['Requested / started / finished', when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
         ['Action', r.action],
         ['Certificate expires', r.expiresAt ? when(r.expiresAt) : undefined],
@@ -590,9 +590,10 @@
     const res = await api('GET', '/audit?limit=200');
     show(
       el('h1', { text: 'Audit log' }),
-      table(['Time', 'Actor', 'Action', 'Target', 'Run', 'Policy', 'Detail'], res.items.map((e) => [
+      table(['Time', 'Actor', 'Authority', 'Action', 'Target', 'Run', 'Policy', 'Detail'], res.items.map((e) => [
         when(e.time),
         td(e.actor, 'mono'),
+        e.actorAuthority ? td(e.actorAuthority, 'mono') : '—',
         td(e.action, 'mono'),
         e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), e.targetId), 'mono') : '—',
         e.runId ? td(link('#/runs/' + encodeURIComponent(e.runId), e.runId), 'mono') : '—',

@@ -23,6 +23,7 @@ Conductor, in the lightweight MADR-like format described in
 | [0015](0015-signed-job-envelope.md) | Signed job envelope and replay ledger |
 | [0016](0016-oidc-bearer-auth-and-gui.md) | OIDC bearer-token authentication, two roles, and a static GUI |
 | [0017](0017-release-pipeline.md) | Release pipeline: GHCR images with SBOM and provenance, digest-pinned bases |
+| [0018](0018-authority-qualified-principals.md) | Audit principals are qualified by their authority (issuer, `localhost-dev`, `scheduler`) |
 
 See also [`docs/architecture.md`](../architecture.md) and
 [`docs/threat-model.md`](../threat-model.md).

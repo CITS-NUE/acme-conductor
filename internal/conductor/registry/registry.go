@@ -104,10 +104,14 @@ type Run struct {
 	TargetID       string
 	TargetRevision int64
 	Status         RunStatus
-	RequestedBy    string
-	RequestedAt    time.Time
-	StartedAt      *time.Time
-	FinishedAt     *time.Time
+	// RequestedBy names who asked for the run within RequestedByAuthority
+	// (an OIDC issuer, "localhost-dev" or "scheduler"). The authority is
+	// empty on rows recorded before schema version 2.
+	RequestedBy          string
+	RequestedByAuthority string
+	RequestedAt          time.Time
+	StartedAt            *time.Time
+	FinishedAt           *time.Time
 	// The following mirror the Result once one is known.
 	Action            v1alpha1.ResultAction
 	ExpiresAt         *time.Time
@@ -146,14 +150,20 @@ const MaxAuditDetailLength = 512
 // sentence built from validated values; it never carries raw external
 // output.
 type AuditEvent struct {
-	ID       string
-	Time     time.Time
-	Actor    string
-	Action   AuditAction
-	TargetID string
-	RunID    string
-	PolicyID string
-	Detail   string
+	ID   string
+	Time time.Time
+	// Actor names who acted within ActorAuthority (an OIDC issuer URL,
+	// "localhost-dev" or "scheduler"); the pair is the durable identity,
+	// since a subject is unique only within the authority that asserted
+	// it. ActorAuthority is empty on rows recorded before schema
+	// version 2.
+	Actor          string
+	ActorAuthority string
+	Action         AuditAction
+	TargetID       string
+	RunID          string
+	PolicyID       string
+	Detail         string
 }
 
 // TargetRunSummary is what the scheduler needs to decide whether a target

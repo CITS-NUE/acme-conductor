@@ -11,7 +11,8 @@
 // and its role claim carries a value the configuration maps to a role.
 // The principal recorded in the audit log is the value of one configured
 // claim, which should be a stable identifier of the subject (sub, or oid
-// for Entra ID), not a display name.
+// for Entra ID), not a display name, qualified by the issuer as its
+// authority: a subject is unique only within the issuer that asserted it.
 //
 // Verification is deliberately narrow: RS256, PS256 and ES256 only (no
 // "none", no HMAC), one issuer, one audience, key ids required, a key
@@ -130,7 +131,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (api.Principal, error) {
 	if !ok {
 		return api.Principal{}, fmt.Errorf("%w: the token carries no role this API grants", api.ErrForbidden)
 	}
-	return api.Principal{Name: name, Role: role}, nil
+	return api.Principal{Name: name, Authority: a.cfg.Issuer, Role: role}, nil
 }
 
 // bearerToken extracts the token of an "Authorization: Bearer" header.
