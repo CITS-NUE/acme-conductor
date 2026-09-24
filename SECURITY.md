@@ -1,113 +1,105 @@
-# Security Policy
+# セキュリティポリシー
 
-## Supported versions
+## サポート対象バージョン
 
-ACME Conductor has not made a versioned release yet (see
-[`docs/architecture.md`](docs/architecture.md#roadmap): only Phase 0 is
-implemented). Until a `v1` release exists, only the `main` branch is
-supported and receives security fixes; there is no older version to
-report against.
+ACME Conductor はまだバージョン付きのリリースを行っていない
+（[`docs/architecture.md`](docs/architecture.md#ロードマップ) を参照．
+実装済みなのは Phase 0 のみ）．`v1` リリースが存在するまでは `main`
+ブランチのみがサポート対象であり，セキュリティ修正を受ける．報告の対象となる
+古いバージョンは存在しない．
 
-## Reporting a vulnerability
+## 脆弱性の報告
 
-Please report suspected security vulnerabilities using **GitHub private
-vulnerability reporting** on this repository:
+セキュリティ脆弱性が疑われる場合は，このリポジトリの **GitHub のプライベート
+脆弱性報告（private vulnerability reporting）** を使って報告すること:
 [CITS-NUE/acme-conductor](https://github.com/CITS-NUE/acme-conductor) →
-**Security** tab → **Report a vulnerability**. This opens a private
-advisory visible only to maintainers, so the report does not need to go
-through a public issue.
+**Security** タブ → **Report a vulnerability**．これによりメンテナだけが
+閲覧できる非公開のアドバイザリが開かれるため，報告を公開の issue を通す
+必要はない．
 
-Do not open a public issue for a suspected vulnerability, and do not post
-it in a public discussion channel.
+脆弱性が疑われる問題について公開の issue を立ててはならない．公開の議論
+チャンネルに投稿してもならない．
 
-## Response expectations
+## 対応の目安
 
-This is a young, actively-developed project without a dedicated security
-team or a formal SLA. As a working expectation: an initial acknowledgement
-within a few business days, and a plan for a fix (or an explanation of why
-the report is out of scope) as soon as the maintainers have had a chance to
-triage it. Given the project's current stage — Phase 0, not yet used to
-issue real certificates — response times are best-effort.
+これは専任のセキュリティチームも正式な SLA も持たない，活発に開発中の若い
+プロジェクトである．実務上の目安としては，数営業日以内の初回応答と，
+メンテナがトリアージする機会を得しだい，修正の計画（または報告が対象範囲外である
+理由の説明）を示す．プロジェクトの現状（Phase 0 で，実際の証明書の発行には
+まだ使われていない）を踏まえ，対応時間はベストエフォートである．
 
-## Scope
+## 対象範囲
 
-In scope (things that count as a security bug in this project):
+対象範囲内（このプロジェクトでセキュリティバグとみなすもの）:
 
-- **FQDN / policy bypass** — any input that causes a certificate to be
-  considered authorized for an FQDN it should not be (label-boundary
-  matching, normalization, wildcard, or IDNA-related bypasses).
-- **Secret leakage** — a private key, DNS/Key Vault/cloud credential, ACME
-  EAB HMAC, access token, or temporary PFX password appearing anywhere it
-  should not: in a `Result`, in a log line, in an error message, or in the
-  Conductor's database.
-- **Identity separation breaks** — anything that lets the Conductor obtain
-  DNS write access, Certificate Store read access, or otherwise act with
-  Runner-scoped privilege, or that lets one Runner execution's identity be
-  used beyond the single run/binding it was granted for.
-- **JobSpec/Result contract bypasses** — strict-decoding bypasses (unknown
-  fields, duplicate keys, oversized documents being accepted), or a
-  `JobSpec`/`Result` that should be rejected being accepted instead.
-- **Supply-chain issues** — a vulnerable or tampered dependency, base
-  image, or pinned `lego` release shipped in a released artifact.
-- **Container/runtime hardening regressions** — for example a released
-  image running as root, with a writable root filesystem where one is not
-  needed, or with `latest`/an unpinned tag deployed.
+- **FQDN / ポリシーの迂回** — 本来認可されるべきでない FQDN について証明書が
+  認可されたとみなされる原因となる入力（ラベル境界での照合，正規化，
+  ワイルドカード，IDNA に関する迂回）．
+- **シークレットの漏えい** — 秘密鍵，DNS/Key Vault/クラウドの資格情報，ACME の
+  EAB HMAC，アクセストークン，一時的な PFX パスワードが，`Result` の中，
+  ログ行，エラーメッセージ，Conductor のデータベースなど，あってはならない
+  場所に現れること．
+- **ID 分離の破れ** — Conductor が DNS の書き込み権限や Certificate Store の
+  読み取り権限を得たり，その他 Runner 相当の権限で動作できるようになるもの，
+  あるいは 1 回の Runner 実行の ID が，付与された単一の run/バインディングを
+  超えて使えるようになるもの．
+- **JobSpec/Result コントラクトの迂回** — 厳密デコードの迂回（未知のフィールド，
+  重複キー，過大な文書が受理される），または拒否されるべき `JobSpec`/`Result`
+  が代わりに受理されること．
+- **サプライチェーンの問題** — 脆弱または改ざんされた依存関係，ベースイメージ，
+  バージョン固定された `lego` リリースが，リリースされた成果物に含まれること．
+- **コンテナ／ランタイム強化の退行** — 例えば，リリースされたイメージが root で
+  動く，不要なのにルートファイルシステムが書き込み可能である，`latest` や
+  固定されていないタグでデプロイされる，など．
 
-## Out of scope
+## 対象外
 
-- Findings that require the reporter to already have Conductor or Runner
-  administrator access (issues that only matter once you already control
-  the system are still welcome as a regular issue, just not as a security
-  advisory unless they demonstrate a privilege escalation beyond what that
-  access should grant).
-- Issues in third-party dependencies with no ACME-Conductor-specific
-  impact (please report those upstream; we do still want to know if a
-  vulnerable version is pinned here — that is in scope as a supply-chain
-  issue above).
-- Social engineering, physical access, or denial-of-service against
-  infrastructure ACME Conductor does not control.
-- Missing security hardening in a phase that has not shipped yet (check
-  [`docs/threat-model.md`](docs/threat-model.md#residual-risks--not-yet-mitigated)
-  first — several controls are explicitly planned for a later phase and
-  are tracked there, not hidden).
+- 報告者がすでに Conductor または Runner の管理者権限を持っていることを前提とする
+  発見（すでにシステムを掌握してはじめて意味を持つ問題も通常の issue としては
+  歓迎するが，その権限が本来与えるべき範囲を超えた権限昇格を示すのでない限り，
+  セキュリティアドバイザリとしては扱わない）．
+- ACME Conductor 固有の影響がないサードパーティ依存関係の問題（上流に報告して
+  ほしい．ただし，脆弱なバージョンがここで固定されている場合は知りたい．それは
+  上記のサプライチェーンの問題として対象範囲内である）．
+- ACME Conductor が管理していないインフラに対するソーシャルエンジニアリング，
+  物理アクセス，サービス拒否（DoS）．
+- まだ出荷されていない Phase におけるセキュリティ強化の欠如（まず
+  [`docs/threat-model.md`](docs/threat-model.md#残存リスクと未対策事項)
+  を確認すること．いくつかの制御は後の Phase で明示的に計画されており，隠されて
+  いるのではなく，そこで追跡されている）．
 
-## Disclosure policy
+## 開示ポリシー
 
-We ask reporters to give us a reasonable opportunity to investigate and fix
-a reported issue before any public disclosure. We will credit reporters
-(unless they prefer to remain anonymous) once a fix is available. As the
-project has no released version yet, coordinated disclosure timing will be
-worked out directly with the reporter through the private advisory.
+報告者には，公開開示の前に，報告された問題を調査し修正する合理的な機会を
+与えてくれるよう求める．修正が利用可能になった時点で，報告者（匿名を希望する
+場合を除く）をクレジットする．プロジェクトにはまだリリースされたバージョンが
+ないため，協調開示の時期は非公開アドバイザリを通じて報告者と直接調整する．
 
-## Security invariants we consider bugs if violated
+## 破られればバグとみなすセキュリティ不変条件
 
-These come directly from the project's design (see
-[`docs/architecture.md`](docs/architecture.md#security-principles) and
-[`docs/threat-model.md`](docs/threat-model.md)). Any code change that
-violates one of these is a bug, regardless of whether a test currently
-catches it:
+これらはプロジェクトの設計から直接導かれる
+（[`docs/architecture.md`](docs/architecture.md#セキュリティ原則) と
+[`docs/threat-model.md`](docs/threat-model.md) を参照）．これらのいずれかを
+破るコード変更は，現時点でテストが捕捉するかどうかにかかわらず，バグである:
 
-- No private key, certificate body, PFX, or cloud credential column exists
-  in the Conductor's database.
-- No Conductor API endpoint returns a private key.
-- No Runner `Result` contains a private key, certificate body, or
-  credential.
-- The Runner stays one-shot: no HTTP server, no cron, no long-running
-  listener.
-- The Conductor being down never prevents an already-scheduled Runner job
-  from running to completion.
-- Deployed images are pinned by commit SHA or digest, never by the
-  `latest` tag.
-- Cloud SDKs live only in launcher/store adapter implementations, never in
-  Conductor core.
-- Azure (and any future cloud) resources are declared in Bicep, never
-  created ad hoc from application code.
-- FQDN policy is validated by the Conductor when it accepts a `Target`/
-  `CertificatePolicy`, and the Runner both validates the `JobSpec`
-  document it receives (self-consistency) and authorizes it against its
-  own trusted policy (`policy.RunnerAuthorizationPolicy`) before acting —
-  see `docs/architecture.md`'s "Validation vs. authorization".
-- `JobSpec`/`Result` documents are strictly decoded: unknown fields,
-  duplicate keys, and trailing data are always rejected.
-- Production ACME certificate authorities are never called from automated
-  tests.
+- Conductor のデータベースには，秘密鍵，証明書本体，PFX，クラウド資格情報の
+  列は存在しない．
+- 秘密鍵を返す Conductor の API エンドポイントは存在しない．
+- Runner の `Result` には，秘密鍵，証明書本体，資格情報が含まれない．
+- Runner はワンショットのままである．HTTP サーバも cron も長時間動作する
+  リスナーも持たない．
+- Conductor が停止していても，すでにスケジュールされた Runner ジョブが完了まで
+  実行されることを決して妨げない．
+- デプロイされるイメージはコミット SHA またはダイジェストで固定し，決して
+  `latest` タグで固定しない．
+- クラウド SDK はランチャー／store アダプタの実装にのみ存在し，決して Conductor
+  のコアには存在しない．
+- Azure（および将来のあらゆるクラウド）のリソースは Bicep で宣言し，決して
+  アプリケーションコードからその場限りに作成しない．
+- FQDN ポリシーは Conductor が `Target`/`CertificatePolicy` を受理する際に検証し，
+  Runner は受け取った `JobSpec` 文書を検証（自己整合性）したうえで，自身の
+  信頼されたポリシー（`policy.RunnerAuthorizationPolicy`）に照らして認可してから
+  動作する — `docs/architecture.md` の「検証と認可」を参照．
+- `JobSpec`/`Result` 文書は厳密にデコードされる．未知のフィールド，重複キー，
+  末尾の余分なデータは常に拒否される．
+- 本番の ACME 認証局を自動テストから呼ぶことは決してない．
