@@ -11,7 +11,9 @@
 package config
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -45,10 +47,6 @@ const (
 	DefaultMaxRetryBackoffSeconds = 6 * 3600
 	MaxRetryBackoffSeconds        = 7 * 86400
 
-	DefaultLaunchTimeoutSeconds = 1200
-	MaxLaunchTimeoutSeconds     = 86400
-	MaxPassthroughEnv           = 64
-
 	DefaultSigningValiditySeconds = 900
 	MaxSigningValiditySeconds     = 86400
 
@@ -58,15 +56,6 @@ const (
 	MaxSigningKeys          = 8
 	DefaultClockSkewSeconds = 300
 	MaxClockSkewSeconds     = 3600
-
-	DefaultPollIntervalSeconds = 10
-	MaxPollIntervalSeconds     = 300
-	// DefaultClaimTimeoutSeconds covers a scheduled Job's cadence (one
-	// execution per minute) plus its start latency several times over.
-	DefaultClaimTimeoutSeconds = 300
-	MaxClaimTimeoutSeconds     = 86400
-	DefaultResultGraceSeconds  = 30
-	MaxResultGraceSeconds      = 600
 
 	// OIDC bounds. DefaultOIDCClockSkewSeconds is the tolerance applied
 	// to a token's exp/nbf/iat; DefaultOIDCKeyCacheSeconds is how long
@@ -109,48 +98,13 @@ const (
 )
 
 // Execution binding types.
-const (
-	// ExecutionLocalProcess runs acme-runner as a child process of the
-	// Conductor (development and tests).
-	ExecutionLocalProcess = "local-process"
-	// ExecutionAzureContainerAppsJob starts an execution of a
-	// pre-provisioned Azure Container Apps Job per run (Phase 4).
-	ExecutionAzureContainerAppsJob = "azure-container-apps-job"
-)
-
-// Azure clouds an Azure execution binding may name.
-const (
-	CloudPublic     = "public"
-	CloudChina      = "china"
-	CloudGovernment = "government"
-)
-
-// Credential kinds an Azure execution binding may select (the same two
-// the Runner's Key Vault store offers, docs/adr/0013).
-const (
-	CredentialDefault         = "default"
-	CredentialManagedIdentity = "managed-identity"
-)
-
-var (
-	guidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	// resourceGroupRe is Azure's rule for resource group names (1-90
-	// characters of letters, digits, '-', '_', '(', ')', '.', not ending
-	// in a period).
-	resourceGroupRe = regexp.MustCompile(`^[-\w._()]{0,89}[-\w_()]$`)
-	// containerAppNameRe is the rule for Container Apps and Jobs names:
-	// 2-32 lower-case alphanumerics and hyphens, starting with a letter,
-	// ending with a letter or digit; "--" is rejected separately.
-	containerAppNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}[a-z0-9]$`)
-)
+const ()
 
 // Errors.
 var (
 	ErrInvalid  = errors.New("invalid conductor configuration")
 	ErrTooLarge = errors.New("conductor configuration exceeds maximum size")
 )
-
-var envNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 // claimNameRe bounds the JWT claim names an OIDC configuration may select.
 var claimNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.:/-]{0,63}$`)
@@ -366,76 +320,21 @@ type Scheduler struct {
 	MaxRetryBackoffSeconds int `json:"maxRetryBackoffSeconds"`
 }
 
-// ExecutionBinding describes one way of running a Runner job.
+// ExecutionBinding describes one way of running a Runner job: a type
+// name and the configuration object of that type. This package knows no
+// launcher type: which types exist, what their configuration looks like
+// and whether it is valid is decided by the launcher providers the binary
+// registers (internal/conductor/launchers), which decode Config strictly
+// themselves. A binding of a type the binary does not provide is refused
+// when the registry validates the configuration, before anything starts.
 type ExecutionBinding struct {
-	Type                  string                 `json:"type"`
-	LocalProcess          *LocalProcess          `json:"localProcess,omitempty"`
-	AzureContainerAppsJob *AzureContainerAppsJob `json:"azureContainerAppsJob,omitempty"`
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"config"`
 }
 
-// AzureContainerAppsJob starts one execution of an existing Container
-// Apps Job per run. The Job itself — image, identity, volumes, Runner
-// configuration — is provisioned in infrastructure (deploy/azure); the
-// Conductor only starts executions of it with the run's arguments and
-// reads the execution's status. The JobSpec and the Result travel over a
-// file share both containers mount (the exchange volume).
-type AzureContainerAppsJob struct {
-	SubscriptionID string `json:"subscriptionId"`
-	ResourceGroup  string `json:"resourceGroup"`
-	JobName        string `json:"jobName"`
-	// Cloud selects the Azure cloud: public (default), china, government.
-	Cloud string `json:"cloud,omitempty"`
-	// Credential selects how the Conductor authenticates to Azure Resource
-	// Manager: "managed-identity" (the platform's identity, the production
-	// choice) or "default" (DefaultAzureCredential, which also tries
-	// environment variables and developer tooling).
-	Credential string `json:"credential,omitempty"`
-	// ManagedIdentityClientID selects a user-assigned managed identity by
-	// client ID (credential "managed-identity" only).
-	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
-	// ExchangeDir is where the exchange volume is mounted in the
-	// Conductor's own filesystem (the Runner mounts the same volume and
-	// is told its own mount path by its arguments in infrastructure).
-	ExchangeDir string `json:"exchangeDir"`
-	// ClaimTimeoutSeconds is how long the Conductor waits for a scheduled
-	// execution of the Job to take an offered job before it withdraws the
-	// job and fails the run. It must not exceed jobSigning.validitySeconds.
-	ClaimTimeoutSeconds int `json:"claimTimeoutSeconds,omitempty"`
-	// TimeoutSeconds bounds one execution as seen by the Conductor from
-	// the moment it was taken; after it the execution is stopped. It
-	// should exceed the Job's own replicaTimeout.
-	TimeoutSeconds int `json:"timeoutSeconds"`
-	// PollIntervalSeconds is how often the exchange directory and the
-	// execution's status are read.
-	PollIntervalSeconds int `json:"pollIntervalSeconds,omitempty"`
-	// ResultGraceSeconds is how long to wait for result.json to appear on
-	// the exchange volume after the execution has ended (file shares
-	// propagate writes with some delay).
-	ResultGraceSeconds int `json:"resultGraceSeconds,omitempty"`
-}
-
-// LocalProcess runs acme-runner as a child process.
-type LocalProcess struct {
-	// RunnerBinary is the absolute path of the acme-runner executable.
-	RunnerBinary string `json:"runnerBinary"`
-	// RunnerConfig is the absolute path of the Runner's own trusted
-	// configuration, passed as --config.
-	RunnerConfig string `json:"runnerConfig"`
-	// WorkDir is the parent of the per-run directory that holds the
-	// JobSpec and the Result while a run is in flight. It never holds
-	// certificate material: the Runner has its own work and state
-	// directories.
-	WorkDir string `json:"workDir"`
-	// TimeoutSeconds bounds one Runner execution as seen by the Conductor.
-	// It should exceed the Runner's own lego timeout.
-	TimeoutSeconds int `json:"timeoutSeconds"`
-	// PassthroughEnv names environment variables of the Conductor process
-	// that are forwarded to the Runner child unchanged. This is how a
-	// development setup hands the Runner a DNS credential; it means the
-	// Conductor process environment carries that credential, which is
-	// acceptable only for local development (docs/threat-model.md, T10).
-	PassthroughEnv []string `json:"passthroughEnv,omitempty"`
-}
+// bindingTypeRe bounds a binding type name: the same shape as a binding
+// name (DNS-label-like, chosen by whoever ships the provider).
+var bindingTypeRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`)
 
 // Load reads, strictly decodes and validates a configuration file.
 func Load(path string) (*Config, error) {
@@ -512,20 +411,6 @@ func (c *Config) Validate() error {
 	if c.ResultSigning != nil {
 		if err := c.ResultSigning.validate(); err != nil {
 			return err
-		}
-	}
-	for name, b := range c.ExecutionBindings {
-		if b.Type != ExecutionAzureContainerAppsJob {
-			continue
-		}
-		if c.JobSigning == nil {
-			return invalid("executionBindings.%s: type %q requires jobSigning to be configured (the job travels over a shared volume)", name, b.Type)
-		}
-		if c.ResultSigning == nil {
-			return invalid("executionBindings.%s: type %q requires resultSigning to be configured (the result travels over a shared volume)", name, b.Type)
-		}
-		if b.AzureContainerAppsJob.ClaimTimeoutSeconds > c.JobSigning.ValiditySeconds {
-			return invalid("executionBindings.%s.azureContainerAppsJob.claimTimeoutSeconds must not exceed jobSigning.validitySeconds (a job claimed after its expiry is refused by the Runner)", name)
 		}
 	}
 	return nil
@@ -795,129 +680,12 @@ func (s *Scheduler) validate() error {
 }
 
 func (b *ExecutionBinding) validate(field string) error {
-	switch b.Type {
-	case ExecutionLocalProcess:
-		if b.LocalProcess == nil {
-			return invalid("%s.localProcess is required for type %q", field, b.Type)
-		}
-		if b.AzureContainerAppsJob != nil {
-			return invalid("%s.azureContainerAppsJob applies to type %q only", field, ExecutionAzureContainerAppsJob)
-		}
-		return b.LocalProcess.validate(field + ".localProcess")
-	case ExecutionAzureContainerAppsJob:
-		if b.AzureContainerAppsJob == nil {
-			return invalid("%s.azureContainerAppsJob is required for type %q", field, b.Type)
-		}
-		if b.LocalProcess != nil {
-			return invalid("%s.localProcess applies to type %q only", field, ExecutionLocalProcess)
-		}
-		return b.AzureContainerAppsJob.validate(field + ".azureContainerAppsJob")
-	default:
-		return invalid("%s.type %q is not supported (only %q and %q)", field, b.Type, ExecutionLocalProcess, ExecutionAzureContainerAppsJob)
+	if !bindingTypeRe.MatchString(b.Type) {
+		return invalid("%s.type %q is not a valid binding type name", field, b.Type)
 	}
-}
-
-func (a *AzureContainerAppsJob) validate(field string) error {
-	if !guidRe.MatchString(a.SubscriptionID) {
-		return invalid("%s.subscriptionId must be a GUID", field)
-	}
-	if !resourceGroupRe.MatchString(a.ResourceGroup) {
-		return invalid("%s.resourceGroup is not a valid resource group name", field)
-	}
-	if !containerAppNameRe.MatchString(a.JobName) || strings.Contains(a.JobName, "--") {
-		return invalid("%s.jobName is not a valid Container Apps Job name", field)
-	}
-	if a.Cloud == "" {
-		a.Cloud = CloudPublic
-	}
-	switch a.Cloud {
-	case CloudPublic, CloudChina, CloudGovernment:
-	default:
-		return invalid("%s.cloud must be %q, %q or %q", field, CloudPublic, CloudChina, CloudGovernment)
-	}
-	if a.Credential == "" {
-		a.Credential = CredentialDefault
-	}
-	switch a.Credential {
-	case CredentialDefault:
-		if a.ManagedIdentityClientID != "" {
-			return invalid("%s.managedIdentityClientId applies to credential %q only", field, CredentialManagedIdentity)
-		}
-	case CredentialManagedIdentity:
-		if a.ManagedIdentityClientID != "" && !guidRe.MatchString(a.ManagedIdentityClientID) {
-			return invalid("%s.managedIdentityClientId must be a GUID", field)
-		}
-	default:
-		return invalid("%s.credential must be %q or %q", field, CredentialManagedIdentity, CredentialDefault)
-	}
-	if a.ExchangeDir == "" {
-		return invalid("%s.exchangeDir is required", field)
-	}
-	if !filepath.IsAbs(a.ExchangeDir) || filepath.Clean(a.ExchangeDir) != a.ExchangeDir {
-		return invalid("%s.exchangeDir must be a clean absolute path", field)
-	}
-	if a.ClaimTimeoutSeconds == 0 {
-		a.ClaimTimeoutSeconds = DefaultClaimTimeoutSeconds
-	}
-	if a.ClaimTimeoutSeconds < 1 || a.ClaimTimeoutSeconds > MaxClaimTimeoutSeconds {
-		return invalid("%s.claimTimeoutSeconds must be between 1 and %d", field, MaxClaimTimeoutSeconds)
-	}
-	if a.TimeoutSeconds == 0 {
-		a.TimeoutSeconds = DefaultLaunchTimeoutSeconds
-	}
-	if a.TimeoutSeconds < 1 || a.TimeoutSeconds > MaxLaunchTimeoutSeconds {
-		return invalid("%s.timeoutSeconds must be between 1 and %d", field, MaxLaunchTimeoutSeconds)
-	}
-	if a.PollIntervalSeconds == 0 {
-		a.PollIntervalSeconds = DefaultPollIntervalSeconds
-	}
-	if a.PollIntervalSeconds < 1 || a.PollIntervalSeconds > MaxPollIntervalSeconds {
-		return invalid("%s.pollIntervalSeconds must be between 1 and %d", field, MaxPollIntervalSeconds)
-	}
-	if a.ResultGraceSeconds == 0 {
-		a.ResultGraceSeconds = DefaultResultGraceSeconds
-	}
-	if a.ResultGraceSeconds < 0 || a.ResultGraceSeconds > MaxResultGraceSeconds {
-		return invalid("%s.resultGraceSeconds must be between 0 and %d", field, MaxResultGraceSeconds)
-	}
-	return nil
-}
-
-func (l *LocalProcess) validate(field string) error {
-	for name, v := range map[string]string{"runnerBinary": l.RunnerBinary, "runnerConfig": l.RunnerConfig, "workDir": l.WorkDir} {
-		if v == "" {
-			return invalid("%s.%s is required", field, name)
-		}
-		if !filepath.IsAbs(v) || filepath.Clean(v) != v {
-			return invalid("%s.%s must be a clean absolute path", field, name)
-		}
-	}
-	if l.TimeoutSeconds == 0 {
-		l.TimeoutSeconds = DefaultLaunchTimeoutSeconds
-	}
-	if l.TimeoutSeconds < 1 || l.TimeoutSeconds > MaxLaunchTimeoutSeconds {
-		return invalid("%s.timeoutSeconds must be between 1 and %d", field, MaxLaunchTimeoutSeconds)
-	}
-	if len(l.PassthroughEnv) > MaxPassthroughEnv {
-		return invalid("%s.passthroughEnv: at most %d entries", field, MaxPassthroughEnv)
-	}
-	seen := map[string]struct{}{}
-	for _, name := range l.PassthroughEnv {
-		if !envNameRe.MatchString(name) {
-			return invalid("%s.passthroughEnv: environment variable name %q must match %s", field, name, envNameRe)
-		}
-		for _, p := range deniedEnvPrefixes {
-			if strings.HasPrefix(name, p) {
-				return invalid("%s.passthroughEnv: environment variable %q is reserved", field, name)
-			}
-		}
-		if _, denied := deniedEnvNames[name]; denied {
-			return invalid("%s.passthroughEnv: environment variable %q is reserved", field, name)
-		}
-		if _, dup := seen[name]; dup {
-			return invalid("%s.passthroughEnv: %q is listed twice", field, name)
-		}
-		seen[name] = struct{}{}
+	trimmed := bytes.TrimSpace(b.Config)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return invalid("%s.config must be a JSON object", field)
 	}
 	return nil
 }

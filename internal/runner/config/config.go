@@ -19,7 +19,9 @@
 package config
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,7 +34,6 @@ import (
 	"strings"
 
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
-	"github.com/CITS-NUE/acme-conductor/internal/store/keyvault"
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -280,34 +281,35 @@ type DNSBinding struct {
 	Resolvers []string `json:"resolvers,omitempty"`
 }
 
-// StoreBinding describes one certificate store. Exactly the fields of its
-// Type may be set; a field of another type is rejected rather than ignored.
+// StoreBinding describes one certificate store: a type name and the
+// configuration object of that type. This package knows no store type:
+// which types exist, what their configuration looks like and whether it
+// is valid is decided by the store providers the binary registers
+// (internal/runner/stores), which decode Config strictly themselves. A
+// binding of a type the binary does not provide is refused when the
+// registry validates the configuration, before any job is handled.
 type StoreBinding struct {
-	Type string `json:"type"`
-	// Directory is the root of a filesystem store (type "filesystem").
-	Directory string `json:"directory,omitempty"`
-	// VaultURL is the base URL of an Azure Key Vault (type
-	// "azure-keyvault"), "https://<name>.vault.azure.net" or the
-	// equivalent in another Azure cloud. Nothing else: no path, port,
-	// query, fragment or credentials.
-	VaultURL string `json:"vaultURL,omitempty"`
-	// Credential selects how the Runner authenticates to Azure (type
-	// "azure-keyvault"): "managed-identity" (the platform's managed
-	// identity, the production choice) or "default" (DefaultAzureCredential,
-	// which also tries environment variables and developer tooling). The
-	// credential itself is never in this file.
-	Credential string `json:"credential,omitempty"`
-	// ManagedIdentityClientID selects a user-assigned managed identity by
-	// client ID (credential "managed-identity" only). Empty means the
-	// system-assigned identity.
-	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"config"`
 }
 
-// Store binding types.
-const (
-	StoreTypeFilesystem    = "filesystem"
-	StoreTypeAzureKeyVault = keyvault.Type
-)
+// bindingTypeRe bounds a binding type name: the same shape as a binding
+// name (DNS-label-like, chosen by whoever ships the provider).
+var bindingTypeRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`)
+
+// ValidateBindingShape checks what this package can check of a typed
+// binding: a well-formed type name and a configuration that is a JSON
+// object. It is shared by the Conductor's execution bindings.
+func ValidateBindingShape(field, typ string, raw json.RawMessage) error {
+	if !bindingTypeRe.MatchString(typ) {
+		return invalid("%s.type %q is not a valid binding type name", field, typ)
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return invalid("%s.config must be a JSON object", field)
+	}
+	return nil
+}
 
 // Load reads, strictly decodes and validates a configuration file.
 func Load(path string) (*Config, error) {
@@ -499,32 +501,7 @@ func splitHostPort(s string) (string, string, error) {
 }
 
 func (b *StoreBinding) validate(field string) error {
-	switch b.Type {
-	case StoreTypeFilesystem:
-		if b.VaultURL != "" || b.Credential != "" || b.ManagedIdentityClientID != "" {
-			return invalid("%s: vaultURL, credential and managedIdentityClientId apply to type %q only", field, StoreTypeAzureKeyVault)
-		}
-		if b.Directory == "" || !filepath.IsAbs(b.Directory) || filepath.Clean(b.Directory) != b.Directory {
-			return invalid("%s.directory must be a clean absolute path", field)
-		}
-		return nil
-	case StoreTypeAzureKeyVault:
-		if b.Directory != "" {
-			return invalid("%s: directory applies to type %q only", field, StoreTypeFilesystem)
-		}
-		if _, err := keyvault.ParseVaultURL(b.VaultURL); err != nil {
-			return invalid("%s.vaultURL: %v", field, err)
-		}
-		if b.Credential == "" {
-			b.Credential = keyvault.CredentialDefault
-		}
-		if err := keyvault.ValidateCredential(b.Credential, b.ManagedIdentityClientID); err != nil {
-			return invalid("%s: %v", field, err)
-		}
-		return nil
-	default:
-		return invalid("%s.type %q is not supported", field, b.Type)
-	}
+	return ValidateBindingShape(field, b.Type, b.Config)
 }
 
 func validateEnvName(field, name string) error {

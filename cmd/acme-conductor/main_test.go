@@ -116,7 +116,7 @@ func writeTestConfig(t *testing.T, dir string) (cfgPath, dbPath string) {
   "jobSigning": {"privateKeyFile": "` + keyPath + `", "validitySeconds": 60},
   "database": {"path": "` + dbPath + `"},
   "scheduler": {"tickSeconds": 1, "maxConcurrentRuns": 2, "retryBackoffSeconds": 1, "maxRetryBackoffSeconds": 2},
-  "executionBindings": {"local": {"type": "local-process", "localProcess": {
+  "executionBindings": {"local": {"type": "local-process", "config": {
     "runnerBinary": "` + self + `", "runnerConfig": "` + runnerCfg + `", "workDir": "` + filepath.Join(dir, "runs") + `",
     "timeoutSeconds": 30, "passthroughEnv": ["ACME_CONDUCTOR_FAKE_RUNNER", "FAKE_RUNNER_MODE"]}}},
   "acmeBindings": ["fake-ca"],
@@ -145,6 +145,7 @@ func startServeWith(t *testing.T, cfgPath, scheme string) (base string, stop fun
 	var logs bytes.Buffer
 	go func() {
 		done <- conductor.Serve(ctx, conductor.Options{
+			Launchers:  officialLaunchers(),
 			ConfigPath: cfgPath,
 			Logger:     newTestLogger(&logs),
 			Listening:  func(a net.Addr) { addrCh <- a },
@@ -343,7 +344,7 @@ func TestServeRequiresDatabaseOwnership(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	code := conductor.Serve(ctx, conductor.Options{
-		ConfigPath: cfgPath, Logger: newTestLogger(&logs),
+		ConfigPath: cfgPath, Logger: newTestLogger(&logs), Launchers: officialLaunchers(),
 		Listening: func(a net.Addr) { t.Errorf("Serve listened on %s without owning the database", a) },
 	})
 	if code != conductor.ExitFatal || !strings.Contains(logs.String(), "another conductor process owns this database") {
@@ -356,7 +357,7 @@ func TestServeRequiresDatabaseOwnership(t *testing.T) {
 	// refused, the first keeps serving and is the one that recovers.
 	base, stop := startServe(t, cfgPath)
 	logs.Reset()
-	if code := conductor.Serve(ctx, conductor.Options{ConfigPath: cfgPath, Logger: newTestLogger(&logs)}); code != conductor.ExitFatal {
+	if code := conductor.Serve(ctx, conductor.Options{ConfigPath: cfgPath, Logger: newTestLogger(&logs), Launchers: officialLaunchers()}); code != conductor.ExitFatal {
 		t.Fatalf("second Serve: exit %d, log %s", code, logs.String())
 	}
 	res, err := http.Get(base + "/readyz")

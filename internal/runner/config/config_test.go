@@ -49,8 +49,8 @@ func validDoc() map[string]any {
 		},
 		"storeBindings": map[string]any{
 			"filesystem-dev": map[string]any{
-				"type":      "filesystem",
-				"directory": "/store",
+				"type":   "filesystem",
+				"config": map[string]any{"directory": "/store"},
 			},
 		},
 	}
@@ -100,14 +100,13 @@ func storeBinding(m map[string]any) map[string]any {
 	return m["storeBindings"].(map[string]any)["filesystem-dev"].(map[string]any)
 }
 
-// setKeyVault turns the store binding into a valid azure-keyvault binding
-// (managed identity, system-assigned).
+// setKeyVault turns the store binding into an azure-keyvault binding. The
+// configuration object is opaque to this package; its content is checked
+// by the provider (internal/store/keyvault).
 func setKeyVault(m map[string]any) {
 	b := storeBinding(m)
-	delete(b, "directory")
 	b["type"] = "azure-keyvault"
-	b["vaultURL"] = "https://kv-acme-dev.vault.azure.net"
-	b["credential"] = "managed-identity"
+	b["config"] = map[string]any{"vaultURL": "https://kv-acme-dev.vault.azure.net", "credential": "managed-identity"}
 }
 
 func legoSection(m map[string]any) map[string]any {
@@ -371,72 +370,29 @@ func TestRead_Rejections(t *testing.T) {
 			wantSubstr: "resolvers",
 		},
 		{
-			name:       "store type unknown",
-			mutate:     func(m map[string]any) { storeBinding(m)["type"] = "aws-secretsmanager" },
-			wantSubstr: "not supported",
+			name:       "store type empty",
+			mutate:     func(m map[string]any) { storeBinding(m)["type"] = "" },
+			wantSubstr: "binding type name",
 		},
 		{
-			name:       "filesystem store with vaultURL",
-			mutate:     func(m map[string]any) { storeBinding(m)["vaultURL"] = "https://kv.vault.azure.net" },
-			wantSubstr: "vaultURL",
+			name:       "store type not a type name",
+			mutate:     func(m map[string]any) { storeBinding(m)["type"] = "AWS Secrets Manager" },
+			wantSubstr: "binding type name",
 		},
 		{
-			name:       "keyvault store without vaultURL",
-			mutate:     func(m map[string]any) { setKeyVault(m); delete(storeBinding(m), "vaultURL") },
-			wantSubstr: "vaultURL",
+			name:       "store config missing",
+			mutate:     func(m map[string]any) { delete(storeBinding(m), "config") },
+			wantSubstr: "config must be a JSON object",
 		},
 		{
-			name:       "keyvault store with directory",
-			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["directory"] = "/store" },
-			wantSubstr: "directory",
+			name:       "store config not an object",
+			mutate:     func(m map[string]any) { storeBinding(m)["config"] = "/store" },
+			wantSubstr: "config must be a JSON object",
 		},
 		{
-			name: "keyvault store http vaultURL",
-			mutate: func(m map[string]any) {
-				setKeyVault(m)
-				storeBinding(m)["vaultURL"] = "http://kv-acme-dev.vault.azure.net"
-			},
-			wantSubstr: "vaultURL",
-		},
-		{
-			name: "keyvault store vaultURL not a key vault host",
-			mutate: func(m map[string]any) {
-				setKeyVault(m)
-				storeBinding(m)["vaultURL"] = "https://kv-acme-dev.example.com"
-			},
-			wantSubstr: "vaultURL",
-		},
-		{
-			name: "keyvault store vaultURL with path",
-			mutate: func(m map[string]any) {
-				setKeyVault(m)
-				storeBinding(m)["vaultURL"] = "https://kv-acme-dev.vault.azure.net/certificates"
-			},
-			wantSubstr: "vaultURL",
-		},
-		{
-			name:       "keyvault store unknown credential",
-			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["credential"] = "azure-cli" },
-			wantSubstr: "credential",
-		},
-		{
-			name: "keyvault store client id with default credential",
-			mutate: func(m map[string]any) {
-				setKeyVault(m)
-				storeBinding(m)["credential"] = "default"
-				storeBinding(m)["managedIdentityClientId"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
-			},
-			wantSubstr: "managedIdentityClientId",
-		},
-		{
-			name:       "keyvault store client id not a guid",
-			mutate:     func(m map[string]any) { setKeyVault(m); storeBinding(m)["managedIdentityClientId"] = "my-identity" },
-			wantSubstr: "managedIdentityClientId",
-		},
-		{
-			name:       "store directory relative",
-			mutate:     func(m map[string]any) { storeBinding(m)["directory"] = "store" },
-			wantSubstr: "directory",
+			name:       "store provider field at the binding level",
+			mutate:     func(m map[string]any) { storeBinding(m)["directory"] = "/store" },
+			wantSubstr: "unknown field",
 		},
 		{
 			name:       "authorization with empty suffixes",
@@ -673,32 +629,33 @@ func TestResolversRejectCommaAndWhitespace(t *testing.T) {
 	}
 }
 
-func TestKeyVaultStoreBinding(t *testing.T) {
-	t.Run("managed identity with client id", func(t *testing.T) {
-		m := validDoc()
-		setKeyVault(m)
-		storeBinding(m)["managedIdentityClientId"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
-		c := mustAccept(t, marshalDoc(t, m))
-		b := c.StoreBindings["filesystem-dev"]
-		if b.Type != StoreTypeAzureKeyVault || b.VaultURL != "https://kv-acme-dev.vault.azure.net" || b.Credential != "managed-identity" || b.ManagedIdentityClientID != "0f8fad5b-d9cb-469f-a165-70867728950e" {
-			t.Fatalf("binding = %+v", b)
-		}
-	})
-	t.Run("credential defaults to default", func(t *testing.T) {
-		m := validDoc()
-		setKeyVault(m)
-		delete(storeBinding(m), "credential")
-		c := mustAccept(t, marshalDoc(t, m))
-		if got := c.StoreBindings["filesystem-dev"].Credential; got != "default" {
-			t.Fatalf("credential = %q, want the documented default", got)
-		}
-	})
-	t.Run("unknown field rejected", func(t *testing.T) {
-		m := validDoc()
-		setKeyVault(m)
-		storeBinding(m)["clientSecret"] = "hunter2"
-		mustReject(t, marshalDoc(t, m), "")
-	})
+// TestStoreBindingConfigIsOpaque: this package keeps a binding's
+// configuration object verbatim for the provider, and accepts any
+// well-formed type name; whether the type exists and the object is valid
+// is the store registry's decision (internal/runner/stores).
+func TestStoreBindingConfigIsOpaque(t *testing.T) {
+	m := validDoc()
+	setKeyVault(m)
+	storeBinding(m)["config"].(map[string]any)["managedIdentityClientId"] = "0f8fad5b-d9cb-469f-a165-70867728950e"
+	c := mustAccept(t, marshalDoc(t, m))
+	b := c.StoreBindings["filesystem-dev"]
+	if b.Type != "azure-keyvault" {
+		t.Fatalf("type = %q", b.Type)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b.Config, &got); err != nil || got["vaultURL"] != "https://kv-acme-dev.vault.azure.net" || got["credential"] != "managed-identity" || got["managedIdentityClientId"] != "0f8fad5b-d9cb-469f-a165-70867728950e" {
+		t.Fatalf("config = %s (%v)", b.Config, err)
+	}
+	// A type this package has never heard of is a registry matter.
+	storeBinding(m)["type"] = "aws-secretsmanager"
+	storeBinding(m)["config"] = map[string]any{"secretPrefix": "acme/"}
+	if c := mustAccept(t, marshalDoc(t, m)); c.StoreBindings["filesystem-dev"].Type != "aws-secretsmanager" {
+		t.Fatal("unknown store type must pass the generic layer")
+	}
+	// Duplicate keys inside the provider object are still refused: the
+	// strict decoder walks the whole document.
+	doc := strings.Replace(marshalDoc(t, m), `"secretPrefix":"acme/"`, `"secretPrefix":"acme/","secretPrefix":"other/"`, 1)
+	mustReject(t, doc, "duplicate")
 }
 
 func TestJobSigning(t *testing.T) {

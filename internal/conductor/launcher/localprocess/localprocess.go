@@ -67,7 +67,7 @@ type LocalProcess struct {
 }
 
 // Type implements Launcher.
-func (l *LocalProcess) Type() string { return "local-process" }
+func (l *LocalProcess) Type() string { return Type }
 
 // Start implements Launcher.
 func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (launcher.Execution, error) {

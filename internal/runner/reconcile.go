@@ -33,8 +33,7 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
-	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
-	"github.com/CITS-NUE/acme-conductor/internal/store/keyvault"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/stores"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
@@ -99,6 +98,10 @@ type Options struct {
 	// ExecutionName is the platform execution name recorded for a claimed
 	// job; empty selects the CONTAINER_APP_JOB_EXECUTION_NAME variable.
 	ExecutionName string
+	// Stores provides the Certificate Store types this Runner can open
+	// (internal/runner/stores). Required: a configuration naming a type
+	// the registry does not provide is refused before any job is handled.
+	Stores *stores.Registry
 	// Stdout receives the single-line JSON Result.
 	Stdout io.Writer
 	Logger *slog.Logger
@@ -161,7 +164,7 @@ func Reconcile(ctx context.Context, opts Options) int {
 		// Claim mode is for a shared transport, on which the Conductor
 		// accepts signed Results only: a Runner that could not sign would
 		// take jobs and fail every one of them, so it refuses to take any.
-		cfg, err := config.Load(opts.ConfigPath)
+		cfg, err := loadConfig(&opts)
 		if err != nil {
 			log.Error("runner configuration could not be loaded; taking no job", "error", err.Error())
 			return ExitNoResult
@@ -259,7 +262,7 @@ func Reconcile(ctx context.Context, opts Options) int {
 	// The trusted configuration is needed before an envelope can be
 	// verified; a bare JobSpec is decoded first and its configuration
 	// failure reported afterwards, as before.
-	cfg, cfgErr := config.Load(opts.ConfigPath)
+	cfg, cfgErr := loadConfig(&opts)
 	if cfgErr == nil && cfg.ResultSigning != nil {
 		signer, err := loadResultSigner(cfg.ResultSigning, opts.Now)
 		if err != nil {
@@ -388,7 +391,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	if !ok {
 		return nil, fail(v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("store binding %q is not defined in runner configuration", spec.Store.Binding), nil)
 	}
-	st, err := openStore(storeBinding)
+	st, err := opts.Stores.Open(storeBinding)
 	if err != nil {
 		return nil, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store could not be opened", err)
 	}
@@ -541,19 +544,22 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	return &outcome{action: action, info: info, objectRef: object, storeType: st.Type(), legoOutcome: res}, nil
 }
 
-func openStore(b config.StoreBinding) (store.Store, error) {
-	switch b.Type {
-	case config.StoreTypeFilesystem:
-		return filesystem.New(b.Directory)
-	case config.StoreTypeAzureKeyVault:
-		return keyvault.Open(keyvault.Config{
-			VaultURL:                b.VaultURL,
-			Credential:              b.Credential,
-			ManagedIdentityClientID: b.ManagedIdentityClientID,
-		})
-	default:
-		return nil, fmt.Errorf("unsupported store type %q", b.Type)
+// loadConfig loads the trusted configuration and has the store registry
+// validate every store binding against its provider, so that a binding
+// of a type this binary does not provide, or with a configuration its
+// provider refuses, is a configuration error and not a run-time surprise.
+func loadConfig(opts *Options) (*config.Config, error) {
+	cfg, err := config.Load(opts.ConfigPath)
+	if err != nil {
+		return nil, err
 	}
+	if opts.Stores == nil {
+		return nil, fmt.Errorf("%w: no store registry", config.ErrInvalid)
+	}
+	if err := opts.Stores.Validate(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // identity is the minimum needed to address a Result.

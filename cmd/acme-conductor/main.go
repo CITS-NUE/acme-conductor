@@ -112,7 +112,7 @@ func runServe(ctx context.Context, args []string, stderr io.Writer, getenv func(
 	}
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: lvl, ReplaceAttr: utcTime}))
 	logger = logger.With("component", component, "version", version.Version)
-	return conductor.Serve(ctx, conductor.Options{ConfigPath: *cfg, Logger: logger})
+	return conductor.Serve(ctx, conductor.Options{ConfigPath: *cfg, Logger: logger, Launchers: officialLaunchers()})
 }
 
 // runKeygen generates the job-signing key pair (internal/keygen).

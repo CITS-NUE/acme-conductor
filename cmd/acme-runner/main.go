@@ -121,6 +121,7 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 		JobPath:     *job,
 		ResultPath:  *result,
 		ExchangeDir: *exchangeDir,
+		Stores:      officialStores(),
 		Stdout:      stdout,
 		Logger:      logger,
 	})

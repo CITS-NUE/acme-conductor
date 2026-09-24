@@ -38,6 +38,7 @@ package keyvault
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -51,6 +52,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
 
+	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
 
@@ -205,10 +207,42 @@ func NewCredential(kind, managedIdentityClientID string, c cloud.Configuration) 
 
 // Config is what a store binding of this type carries.
 type Config struct {
-	VaultURL                string
-	Credential              string
-	ManagedIdentityClientID string
+	// VaultURL is the vault's base URL, "https://<name>.vault.azure.net"
+	// or the equivalent in another Azure cloud: no path, port, query,
+	// fragment or credentials.
+	VaultURL string `json:"vaultURL"`
+	// Credential selects how the Runner authenticates to Azure:
+	// CredentialManagedIdentity (production) or CredentialDefault. The
+	// credential itself is never in a configuration file.
+	Credential string `json:"credential,omitempty"`
+	// ManagedIdentityClientID selects a user-assigned managed identity by
+	// client ID (credential "managed-identity" only); empty means the
+	// system-assigned identity.
+	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
 }
+
+// ParseConfig strictly decodes and validates a binding's configuration
+// object (unknown fields are refused) and applies the credential default.
+// It makes no network request.
+func ParseConfig(raw json.RawMessage) (Config, error) {
+	var c Config
+	if err := strictjson.Unmarshal(raw, &c); err != nil {
+		return Config{}, err
+	}
+	if _, err := ParseVaultURL(c.VaultURL); err != nil {
+		return Config{}, fmt.Errorf("vaultURL: %w", err)
+	}
+	if c.Credential == "" {
+		c.Credential = CredentialDefault
+	}
+	if err := ValidateCredential(c.Credential, c.ManagedIdentityClientID); err != nil {
+		return Config{}, err
+	}
+	return c, nil
+}
+
+// OpenStore is Open for the composition layer (pkg/store.Store result).
+func OpenStore(c Config) (store.Store, error) { return Open(c) }
 
 // Open validates cfg, builds its credential and returns a store for the
 // vault. No network request is made until Current or Put.

@@ -3,7 +3,9 @@
   "kind": "ConductorConfig",
   "server": {
     "listen": "127.0.0.1:8080",
-    "auth": { "mode": "localhost-dev" },
+    "auth": {
+      "mode": "localhost-dev"
+    },
     "shutdownGraceSeconds": 900
   },
   "database": {
@@ -18,7 +20,7 @@
   "executionBindings": {
     "local": {
       "type": "local-process",
-      "localProcess": {
+      "config": {
         "runnerBinary": "/usr/local/bin/acme-runner",
         "runnerConfig": "/etc/acme-runner/config.json",
         "workDir": "/var/lib/acme-conductor/runs",
@@ -26,7 +28,13 @@
       }
     }
   },
-  "acmeBindings": ["letsencrypt-staging"],
-  "dnsBindings": ["azure-dns-staging"],
-  "storeBindings": ["filesystem-dev"]
+  "acmeBindings": [
+    "letsencrypt-staging"
+  ],
+  "dnsBindings": [
+    "azure-dns-staging"
+  ],
+  "storeBindings": [
+    "filesystem-dev"
+  ]
 }

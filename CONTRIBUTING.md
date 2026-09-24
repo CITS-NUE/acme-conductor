@@ -74,7 +74,13 @@ Go modules and GitHub Actions; treat those pull requests like any other
   in launcher and Certificate Store adapter implementations
   (`internal/store/keyvault` and `internal/conductor/launcher/acajob`
   today), never in `acme-conductor`'s core packages (Target Registry,
-  Policy, Audit Log, Run Registry, Scheduler).
+  Policy, Audit Log, Run Registry, Scheduler). An adapter implements the
+  `pkg/store` or `pkg/launcher` contract, exposes `ParseConfig` (strict
+  decoding of its own `config` object) and `Open`/`Build`, and is
+  registered in `cmd/<binary>/providers.go`; the generic configuration
+  packages know no provider type or key name, and the core opens stores
+  and builds launchers through the registries in `internal/runner/stores`
+  and `internal/conductor/launchers` only.
   Keep the SDK's pinned versions within the Go version `go.mod` declares.
 - **Strict decoders.** Any new wire format follows the same rule the
   `v1alpha1` contract does: reject unknown fields, duplicate keys, and

@@ -53,14 +53,13 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appcontainers/armappcontainers/v3"
 
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 // Type is the launcher type name.
-const Type = config.ExecutionAzureContainerAppsJob
+const Type = "azure-container-apps-job"
 
 // Defaults.
 const (
@@ -81,7 +80,7 @@ const (
 	maxConsecutivePollErrors = 30
 )
 
-// Config configures a Launcher. It mirrors config.AzureContainerAppsJob.
+// Config configures a Launcher (the parsed form of Binding).
 type Config struct {
 	SubscriptionID          string
 	ResourceGroup           string
@@ -120,11 +119,11 @@ type Launcher struct {
 // CloudConfiguration maps a config cloud name to the SDK's configuration.
 func CloudConfiguration(name string) (cloud.Configuration, error) {
 	switch name {
-	case "", config.CloudPublic:
+	case "", CloudPublic:
 		return cloud.AzurePublic, nil
-	case config.CloudChina:
+	case CloudChina:
 		return cloud.AzureChina, nil
-	case config.CloudGovernment:
+	case CloudGovernment:
 		return cloud.AzureGovernment, nil
 	}
 	return cloud.Configuration{}, fmt.Errorf("unknown cloud %q", name)
@@ -134,7 +133,7 @@ func CloudConfiguration(name string) (cloud.Configuration, error) {
 // Nothing is contacted until the first token request.
 func newCredential(kind, clientID string, c cloud.Configuration) (azcore.TokenCredential, error) {
 	switch kind {
-	case config.CredentialManagedIdentity:
+	case CredentialManagedIdentity:
 		opts := &azidentity.ManagedIdentityCredentialOptions{ClientOptions: azcore.ClientOptions{Cloud: c}}
 		if clientID != "" {
 			opts.ID = azidentity.ClientID(clientID)
@@ -144,7 +143,7 @@ func newCredential(kind, clientID string, c cloud.Configuration) (azcore.TokenCr
 			return nil, fmt.Errorf("managed identity credential: %w", err)
 		}
 		return cred, nil
-	case "", config.CredentialDefault:
+	case "", CredentialDefault:
 		cred, err := azidentity.NewDefaultAzureCredential(&azidentity.DefaultAzureCredentialOptions{ClientOptions: azcore.ClientOptions{Cloud: c}})
 		if err != nil {
 			return nil, fmt.Errorf("default azure credential: %w", err)

@@ -47,9 +47,11 @@
   "storeBindings": {
     "keyvault-staging": {
       "type": "azure-keyvault",
-      "vaultURL": "https://kv-acme-staging.vault.azure.net",
-      "credential": "managed-identity",
-      "managedIdentityClientId": "22222222-2222-2222-2222-222222222222"
+      "config": {
+        "vaultURL": "https://kv-acme-staging.vault.azure.net",
+        "credential": "managed-identity",
+        "managedIdentityClientId": "22222222-2222-2222-2222-222222222222"
+      }
     }
   },
   "jobSigning": {
