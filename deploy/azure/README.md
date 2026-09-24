@@ -61,12 +61,20 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   `ghcr.io/cits-nue/acme-runner` が `linux/amd64` と `linux/arm64` 向けに
   SBOM と SLSA provenance 付きで公開される
   （[ADR 0017](../../docs/adr/0017-release-pipeline.md)）．固定する前に
-  リリースを検証し，そのダイジェストを読み取ること:
+  リリースを検証し，そのダイジェストを読み取ること（ダイジェストはリリース
+  実行のサマリにもある）:
 
   ```sh
-  gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:0.5.0 --owner CITS-NUE
-  docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:0.5.0
+  gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE
+  gh attestation verify oci://ghcr.io/cits-nue/acme-runner:<version> --owner CITS-NUE
+  docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:<version>
   ```
+
+  イメージはこのテンプレートと **同じツリーのリリース** から取ること．この
+  テンプレートが両バイナリに渡す設定は現在の形式（store バインディングの
+  `{type, config}` エンベロープなど）であり，それ以前のリリース（v0.5.0）の
+  バイナリはこれを読めない．`main.bicepparam` の固定値のコメントがどの
+  リリースかを示す．
 
   GHCR の公開イメージにはレジストリの資格情報は不要である．パッケージは初回
   リリース以降公開されている．GitHub が初回プッシュ時に作成するパッケージは
@@ -103,15 +111,23 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
    のままにし，すべての DNS バインディングがマネージド ID で認証するようにする
    （後述）．`jobSigning.publicKeys` は `jobSigningPublicKey` パラメータから
    **テンプレートが追加する** ため，Runner は必要な鍵なしにはデプロイできない．
-2. `main.bicepparam` をコピーし，イメージ，バインディング名，ゾーン，Key Vault，
-   公開鍵を記入する．
-3. デプロイする:
+2. `main.bicepparam` を **このディレクトリ内に** コピーし（`runnerConfigJson`
+   の `loadTextContent` はそのファイルからの相対パスで解決される），イメージ，
+   バインディング名，ゾーン，Key Vault，公開鍵，OIDC の値を記入する．
+3. 秘密鍵は環境変数から読まれる（`readEnvironmentVariable`）．両方を設定して
+   デプロイする:
 
    ```sh
+   cd deploy/azure
+   cp main.bicepparam my.bicepparam
    export ACME_JOB_SIGNING_PRIVATE_KEY_PEM="$(cat job-signing.pem)"
+   export ACME_RESULT_SIGNING_PRIVATE_KEY_PEM="$(cat result-signing.pem)"
    az deployment group create --resource-group rg-acme \
-     --template-file main.bicep --parameters main.bicepparam
+     --template-file main.bicep --parameters my.bicepparam
    ```
+
+   イメージをローカルでビルドする必要も，GHCR の資格情報も要らない．Container
+   Apps は公開イメージをダイジェストでそのまま pull する．
 
 `conductorConfig` 出力は，テンプレートが導出した Conductor の設定
 （サブスクリプション，リソースグループ，ジョブ名，Conductor の ID のクライアント
@@ -174,11 +190,17 @@ curl -s -H "Authorization: Bearer $token" https://<app fqdn>/api/v1alpha1/target
 ### Job 内での Runner の ID
 
 Runner はユーザー割り当て ID で Key Vault に認証する．テンプレートは
-`credential: managed-identity` を持つすべての `azure-keyvault` store
-バインディングの `managedIdentityClientId` をその ID のクライアント ID に設定し
-（クライアント ID を指定しないマネージド ID 資格情報は，プラットフォームに
+`config.credential: managed-identity` を持つすべての `azure-keyvault` store
+バインディングの `config.managedIdentityClientId` をその ID のクライアント ID に
+設定し（クライアント ID を指定しないマネージド ID 資格情報は，プラットフォームに
 システム割り当て ID を求めるが，この Job はそれを持たない），`lego` のために
-Job の環境に `AZURE_CLIENT_ID` を設定する．`lego` の `azuredns` プロバイダは，
+Job の環境に `AZURE_CLIENT_ID` を設定する．store バインディングは
+`{type, config}` のエンベロープであり（[`docs/runner.md`](../../docs/runner.md)），
+テンプレートが触れるのはプロバイダの `config` オブジェクトだけである．
+エンベロープのルートに置かれたフィールドは Runner が未知のものとして拒否する．
+`cmd/acme-runner/deploy_azure_test.go` は，テンプレートがこの設定例に加える
+編集を Runner の設定ローダと store プロバイダのレジストリに通し，この形が
+保たれていることを検査する．`lego` の `azuredns` プロバイダは，
 DNS バインディングが `AZURE_AUTH_METHOD=msi` を指定していれば同じ ID を使う．
 Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変数を
 通して ID を公開し，Runner は `lego` の環境を一から組み立てるので，
@@ -255,11 +277,13 @@ Conductor がデプロイされる．一覧は `acme-conductor migrate import --
 
 ## このリポジトリでは検証していないこと
 
-このテンプレートはコンパイルが通り（`bicep build`，`bicep lint`），その設定
-文書はバイナリが使うのと同じ検証器（`internal/conductor/config`，
-`internal/runner/config`）で読み込める．しかしプロジェクトとしてサブスクリプ
-ションにデプロイ **していない** ため，以下はプラットフォームのリファレンス
-ドキュメントに基づく記述であり，観測したものではない:
+このテンプレートはコンパイルが通り（`bicep build`，`bicep lint`，
+`bicep build-params`．CI の `bicep` ジョブが実行する），その設定文書はバイナリが
+使うのと同じ検証器（`internal/conductor/config`，`internal/runner/config`）と
+store プロバイダのレジストリで読み込める（`cmd/acme-runner/deploy_azure_test.go`）．
+しかしプロジェクトとしてサブスクリプションにデプロイ **していない** ため，
+以下はプラットフォームのリファレンスドキュメントに基づく記述であり，観測した
+ものではない:
 
 - **スケジュールの意味論．** 1 レプリカの実行は毎分開始し，前の tick のまだ
   動いている実行と重なることが想定されている．代わりに tick をスキップする

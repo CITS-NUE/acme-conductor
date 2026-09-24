@@ -60,6 +60,36 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+  # deploy/azure is the reference deployment: it must compile, lint clean
+  # and its example parameters must build, or the released tree cannot be
+  # handed to an operator (CONTRIBUTING.md, "ローカルでの検査").
+  bicep:
+    name: bicep
+    runs-on: ubuntu-latest
+    env:
+      # The Bicep CLI is one binary from its GitHub release; bump by hand.
+      BICEP_VERSION: v0.47.16
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the Bicep CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bicep" \
+            "https://github.com/Azure/bicep/releases/download/${BICEP_VERSION}/bicep-linux-x64"
+          chmod +x "$RUNNER_TEMP/bicep"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bicep" --version
+
+      - name: bicep build
+        run: bicep build deploy/azure/main.bicep --stdout > /dev/null
+
+      - name: bicep lint
+        run: bicep lint deploy/azure/main.bicep
+
+      - name: bicep build-params
+        run: bicep build-params deploy/azure/main.bicepparam --stdout > /dev/null
+
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
