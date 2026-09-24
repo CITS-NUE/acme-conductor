@@ -18,27 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
-	"time"
 
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
-
-// Deps is what the Conductor hands a launcher provider when it builds a
-// launcher from an execution binding: the job signer and result verifier
-// the deployment is configured with (either may be nil when signing is
-// not configured; a provider whose transport is shared must then refuse
-// to build), how long a signed job stays valid (zero when unsigned), a
-// logger already scoped to the binding, and the environment lookup the
-// local launcher forwards variables from.
-type Deps struct {
-	Signer      *Signer
-	Verifier    *Verifier
-	JobValidity time.Duration
-	Logger      *slog.Logger
-	LookupEnv   func(string) (string, bool)
-}
 
 // Launcher starts Runner executions.
 type Launcher interface {

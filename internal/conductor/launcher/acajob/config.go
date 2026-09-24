@@ -170,11 +170,20 @@ func ParseConfig(raw json.RawMessage) (Binding, error) {
 	return a, nil
 }
 
+// Deps is what Build needs from the Conductor: the deployment's job
+// signer and result verifier, both required (see Build), and a logger
+// (slog.Default when nil).
+type Deps struct {
+	Signer   *launcher.Signer
+	Verifier *launcher.Verifier
+	Logger   *slog.Logger
+}
+
 // Build returns the launcher for a parsed binding. Jobs and Results
 // travel over a shared volume, so the deployment must sign jobs and
-// verify results, and a job must stay valid for at least as long as the
-// Conductor waits for an execution to claim it.
-func Build(name string, a Binding, deps launcher.Deps) (launcher.Launcher, error) {
+// verify results, and a job must stay valid (the signer's validity) for
+// at least as long as the Conductor waits for an execution to claim it.
+func Build(name string, a Binding, deps Deps) (launcher.Launcher, error) {
 	if deps.Signer == nil {
 		return nil, fmt.Errorf("type %q requires jobSigning to be configured (the job travels over a shared volume)", Type)
 	}
@@ -182,8 +191,8 @@ func Build(name string, a Binding, deps launcher.Deps) (launcher.Launcher, error
 		return nil, fmt.Errorf("type %q requires resultSigning to be configured (the result travels over a shared volume)", Type)
 	}
 	claim := time.Duration(a.ClaimTimeoutSeconds) * time.Second
-	if deps.JobValidity > 0 && claim > deps.JobValidity {
-		return nil, fmt.Errorf("claimTimeoutSeconds (%d) must not exceed jobSigning.validitySeconds (%d): a job claimed after its expiry is refused by the Runner", a.ClaimTimeoutSeconds, int(deps.JobValidity/time.Second))
+	if validity := deps.Signer.Validity(); claim > validity {
+		return nil, fmt.Errorf("claimTimeoutSeconds (%d) must not exceed jobSigning.validitySeconds (%d): a job claimed after its expiry is refused by the Runner", a.ClaimTimeoutSeconds, int(validity/time.Second))
 	}
 	if err := os.MkdirAll(a.ExchangeDir, 0o700); err != nil {
 		return nil, fmt.Errorf("exchange directory: %w", err)

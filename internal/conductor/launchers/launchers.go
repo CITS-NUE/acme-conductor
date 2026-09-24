@@ -12,11 +12,28 @@ package launchers
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
+
+// BuildDeps is what the Conductor provides every launcher provider when
+// it builds a launcher: the deployment's job signer and result verifier
+// (either nil when that signing is not configured; a provider whose
+// transport is shared must then refuse to build) and a logger scoped to
+// the binding. It holds what every launcher shares and nothing a single
+// provider needs: a provider with a dependency of its own (the
+// local-process launcher's environment lookup, for example) declares it
+// in its own package and receives it where it is registered
+// (cmd/acme-conductor/providers.go), so the public contract
+// (pkg/launcher) and this layer stay provider-neutral.
+type BuildDeps struct {
+	Signer   *launcher.Signer
+	Verifier *launcher.Verifier
+	Logger   *slog.Logger
+}
 
 // Provider implements one execution binding type.
 type Provider struct {
@@ -28,20 +45,23 @@ type Provider struct {
 	Validate func(raw json.RawMessage) error
 	// New decodes the configuration object again and builds the launcher
 	// for the named binding with what the Conductor provides.
-	New func(name string, raw json.RawMessage, deps launcher.Deps) (launcher.Launcher, error)
+	New func(name string, raw json.RawMessage, deps BuildDeps) (launcher.Launcher, error)
 }
 
-// Adapt builds a Provider from an adapter's typed parse and build
-// functions, so an adapter exposes ParseConfig and Build and knows
-// nothing of this package.
-func Adapt[C any](typ string, parse func(json.RawMessage) (C, error), build func(name string, c C, deps launcher.Deps) (launcher.Launcher, error)) Provider {
+// Adapt builds a Provider from an adapter's typed parse function and a
+// build function that turns the parsed configuration and the generic
+// dependencies into a launcher. The adapter itself knows nothing of this
+// package: build is usually a closure written where the provider is
+// registered, translating BuildDeps into the adapter's own dependency
+// type and adding what only that adapter needs.
+func Adapt[C any](typ string, parse func(json.RawMessage) (C, error), build func(name string, c C, deps BuildDeps) (launcher.Launcher, error)) Provider {
 	return Provider{
 		Type: typ,
 		Validate: func(raw json.RawMessage) error {
 			_, err := parse(raw)
 			return err
 		},
-		New: func(name string, raw json.RawMessage, deps launcher.Deps) (launcher.Launcher, error) {
+		New: func(name string, raw json.RawMessage, deps BuildDeps) (launcher.Launcher, error) {
 			c, err := parse(raw)
 			if err != nil {
 				return nil, err
@@ -99,7 +119,7 @@ func (r *Registry) Validate(cfg *config.Config) error {
 
 // Build builds one launcher per execution binding. deps.Logger, when
 // set, is scoped per binding before it is handed to the provider.
-func (r *Registry) Build(cfg *config.Config, deps launcher.Deps) (map[string]launcher.Launcher, error) {
+func (r *Registry) Build(cfg *config.Config, deps BuildDeps) (map[string]launcher.Launcher, error) {
 	out := make(map[string]launcher.Launcher, len(cfg.ExecutionBindings))
 	for _, name := range sortedNames(cfg) {
 		b := cfg.ExecutionBindings[name]

@@ -100,11 +100,25 @@ func ParseConfig(raw json.RawMessage) (Config, error) {
 	return c, nil
 }
 
+// Deps is what Build needs from the Conductor: the deployment's job
+// signer and result verifier (either may be nil, see Build), a logger
+// (slog.Default when nil) and the environment lookup the launcher
+// forwards passthroughEnv variables from (os.LookupEnv when nil). The
+// lookup is this launcher's own concern — it is the only launcher that
+// runs the Runner in the Conductor's environment — so it is declared
+// here and not in the composition layer's generic dependencies.
+type Deps struct {
+	Signer    *launcher.Signer
+	Verifier  *launcher.Verifier
+	Logger    *slog.Logger
+	LookupEnv func(string) (string, bool)
+}
+
 // Build returns the launcher for a parsed binding configuration, creating
 // the work directory if needed. Signing is used when the deployment
 // configures it and not required: the per-run directory is private to
 // the Conductor and its child.
-func Build(name string, c Config, deps launcher.Deps) (launcher.Launcher, error) {
+func Build(name string, c Config, deps Deps) (launcher.Launcher, error) {
 	if name == "" {
 		return nil, errors.New("binding name is required")
 	}

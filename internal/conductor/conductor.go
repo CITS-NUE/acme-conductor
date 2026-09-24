@@ -51,8 +51,6 @@ type Options struct {
 	// Listening, when set, is called with the bound address once the API
 	// accepts connections (tests use it to learn an ephemeral port).
 	Listening func(addr net.Addr)
-	// LookupEnv is passed to the local-process launcher.
-	LookupEnv func(string) (string, bool)
 	// Launchers provides the execution binding types this Conductor can
 	// build (internal/conductor/launchers). Required: a configuration
 	// naming a type the registry does not provide is refused at start.
@@ -119,14 +117,14 @@ func Serve(ctx context.Context, opts Options) int {
 	if signer != nil {
 		log.Info("job signing enabled", "keyId", signer.KeyID(), "validitySeconds", cfg.JobSigning.ValiditySeconds)
 	}
-	launchers, err := opts.Launchers.Build(cfg, launcher.Deps{Signer: signer, Verifier: verifier, JobValidity: jobValidity(cfg), Logger: log, LookupEnv: opts.LookupEnv})
+	built, err := opts.Launchers.Build(cfg, launchers.BuildDeps{Signer: signer, Verifier: verifier, Logger: log})
 	if err != nil {
 		log.Error("launchers could not be built", "error", err.Error())
 		return ExitConfig
 	}
 	sched := scheduler.New(scheduler.Options{
 		Registry:          reg,
-		Launchers:         launchers,
+		Launchers:         built,
 		Tick:              time.Duration(cfg.Scheduler.TickSeconds) * time.Second,
 		MaxConcurrentRuns: cfg.Scheduler.MaxConcurrentRuns,
 		RetryBackoff:      time.Duration(cfg.Scheduler.RetryBackoffSeconds) * time.Second,
@@ -318,15 +316,6 @@ func loadSigner(cfg *config.Config) (*launcher.Signer, error) {
 		return nil, fmt.Errorf("%s: %w", cfg.JobSigning.PrivateKeyFile, err)
 	}
 	return launcher.NewSigner(key, time.Duration(cfg.JobSigning.ValiditySeconds)*time.Second)
-}
-
-// jobValidity is how long a signed job stays valid, or zero when jobs
-// are not signed.
-func jobValidity(cfg *config.Config) time.Duration {
-	if cfg.JobSigning == nil {
-		return 0
-	}
-	return time.Duration(cfg.JobSigning.ValiditySeconds) * time.Second
 }
 
 func sortStrings(s []string) []string {

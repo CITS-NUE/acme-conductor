@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -37,7 +35,7 @@ func TestParseConfig(t *testing.T) {
 func TestBuild(t *testing.T) {
 	work := filepath.Join(t.TempDir(), "runs")
 	c := Config{RunnerBinary: "/usr/local/bin/acme-runner", RunnerConfig: "/etc/acme-runner/config.json", WorkDir: work, TimeoutSeconds: 30}
-	l, err := Build("local", c, launcher.Deps{})
+	l, err := Build("local", c, Deps{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +43,19 @@ func TestBuild(t *testing.T) {
 	if !ok || lp.Type() != Type || lp.Timeout != 30*time.Second || lp.LookupEnv == nil || lp.Logger == nil || lp.Signer != nil {
 		t.Fatalf("launcher = %+v", l)
 	}
-	if _, err := Build("", c, launcher.Deps{}); err == nil {
+	t.Setenv("ACME_LOCALPROCESS_BUILD_TEST", "from-the-process")
+	if v, ok := lp.LookupEnv("ACME_LOCALPROCESS_BUILD_TEST"); !ok || v != "from-the-process" {
+		t.Fatalf("nil lookup should fall back to the process environment: %q, %v", v, ok)
+	}
+	env := map[string]string{"X": "injected"}
+	l, err = Build("local", c, Deps{LookupEnv: func(k string) (string, bool) { v, ok := env[k]; return v, ok }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := l.(*LocalProcess).LookupEnv("X"); !ok || v != "injected" {
+		t.Fatalf("injected lookup not used: %q, %v", v, ok)
+	}
+	if _, err := Build("", c, Deps{}); err == nil {
 		t.Fatal("built without a binding name")
 	}
 }

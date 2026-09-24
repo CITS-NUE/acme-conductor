@@ -84,20 +84,27 @@ func TestBuildRequiresSigningAndBoundsTheClaimTimeout(t *testing.T) {
 	signer, _ := launcher.NewSigner(priv, 15*time.Minute)
 	pub, _, _ := v1alpha1.GenerateSigningKey()
 	verifier, _ := launcher.NewVerifier(map[string]ed25519.PublicKey{v1alpha1.KeyID(pub): pub}, 0)
-	ok := launcher.Deps{Signer: signer, Verifier: verifier, JobValidity: 15 * time.Minute}
+	ok := Deps{Signer: signer, Verifier: verifier}
 	if l, err := Build("aca", a, ok); err != nil || l.Type() != Type {
 		t.Fatalf("build: %v, %v", l, err)
 	}
-	for name, deps := range map[string]launcher.Deps{
-		"no signer":   {Verifier: verifier, JobValidity: 15 * time.Minute},
-		"no verifier": {Signer: signer, JobValidity: 15 * time.Minute},
+	for name, deps := range map[string]Deps{
+		"no signer":   {Verifier: verifier},
+		"no verifier": {Signer: signer},
 	} {
 		if _, err := Build("aca", a, deps); err == nil || !strings.Contains(err.Error(), "Signing") {
 			t.Fatalf("%s: err = %v", name, err)
 		}
 	}
+	// The bound is the signer's own validity: a job the Conductor may
+	// still be waiting to have claimed must not have expired.
 	a.ClaimTimeoutSeconds = 901
-	if _, err := Build("aca", a, launcher.Deps{Signer: signer, Verifier: verifier, JobValidity: 900 * time.Second}); err == nil || !strings.Contains(err.Error(), "claimTimeoutSeconds") {
+	short, _ := launcher.NewSigner(priv, 900*time.Second)
+	if _, err := Build("aca", a, Deps{Signer: short, Verifier: verifier}); err == nil || !strings.Contains(err.Error(), "claimTimeoutSeconds") {
 		t.Fatalf("claim timeout beyond validity: %v", err)
+	}
+	a.ClaimTimeoutSeconds = 900
+	if _, err := Build("aca", a, Deps{Signer: short, Verifier: verifier}); err != nil {
+		t.Fatalf("claim timeout equal to validity: %v", err)
 	}
 }
