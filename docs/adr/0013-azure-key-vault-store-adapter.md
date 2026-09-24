@@ -1,134 +1,121 @@
-# 0013: Azure Key Vault store adapter
+# 0013: Azure Key Vault の store アダプタ
 
-- Status: Accepted
-- Date: 2026-09-22
+- ステータス: 採択
+- 日付: 2026-09-22
 
-## Context
+## 背景
 
-Phase 3 adds the first Certificate Store meant for real deployments. The
-filesystem store (Phase 1) exists to make the Runner runnable without a
-cloud dependency; it has no access control of its own and is not where a
-production certificate and its private key can live. Azure Key Vault is
-the target platform's secrets store, with access control and audit of
-its own, and it is where a consumer on that platform reads a certificate
-from (through the certificate's secret). The store contract
-(`internal/store.Store`: `Current`, `Put`, `Type`) was designed for this
-adapter; what remained to decide is how a bundle maps onto Key Vault's
-object model, how the Runner authenticates, how object names are
-derived, and what the Runner may never do to the vault.
+Phase 3 は，実際のデプロイ向けの最初の Certificate Store を追加する．ファイル
+システム store（Phase 1）はクラウド依存なしに Runner を動かせるようにするために
+存在し，独自のアクセス制御を持たず，本番の証明書とその秘密鍵を置ける場所では
+ない．Azure Key Vault は対象プラットフォームのシークレットストアであり，独自の
+アクセス制御と監査を持ち，そのプラットフォーム上の利用者が（証明書のシークレット
+を通じて）証明書を読み出す場所である．store コントラクト
+（`internal/store.Store`: `Current`，`Put`，`Type`）はこのアダプタを念頭に設計
+された．残っていた決定事項は，バンドルを Key Vault のオブジェクトモデルにどう
+対応付けるか，Runner がどう認証するか，オブジェクト名をどう導出するか，そして
+Runner が vault に対して決してしてはならないことは何か，である．
 
-## Decision
+## 決定
 
-- **One target is one Key Vault *certificate*, imported as PEM.** `Put`
-  concatenates leaf, chain and private key (re-encoded as unencrypted
-  PKCS #8, since Key Vault's PEM import documents that form and `lego`
-  writes SEC 1 for EC keys) and calls the *import certificate*
-  operation with content type `application/x-pem-file`. This uses Key
-  Vault's own certificate object — versions, the backing key, and the
-  secret consumers read — rather than a bare secret holding a PEM blob,
-  so a consumer references the certificate by its versionless name and
-  sees each new version on its next refresh. It also means **no PFX and
-  no PFX password** exist anywhere in the system (the threat model's
-  "temporary PFX password" concern in T6 has nothing to leak). Every
-  `Put` creates a new version; nothing is overwritten, and the store
-  never deletes, disables, recovers or purges
-  ([ADR 0008](0008-no-purge-in-mvp.md)).
-- **PEM is the only content type; PKCS #12 consumers are out of scope
-  for Phase 3.** A consumer that reads the certificate's secret and
-  accepts PEM content is served (an application fetching the secret, a
-  VM or container receiving it through a Key Vault reference, any
-  service whose Key Vault integration accepts PEM). The built-in Key
-  Vault integrations of App Service and Azure Front Door require PKCS #12
-  (`application/x-pkcs12`; Front Door also rejects EC certificates), so
-  those services are **not** served by this store as it stands. Adding a
-  PKCS #12 import would mean building a PFX in the Runner (an encoding
-  step with a password, even if empty, that T6 then has to cover), a
-  per-consumer key-type constraint, and tests for both; that is a later
-  phase, decided when a target actually needs one of those services.
-- **`Current` reads the public part only.** The renewal decision needs
-  the certificate's SANs, validity and key type, all of which the
-  `certificates/get` operation returns (`cer`). The Runner never calls
-  `secrets/get`, so its identity is never granted it: even a compromised
-  Runner cannot use the store to read back keys of other targets — the
-  only key it ever holds is the one it just generated for the run it was
-  launched for. A certificate that is present but disabled, or not the
-  one asked for, is an error, not "absent": an operator's decision to
-  disable a certificate must not be undone by an automatic reissue.
-- **Read-after-write verification.** After the import, the vault's
-  response must describe the certificate that was sent (same name, same
-  SHA-256 fingerprint); otherwise the run fails rather than report a
-  fingerprint the vault does not hold.
-- **Authentication is the platform's workload identity, selected by
-  name.** A binding says `credential: managed-identity` (the SDK's
-  `ManagedIdentityCredential`, optionally a user-assigned identity by
-  client ID) or `credential: default` (`DefaultAzureCredential`, the
-  roadmap's original phrasing, which also tries environment variables
-  and developer tooling). No credential value is ever in configuration;
-  the only credential-related settings are the kind and a client ID. The
-  default is `default` for development ergonomics, and the operator
-  guide and threat model say plainly that production means
-  `managed-identity`.
-- **The vault URL is strict, and the cloud follows from it.** The
-  configuration accepts `https://<name>.<known Key Vault suffix>` only
-  (public, China and US Government clouds), with a well-formed vault
-  name and no port, path, query, fragment or credentials; the suffix
-  selects the identity authority of that cloud. The SDK's challenge
-  policy independently verifies that the resource the vault demands a
-  token for matches the request host, so a token can never be sent to a
-  host that merely looks like a vault.
-- **Object names.** Key Vault certificate names allow `[0-9A-Za-z-]`, at
-  most 127 characters. The store contract now lets each store derive its
-  own object name (`Store.ObjectName`): the filesystem store keeps the
-  logical `store.ObjectName`, the Key Vault store derives the same name
-  bounded to 127 characters with `.`/`_` mapped to `-`. The 64-bit hash
-  suffix is untouched, so uniqueness per FQDN is unchanged, and the
-  Result's `storeObjectRef` is the actual vault certificate name.
-- **Errors are fixed wording, whatever their source.** A vault error
-  becomes `key vault <op>: HTTP <status> (<code>)`; a token failure
-  becomes `key vault <op>: authentication failed (identity endpoint HTTP
-  <status>)` or `(credential unavailable)`; a transport failure `request
-  timed out` or `connection failed`; anything else names the Go type of
-  the innermost error. Both the vault's `ResponseError` and azidentity's
-  `AuthenticationFailedError` print whole response bodies in their own
-  `Error()`; neither is ever wrapped into what the store returns, so the
-  Runner's `cause` log field and the `Result` cannot carry them. Context
-  cancellation and deadline errors are wrapped as bare sentinels so the
-  Runner still classifies them.
-- **Tests use an in-process fake vault, never a real one.** The fake
-  imitates the REST API's shapes — bearer-challenge authentication, PEM
-  import validation with a key-matches-certificate check, get, error
-  bodies — over TLS, so what is under test is the request the store
-  builds and how it treats what comes back. A real vault is never called
-  from CI (principle 8).
-- **The Azure SDK is confined to `internal/store/keyvault`** (and the
-  Runner configuration package, which validates a binding through it).
-  `acme-conductor` links none of it. SDK versions are pinned to the
-  newest releases whose `go` directive stays within `go.mod`'s.
+- **1 つの target は 1 つの Key Vault *証明書* であり，PEM として取り込む．**
+  `Put` はリーフ，チェーン，秘密鍵（暗号化なしの PKCS #8 に再エンコードする．
+  Key Vault の PEM 取り込みがその形式を文書化しており，`lego` は EC 鍵を SEC 1
+  で書くため）を連結し，コンテンツタイプ `application/x-pem-file` で
+  *証明書の取り込み* 操作を呼ぶ．これは PEM の塊を保持するただのシークレット
+  ではなく，Key Vault 自身の証明書オブジェクト（バージョン，裏付けとなる鍵，
+  利用者が読むシークレット）を使うので，利用者はバージョンなしの名前で証明書を
+  参照し，次のリフレッシュで新しい各バージョンを見る．これはまた，システムの
+  どこにも **PFX も PFX パスワードも存在しない** ことを意味する（脅威モデルの
+  T6 にある「一時的な PFX パスワード」の懸念には漏れるものがない）．`Put` の
+  たびに新しいバージョンが作られる．何も上書きされず，store が削除・無効化・
+  復旧・purge を行うことは決してない（[ADR 0008](0008-no-purge-in-mvp.md)）．
+- **コンテンツタイプは PEM のみ．PKCS #12 の利用者は Phase 3 の対象外．**
+  証明書のシークレットを読み PEM コンテンツを受け付ける利用者は対応される
+  （シークレットを取得するアプリケーション，Key Vault 参照を通じて受け取る VM
+  やコンテナ，Key Vault 統合が PEM を受け付けるあらゆるサービス）．App Service
+  と Azure Front Door の組み込み Key Vault 統合は PKCS #12
+  （`application/x-pkcs12`．Front Door は EC 証明書も拒否する）を要求するため，
+  それらのサービスは現状の本 store では **対応されない**．PKCS #12 取り込みの
+  追加は，Runner 内での PFX 構築（空であってもパスワードを伴うエンコード手順で，
+  T6 がそれを扱わなければならなくなる），利用者ごとの鍵種別の制約，両方の
+  テストを意味する．それは後の Phase であり，実際に target がそれらのサービスを
+  必要とするときに決める．
+- **`Current` は公開部分だけを読む．** 更新判断に必要なのは証明書の SAN，有効
+  期間，鍵種別であり，いずれも `certificates/get` 操作が返す（`cer`）．Runner
+  は決して `secrets/get` を呼ばないので，その ID にそれが付与されることも
+  決してない．侵害された Runner であっても，store を使って他の target の鍵を
+  読み戻すことはできない．Runner が保持する唯一の鍵は，起動された run のために
+  たった今生成したものだけである．存在するが無効化された証明書，あるいは
+  求めたものとは別の証明書は，「不在」ではなくエラーである．証明書を無効化する
+  という操作者の決定が，自動的な再発行で覆されてはならない．
+- **書き込み後の読み取り検証．** 取り込みの後，vault の応答は送った証明書を
+  記述していなければならない（同じ名前，同じ SHA-256 フィンガープリント）．
+  そうでなければ，vault が保持していないフィンガープリントを報告するのではなく，
+  run を失敗させる．
+- **認証はプラットフォームのワークロード ID であり，名前で選択する．**
+  バインディングは `credential: managed-identity`（SDK の
+  `ManagedIdentityCredential`．任意でクライアント ID によるユーザー割り当て ID）
+  または `credential: default`（`DefaultAzureCredential`．ロードマップの元の
+  表現で，環境変数や開発者ツールも試す）と述べる．資格情報の値が設定に置かれる
+  ことは決してない．資格情報に関する設定は種別とクライアント ID だけである．
+  既定は開発のしやすさのため `default` であり，運用ガイドと脅威モデルは本番は
+  `managed-identity` を意味すると明言する．
+- **vault の URL は厳格で，クラウドはそれから決まる．** 設定が受け付けるのは
+  `https://<name>.<既知の Key Vault サフィックス>` のみ（パブリック，中国，
+  米国政府クラウド）で，vault 名は整形式でなければならず，ポート・パス・
+  クエリ・フラグメント・資格情報を含んではならない．サフィックスがそのクラウドの
+  ID 認証局を選ぶ．SDK のチャレンジポリシーは，vault がトークンを要求する
+  リソースがリクエストのホストと一致することを独立に検証するので，vault に
+  見えるだけのホストにトークンが送られることは決してない．
+- **オブジェクト名．** Key Vault の証明書名に許されるのは `[0-9A-Za-z-]` で，
+  最大 127 文字である．store コントラクトは各 store が独自のオブジェクト名を
+  導出できるようになった（`Store.ObjectName`）．ファイルシステム store は論理的な
+  `store.ObjectName` をそのまま使い，Key Vault store は同じ名前を 127 文字に
+  収め，`.`/`_` を `-` に写した名前を導出する．64 ビットのハッシュサフィックスは
+  そのままなので FQDN ごとの一意性は変わらず，Result の `storeObjectRef` は
+  実際の vault 証明書名となる．
+- **エラーは出所にかかわらず固定の文言．** vault のエラーは
+  `key vault <op>: HTTP <status> (<code>)` となり，トークンの失敗は
+  `key vault <op>: authentication failed (identity endpoint HTTP <status>)`
+  または `(credential unavailable)`，トランスポートの失敗は `request timed out`
+  または `connection failed`，それ以外は最も内側のエラーの Go の型名となる．
+  vault の `ResponseError` も azidentity の `AuthenticationFailedError` も自身の
+  `Error()` で応答ボディ全体を出力する．どちらも store が返すものにラップされる
+  ことは決してないので，Runner の `cause` ログフィールドや `Result` がそれらを
+  運ぶことはできない．コンテキストのキャンセルと期限超過のエラーは，Runner が
+  分類できるよう素のセンチネルとしてラップされる．
+- **テストはプロセス内の偽物の vault を使い，本物は決して使わない．** 偽物は
+  REST API の形，すなわちベアラーチャレンジ認証，鍵と証明書の一致確認を伴う
+  PEM 取り込みの検証，取得，エラーボディを TLS 越しに模倣するので，テストの
+  対象は store が組み立てるリクエストと，返ってきたものの扱いである．CI から
+  本物の vault が呼ばれることは決してない（原則 8）．
+- **Azure SDK は `internal/store/keyvault` に閉じ込める**（および Runner の設定
+  パッケージ．これはバインディングをそれを通じて検証する）．`acme-conductor`
+  はそのいずれもリンクしない．SDK のバージョンは，`go` ディレクティブが
+  `go.mod` のものに収まる最新リリースに固定する．
 
-## Consequences
+## 結果
 
-- Deployments get a store with real access control and audit, and a
-  certificate that PEM-capable consumers read through its secret. The
-  Runner's vault permissions are two data actions (`certificates/get`,
-  `certificates/import`); the Conductor has none.
-- App Service and Azure Front Door cannot consume the stored certificate
-  through their built-in Key Vault integrations until a PKCS #12 import
-  exists; the operator guide says so.
-- An imported certificate's key is **exportable through its secret**:
-  that is the delivery mechanism and it is deliberate. Whoever holds
-  `secrets/get` on the vault can read every certificate's key; that is
-  a vault-access decision, made in IAM (Bicep, Phase 4), not something
-  this code can narrow.
-- A soft-deleted certificate of the same name blocks an import (HTTP
-  409); the run fails and an operator recovers or purges. The Runner will
-  not do that on its own.
-- The store's behavior against the real import operation (PEM layout,
-  PKCS #8 key, chain handling) is documented from the service
-  documentation and verified only by the first run against a real vault,
-  not by CI. It is called out as unverified in the operator guide.
-- `credential: default` on a Runner started by hand or by the Phase 2
-  local launcher is the only way to use a Key Vault binding until the
-  Phase 4 platform launcher runs the Runner under a managed identity.
-- Adding another store backend means another package under
-  `internal/store/` implementing the same three methods plus
-  `ObjectName`; nothing in the Runner's reconcile loop changes.
+- デプロイは本物のアクセス制御と監査を備えた store と，PEM 対応の利用者が
+  シークレットを通じて読む証明書を得る．Runner の vault 権限はデータアクション
+  2 つ（`certificates/get`，`certificates/import`）であり，Conductor は何も持た
+  ない．
+- App Service と Azure Front Door は，PKCS #12 取り込みが存在するまで組み込みの
+  Key Vault 統合で保存された証明書を利用できない．運用ガイドがそう述べる．
+- 取り込まれた証明書の鍵は **シークレットを通じてエクスポート可能** である．
+  それが配布の仕組みであり，意図的である．vault の `secrets/get` を持つ者は誰でも
+  すべての証明書の鍵を読める．それは IAM（Bicep，Phase 4）で行う vault アクセスの
+  決定であり，このコードが狭められるものではない．
+- 同名の論理削除された証明書は取り込みを妨げる（HTTP 409）．run は失敗し，
+  操作者が復旧または purge する．Runner が自分でそれを行うことはない．
+- 本物の取り込み操作に対する store の振る舞い（PEM のレイアウト，PKCS #8 の鍵，
+  チェーンの扱い）はサービスのドキュメントから文書化されており，CI ではなく
+  本物の vault への最初の run でのみ検証される．運用ガイドでは未検証と明記
+  している．
+- 手動または Phase 2 のローカルランチャーで起動した Runner での
+  `credential: default` は，Phase 4 のプラットフォームランチャーが Runner を
+  マネージド ID で動かすまで，Key Vault バインディングを使う唯一の方法である．
+- 別の store バックエンドを追加するとは，`internal/store/` 配下に同じ 3 つの
+  メソッドと `ObjectName` を実装する別のパッケージを作ることである．Runner の
+  reconcile ループでは何も変わらない．

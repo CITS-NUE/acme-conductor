@@ -1,54 +1,50 @@
-# 0008: No purge in the MVP
+# 0008: MVP では purge しない
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-Over a `Target`'s lifetime, an operator will eventually want to stop
-managing a certificate for it. There are two different operations that
-could be meant by that: stopping future issuance/renewal while keeping the
-`Target`'s history, or permanently erasing the `Target` and everything
-recorded about it (its `Run` history, its `AuditEvent`s). Conflating these
-two — for example, implementing "disable" so that it also deletes audit
-history, or expecting "disable" to delete a certificate that is still in
-active use elsewhere — is a documented threat in its own right (see
-[`docs/threat-model.md`](../threat-model.md), T11: disable vs. purge
-confusion), and permanent deletion of audit data is a much bigger decision
-than pausing management of a name.
+`Target` の生涯のうちには，操作者がその証明書の管理をやめたくなるときが
+いずれ来る．それが意味しうる操作は 2 つある．`Target` の履歴を残したまま
+今後の発行／更新を止めることと，`Target` とそれについて記録されたすべて
+（`Run` の履歴，`AuditEvent`）を恒久的に消去することである．この 2 つを
+混同すること（例えば「無効化」が監査履歴も削除するように実装したり，
+「無効化」が他所でまだ使用中の証明書を削除することを期待したりすること）は，
+それ自体が文書化された脅威であり
+（[`docs/threat-model.md`](../threat-model.md) の T11: 無効化と purge の混同を
+参照），監査データの恒久的な削除は，名前の管理を一時停止するよりもはるかに
+大きな決定である．
 
-## Decision
+## 決定
 
-The MVP implements **disable only**. `Target.enabled = false` stops future
-issuance and renewal for that target; it does not delete the `Target`
-row, its `Run` history, or its `AuditEvent`s. There is no purge operation
-of any kind in the MVP — no API endpoint, no scheduled job, no admin
-tooling deletes a `Target`, a `Run`, or an `AuditEvent`.
+MVP は **無効化のみ** を実装する．`Target.enabled = false` はその target に
+対する今後の発行と更新を止めるが，`Target` の行，その `Run` の履歴，その
+`AuditEvent` は削除しない．MVP にはいかなる種類の purge 操作もない．`Target`，
+`Run`，`AuditEvent` を削除する API エンドポイント，スケジュールジョブ，管理
+ツールは存在しない．
 
-If and when a purge operation is added, it must be:
+purge 操作をいつか追加するとすれば，それは次の条件を満たさなければならない．
 
-- **a separate operation** from disable, requiring its own explicit
-  action, never a side effect or an automatic consequence of disabling a
-  target;
-- **audited**, recording who purged what and when, in the same append-only
-  audit log that records everything else; and
-- scoped deliberately (what exactly is deleted — the `Target` row, its
-  `Run` history, both? — and what, if anything, about a certificate
-  already issued into the Certificate Store) rather than an unqualified
-  "delete everything for this target."
+- 無効化とは **別の操作** であり，それ自体の明示的な操作を要し，target の
+  無効化の副作用や自動的な帰結であっては決してならない．
+- **監査される** こと．誰が何をいつ purge したかを，他のすべてを記録するのと
+  同じ追記専用の監査ログに記録する．
+- 対象範囲が意図的に定められていること（正確に何が削除されるのか．`Target` の
+  行か，その `Run` の履歴か，両方か．そして Certificate Store にすでに発行済みの
+  証明書について何かするのか，するとすれば何か）．「この target のすべてを
+  削除する」という無条件の操作であってはならない．
 
-## Consequences
+## 結果
 
-- Operators can stop managing a name without any risk of losing the audit
-  trail for it — "why was this certificate issued, who requested it, did
-  it ever fail" remains answerable indefinitely for every `Target` that
-  has ever existed.
-- There is currently no way to actually remove a `Target`'s data from the
-  system at all, even for legitimate reasons (e.g. GDPR-style data
-  minimization requests, or simple database hygiene) — this is an accepted
-  limitation of the MVP, deferred rather than solved, and tracked as a
-  non-goal in [`docs/architecture.md`](../architecture.md#non-goals) until
-  a future ADR designs purge properly.
-- Any future work that touches deletion of a `Target`, `Run`, or
-  `AuditEvent` should be read as implicitly requiring a new ADR, since it
-  changes a decision recorded here.
+- 操作者は監査証跡を失う危険なしに名前の管理をやめられる．「なぜこの証明書は
+  発行されたのか，誰が要求したのか，失敗したことはあるか」は，これまでに存在
+  したすべての `Target` について，いつまでも答えられる．
+- 現時点では，正当な理由（例えば GDPR 型のデータ最小化要求や，単なる
+  データベースの整理）があっても，`Target` のデータをシステムから実際に
+  削除する手段が一切ない．これは MVP の受け入れられた制限事項であり，解決では
+  なく先送りであって，将来の ADR が purge を適切に設計するまで
+  [`docs/architecture.md`](../architecture.md#非目標) の非目標として追跡する．
+- `Target`，`Run`，`AuditEvent` の削除に触れる将来の作業はすべて，ここに
+  記録された決定を変えるものなので，暗黙に新しい ADR を要するものとして
+  読むべきである．

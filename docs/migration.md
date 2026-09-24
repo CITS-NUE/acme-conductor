@@ -1,177 +1,169 @@
-# Migrating from cert-infra
+# cert-infra からの移行
 
-How an existing `cert-infra` deployment (a Bicep-defined Container Apps
-Job that renews a fixed list of hosts with `lego` and imports them into
-Key Vault) is moved onto ACME Conductor without a flag day, and how it
-is moved back if that is what the shadow phase shows is needed.
-Everything here is Phase 6 of the [roadmap](architecture.md#roadmap);
-the decisions are recorded in [ADR 0020](adr/0020-migration-from-cert-infra.md).
+既存の `cert-infra` デプロイ（固定されたホスト一覧を `lego` で更新し Key Vault に
+取り込む，Bicep で定義された Container Apps Job）を，切替日を設けずに
+ACME Conductor へ移す方法と，shadow フェーズの結果から必要だと分かった場合に
+元へ戻す方法を述べる．ここにあるものはすべて
+[ロードマップ](architecture.md#ロードマップ)の Phase 6 であり，決定は
+[ADR 0020](adr/0020-migration-from-cert-infra.md) に記録されている．
 
-The `cert-infra` repository itself is **not changed** by this project:
-its `infra/main.bicepparam` is read, never written, and its job keeps
-running until an operator stops it.
+`cert-infra` リポジトリ自体はこのプロジェクトによって **変更されない**．その
+`infra/main.bicepparam` は読まれるだけで決して書かれず，そのジョブは操作者が
+止めるまで動き続ける．
 
-## What migrates, and what does not
+## 移行するものとしないもの
 
-What migrates is the **set of managed names**: `cert-infra` keeps it in
-the `targetDomains` array of `infra/main.bicepparam`; the Conductor keeps
-it in its target registry, one `Target` per FQDN, each under a
-`CertificatePolicy` and a set of bindings
-([`docs/conductor.md`](conductor.md#target)). The migration tooling
-reads the list, compares it with the registry, and creates the targets
-the registry lacks. That is all it moves:
+移行するのは **管理対象の名前の集合** である．`cert-infra` はそれを
+`infra/main.bicepparam` の `targetDomains` 配列に保持し，Conductor は target
+レジストリに，FQDN ごとに 1 つの `Target` として，それぞれ `CertificatePolicy` と
+バインディングの集合の下に保持する
+（[`docs/conductor.md`](conductor.md#target)）．移行ツールは一覧を読み，
+レジストリと比較し，レジストリに欠けている target を作成する．移すのはそれが
+すべてである:
 
-- **The ACME account is not migrated.** The Runner's `lego` registers
-  its own account under its own state directory
-  ([`docs/runner.md`](runner.md#directories-and-container-usage)).
-  Both accounts can coexist at the CA; a Let's Encrypt account carries
-  no quota of its own.
-- **Certificates are not migrated.** The Runner issues a fresh
-  certificate for each imported target on its first run after the
-  switch, and stores it under the Conductor's object name
-  ([`docs/runner.md`](runner.md#certificate-store-azure-key-vault)),
-  which is not the name `cert-infra` used (`leaf-cerdad-…` with dots
-  replaced). Consumers that reference a Key Vault certificate by name
-  (an Application Gateway listener, for example) are re-pointed by the
-  operator once the new object exists; the old object stays until it is
-  deleted by hand. This is the one consumer-visible step of the
-  migration and it is outside this repository.
-- **Policy is not derived.** Which suffixes are allowed, which ACME
-  binding is used and how early renewal happens are an administrator's
-  decisions, made once in a policy the import profile names. The list
-  is not consulted for any of it.
+- **ACME アカウントは移行しない．** Runner の `lego` は自身の状態ディレクトリの
+  下に自身のアカウントを登録する
+  （[`docs/runner.md`](runner.md#ディレクトリとコンテナでの利用)）．
+  両方のアカウントは CA 側で共存できる．Let's Encrypt のアカウントは固有の
+  クォータを持たない．
+- **証明書は移行しない．** Runner は切替後の初回の実行で，取り込んだ各 target に
+  新しい証明書を発行し，Conductor のオブジェクト名
+  （[`docs/runner.md`](runner.md#certificate-store-azure-key-vault)）の下に
+  格納する．これは `cert-infra` が使っていた名前（ドットを置き換えた
+  `leaf-cerdad-…`）ではない．Key Vault の証明書を名前で参照している利用側
+  （たとえば Application Gateway のリスナー）は，新しいオブジェクトができた
+  時点で操作者が向け直す．古いオブジェクトは手で削除されるまで残る．これが
+  移行の中で利用側から見える唯一の手順であり，このリポジトリの外にある．
+- **ポリシーは導出しない．** どのサフィックスを許可するか，どの ACME
+  バインディングを使うか，どれだけ早く更新するかは管理者の決定であり，取り込み
+  プロファイルが名指すポリシーの中で一度だけ決める．一覧はそのいずれにも
+  参照されない．
 
-## The target source flag
+## target source フラグ
 
-The Conductor configuration's `migration.targetSource` says who issues
-([`docs/conductor.md`](conductor.md#migration)):
+Conductor 設定の `migration.targetSource` が誰が発行するかを定める
+（[`docs/conductor.md`](conductor.md#migration)）:
 
-| `targetSource` | The Conductor issues | The Conductor compares | Meaning |
+| `targetSource` | Conductor が発行する | Conductor が比較する | 意味 |
 |---|---|---|---|
-| `iac` | no | no | The infrastructure list drives issuance elsewhere (the `cert-infra` job). The registry can be edited, nothing is scheduled, `POST /targets/{id}/runs` answers `409 issuance_disabled`. The state before the migration, and the one a rollback returns to. |
-| `shadow` | no | yes, every `compareIntervalSeconds` | As `iac`, plus the configured list is compared with the registry at an interval; every comparison is logged and every change of outcome is an audit event (`migration.compared`). `GET /migration` and the GUI's Migration page show the latest report. |
-| `registry` | yes | no | The registry is the source of truth; the scheduler plans and starts runs. The default, and the state after the migration. |
+| `iac` | しない | しない | インフラの一覧が別の場所（`cert-infra` のジョブ）での発行を駆動する．レジストリは編集できるが何もスケジュールされず，`POST /targets/{id}/runs` は `409 issuance_disabled` を返す．移行前の状態であり，ロールバックで戻る先でもある． |
+| `shadow` | しない | する（`compareIntervalSeconds` ごと） | `iac` と同じだが，加えて設定された一覧を一定間隔でレジストリと比較する．すべての比較はログに記録され，結果が変わるたびに監査イベント（`migration.compared`）になる．`GET /migration` と GUI の Migration ページに最新のレポートが表示される． |
+| `registry` | する | しない | レジストリが正であり，スケジューラが run を計画し開始する．既定であり，移行後の状態である． |
 
-The flag is read at start. Changing it is a configuration change and a
-restart (a new revision, on Container Apps), nothing else: no data moves
-and nothing is recomputed. The `iac` and `shadow` values stay supported
-for at least one minor release after the release in which the migration
-is declared complete, so a rollback needs nothing but the flag.
+このフラグは起動時に読まれる．変更は設定変更と再起動（Container Apps では新しい
+リビジョン）であり，それ以外は何もない．データは移動せず，何も再計算されない．
+`iac` と `shadow` の値は，移行完了を宣言したリリースの後，少なくとも 1 つの
+マイナーリリースの間はサポートされ続けるので，ロールバックにはフラグ以外に
+何も要らない．
 
-Under `iac` and `shadow`, a run that was queued before the flag was set
-stays queued and is started when the flag returns to `registry`; cancel
-it through the API if that is not wanted.
+`iac` と `shadow` の下では，フラグが設定される前にキューに入っていた run は
+キューに残り，フラグが `registry` に戻ったときに開始される．それを望まない
+場合は API でキャンセルすること．
 
-## The comparison
+## 比較
 
-A comparison reads the list, normalizes every name the way the API does
-(lower case, one trailing dot removed, syntax checked; one bad entry
-fails the whole list, since a list the Conductor cannot read completely
-is not acted on at all), and sorts each name into one category:
+比較は一覧を読み，API と同じ方法ですべての名前を正規化し（小文字化，末尾の
+ドット 1 つを除去，構文検査．Conductor が完全には読めない一覧には一切手を
+つけないため，1 つでも不正な項目があれば一覧全体が失敗する），各名前を 1 つの
+カテゴリに振り分ける:
 
-| Category | Meaning | What an import does with it |
+| カテゴリ | 意味 | 取り込みが行うこと |
 |---|---|---|
-| `added` | In the list, not in the registry. | Creates a target from the profile. |
-| `changed` | In both, but the registry target is disabled, or names another policy or binding than the profile. | Nothing. The operator decides; the report says which fields differ. |
-| `missing` | In the registry, not in the list. | Nothing. The migration deletes nothing ([ADR 0008](adr/0008-no-purge-in-mvp.md)); disable the target if it is not wanted. |
-| `unchanged` | In both and alike. | Nothing. |
-| `rejected` | In the list, but the profile's policy does not allow the name (suffix or wildcard rule). | Nothing, and nothing else either: a list with a rejected entry is not imported at all until the list or the policy is fixed. |
+| `added` | 一覧にあり，レジストリにない． | プロファイルから target を作成する． |
+| `changed` | 両方にあるが，レジストリの target が無効化されているか，プロファイルと異なるポリシーまたはバインディングを名指している． | 何もしない．操作者が判断する．レポートはどのフィールドが異なるかを示す． |
+| `missing` | レジストリにあり，一覧にない． | 何もしない．移行は何も削除しない（[ADR 0008](adr/0008-no-purge-in-mvp.md)）．不要なら target を無効化すること． |
+| `unchanged` | 両方にあり，同じ． | 何もしない． |
+| `rejected` | 一覧にあるが，プロファイルのポリシーがその名前を許可しない（サフィックスまたはワイルドカードの規則）． | 何もせず，他の何も行わない．拒否された項目を含む一覧は，一覧かポリシーが修正されるまで一切取り込まれない． |
 
-The owner is not compared: the list does not know one, and an operator
-may well refine the profile's owner on a target after the import.
+所有者は比較しない．一覧は所有者を知らず，取り込み後に操作者が target ごとに
+プロファイルの所有者を精緻化することは十分にありうる．
 
-The import is **idempotent**: running it again against the same list
-creates nothing, and a target that exists is never updated by it,
-whatever the profile says now. It is a **dry run by default**: the API
-takes `dryRun: false` and the CLI `--apply` to create anything. Every
-created target gets a `target.imported` audit event naming the caller
-and the list it came from.
+取り込みは **冪等** である．同じ一覧に対してもう一度実行しても何も作成されず，
+存在する target は，プロファイルが今何を言っていようと，取り込みによって決して
+更新されない．**既定では dry-run** である．何かを作成するには API では
+`dryRun: false` を，CLI では `--apply` を渡す．作成された各 target には，呼び出し元と
+元になった一覧を記した `target.imported` 監査イベントが付く．
 
-## Sources
+## ソース
 
-The list is read from one of:
+一覧は次のいずれかから読む:
 
-- **A Bicep parameter file** (`bicepParamFile`, with `parameter`,
-  default `targetDomains`): the `cert-infra` file as it is. The reader
-  understands the `param <name> = [ … ]` statement, `//` and `/* */`
-  comments and single-quoted string literals with Bicep's escapes, and
-  refuses anything it would have to evaluate (an interpolated string, a
-  variable, a function call): the Conductor cannot run Bicep, and a list
-  that needs evaluation is exported to a TargetList first.
-- **A TargetList document** (`jsonFile`): a strictly decoded JSON file,
+- **Bicep パラメータファイル**（`bicepParamFile`，`parameter` 付き，既定は
+  `targetDomains`）: `cert-infra` のファイルそのまま．リーダは
+  `param <name> = [ … ]` 文，`//` と `/* */` のコメント，Bicep のエスケープを
+  含む単一引用符の文字列リテラルを理解し，評価が必要になるもの（補間文字列，
+  変数，関数呼び出し）はすべて拒否する．Conductor は Bicep を実行できないので，
+  評価が必要な一覧はまず TargetList に書き出す．
+- **TargetList 文書**（`jsonFile`）: 厳密にデコードされる JSON ファイル．
   `{"apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1", "kind": "TargetList", "fqdns": [ … ]}`
-  ([`deploy/examples/targets.example.json`](../deploy/examples/targets.example.json)).
-  `acme-conductor migrate list --bicepparam FILE --output json` writes one.
-- **An inline list** (`fqdns`): the names in the configuration itself.
-  This is how the Container Apps deployment gets its list: the
-  `migration` Bicep parameter is the section verbatim, so the
-  `targetDomains` array can be pasted into `source.fqdns`.
+  （[`deploy/examples/targets.example.json`](../deploy/examples/targets.example.json)）．
+  `acme-conductor migrate list --bicepparam FILE --output json` がこれを書き出す．
+- **インライン一覧**（`fqdns`）: 設定そのものに書いた名前．Container Apps
+  デプロイはこの方法で一覧を得る．`migration` Bicep パラメータはこのセクション
+  そのままなので，`targetDomains` 配列を `source.fqdns` に貼り付けられる．
 
-A source is configured on the server (`migration.source`) and is then
-what the shadow comparison compares and what a diff or import without a
-list of its own uses; the CLI can also read a file locally and send the
-names it found, so the operator's checkout of `cert-infra` is enough.
+ソースはサーバ側で設定され（`migration.source`），shadow 比較が比較する対象と，
+独自の一覧を持たない差分や取り込みが使う対象になる．CLI はファイルをローカルで
+読んで見つけた名前を送ることもできるので，操作者の手元の `cert-infra` の
+チェックアウトがあれば足りる．
 
-Every name the list contributes is an FQDN and nothing else. The policy,
-the execution, DNS and store bindings and the owner of an imported target
-come from `migration.profile`, in the administrator's configuration
-([principle 6](architecture.md#security-principles)): a host list, wherever it
-comes from, can never choose a binding.
+一覧が寄与する名前はすべて FQDN であり，それ以外の何物でもない．取り込まれた
+target のポリシー，実行・DNS・store のバインディング，所有者は，管理者の設定内の
+`migration.profile` から来る
+（[原則 6](architecture.md#セキュリティ原則)）．ホスト一覧は，どこから来た
+ものであれ，決してバインディングを選べない．
 
-## Procedure
+## 手順
 
-Assumes a Conductor deployed as in
-[`deploy/azure/README.md`](../deploy/azure/README.md) (or on one host
-for a rehearsal), with the Runner able to complete challenges in the
-same zone `cert-infra` delegates to and to write to a Key Vault.
+[`deploy/azure/README.md`](../deploy/azure/README.md) のとおりにデプロイされた
+Conductor（またはリハーサル用の 1 台のホスト）があり，Runner が `cert-infra` の
+委任先と同じゾーンでチャレンジを完了でき，Key Vault に書き込めることを前提と
+する．
 
-1. **Start dark.** Deploy the Conductor with `targetSource: shadow` (or
-   `iac`), the `cert-infra` list as `migration.source`, and a
-   `migration.profile` naming a policy created for the migrated hosts
-   (its `allowedDnsSuffixes` cover them; its `acmeBinding` points at
-   the staging CA until the rehearsal is done). The `cert-infra` job
-   keeps renewing. Nothing the Conductor does from here on issues a
-   certificate, changes a DNS record or touches an Azure resource.
-2. **Look at the diff.**
+1. **暗転状態で始める．** `targetSource: shadow`（または `iac`），
+   `migration.source` としての `cert-infra` の一覧，そして移行対象ホストの
+   ために作ったポリシー（その `allowedDnsSuffixes` がホストを覆い，その
+   `acmeBinding` はリハーサルが終わるまでステージング CA を指す）を名指す
+   `migration.profile` で Conductor をデプロイする．`cert-infra` のジョブは
+   更新を続ける．ここから先，Conductor が行うことは何一つ，証明書を発行せず，
+   DNS レコードを変更せず，Azure リソースに触れない．
+2. **差分を見る．**
 
    ```sh
    acme-conductor migrate diff --bicepparam ~/src/cert-infra/infra/main.bicepparam \
      --server https://acme-conductor.example.ac.jp --token-file token
    ```
 
-   Expect every name under `added` and nothing under `rejected`. A
-   `rejected` name means the policy does not cover it: fix the policy
-   (or the list) before importing, since a list with a rejected entry is
-   not imported at all.
-3. **Import, then apply.** The same command with `import` is a dry run
-   that says what `--apply` would create; `--apply` creates it. The
-   audit log records each target as `target.imported`. Run it again:
-   nothing is created (idempotent), and every name is `unchanged`.
-4. **Shadow.** Leave `targetSource: shadow` for as long as the
-   `cert-infra` list may still change. The Migration page of the GUI
-   (and `GET /migration`) shows the latest comparison; a
-   `migration.compared` audit event marks each change of outcome, so a
-   host added to `cert-infra` shows up as `added` (import again), a
-   target disabled in the registry as `changed`, a target created only
-   in the registry as `missing`. The registry is fully editable
-   meanwhile: policies, owners and bindings can be prepared without
-   issuing anything.
-5. **Switch.** Set `targetSource: registry` and restart. The scheduler
-   plans a run for every imported target (never reconciled), the Runner
-   issues and stores, and the certificate summary appears on each
-   target. Then re-point the consumers to the new Key Vault objects, and
-   stop the `cert-infra` job (suspend its schedule, or remove the
-   deployment) at a time of the operator's choosing: the two can overlap,
-   since they use separate ACME accounts and separate object names, at
-   the cost of one extra issuance per host against the CA's rate limits.
-6. **Roll back** by setting `targetSource: iac` (or `shadow`) and
-   restarting: the Conductor stops planning at once, in-flight runs
-   finish or are cancelled at shutdown as usual, and the registry keeps
-   everything the shadow phase and the switch recorded. Resume the
-   `cert-infra` job if it was stopped. No data has to be restored;
-   nothing was deleted.
+   すべての名前が `added` に入り，`rejected` には何もないことを期待する．
+   `rejected` の名前はポリシーがそれを覆っていないことを意味する．拒否された
+   項目を含む一覧は一切取り込まれないので，取り込む前にポリシー（または一覧）を
+   修正する．
+3. **取り込み，そして適用する．** 同じコマンドを `import` で実行すると，
+   `--apply` が何を作成するかを示す dry-run になる．`--apply` はそれを作成する．
+   監査ログは各 target を `target.imported` として記録する．もう一度実行すると
+   何も作成されず（冪等），すべての名前が `unchanged` になる．
+4. **shadow．** `cert-infra` の一覧がまだ変わりうる間は `targetSource: shadow`
+   のままにしておく．GUI の Migration ページ（と `GET /migration`）は最新の
+   比較を示し，`migration.compared` 監査イベントが結果の変化のたびに記録される．
+   したがって `cert-infra` に追加されたホストは `added` として現れ（再度
+   取り込む），レジストリで無効化された target は `changed` として，レジストリ
+   にだけ作られた target は `missing` として現れる．この間もレジストリは完全に
+   編集可能である．何も発行せずにポリシー・所有者・バインディングを準備できる．
+5. **切り替える．** `targetSource: registry` を設定して再起動する．スケジューラは
+   取り込んだすべての target（一度も reconcile されていない）に run を計画し，
+   Runner が発行して格納し，各 target に証明書の概要が現れる．次に利用側を
+   新しい Key Vault オブジェクトへ向け直し，操作者が選んだタイミングで
+   `cert-infra` のジョブを止める（スケジュールを一時停止するか，デプロイを
+   削除する）．両者は別々の ACME アカウントと別々のオブジェクト名を使うので
+   重なっていてもよいが，その代償として CA のレート制限に対してホストごとに
+   1 回余分な発行が生じる．
+6. **ロールバック** は `targetSource: iac`（または `shadow`）を設定して再起動する
+   ことで行う．Conductor は直ちに計画を止め，進行中の run は通常どおり完了するか
+   シャットダウン時にキャンセルされ，レジストリは shadow フェーズと切替が
+   記録したすべてを保持する．`cert-infra` のジョブを止めていたなら再開する．
+   復元すべきデータはない．何も削除されていない．
 
-## Command line
+## コマンドライン
 
 ```
 acme-conductor migrate list   (--bicepparam FILE [--parameter NAME] | --json FILE) [--output text|json]
@@ -179,48 +171,46 @@ acme-conductor migrate diff   [SOURCE] [--server URL] [--token-file FILE] [--out
 acme-conductor migrate import [SOURCE] [--server URL] [--token-file FILE] [--apply] [--output text|json]
 ```
 
-`SOURCE` is `--bicepparam FILE [--parameter NAME]` or `--json FILE`,
-read locally and sent as the list; without it `diff` and `import` use
-the list the server is configured with. `--server` defaults to
-`$ACME_CONDUCTOR_SERVER`, then `http://127.0.0.1:8080` (the
-`localhost-dev` listener, which needs no token). Against an `oidc`
-server, `--token-file` names a file holding a bearer access token for
-the API's audience, or `$ACME_CONDUCTOR_TOKEN` holds the token itself;
-a token is sent over `https` only. `list` needs no server: it prints the
-normalized names a source reads to, and with `--output json` a
-TargetList document.
+`SOURCE` は `--bicepparam FILE [--parameter NAME]` または `--json FILE` であり，
+ローカルで読んで一覧として送られる．これがない場合，`diff` と `import` は
+サーバに設定された一覧を使う．`--server` の既定は `$ACME_CONDUCTOR_SERVER`，
+次いで `http://127.0.0.1:8080`（`localhost-dev` リスナー．トークン不要）である．
+`oidc` サーバに対しては，`--token-file` に API のオーディエンス向けのベアラー
+アクセストークンを収めたファイルを指定するか，`$ACME_CONDUCTOR_TOKEN` に
+トークンそのものを入れる．トークンは `https` 上でのみ送られる．`list` は
+サーバを必要としない．ソースが読み取った正規化済みの名前を印字し，
+`--output json` なら TargetList 文書を印字する．
 
-`--output text` prints the summary line and then one line per name,
-category first; `--output json` prints the API's report (or import
-result). Exit codes: `0`; `1` when the report has rejected entries or an
-`--apply` was refused because of them; `2` for a usage error (including
-an unreadable source); `3` when the request failed.
+`--output text` は概要行に続いて名前ごとに 1 行を，カテゴリを先頭にして印字する．
+`--output json` は API のレポート（または取り込み結果）を印字する．終了コード:
+`0`．レポートに拒否された項目がある，またはそれが理由で `--apply` が拒否された
+場合は `1`．使い方の誤り（読めないソースを含む）は `2`．リクエストが失敗した
+場合は `3`．
 
 ## API
 
-| Method and path | Purpose |
+| メソッドとパス | 目的 |
 |---|---|
-| `GET /api/v1alpha1/migration` | The flag, whether issuance is enabled, the configured source and profile, and under `shadow` the latest comparison (`lastComparison.report`, or `lastComparison.error` when the last attempt failed and the last good report). |
-| `GET /api/v1alpha1/migration/diff` | Compare the configured list → report. Readable by a viewer. |
-| `POST /api/v1alpha1/migration/diff` | Compare `{"fqdns": […]}` → report. |
-| `POST /api/v1alpha1/migration/import` | Import `{"fqdns": […], "dryRun": true}`; both optional, `dryRun` defaults to `true`, without `fqdns` the configured list. → `{"dryRun", "applied", "report", "created"}`; `applied` is `false` in a dry run and when the list has rejected entries (nothing created). Wakes the scheduler when it created something. |
+| `GET /api/v1alpha1/migration` | フラグ，発行が有効かどうか，設定されたソースとプロファイル，および `shadow` の下では最新の比較（`lastComparison.report`，または直前の試行が失敗した場合は `lastComparison.error` と最後に成功したレポート）． |
+| `GET /api/v1alpha1/migration/diff` | 設定された一覧を比較する → レポート．viewer が読める． |
+| `POST /api/v1alpha1/migration/diff` | `{"fqdns": […]}` を比較する → レポート． |
+| `POST /api/v1alpha1/migration/import` | `{"fqdns": […], "dryRun": true}` を取り込む．どちらも任意で，`dryRun` の既定は `true`，`fqdns` がなければ設定された一覧．→ `{"dryRun", "applied", "report", "created"}`．`applied` は dry-run のときと一覧に拒否された項目があるとき（何も作成されない）に `false` になる．何かを作成したときはスケジューラを起こす． |
 
-`409 migration_unconfigured` when no `migration.profile` is configured or
-its policy does not exist; `409 source_unreadable` when the configured
-list cannot be read; `400 invalid_request` when a request names no list
-and none is configured, or the list it names is malformed.
+`migration.profile` が設定されていないかそのポリシーが存在しない場合は
+`409 migration_unconfigured`．設定された一覧が読めない場合は
+`409 source_unreadable`．リクエストが一覧を名指さず設定にもない場合，または
+名指した一覧が不正な形式の場合は `400 invalid_request`．
 
-## Testing the migration
+## 移行のテスト
 
-The tests never call a CA or a cloud API. The migration package's tests
-run the reader against
-[`internal/conductor/migration/testdata/cert-infra-main.bicepparam`](../internal/conductor/migration/testdata/cert-infra-main.bicepparam),
-a fixture with the same statements, comment styles and commented-out
-entries as `cert-infra`'s `infra/main.bicepparam` (with example names),
-and the comparison and import against a real SQLite registry; the
-Conductor's tests start the whole process in `shadow` mode against the
-fake Runner and check that a comparison is recorded, that a due target
-is never planned and that a run request is refused, and drive
-`acme-conductor migrate` end to end against a running Conductor. To
-rehearse with the real list, `acme-conductor migrate list --bicepparam
-…/main.bicepparam` shows what the reader makes of it without a server.
+テストは CA やクラウド API を決して呼ばない．移行パッケージのテストはリーダを
+[`internal/conductor/migration/testdata/cert-infra-main.bicepparam`](../internal/conductor/migration/testdata/cert-infra-main.bicepparam)
+に対して実行する．これは `cert-infra` の `infra/main.bicepparam` と同じ文，
+コメントスタイル，コメントアウトされた項目を持つフィクスチャ（名前は例）で
+ある．比較と取り込みは本物の SQLite レジストリに対して実行する．Conductor の
+テストはプロセス全体を `shadow` モードで偽の Runner に対して起動し，比較が
+記録されること，期限到来の target が決して計画されないこと，run の要求が
+拒否されることを確認し，さらに `acme-conductor migrate` を動作中の Conductor に
+対してエンドツーエンドで動かす．本物の一覧でリハーサルするには，
+`acme-conductor migrate list --bicepparam …/main.bicepparam` がサーバなしで
+リーダの解釈結果を示す．

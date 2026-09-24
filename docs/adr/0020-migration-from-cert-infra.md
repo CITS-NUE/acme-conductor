@@ -1,87 +1,80 @@
-# 0020: Migration from cert-infra — list import, shadow comparison, target-source flag
+# 0020: cert-infra からの移行 — 一覧の取り込み，shadow 比較，target-source フラグ
 
-- Status: Accepted
-- Date: 2026-09-24
+- ステータス: 採択
+- 日付: 2026-09-24
 
-## Context
+## 背景
 
-The hosts ACME Conductor is meant to take over are renewed today by the
-`cert-infra` deployment: a Bicep-defined Container Apps Job that runs
-`lego` for a fixed list of names, the `targetDomains` parameter of
-`infra/main.bicepparam`, and imports the results into Key Vault. That
-list is the only thing the two systems share; the ACME account, the
-certificates and their Key Vault names are each system's own. The
-migration has to move the list into the Conductor's registry without a
-flag day, let both systems be looked at side by side before the
-Conductor issues anything, and be reversible by an operator who has
-found a reason to go back. The `cert-infra` repository is a reference
-and a source, not something this project changes.
+ACME Conductor が引き継ぐことになっているホストは，今日 `cert-infra` の
+デプロイによって更新されている．これは Bicep で定義された Container Apps Job
+で，固定された名前の一覧，すなわち `infra/main.bicepparam` の `targetDomains`
+パラメータに対して `lego` を実行し，結果を Key Vault に取り込む．この一覧が
+2 つのシステムが共有する唯一のものである．ACME アカウント，証明書，その
+Key Vault 上の名前はそれぞれのシステム固有のものである．移行は，一斉切り替えの
+日を設けずに一覧を Conductor のレジストリへ移し，Conductor が何かを発行する前に
+両方のシステムを並べて見られるようにし，戻る理由を見つけた操作者が元に戻せる
+ものでなければならない．`cert-infra` リポジトリは参照とソースであって，この
+プロジェクトが変更するものではない．
 
-## Decision
+## 決定
 
-- **The list is the only input, and it carries names only.** A source
-  is a `.bicepparam` file (read by a purpose-built reader that accepts
-  the `param <name> = [ … ]` statement, comments and string literals,
-  and refuses anything it would have to evaluate), a strictly decoded
-  `TargetList` JSON document, or an inline list in the configuration.
-  Every other property of an imported target — policy, execution, DNS
-  and store bindings, owner — comes from `migration.profile` in the
-  administrator's configuration. A host list can never choose a binding
-  (principle 6), and the names it contributes are normalized and checked
-  by the same code as the API and against the profile's policy.
-- **Comparison before import, and import creates only.** A report sorts
-  every name into `added`, `changed`, `missing`, `unchanged` or
-  `rejected`. Import creates the `added` targets and nothing else: no
-  update of a `changed` one, no deletion of a `missing` one
-  ([ADR 0008](0008-no-purge-in-mvp.md)), nothing at all when any name is
-  `rejected`. It is a dry run unless asked otherwise, idempotent, and
-  each created target is a `target.imported` audit event naming the
-  caller and the list.
-- **A feature flag says who issues.** `migration.targetSource` is
-  `registry` (the default and the end state: the scheduler plans and
-  starts runs), `shadow` (it does not, and the configured list is
-  compared with the registry at an interval, every change of outcome an
-  audit event) or `iac` (it does not, full stop). Under `shadow` and
-  `iac` the scheduler's plan and dispatch are inert and a run request is
-  refused, so nothing the migration does issues a certificate or
-  touches a DNS record or a cloud resource until the operator sets
-  `registry`. The flag is configuration, read at start, never settable
-  through the API; a rollback is the flag set back. `iac` and `shadow`
-  stay supported for at least one minor release after the migration is
-  declared complete.
-- **The tooling lives in the Conductor.** The API gains
-  `GET /migration`, `GET|POST /migration/diff` and
-  `POST /migration/import`; a `migrate` command reads a source locally
-  and drives them, so the operator's checkout of `cert-infra` is enough.
-  The shadow comparison runs inside `serve` against the configured
-  source. No second binary, no direct access to the database from the
-  command line: the API's authentication, roles and audit apply to the
-  migration as to everything else.
+- **一覧が唯一の入力であり，それは名前だけを運ぶ．** ソースは
+  `.bicepparam` ファイル（`param <name> = [ … ]` 文とコメントと文字列
+  リテラルを受け付け，評価が必要になるものはすべて拒否する専用のリーダーで
+  読む），厳格にデコードされる `TargetList` JSON 文書，または設定内のインライン
+  一覧である．取り込まれた target の他のすべての属性（ポリシー，実行・DNS・store
+  のバインディング，所有者）は管理者の設定にある `migration.profile` から来る．
+  ホスト一覧がバインディングを選ぶことは決してできず（原則 6），一覧が提供する
+  名前は API と同じコードで正規化・検査され，プロファイルのポリシーに照らして
+  検査される．
+- **取り込みの前に比較し，取り込みは作成のみ行う．** レポートはすべての名前を
+  `added`，`changed`，`missing`，`unchanged`，`rejected` のいずれかに分類する．
+  取り込みは `added` の target を作成し，それ以外は何もしない．`changed` の
+  ものを更新せず，`missing` のものを削除せず
+  （[ADR 0008](0008-no-purge-in-mvp.md)），いずれかの名前が `rejected` なら
+  何もしない．特に指示がなければ dry-run であり，冪等であり，作成された
+  target ごとに，呼び出し元と一覧を名指しする `target.imported` 監査イベントが
+  記録される．
+- **誰が発行するかはフィーチャーフラグが決める．** `migration.targetSource` は
+  `registry`（既定であり最終状態．スケジューラが run を計画し開始する），
+  `shadow`（開始せず，設定された一覧を一定間隔でレジストリと比較し，結果が
+  変わるたびに監査イベントを記録する），または `iac`（開始しない，それだけ）
+  である．`shadow` と `iac` の下ではスケジューラの計画とディスパッチは停止して
+  おり，run の要求は拒否されるので，操作者が `registry` を設定するまで，移行が
+  行うことは何も証明書を発行せず，DNS レコードにもクラウドリソースにも触れ
+  ない．このフラグは設定であり，起動時に読まれ，API からは決して設定できない．
+  ロールバックはフラグを戻すことである．`iac` と `shadow` は移行完了の宣言後も
+  少なくとも 1 マイナーリリースの間サポートされる．
+- **ツールは Conductor の中にある．** API に `GET /migration`，
+  `GET|POST /migration/diff`，`POST /migration/import` が加わる．`migrate`
+  コマンドはソースをローカルで読んでそれらを駆動するので，操作者の手元の
+  `cert-infra` のチェックアウトがあれば十分である．shadow 比較は `serve` の
+  中で設定されたソースに対して動く．第 2 のバイナリはなく，コマンドラインから
+  データベースへ直接アクセスすることもない．API の認証，ロール，監査は他の
+  すべてと同様に移行にも適用される．
 
-## Consequences
+## 結果
 
-- The registry can be filled and reviewed while `cert-infra` keeps
-  renewing, and the Conductor's first issuance is an explicit operator
-  step. The two may overlap after the switch: separate ACME accounts and
-  separate Key Vault object names make that safe, at the cost of one
-  extra issuance per host against the CA's rate limits, and re-pointing
-  consumers to the new objects is an operator step outside this
-  repository.
-- Shadow mode compares lists, not certificates: a host the old job
-  stopped renewing is not noticed by it. That is a known limit, recorded
-  in the threat model (T16).
-- The Bicep reader is deliberately small; a `targetDomains` that ever
-  needs evaluation is exported to a `TargetList` first, by hand or with
-  `acme-conductor migrate list --output json`.
-- A queued run that predates the flag stays queued under `iac`/`shadow`
-  and starts when the flag returns to `registry`, unless cancelled. The
-  flag pauses planning and dispatch; it does not rewrite history.
-- The fixture the tests read mirrors the shape of `cert-infra`'s
-  parameter file with example names; the reader is also run against the
-  real file by hand before a release that touches it.
+- `cert-infra` が更新を続けている間にレジストリを埋めてレビューでき，Conductor の
+  最初の発行は明示的な操作者の手順になる．切り替え後は 2 つが重なって動いても
+  よい．別々の ACME アカウントと別々の Key Vault オブジェクト名がそれを安全に
+  する．その代償は CA のレート制限に対するホストごと 1 回の余分な発行であり，
+  利用側を新しいオブジェクトへ向け直すのはこのリポジトリの外の操作者の手順で
+  ある．
+- shadow モードは一覧を比較するのであって証明書を比較するのではない．古いジョブが
+  更新をやめたホストには気づかない．これは既知の制限であり，脅威モデルに
+  記録されている（T16）．
+- Bicep リーダーは意図的に小さい．評価が必要になる `targetDomains` は，手作業か
+  `acme-conductor migrate list --output json` で先に `TargetList` へ書き出す．
+- フラグより前にキューに入った run は `iac`/`shadow` の下でもキューに残り，
+  取り消されない限りフラグが `registry` に戻ったときに開始する．フラグは計画と
+  ディスパッチを一時停止するのであって，履歴を書き換えはしない．
+- テストが読むフィクスチャは `cert-infra` のパラメータファイルの形を例の名前で
+  写したものである．リーダーは，それに触れるリリースの前に本物のファイルに
+  対しても手作業で実行する．
 
-## See also
+## 関連文書
 
 - [`docs/migration.md`](../migration.md)
 - [`docs/conductor.md`](../conductor.md#migration)
-- [`docs/threat-model.md`](../threat-model.md), T16
+- [`docs/threat-model.md`](../threat-model.md)，T16

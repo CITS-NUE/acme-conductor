@@ -1,70 +1,66 @@
-# 0003: Use the lego CLI as a subprocess in the Runner
+# 0003: Runner で lego CLI をサブプロセスとして使う
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-The Runner needs to perform the ACME protocol (account registration,
-DNS-01 challenge, certificate issuance/renewal) against a wide range of DNS
-providers. [go-acme/lego](https://github.com/go-acme/lego) already
-implements this, is widely used, is actively maintained, and ships both a
-Go library and an official CLI binary. ACME Conductor's stated purpose is
-to be a certificate-management *control plane*, not a new ACME client or a
-new set of DNS provider integrations (see
-[non-goals](../architecture.md#non-goals)).
+Runner は，幅広い DNS プロバイダに対して ACME プロトコル（アカウント登録，
+DNS-01 チャレンジ，証明書の発行／更新）を実行する必要がある．
+[go-acme/lego](https://github.com/go-acme/lego) はすでにこれを実装しており，
+広く使われ，活発に保守され，Go ライブラリと公式の CLI バイナリの両方を提供
+している．ACME Conductor の掲げる目的は証明書管理の *コントロールプレーン* で
+あることであり，新しい ACME クライアントや新しい DNS プロバイダ連携の集合では
+ない（[非目標](../architecture.md#非目標)を参照）．
 
-Two integration shapes were available: import `lego` as a Go library
-inside `acme-runner`, or invoke the official `lego` CLI binary as a
-subprocess. There is also the question of *how* to invoke it: build a
-command string and hand it to a shell, or build an explicit argument
-vector (`argv`) and exec it directly.
+連携の形は 2 つ考えられた．`acme-runner` の中に `lego` を Go ライブラリとして
+import するか，公式の `lego` CLI バイナリをサブプロセスとして起動するかである．
+また *どのように* 起動するかという問題もある．コマンド文字列を組み立てて
+シェルに渡すか，明示的な引数ベクタ（`argv`）を組み立てて直接 exec するかである．
 
-## Decision
+## 決定
 
-The Runner invokes the official, version-pinned `lego` CLI binary as a
-subprocess, once per run, with an explicit argument vector built
-programmatically from the validated `JobSpec`. It is never invoked through
-a shell string (`sh -c "..."` or equivalent), and the Runner never
-constructs command text from untrusted input.
+Runner は，公式でバージョン固定された `lego` CLI バイナリを，run ごとに 1 回，
+検証済みの `JobSpec` からプログラム的に組み立てた明示的な引数ベクタを用いて
+サブプロセスとして起動する．シェル文字列（`sh -c "..."` やその同等物）を
+通して起動することは決してなく，Runner が信頼されない入力からコマンド文字列を
+組み立てることも決してない．
 
-We use the **CLI**, not the **library**, for now:
+当面は **ライブラリ** ではなく **CLI** を使う．
 
-- The CLI is the artifact upstream actually releases, version-tags, and
-  documents as their supported entry point; pinning a specific CLI release
-  gives a clear, auditable version boundary (see
-  [ADR 0007](0007-container-baseline.md) on how that pin is fetched and
-  verified) that a library dependency pinned in `go.mod` would blur (a
-  `go.mod` pin tracks a commit of a library, not a release the `lego`
-  project itself declares stable for third-party use in this way).
-  A future ADR can revisit the library integration if the subprocess
-  boundary turns out to cost more (in startup latency or output-parsing
-  fragility) than it is worth.
-- A subprocess boundary is also a natural place to enforce "the Runner
-  never runs a shell, never accepts a caller-supplied command, image, or
-  executable path" (see [`docs/threat-model.md`](../threat-model.md), T2):
-  the argument vector is built entirely from validated, typed `JobSpec`
-  fields (a normalized FQDN, a bounded key type enum, resolved binding
-  configuration), never from a raw string the caller supplied.
+- CLI は，上流が実際にリリースし，バージョンタグを打ち，サポートされる
+  エントリポイントとして文書化している成果物である．特定の CLI リリースを
+  固定することで，明確で監査可能なバージョン境界が得られる（その固定版を
+  どう取得し検証するかは [ADR 0007](0007-container-baseline.md) を参照）．
+  `go.mod` で固定したライブラリ依存ではこの境界が曖昧になる（`go.mod` の固定は
+  ライブラリのあるコミットを追跡するものであって，`lego` プロジェクト自身が
+  この形での第三者利用に対して安定だと宣言したリリースを追跡するものでは
+  ない）．サブプロセス境界のコスト（起動レイテンシや出力パースの脆さ）が
+  見合わないと判明した場合は，将来の ADR でライブラリ連携を再検討できる．
+- サブプロセス境界は「Runner は決してシェルを実行せず，呼び出し元が指定した
+  コマンド・イメージ・実行可能ファイルのパスを決して受け付けない」を強制する
+  自然な場所でもある（[`docs/threat-model.md`](../threat-model.md) の T2 を
+  参照）．引数ベクタは，検証済みで型付けされた `JobSpec` のフィールド
+  （正規化された FQDN，値域の限られた鍵種別の列挙，解決済みのバインディング
+  設定）のみから組み立てられ，呼び出し元が与えた生の文字列からは決して
+  組み立てられない．
 
-We do **not** reimplement ACME or any DNS provider ourselves: that
-functionality, and its correctness and security properties, stays owned by
-upstream `lego`.
+ACME や DNS プロバイダを自前で再実装することは **しない**．その機能と，
+その正確性・セキュリティ特性は，上流の `lego` が引き続き所有する．
 
-## Consequences
+## 結果
 
-- Certificate issuance correctness and DNS provider coverage track
-  upstream `lego` directly; ACME Conductor does not need to keep its own
-  ACME state machine or DNS provider list up to date.
-- The Runner image bundles a specific `lego` release (Phase 1), fetched and
-  checksum-verified at image build time, not resolved at runtime — so the
-  exact `lego` version in a given Runner image is pinned and reproducible.
-- Parsing `lego`'s CLI output/exit codes into the `Result` contract's fixed
-  error taxonomy (`ErrorCode`) is Runner-side integration work and a
-  potential source of drift if `lego`'s CLI output format changes across
-  releases; this is a cost accepted in exchange for the version-boundary
-  clarity above.
-- Because invocation is always `argv`, never a shell string, there is no
-  shell-metacharacter injection surface between the `JobSpec` and the
-  subprocess, by construction — this is enforced by code shape, not by
-  escaping.
+- 証明書発行の正確性と DNS プロバイダの対応範囲は上流の `lego` にそのまま
+  追随する．ACME Conductor は独自の ACME 状態機械や DNS プロバイダ一覧を最新に
+  保つ必要がない．
+- Runner イメージは特定の `lego` リリースを同梱する（Phase 1）．これはイメージの
+  ビルド時に取得しチェックサムで検証したものであり，実行時に解決するものでは
+  ない．したがって，ある Runner イメージに含まれる `lego` の正確なバージョンは
+  固定され，再現可能である．
+- `lego` の CLI 出力／終了コードを `Result` コントラクトの固定されたエラー分類
+  （`ErrorCode`）へパースするのは Runner 側の連携作業であり，`lego` の CLI
+  出力形式がリリース間で変わった場合に乖離が生じうる箇所である．これは上記の
+  バージョン境界の明確さと引き換えに受け入れるコストである．
+- 起動は常に `argv` であり，シェル文字列では決してないので，`JobSpec` と
+  サブプロセスの間にはシェルのメタ文字によるインジェクションの余地が構造上
+  存在しない．これはエスケープではなくコードの形によって強制される．

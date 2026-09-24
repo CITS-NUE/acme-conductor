@@ -1,145 +1,135 @@
-# 0016: OIDC bearer-token authentication, two roles, and a static GUI
+# 0016: OIDC ベアラートークン認証と 2 つのロールと静的 GUI
 
-- Status: Accepted
-- Date: 2026-09-23
+- ステータス: 採択
+- 日付: 2026-09-23
 
-## Context
+## 背景
 
-Phase 2 gave the API one authentication mode, `localhost-dev`
-([ADR 0012](0012-localhost-only-dev-auth.md)): a loopback peer is an
-administrator, the audit log names every caller `localhost-dev`, and a
-deployment cannot be reached over a network at all. Phase 4 worked around
-that in Container Apps with an admin sidecar and `az containerapp exec`.
-Phase 5 has to give the API named principals, a way to say who may read
-and who may change things, a reachable listener that does not put a
-credential on the wire in the clear, and a minimal GUI — without the
-Conductor holding a new secret ([ADR 0005](0005-conductor-never-touches-secrets.md))
-and without a framework or a build step the project would then have to
-keep secure ([architecture, technology choices](../architecture.md#technology-choices)).
+Phase 2 は API に 1 つの認証モード `localhost-dev`
+（[ADR 0012](0012-localhost-only-dev-auth.md)）を与えた．ループバックの相手は
+管理者であり，監査ログはすべての呼び出し元を `localhost-dev` と記録し，
+デプロイにはネットワーク越しにまったく到達できない．Phase 4 は Container Apps
+において管理用サイドカーと `az containerapp exec` でこれを回避した．
+Phase 5 は API に，名前付きプリンシパルと，誰が読めて誰が変更できるかを言い表す
+手段と，資格情報を平文でネットワークに流さない到達可能なリスナーと，最小限の
+GUI を与えなければならない．しかも Conductor に新たなシークレットを持たせず
+（[ADR 0005](0005-conductor-never-touches-secrets.md)），プロジェクトがその後
+安全に保ち続けなければならなくなるフレームワークやビルド手順も持ち込まずに，
+である（[アーキテクチャ，技術選定](../architecture.md#技術選定)）．
 
-## Decision
+## 決定
 
-- **The Conductor is an OIDC resource server; it never signs anyone in.**
-  Mode `oidc` (`internal/conductor/oidc`) accepts an
-  `Authorization: Bearer` access token and nothing else — not a cookie,
-  not a query parameter. A token is accepted when its signature verifies
-  against a key the provider publishes (discovery document → `jwks_uri`),
-  its `iss` equals the configured issuer exactly, its `aud` contains the
-  configured audience, its `exp`/`nbf`/`iat` admit now within a small
-  configured skew, and its roles claim carries a configured value. The
-  Conductor holds no client secret: what it needs from the provider is
-  public, and a compromise of the Conductor yields no credential usable
-  anywhere else.
-- **Narrow verification, written in the repository.** RS256, PS256 and
-  ES256 only (`none` and the HMAC family are refused by omission, since a
-  symmetric algorithm would turn the provider's public key set into a
-  verification secret), a key id is required, `crit` is refused, the
-  header and claims are decoded with the project's strict decoder
-  (duplicate members refused), and the compact JWS is verified with the
-  standard library's `crypto/rsa` and `crypto/ecdsa`. This is a few
-  hundred lines that the threat model can read end to end, in the same
-  style as the signed job envelope ([ADR 0015](0015-signed-job-envelope.md));
-  a general JWT library would accept more shapes than this API wants and
-  would be one more dependency in the supply chain (T8). It is not custom
-  cryptography: the primitives are the standard library's.
-- **Keys are cached, refreshed on age or on an unknown key id, and
-  rate-limited.** The provider's discovery document and key set are read
-  with bounded readers and kept for `keyCacheSeconds`; a token naming an
-  unknown key id triggers a refresh at most once per minute, so a key
-  rotation does not lock operators out for the cache time and a flood
-  of made-up key ids does not become a flood of requests to the
-  provider. A refresh that fails keeps the previous keys (a provider
-  outage does not lock everyone out while the keys are unchanged); a
-  provider unreachable at start is a warning, not a startup failure —
-  scheduled renewals do not depend on it.
-- **Two roles, decided by method, enforced in one place.** A token maps to
-  `admin` or `viewer` from the values of one configured claim (`roles` by
-  default, an Entra ID app-role claim); a token with neither is refused
-  with `403` even though it verified. A viewer may `GET`; every other
-  method needs admin. The check sits in the authentication middleware
-  that wraps every endpoint under the API prefix, so no handler can
-  forget it and no new endpoint can bypass it. Finer permissions (per
-  policy, per target) are not modelled: the registry is one operator
-  team's, and a viewer role is what an auditor or a dashboard needs.
-- **Audience and scopes are two settings; nothing is derived.**
-  `audience` is what the provider writes into `aud` and is used for
-  verification only; `scopes` is what the GUI asks the provider for and
-  is required whenever a GUI client is configured. They are different
-  identifiers at Entra ID: a v2 access token's `aud` is the API
-  registration's client ID (a GUID), while the scope is
-  `<application ID URI>/.default` (`api://<client-id>/.default` by
-  default). An earlier draft derived `<audience>/.default`, which is
-  right for no provider in general and wrong for Entra ID v2 in
-  particular; the configuration now refuses a client id without scopes
-  rather than guessing.
-- **The principal is one claim, recorded as is, and it identifies.** The
-  actor written to the audit log and to `requestedBy` is the value of
-  `principalClaim`, bounded and printable like every other actor
-  string. The default is `sub`, the stable subject identifier every
-  provider issues; Entra ID deployments set `oid`, since `sub` is
-  pairwise per client there. A display name (`preferred_username`,
-  `email`, `name`) is not the actor: it changes when a user is renamed
-  and can be reassigned, and an audit record that names a person by
-  something mutable stops identifying them. The GUI shows the signed-in
-  user's display name for its own header only; the Conductor does not
-  look users up anywhere, and what the provider asserts is what the log
-  says.
-- **A published key verifies its published algorithm only.** A JWK that
-  carries `alg` is used for that algorithm and no other, so an RSA key
-  published for RS256 does not verify a PS256 token; a key published
-  for an algorithm outside the three is not used at all, and a key
-  whose `alg` does not fit its type makes the whole set untrusted.
-- **The listener may leave loopback only with TLS or an explicit
-  statement.** In `oidc` mode a non-loopback `server.listen` needs
-  `server.tls` (the Conductor's own certificate, TLS 1.2+) or
-  `server.behindTlsProxy: true`, an operator's statement that a platform
-  ingress or reverse proxy terminates TLS and is the only route to the
-  port (Container Apps ingress with encrypted peer traffic in the Bicep).
-  A bearer token in the clear on a network is a stolen session; the
-  configuration refuses that shape by default rather than warning about
-  it.
-- **The GUI is three static files served by the Conductor.** One HTML
-  page, one script, one stylesheet, embedded in the binary
-  (`internal/conductor/ui`), no framework, no build step, no inline
-  script. It renders through DOM methods only, calls the API on its own
-  origin, and in `oidc` mode signs in as a *public client* with the
-  authorization code flow and PKCE in the browser — the standard shape
-  for a single-page application, and the only one that needs no secret
-  and no server-side session. The access token lives in the tab's
-  session storage and is sent as a bearer header, so the API never sees
-  a cookie and needs no CSRF token. The page ships with a
-  Content-Security-Policy that allows its own assets, connections to its
-  own origin and to the provider's token endpoint origin, and nothing
-  else; it cannot be framed. In `localhost-dev` mode the same page works
-  without sign-in.
-- **`/ui/config` is unauthenticated and public by construction.** The
-  browser needs the issuer, the client id, the scopes and the provider's
-  endpoints before it has a token; all of them are what an app
-  registration publishes anyway.
+- **Conductor は OIDC のリソースサーバであり，決して誰かをサインインさせない．**
+  モード `oidc`（`internal/conductor/oidc`）は `Authorization: Bearer` の
+  アクセストークンだけを受け付け，それ以外は受け付けない．cookie も
+  クエリパラメータも受け付けない．トークンは，その署名がプロバイダの公開する鍵
+  （ディスカバリ文書 → `jwks_uri`）で検証でき，`iss` が設定された issuer と
+  完全に一致し，`aud` が設定されたオーディエンスを含み，`exp`/`nbf`/`iat` が
+  設定された小さな時刻のずれの範囲内で現在時刻を許容し，ロールクレームが設定
+  された値を持つときに受け入れられる．Conductor はクライアントシークレットを
+  持たない．プロバイダから必要とするものは公開情報であり，Conductor が侵害
+  されても他の場所で使える資格情報は得られない．
+- **狭い検証を，このリポジトリの中に書く．** RS256，PS256，ES256 のみ
+  （`none` と HMAC 系は書かないことで拒否する．対称アルゴリズムはプロバイダの
+  公開鍵集合を検証用シークレットに変えてしまうため），鍵 ID は必須，`crit` は
+  拒否，ヘッダとクレームはプロジェクトの厳格なデコーダで復号し（重複メンバは
+  拒否），コンパクト JWS は標準ライブラリの `crypto/rsa` と `crypto/ecdsa` で
+  検証する．これは脅威モデルが端から端まで読める数百行であり，署名付きジョブ
+  エンベロープ（[ADR 0015](0015-signed-job-envelope.md)）と同じ流儀である．
+  汎用の JWT ライブラリはこの API が望むより多くの形を受け入れてしまい，
+  サプライチェーンの依存関係を 1 つ増やすことになる（T8）．これは独自暗号では
+  ない．プリミティブは標準ライブラリのものである．
+- **鍵はキャッシュされ，経過時間または未知の鍵 ID をきっかけに更新され，
+  レート制限される．** プロバイダのディスカバリ文書と鍵集合は上限付きの
+  リーダーで読み，`keyCacheSeconds` の間保持する．未知の鍵 ID を名指しする
+  トークンは多くとも 1 分に 1 回の更新を引き起こす．したがって鍵のローテーションが
+  キャッシュ時間の間操作者を締め出すことはなく，でっち上げの鍵 ID の洪水が
+  プロバイダへのリクエストの洪水になることもない．更新に失敗しても以前の鍵を
+  保持する（鍵が変わっていない限り，プロバイダの障害が全員を締め出すことは
+  ない）．起動時にプロバイダへ到達できないのは警告であって起動失敗ではない．
+  スケジュールされた更新はそれに依存しない．
+- **2 つのロールを，メソッドで判定し，1 か所で強制する．** トークンは設定された
+  1 つのクレーム（既定では `roles`，Entra ID のアプリロールクレーム）の値から
+  `admin` または `viewer` に対応づけられる．どちらでもないトークンは，検証に
+  通っていても `403` で拒否される．viewer は `GET` してよい．それ以外のすべての
+  メソッドは admin を必要とする．この検査は API プレフィックス配下のすべての
+  エンドポイントを包む認証ミドルウェアにあるので，どのハンドラも忘れることが
+  できず，新しいエンドポイントが迂回することもできない．より細かい権限
+  （ポリシーごと，target ごと）はモデル化しない．レジストリは 1 つの運用チームの
+  ものであり，viewer ロールは監査者やダッシュボードが必要とするものである．
+- **オーディエンスとスコープは 2 つの設定であり，何も導出しない．**
+  `audience` はプロバイダが `aud` に書き込むものであり，検証にのみ使う．
+  `scopes` は GUI がプロバイダに要求するものであり，GUI クライアントが設定
+  されているときは必ず必要である．Entra ID ではこれらは別の識別子である．v2
+  アクセストークンの `aud` は API 登録のクライアント ID（GUID）であるのに対し，
+  スコープは `<application ID URI>/.default`（既定では
+  `api://<client-id>/.default`）である．以前の草案は `<audience>/.default` を
+  導出していたが，これは一般にどのプロバイダに対しても正しくなく，とりわけ
+  Entra ID v2 に対しては誤りである．設定は今では推測するのではなく，スコープの
+  ないクライアント ID を拒否する．
+- **プリンシパルは 1 つのクレームであり，そのまま記録され，それが識別する．**
+  監査ログと `requestedBy` に書かれるアクターは `principalClaim` の値であり，
+  他のすべてのアクター文字列と同様に長さが制限され印字可能である．既定は `sub`，
+  すべてのプロバイダが発行する安定した subject 識別子である．Entra ID の
+  デプロイでは `oid` を設定する．そこでは `sub` がクライアントごとにペアワイズ
+  だからである．表示名（`preferred_username`，`email`，`name`）はアクターでは
+  ない．ユーザーの名前が変わると変化し，再割り当てもされうるので，可変なもので
+  人を名指しする監査記録はその人を識別しなくなる．GUI はサインインした
+  ユーザーの表示名を自身のヘッダのためだけに表示する．Conductor はどこでも
+  ユーザーを検索せず，プロバイダが主張したものがそのままログの内容になる．
+- **公開された鍵は，公開されたアルゴリズムだけを検証する．** `alg` を持つ JWK は
+  そのアルゴリズムにのみ使われ，他には使われない．したがって RS256 用に公開
+  された RSA 鍵は PS256 のトークンを検証しない．3 つ以外のアルゴリズム用に
+  公開された鍵はまったく使われず，`alg` がその型に合わない鍵は集合全体を
+  信頼できないものにする．
+- **リスナーがループバックを離れてよいのは，TLS があるか明示的な宣言がある
+  ときだけである．** `oidc` モードでループバック以外の `server.listen` には
+  `server.tls`（Conductor 自身の証明書，TLS 1.2 以上）か
+  `server.behindTlsProxy: true`，すなわちプラットフォームの ingress または
+  リバースプロキシが TLS を終端しそのポートへの唯一の経路であるという操作者の
+  宣言（Bicep ではピア間トラフィックを暗号化した Container Apps ingress）が
+  必要である．ネットワーク上を平文で流れるベアラートークンは盗まれたセッション
+  である．設定はその形について警告するのではなく，既定で拒否する．
+- **GUI は Conductor が配信する 3 つの静的ファイルである．** HTML ページ 1 つ，
+  スクリプト 1 つ，スタイルシート 1 つをバイナリに埋め込む
+  （`internal/conductor/ui`）．フレームワークなし，ビルド手順なし，インライン
+  スクリプトなし．DOM メソッドだけで描画し，自身のオリジンで API を呼び，`oidc`
+  モードではブラウザ内で認可コードフローと PKCE を使って *パブリッククライアント*
+  としてサインインする．これはシングルページアプリケーションの標準的な形で
+  あり，シークレットもサーバ側セッションも必要としない唯一の形である．
+  アクセストークンはタブのセッションストレージに置かれ，ベアラーヘッダとして
+  送られるので，API は決して cookie を見ず，CSRF トークンも必要としない．
+  ページには，自身の資産と，自身のオリジンおよびプロバイダのトークン
+  エンドポイントのオリジンへの接続だけを許し，それ以外は何も許さない
+  Content-Security-Policy が付いている．フレームに埋め込むこともできない．
+  `localhost-dev` モードでは同じページがサインインなしで動く．
+- **`/ui/config` は認証なしであり，構成上公開である．** ブラウザはトークンを
+  得る前に issuer，クライアント ID，スコープ，プロバイダのエンドポイントを
+  必要とする．いずれもアプリ登録がどのみち公開しているものである．
 
-## Consequences
+## 結果
 
-- A deployment names its principals: the audit log's actor is the
-  operator's stable identifier at the provider (an Entra ID `oid`, a
-  `sub`), which an administrator resolves to a person at the provider,
-  and a read-only role exists. Since [ADR 0018](0018-authority-qualified-principals.md)
-  the actor is recorded together with its authority (the issuer), because
-  a subject is unique only within the provider that asserted it.
-  Threat T13's residual (a local user is an administrator) is closed for
-  `oidc` deployments; `localhost-dev` stays what it was, for one host.
-- The trust the Conductor places in the provider is total within the
-  audience: whoever the provider gives an admin-role token for the
-  audience is an administrator here. Role assignment is provider-side
-  administration (Entra ID app roles and their assignments), which this
-  project cannot audit; the Conductor's own log records only who acted.
-- A stolen access token is usable until it expires (Entra ID: about an
-  hour; the Conductor adds no revocation check). TLS everywhere the
-  token travels, short provider lifetimes, and the session-storage
-  scope of the GUI's copy bound that; the threat model lists it (T14).
-- The GUI is minimal by design: lists and forms over the existing API,
-  nothing the API does not offer, no state of its own. The strict CSP
-  means no inline handlers, no third-party assets and no analytics can
-  be added without a deliberate change to the policy.
-- The Container Apps deployment gains an ingress and loses the admin
-  sidecar; the API and GUI are reached at the app's FQDN. `az
-  containerapp exec` is no longer an administrator session.
+- デプロイはそのプリンシパルを名指しする．監査ログのアクターは操作者の
+  プロバイダにおける安定した識別子（Entra ID の `oid`，`sub`）であり，管理者は
+  プロバイダ側でそれを人に解決する．また読み取り専用のロールが存在する．
+  [ADR 0018](0018-authority-qualified-principals.md) 以降，アクターはその権威
+  （issuer）とともに記録される．subject はそれを主張したプロバイダの中でしか
+  一意でないからである．脅威 T13 の残存リスク（ローカルユーザーが管理者である）は
+  `oidc` デプロイでは解消した．`localhost-dev` は 1 台のホストのために従来の
+  ままである．
+- Conductor がプロバイダに置く信頼はオーディエンスの範囲内で全面的である．
+  プロバイダがそのオーディエンスに対して admin ロールのトークンを与えた者は
+  誰でもここでは管理者である．ロールの割り当てはプロバイダ側の管理（Entra ID の
+  アプリロールとその割り当て）であり，このプロジェクトはそれを監査できない．
+  Conductor 自身のログは誰が操作したかだけを記録する．
+- 盗まれたアクセストークンは期限切れまで使える（Entra ID ではおよそ 1 時間．
+  Conductor は失効の検査を加えない）．トークンが通るすべての経路での TLS，
+  プロバイダ側の短い有効期間，GUI の複製がセッションストレージに限定されることが
+  それを抑える．脅威モデルに記載がある（T14）．
+- GUI は設計上最小限である．既存の API の上の一覧とフォームであり，API が提供
+  しないものはなく，独自の状態も持たない．厳格な CSP により，ポリシーの意図的な
+  変更なしにはインラインハンドラも，サードパーティの資産も，アナリティクスも
+  追加できない．
+- Container Apps のデプロイは ingress を得て管理用サイドカーを失う．API と GUI
+  にはアプリの FQDN で到達する．`az containerapp exec` はもはや管理者セッション
+  ではない．

@@ -1,71 +1,70 @@
-# 0007: Container baseline
+# 0007: コンテナの基本方針
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-Both `acme-conductor` and `acme-runner` ship as container images
-(`ghcr.io/cits-nue/acme-conductor`, `ghcr.io/cits-nue/acme-runner`). The
-Runner in particular briefly holds private key material during a run (see
-[ADR 0005](0005-conductor-never-touches-secrets.md)), so the runtime
-environment it executes in is itself part of the system's security
-posture, not just a packaging detail.
+`acme-conductor` と `acme-runner` はどちらもコンテナイメージ
+（`ghcr.io/cits-nue/acme-conductor`，`ghcr.io/cits-nue/acme-runner`）として
+出荷される．特に Runner は run の間，秘密鍵の素材を短時間保持する
+（[ADR 0005](0005-conductor-never-touches-secrets.md) を参照）ので，それが
+実行される実行時環境自体が，単なるパッケージングの詳細ではなく，システムの
+セキュリティ態勢の一部である．
 
-## Decision
+## 決定
 
-Both images share a common baseline (`Dockerfile.conductor`,
-`Dockerfile.runner`):
+両方のイメージは共通の基本方針（`Dockerfile.conductor`，`Dockerfile.runner`）
+を共有する．
 
-- **Distroless, static, non-root.** The runtime stage is
-  `gcr.io/distroless/static-debian12:nonroot` — no shell, no package
-  manager, no OS userland beyond what the static Go binary needs. The
-  process runs as uid/gid `65532` (`nonroot:nonroot`), set explicitly in
-  the Dockerfile even though it is already the base image's default, so
-  the intent survives a future base-image change.
-- **Read-only root filesystem.** Neither binary writes to its own
-  filesystem at startup, so both images are safe to run with
-  `--read-only` / Kubernetes `readOnlyRootFilesystem: true`. The Runner's
-  future scratch space and certificate staging area (Phase 1+) are
-  supplied by the caller as a writable tmpfs/emptyDir mount, not baked
-  into the image; no `VOLUME` is declared, since a `VOLUME` instruction
-  would create anonymous volumes on every `docker run`, which is not
-  wanted.
-- **No `latest` tag in deployment.** CI builds and smoke-tests images
-  tagged `:ci`/local development tags only; it never pushes to the
-  registry. Deployments are required to pin images by commit SHA or digest
-  — `latest` (or any other floating tag) is never an acceptable deployment
-  reference.
-- **Digest pinning of the base image at release time.** The builder stage
-  currently pins `golang:1.25-bookworm` by tag for Phase 0 development
-  velocity; a release build pins the same base image by digest
-  (`golang:1.25-bookworm@sha256:<digest>`) instead, so a released image's
-  build is fully reproducible and immune to a tag being silently
-  repointed. This pinning is done at release time, not in the
-  Phase-0-era Dockerfile itself.
-- **Version via ldflags, not baked at COPY time.** `VERSION`, `COMMIT`, and
-  `BUILD_DATE` build args are injected into `internal/version` via
-  `-ldflags -X ...` at compile time (mirrored in `Makefile`'s `LDFLAGS`),
-  so the same source tree produces a differently self-identifying binary
-  per build without needing a separate source change, and `--version`
-  always reports the exact commit an image was built from.
+- **distroless，静的，非 root．** 実行時ステージは
+  `gcr.io/distroless/static-debian12:nonroot` である．シェルもパッケージ
+  マネージャもなく，静的な Go バイナリが必要とする以上の OS ユーザランドは
+  ない．プロセスは uid/gid `65532`（`nonroot:nonroot`）として動作する．これは
+  ベースイメージの既定値でもあるが，将来ベースイメージが変わっても意図が
+  残るように Dockerfile で明示的に設定している．
+- **読み取り専用のルートファイルシステム．** どちらのバイナリも起動時に自身の
+  ファイルシステムへ書き込まないので，両方のイメージは `--read-only` /
+  Kubernetes の `readOnlyRootFilesystem: true` で安全に動かせる．Runner の
+  将来のスクラッチ領域と証明書のステージング領域（Phase 1 以降）は，イメージに
+  焼き込むのではなく，呼び出し元が書き込み可能な tmpfs/emptyDir マウントとして
+  供給する．`VOLUME` は宣言しない．`VOLUME` 命令があると `docker run` のたびに
+  匿名ボリュームが作られるが，それは望ましくない．
+- **デプロイに `latest` タグを使わない．** CI は `:ci` やローカル開発用の
+  タグの付いたイメージのみをビルドしてスモークテストし，レジストリへ push する
+  ことは決してない．デプロイではイメージをコミット SHA またはダイジェストで
+  固定することが必須である．`latest`（あるいは他のあらゆる浮動タグ）は
+  デプロイの参照として決して認められない．
+- **リリース時にベースイメージをダイジェストで固定する．** ビルダーステージは
+  現在，Phase 0 の開発速度のために `golang:1.25-bookworm` をタグで固定して
+  いる．リリースビルドでは代わりに同じベースイメージをダイジェストで固定する
+  （`golang:1.25-bookworm@sha256:<digest>`）ので，リリースされたイメージの
+  ビルドは完全に再現可能で，タグが黙って付け替えられても影響を受けない．
+  この固定はリリース時に行うものであり，Phase 0 時点の Dockerfile 自体では
+  行わない．
+- **バージョンは COPY 時に焼き込むのではなく ldflags で与える．** `VERSION`，
+  `COMMIT`，`BUILD_DATE` のビルド引数はコンパイル時に `-ldflags -X ...` で
+  `internal/version` に注入される（`Makefile` の `LDFLAGS` にも同じものが
+  ある）．そのため同じソースツリーから，ソースを別途変更することなく，ビルド
+  ごとに異なる自己識別情報を持つバイナリが得られ，`--version` は常にイメージが
+  ビルドされた正確なコミットを報告する．
 
-## Consequences
+## 結果
 
-- The runtime attack surface of both images is minimal: no shell means no
-  interactive foothold even if a container is somehow gained access to,
-  and a read-only root filesystem means no on-disk persistence within the
-  container across a restart.
-- Running as a fixed non-root uid (`65532`) is required by any deployment
-  target that enforces `runAsNonRoot`, and is already the CI smoke test's
-  assumption (`docker run --read-only --user 65532:65532 ... --version`).
-- Digest pinning at release time (rather than in every Phase-0 commit)
-  keeps day-to-day development friction-free while still giving released
-  artifacts a fully reproducible, tamper-evident base image reference;
-  this tradeoff is revisited if Phase 0's tag-pinned builder stage ever
-  causes a build to silently pick up an unwanted base image change.
-- Because the Runner needs a writable scratch area at runtime despite a
-  read-only root filesystem, every deployment target (local `docker run`,
-  Azure Container Apps Job from Phase 4, etc.) must supply that mount
-  explicitly; this is documented per-launcher as launchers are added,
-  rather than assumed.
+- 両方のイメージの実行時の攻撃面は最小限である．シェルがないので，仮に
+  コンテナへ何らかの形で侵入されても対話的な足場はなく，読み取り専用のルート
+  ファイルシステムなので，再起動をまたいでコンテナ内のディスクに永続化される
+  ものはない．
+- 固定の非 root uid（`65532`）として動作することは，`runAsNonRoot` を強制する
+  どのデプロイ先でも必須であり，すでに CI のスモークテストの前提でもある
+  （`docker run --read-only --user 65532:65532 ... --version`）．
+- ダイジェスト固定を（Phase 0 のすべてのコミットではなく）リリース時に行う
+  ことで，日々の開発の摩擦をなくしつつ，リリースされた成果物には完全に
+  再現可能で改ざんが検知できるベースイメージ参照を与えられる．Phase 0 のタグ
+  固定のビルダーステージが，望まないベースイメージの変更を黙って取り込む事態が
+  起きたなら，このトレードオフは見直す．
+- Runner は読み取り専用のルートファイルシステムにもかかわらず実行時に書き込み
+  可能なスクラッチ領域を必要とするので，すべてのデプロイ先（ローカルの
+  `docker run`，Phase 4 以降の Azure Container Apps Job など）がそのマウントを
+  明示的に供給しなければならない．これは暗黙の前提とせず，ランチャーが追加
+  されるたびにランチャーごとに文書化する．

@@ -1,194 +1,178 @@
-# 0014: Azure Container Apps Job launcher
+# 0014: Azure Container Apps Job ランチャー
 
-- Status: Accepted (the administration sidecar described below was replaced by the OIDC ingress in Phase 5, [ADR 0016](0016-oidc-bearer-auth-and-gui.md))
-- Date: 2026-09-22
+- ステータス: 採択（以下で述べる管理用サイドカーは Phase 5 で OIDC ingress に置き換えられた，[ADR 0016](0016-oidc-bearer-auth-and-gui.md)）
+- 日付: 2026-09-22
 
-## Context
+## 背景
 
-Phase 4 gives the Conductor its first platform launcher: the Runner runs
-as an Azure Container Apps Job, one execution per run, under a managed
-identity of its own, so that no DNS or Store credential exists in the
-Conductor's environment any more (the Phase 2 local launcher's
-`passthroughEnv` residual, threat model T10). The `launcher.Launcher`
-interface fixes what a launcher does — obtain an execution for a
-`JobSpec`, report a platform id, wait for a `Result` — but leaves open
-how the two documents cross the boundary on that platform, what the
-Conductor's identity must be allowed to do (and, decisively, what it
-must not be allowed to do), how a run is bounded and stopped, and how
-the infrastructure is provisioned.
+Phase 4 は Conductor に最初のプラットフォームランチャーを与える．Runner は
+Azure Container Apps Job として，run ごとに 1 つの実行（execution）として，自身の
+マネージド ID の下で動く．したがって Conductor の環境にはもはや DNS や Store の
+資格情報が存在しない（Phase 2 のローカルランチャーの `passthroughEnv` という
+残存事項，脅威モデル T10）．`launcher.Launcher` インターフェースはランチャーが
+何をするかを定める．すなわち `JobSpec` に対する execution を得ること，
+プラットフォーム id を報告すること，`Result` を待つことである．しかし，その
+プラットフォーム上で 2 つの文書がどのように境界を越えるか，Conductor の ID に
+何を許可しなければならないか（そして決定的なのは，何を許可してはならないか），
+run をどう制限し停止するか，インフラをどうプロビジョニングするかは開かれた
+ままであった．
 
-## Decision
+## 決定
 
-- **A scheduled Job that takes its work; the Conductor never starts an
-  execution.** The Job — image, identity, volumes, secrets, Runner
-  configuration, and a fixed command `reconcile --exchange /exchange` —
-  is declared in Bicep (`deploy/azure`) and never touched by the
-  Conductor. Its trigger is a schedule (every minute, the finest the
-  platform offers): each execution takes the oldest job the Conductor has
-  offered on the exchange share, or exits at once when there is none.
-  The platform's *start* operation was rejected as the trigger because it
-  accepts an execution template that can replace the image, the command
-  and the environment of the Job's containers: an identity holding
-  `Microsoft.App/jobs/start/action` can run any image under the Job's
-  managed identity, so a compromise of the Conductor's identity would
-  have escalated to the Runner's DNS and Key Vault permissions whatever
-  the launcher code refrained from doing. The Conductor's identity
-  therefore does not hold it. What the Conductor chooses is *what run*
-  a Runner executes; *what the Runner is* is fixed in infrastructure.
-- **One run is one execution, with one replica.** The platform's
-  `parallelism` is the number of replicas *within* one execution; they
-  would share the execution name, and stop and verdict are per
-  execution, so replicas taking different runs would tie those runs
-  together. The Job fixes `parallelism` and `replicaCompletionCount` at
-  1; concurrency is executions of successive schedule ticks overlapping.
-- **Documents travel over a file share both containers mount, through a
-  claim protocol** (`internal/exchange`). The Conductor writes the signed
-  job under `staging/run-<runId>/` and moves the directory to `pending/`
-  in one rename; a Runner takes it by renaming it to `claimed/`, so of
-  several executions exactly one wins; the Runner records its execution
-  name (`CONTAINER_APP_JOB_EXECUTION_NAME`) in the claimed directory,
-  works, and writes `result.json` next to the job. The Conductor learns
-  the execution from that marker, confirms with the platform that it is
-  an execution of this Job, watches it, and removes the directory when
-  it ends. If no execution takes the job within `claimTimeoutSeconds`
-  the Conductor withdraws it by the same rename, so a job is either taken
-  or withdrawn, never both. Once a job is taken, the Conductor never
-  abandons the Runner behind it: the recorded execution name is
-  confirmed with the platform (a name the platform does not know ends
-  the run, a platform that cannot be asked does not — the execution is
-  watched unconfirmed), and the run directory is removed only once the
-  execution has been seen to end; otherwise it is kept and reported, so
-  a Runner that may still be working keeps its result path. The share
-  holds no certificate material and
-  no credential, only these documents. It is not a transport the
-  Conductor owns (anyone with the storage key or a mount can write it),
-  so both directions are authenticated: the job is a **signed envelope**
-  and the Result must be a **signed Result** that verifies against the
-  Runners' public keys ([ADR 0015](0015-signed-job-envelope.md)); the
-  launcher refuses to be built without a signer and a verifier, and the
-  configuration refuses an `azure-container-apps-job` binding without
-  `jobSigning` and `resultSigning`. The Result must also name the run and
-  target it was offered for and agree with the platform's own verdict (an
-  execution that ended `Succeeded` with a `failed` Result, or the
-  reverse, is a mismatch, not a result).
-- **Three permissions, on one resource.** The Conductor's identity is
-  granted a custom role with `Microsoft.App/jobs/execution/read`,
-  `jobs/executions/read` and `jobs/stop/execution/action` on the Runner
-  Job only — read one execution, list them, stop one. It cannot start an
-  execution, cannot change the Job, cannot read its secrets, and holds no
-  DNS, Key Vault or storage data permission. The Runner's identity is
-  granted a custom role with the four DNS zone/TXT actions on the
-  challenge zone and a custom role with `certificates/read` and
-  `certificates/import/action` on the vault
-  ([ADR 0013](0013-azure-key-vault-store-adapter.md)), and nothing on the
-  Job, the app or the storage account. The roles are custom rather than
-  built-in so that each grant is an explicit, reviewable list, and they
-  are assignable in the deployment's subscription only, so the zone and
-  the vault must live in that subscription in Phase 4.
-- **Polling, timeout, stop.** The Conductor polls the execution's status
-  (`pollIntervalSeconds`, 10 s) until it is terminal; transient read
-  errors are retried up to a bound. Whenever polling ends without a
-  terminal status — the run's context ended (an operator cancel,
-  shutdown, or the binding's `timeoutSeconds`), or the status could not
-  be read any more — the execution is stopped through the platform
-  before the run directory is removed, since it may still be running and
-  a Runner that loses its result path would otherwise finish unobserved;
-  the execution is then polled for a bounded grace and whatever Result
-  the Runner managed to write (normally `Cancelled`) is reported. The
-  Job's own `replicaTimeout` is a second bound below the Conductor's.
-  `replicaRetryLimit` is zero: a retried replica would present the same
-  signed job again and be refused by the Runner's replay ledger.
-- **Errors are fixed wording.** An ARM error becomes `<op>: HTTP <status>
-  (<code>)`, a transport failure its kind, anything else the Go type of
-  the innermost error; response bodies are never wrapped in. The run
-  record gets Conductor-owned summaries only, as for the local launcher.
-- **The Conductor runs in the same environment, without ingress.** Its
-  API keeps `localhost-dev` authentication ([ADR 0012](0012-localhost-only-dev-auth.md))
-  and is reachable only from the replica's loopback. An optional
-  administration sidecar in the same replica (a shell with `curl`,
-  reached with `az containerapp exec`) is the operator's way in until
-  Phase 5; Azure RBAC on the Container App gates who can do that.
-- **Tests run against a fake platform.** An in-process fake of the two
-  REST operations the launcher uses starts executions of the fake Runner
-  in claim mode on its own cadence, as the platform's schedule would, so
-  the whole exchange — signed job offered, taken, execution confirmed,
-  signed Result back, stop on cancel, timeout, polling failure, mismatch
-  and tampering detection, error wording — is exercised on disk without
-  an Azure subscription (principle 8). The Azure SDK is confined to
-  `internal/conductor/launcher/acajob`.
+- **仕事を自ら取りに来るスケジュール実行の Job．Conductor が execution を開始
+  することは決してない．** Job（イメージ，ID，ボリューム，シークレット，Runner の
+  設定，固定コマンド `reconcile --exchange /exchange`）は Bicep（`deploy/azure`）
+  で宣言され，Conductor が触れることは決してない．そのトリガーはスケジュール
+  （毎分．プラットフォームが提供する最小間隔）である．各 execution は Conductor が
+  交換用共有に差し出した最も古いジョブを取るか，何もなければ直ちに終了する．
+  プラットフォームの *start* 操作はトリガーとして却下された．それは Job の
+  コンテナのイメージ・コマンド・環境を置き換えられる execution テンプレートを
+  受け付けるからである．`Microsoft.App/jobs/start/action` を持つ ID は Job の
+  マネージド ID の下で任意のイメージを実行できるので，Conductor の ID が侵害
+  されれば，ランチャーのコードが何を控えていようと Runner の DNS と Key Vault の
+  権限へ昇格していたであろう．したがって Conductor の ID はそれを持たない．
+  Conductor が選ぶのは Runner が *どの run* を実行するかであり，*Runner が何で
+  あるか* はインフラで固定されている．
+- **1 つの run は 1 つの execution，レプリカは 1 つ．** プラットフォームの
+  `parallelism` は 1 つの execution *内の* レプリカ数である．レプリカは execution
+  名を共有し，停止と判定は execution 単位なので，別々の run を取ったレプリカは
+  それらの run を結びつけてしまう．Job は `parallelism` と
+  `replicaCompletionCount` を 1 に固定する．並行性は，連続するスケジュール tick
+  の execution が重なることで得られる．
+- **文書は両方のコンテナがマウントするファイル共有を，claim プロトコルで
+  行き来する**（`internal/exchange`）．Conductor は署名付きジョブを
+  `staging/run-<runId>/` の下に書き，そのディレクトリを 1 回のリネームで
+  `pending/` に移す．Runner は `claimed/` へリネームすることでそれを取るので，
+  複数の execution のうちちょうど 1 つが勝つ．Runner は claim したディレクトリに
+  自身の execution 名（`CONTAINER_APP_JOB_EXECUTION_NAME`）を記録し，処理を行い，
+  ジョブの隣に `result.json` を書く．Conductor はそのマーカーから execution を
+  知り，それがこの Job の execution であることをプラットフォームに確認し，
+  監視し，終了したらディレクトリを削除する．`claimTimeoutSeconds` 以内にどの
+  execution もジョブを取らなければ，Conductor は同じリネームでそれを引き揚げる．
+  したがってジョブは取られるか引き揚げられるかのどちらかであり，両方になる
+  ことは決してない．ジョブが取られた後，Conductor がその背後の Runner を見捨てる
+  ことは決してない．記録された execution 名はプラットフォームに確認され
+  （プラットフォームが知らない名前なら run を終え，プラットフォームに問い合わせ
+  できない場合は終えず，execution は未確認のまま監視される），run ディレクトリは
+  execution の終了が確認されたときにのみ削除される．そうでなければ保持され
+  報告されるので，まだ処理中かもしれない Runner はその result のパスを失わない．
+  共有には証明書の素材も資格情報もなく，これらの文書だけがある．これは
+  Conductor が所有するトランスポートではない（ストレージキーやマウントを持つ
+  者は誰でも書ける）ので，両方向を認証する．ジョブは **署名付きエンベロープ**
+  であり，Result は Runner の公開鍵で検証できる **署名付き Result** でなければ
+  ならない（[ADR 0015](0015-signed-job-envelope.md)）．ランチャーは署名者と
+  検証者なしに構築されることを拒否し，設定は `jobSigning` と `resultSigning`
+  のない `azure-container-apps-job` バインディングを拒否する．Result はさらに，
+  差し出された run と target を指し，プラットフォーム自身の判定と一致しなければ
+  ならない（`Succeeded` で終了した execution に `failed` の Result，あるいはその
+  逆は，不一致であって result ではない）．
+- **3 つの権限を，1 つのリソースに．** Conductor の ID には，Runner の Job
+  のみに対する `Microsoft.App/jobs/execution/read`，`jobs/executions/read`，
+  `jobs/stop/execution/action` を持つカスタムロールが付与される．すなわち
+  execution を 1 つ読む，一覧する，1 つ停止する，である．execution を開始
+  できず，Job を変更できず，そのシークレットを読めず，DNS・Key Vault・
+  ストレージのデータ権限は何も持たない．Runner の ID には，チャレンジゾーンに
+  対する DNS ゾーン/TXT の 4 つのアクションを持つカスタムロールと，vault に
+  対する `certificates/read` と `certificates/import/action` を持つカスタム
+  ロール（[ADR 0013](0013-azure-key-vault-store-adapter.md)）が付与され，Job・
+  アプリ・ストレージアカウントに対しては何も付与されない．ロールは組み込み
+  ではなくカスタムとし，各付与が明示的でレビュー可能な一覧になるようにする．
+  ロールはデプロイ先のサブスクリプション内でのみ割り当て可能なので，Phase 4
+  ではゾーンと vault はそのサブスクリプションに置かなければならない．
+- **ポーリング，タイムアウト，停止．** Conductor は execution の状態を
+  終端になるまでポーリングする（`pollIntervalSeconds`，10 秒）．一時的な読み取り
+  エラーは上限まで再試行する．終端状態に至らずにポーリングが終わったとき，
+  すなわち run のコンテキストが終了したとき（操作者のキャンセル，シャットダウン，
+  バインディングの `timeoutSeconds`），または状態を読めなくなったときは，run
+  ディレクトリを削除する前にプラットフォームを通じて execution を停止する．
+  まだ動いているかもしれず，result のパスを失った Runner は誰にも観測されずに
+  完了してしまうからである．その後 execution を限られた猶予の間ポーリングし，
+  Runner が書けた Result（通常は `Cancelled`）を報告する．Job 自身の
+  `replicaTimeout` は Conductor のものより下にある 2 つ目の上限である．
+  `replicaRetryLimit` はゼロである．再試行されたレプリカは同じ署名付きジョブを
+  再び提示し，Runner のリプレイ台帳に拒否されるからである．
+- **エラーは固定の文言．** ARM のエラーは `<op>: HTTP <status> (<code>)` となり，
+  トランスポートの失敗はその種別，それ以外は最も内側のエラーの Go の型名と
+  なる．応答ボディがラップされることは決してない．run レコードが得るのは
+  ローカルランチャーと同様に Conductor 自身の要約だけである．
+- **Conductor は同じ環境で，ingress なしで動く．** その API は `localhost-dev`
+  認証（[ADR 0012](0012-localhost-only-dev-auth.md)）のままで，レプリカの
+  ループバックからのみ到達できる．同じレプリカ内の任意の管理用サイドカー
+  （`curl` を備えたシェル．`az containerapp exec` で到達する）が Phase 5 までの
+  操作者の入口である．誰がそれをできるかは Container App に対する Azure RBAC が
+  制御する．
+- **テストは偽物のプラットフォームに対して走る．** ランチャーが使う 2 つの REST
+  操作のプロセス内の偽物が，プラットフォームのスケジュールがそうするように
+  独自の周期で claim モードの偽物の Runner の execution を開始する．したがって
+  交換の全体，すなわち署名付きジョブの差し出し，取得，execution の確認，
+  署名付き Result の返却，キャンセル時の停止，タイムアウト，ポーリングの失敗，
+  不一致と改竄の検出，エラーの文言が，Azure サブスクリプションなしにディスク上で
+  検証される（原則 8）．Azure SDK は `internal/conductor/launcher/acajob` に
+  閉じ込める．
 
-## Alternatives considered
+## 検討した代替案
 
-- **Starting each execution from the Conductor with an execution
-  template that only replaces the Runner's arguments** (the first draft
-  of this phase). Rejected in review: the restraint is in the code, not
-  in the permission. `jobs/start/action` lets the holder submit any
-  template, and the platform documents that an identity with it "can use
-  an execution template to reference job secrets ... and use managed
-  identities configured to be available to the container". A compromised
-  Conductor process or identity would run an attacker's image under the
-  Runner's identity. The schedule trigger removes the permission
-  altogether at the cost of up to a minute of start latency.
-- **An event-driven Job (a queue scaler) instead of a schedule.** Not
-  taken for Phase 4: it needs a queue, a data-plane permission on it for
-  the Conductor (to enqueue) and for the scaler or the Runner (to read
-  and delete), and queue SDK code in a second package; the schedule gives
-  the same property — a fixed template, no start permission — with
-  nothing but a cron expression. It remains the natural next step if the
-  one-minute cadence or the idle executions become a cost.
-- **A broker (a Function or Logic App) that starts the Job with a fixed
-  template on the Conductor's behalf.** Rejected: another component with
-  its own identity and code to review, holding the very permission the
-  design is removing.
-- **Passing the JobSpec in the execution's environment or arguments and
-  the Result through blob storage or a queue.** Rejected for Phase 4: a
-  return channel is needed either way, and a blob or queue adds a second
-  Azure data-plane permission to both identities plus SDK code on the
-  Runner side, whereas the share keeps the Runner's file-based contract
-  unchanged. The envelopes make the share's weakness (writable by
-  others) explicit and detectable in both directions.
-- **A Runner callback into the Conductor's API to deliver the Result.**
-  Rejected: the Conductor has no authenticated, network-reachable API
-  before Phase 5, and a callback would make a Runner depend on the
-  Conductor being up, which the architecture forbids.
-- **Letting the Conductor create or update the Job per run.** Rejected:
-  it would require `jobs/write`, with which a compromised Conductor could
-  change the Runner's image, identity or mounts — exactly the escalation
-  T10 is about.
-- **Built-in roles (Container Apps Jobs Operator, DNS Zone Contributor,
-  Key Vault Certificates Officer).** Rejected: each grants far more than
-  needed (start and `listSecrets` through the `jobs/*/action` wildcard;
-  all record types; certificate deletion and purge). Custom roles are a
-  subscription-level resource the deployer must be allowed to create,
-  which is accepted.
+- **Runner の引数だけを置き換える execution テンプレートで，Conductor から各
+  execution を開始する**（この Phase の最初の草案）．レビューで却下．抑制は
+  コードにあって権限にはない．`jobs/start/action` は保持者に任意のテンプレートの
+  提出を許し，プラットフォームはこの権限を持つ ID が「execution テンプレートを
+  使って Job のシークレットを参照し ... コンテナで利用可能に設定されたマネージド
+  ID を使う」ことができると文書化している．侵害された Conductor のプロセスや
+  ID は，Runner の ID の下で攻撃者のイメージを実行するだろう．スケジュール
+  トリガーは，最大 1 分の開始遅延と引き換えにこの権限を完全に取り除く．
+- **スケジュールの代わりにイベント駆動の Job（キュースケーラー）．** Phase 4
+  では採らない．キューと，それに対する Conductor のデータプレーン権限
+  （エンキュー用）およびスケーラーまたは Runner の権限（読み取りと削除用），
+  そして 2 つ目のパッケージにキュー SDK のコードが必要になる．スケジュールなら
+  cron 式 1 つだけで同じ性質（固定テンプレート，start 権限なし）が得られる．
+  1 分周期やアイドルの execution がコストになれば，自然な次の一手として残る．
+- **Conductor に代わって固定テンプレートで Job を開始するブローカー（Function
+  や Logic App）．** 却下．独自の ID とレビューすべきコードを持ち，設計が
+  取り除こうとしているまさにその権限を保持する，もう 1 つのコンポーネントで
+  ある．
+- **JobSpec を execution の環境変数や引数で渡し，Result を blob ストレージや
+  キューで返す．** Phase 4 では却下．どのみち戻りの経路は必要であり，blob や
+  キューは両方の ID に 2 つ目の Azure データプレーン権限と Runner 側の SDK コード
+  を加えるのに対し，共有なら Runner のファイルベースのコントラクトを変えずに
+  済む．エンベロープは共有の弱点（他者が書ける）を両方向で明示的かつ検出可能に
+  する．
+- **Result を届けるための Runner から Conductor の API へのコールバック．**
+  却下．Conductor は Phase 5 まで認証されネットワークから到達可能な API を持たず，
+  コールバックは Runner を Conductor の稼働に依存させることになり，それは
+  アーキテクチャが禁じている．
+- **run ごとに Conductor が Job を作成または更新する．** 却下．`jobs/write` が
+  必要になり，侵害された Conductor はそれで Runner のイメージ・ID・マウントを
+  変更できる．まさに T10 が扱う昇格である．
+- **組み込みロール（Container Apps Jobs Operator，DNS Zone Contributor，
+  Key Vault Certificates Officer）．** 却下．いずれも必要よりはるかに多くを
+  付与する（`jobs/*/action` ワイルドカードによる start と `listSecrets`，
+  すべてのレコード種別，証明書の削除と purge）．カスタムロールはデプロイ担当者が
+  作成を許可されている必要があるサブスクリプションレベルのリソースであり，
+  それは受け入れる．
 
-## Consequences
+## 結果
 
-- The Conductor's environment carries no Runner credential in this
-  deployment shape, and its identity cannot make the Runner Job run
-  anything but the Runner image declared in Bicep: T10's Phase 2 residual
-  is closed for it, and a Conductor compromise is bounded to choosing
-  which runs execute (T1).
-- A run starts up to a minute plus the platform's start latency after it
-  is queued, at most one run per tick, and the platform runs one short,
-  idle execution per tick while nothing is pending; the scheduler's
-  `maxConcurrentRuns` bounds how many runs wait for or hold an execution
-  at once.
-- A run directory can outlive its run when the execution was never seen
-  to end; the operator guide says how to recognize and remove it.
-- Both signing keys are operator-owned secrets: the Conductor's
-  job-signing key and the Runner's result-signing key, each mounted for
-  its own binary only. Rotation is additive on the verifying side.
-- The launcher's behaviour against the real platform (schedule cadence
-  and overlap of executions across ticks, rename atomicity on an SMB
-  share, role
-  action names, SQLite and `flock` on an SMB share, Result propagation
-  delay) is documented from the reference documentation and verified only
-  by a first real deployment, not by CI; `deploy/azure/README.md` lists
-  each item.
-- Administration before Phase 5 is `az containerapp exec` into the
-  sidecar; the audit log still records every caller as `localhost-dev`.
-- Cancelling a run now involves a platform call; a stop the platform
-  does not honour ends as `Timeout`/`Cancelled` without a Result after
-  the stop grace, and the Job's `replicaTimeout` eventually ends the
-  execution regardless.
+- このデプロイ形態では Conductor の環境は Runner の資格情報を一切持たず，その
+  ID は Runner Job に Bicep で宣言された Runner イメージ以外を実行させることが
+  できない．T10 の Phase 2 の残存事項はこれについては閉じられ，Conductor の
+  侵害はどの run を実行するかの選択に限定される（T1）．
+- run はキューに入ってから最大 1 分とプラットフォームの開始遅延の後に開始し，
+  tick あたり最大 1 つの run であり，何も保留されていない間はプラットフォームが
+  tick ごとに短いアイドルの execution を 1 つ動かす．スケジューラの
+  `maxConcurrentRuns` が，同時に execution を待つか保持する run の数を制限する．
+- execution の終了が確認できなかったとき，run ディレクトリは run より長く残り
+  得る．運用ガイドがその見分け方と削除方法を述べる．
+- 両方の署名鍵は操作者が所有するシークレットである．Conductor のジョブ署名鍵と
+  Runner の Result 署名鍵で，それぞれ自身のバイナリのためだけにマウントされる．
+  ローテーションは検証側で追加的に行う．
+- 本物のプラットフォームに対するランチャーの振る舞い（スケジュールの周期と
+  tick をまたぐ execution の重なり，SMB 共有上のリネームの原子性，ロールの
+  アクション名，SMB 共有上の SQLite と `flock`，Result の伝播遅延）はリファ
+  レンスドキュメントから文書化されており，CI ではなく最初の本物のデプロイで
+  のみ検証される．`deploy/azure/README.md` が各項目を列挙する．
+- Phase 5 までの管理は `az containerapp exec` でサイドカーに入ることである．
+  監査ログは依然としてすべての呼び出し元を `localhost-dev` として記録する．
+- run のキャンセルにはプラットフォーム呼び出しが伴うようになった．プラット
+  フォームが停止に応じなければ，停止の猶予の後に Result なしで
+  `Timeout`/`Cancelled` として終わり，Job の `replicaTimeout` がいずれにせよ
+  execution を終わらせる．

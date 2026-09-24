@@ -1,35 +1,32 @@
-# Architecture
+# アーキテクチャ
 
-## Overview
+## 概要
 
-ACME Conductor is a cloud-agnostic certificate-management control plane. It
-is **not** a new ACME client. All ACME protocol work is delegated to the
-existing, widely used [go-acme/lego](https://github.com/go-acme/lego) CLI, a
-version-pinned official binary invoked as a subprocess by the Runner via an
-argument vector (`argv`), never through a shell string.
+ACME Conductor は，クラウドに依存しない証明書管理のコントロールプレーンである．
+新しい ACME クライアントでは **ない**．ACME プロトコルの処理はすべて，既存で広く
+使われている [go-acme/lego](https://github.com/go-acme/lego) CLI に委ねる．これは
+バージョン固定した公式バイナリであり，Runner が引数ベクトル（`argv`）でサブプロセス
+として起動する．シェル文字列を経由することは決してない．
 
-The system is split into two binaries with a hard boundary between them:
+システムは 2 つのバイナリに分かれ，その間には厳格な境界がある:
 
-- **`acme-conductor`** is the control plane: a long-running service that
-  owns the FQDN registry (`Target`), certificate policy, an append-only
-  audit log, the run registry, a scheduler, and a `Job Launcher` interface
-  that starts Runner executions on whatever execution platform is
-  configured. It never touches ACME, DNS or certificate material directly.
-- **`acme-runner`** is the data plane: a one-shot OCI job. It strictly
-  validates the `JobSpec` it receives, authorizes the request against its
-  own trusted, Runner-side policy (`policy.RunnerAuthorizationPolicy`,
-  Phase 1), invokes `lego` exactly once, normalizes
-  the result, writes the certificate directly into an external
-  **Certificate Store** (filesystem for local development, Azure Key Vault
-  since Phase 3), and exits. It runs no server and no
-  scheduler of its own.
+- **`acme-conductor`** はコントロールプレーンである．常駐サービスとして FQDN の
+  レジストリ（`Target`），証明書ポリシー，追記専用の監査ログ，run のレジストリ，
+  スケジューラ，そして設定された実行基盤上で Runner の実行を開始する
+  `Job Launcher` インタフェースを持つ．ACME，DNS，証明書の実体に直接触れることは
+  決してない．
+- **`acme-runner`** はデータプレーンである．ワンショットの OCI ジョブとして，受け取った
+  `JobSpec` を厳格に検証し，自身の信頼された Runner 側ポリシー
+  （`policy.RunnerAuthorizationPolicy`，Phase 1）に照らして要求を認可し，`lego` を
+  ちょうど 1 回起動し，結果を正規化し，証明書を外部の **Certificate Store**
+  （ローカル開発ではファイルシステム，Phase 3 以降は Azure Key Vault）に直接書き込み，
+  終了する．自身のサーバもスケジューラも動かさない．
 
-This split exists so that the two halves can be deployed with different,
-minimal identities: the Conductor coordinates but is never trusted with
-secrets, and the Runner is trusted with secrets only for the single run it
-was launched for.
+この分割は，2 つの半分をそれぞれ異なる最小限の ID でデプロイできるようにするために
+ある．Conductor は調整役だが決してシークレットを預からず，Runner は起動された 1 回の
+実行の間だけシークレットを預かる．
 
-## Diagram
+## 構成図
 
 ```
  Web UI / REST API
@@ -54,176 +51,160 @@ was launched for.
    (lego built-in)                  (filesystem / Key Vault / ...)
 ```
 
-The Conductor never talks to the DNS provider or the Certificate Store
-directly; it only ever produces a `JobSpec` and later consumes a `Result`.
-Both cross the Conductor/Runner boundary as the only two documents the two
-binaries ever exchange, and both are defined by the versioned contract in
-`pkg/api/v1alpha1` (see [JobSpec/Result contract](#jobspecresult-contract)
-below).
+Conductor が DNS プロバイダや Certificate Store と直接やり取りすることは決してない．
+`JobSpec` を生成し，後で `Result` を消費するだけである．両者は 2 つのバイナリが
+やり取りする唯一の 2 種類の文書として Conductor/Runner 境界を越え，どちらも
+`pkg/api/v1alpha1` のバージョン付きコントラクトで定義される（後述の
+[JobSpec/Result コントラクト](#jobspecresult-コントラクト)を参照）．
 
-## Components and responsibilities
+## コンポーネントと責務
 
-### acme-conductor (control plane)
+### acme-conductor (コントロールプレーン)
 
-- **Target Registry** — the authoritative list of FQDNs under management
-  (see [domain model](#domain-model)). Owns uniqueness and normalization of
-  FQDNs.
-- **CertificatePolicy** — the rules a `Target` is issued under: allowed DNS
-  suffixes, whether wildcards are permitted, renewal window, key type.
-- **Audit Log** — an append-only record of administrative and run events
-  (target create/update/disable, job start, failure, policy rejection).
-  Nothing is ever deleted from it in the MVP.
-- **Run Registry** — the history and current state of every reconcile
-  attempt (`Run`), independent of where or how it executed.
-- **Scheduler** — decides when a `Target` is due for issuance or renewal and
-  produces a `JobSpec` for it.
-- **Job Launcher interface** — an abstraction over "start a Runner
-  execution somewhere" (the contract is `pkg/launcher`; the
-  implementations are `internal/conductor/launcher/localprocess`, a local
-  process since Phase 2, and `internal/conductor/launcher/acajob`, an
-  Azure Container Apps Job since Phase 4). Cloud-specific launcher code
-  lives behind this interface, never in Conductor core.
-- **API and GUI** — the REST API (`internal/conductor/api`) is the only
-  boundary that accepts free-form input; since Phase 5 it authenticates
-  callers with OIDC bearer tokens as named principals with an admin or
-  viewer role (`internal/conductor/oidc`, [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md))
-  and serves a minimal static GUI (`internal/conductor/ui`) over the
-  same API. The development mode `localhost-dev` remains for one host.
+- **Target Registry** — 管理下にある FQDN の正となる一覧
+  （[ドメインモデル](#ドメインモデル)を参照）．FQDN の一意性と正規化を司る．
+- **CertificatePolicy** — `Target` が発行される際の規則: 許可する DNS サフィックス，
+  ワイルドカードの可否，更新ウィンドウ，鍵種別．
+- **Audit Log** — 管理操作と run のイベント（target の作成/更新/無効化，ジョブ開始，
+  失敗，ポリシー拒否）の追記専用の記録．MVP ではここから何かが削除されることは
+  決してない．
+- **Run Registry** — すべての reconcile 試行（`Run`）の履歴と現在の状態．どこで
+  どのように実行されたかには依存しない．
+- **Scheduler** — `Target` の発行または更新の期限が到来したかを判断し，その
+  `JobSpec` を生成する．
+- **Job Launcher interface** — 「どこかで Runner の実行を開始する」ことの抽象化
+  （コントラクトは `pkg/launcher`．実装は Phase 2 以降のローカルプロセスである
+  `internal/conductor/launcher/localprocess` と，Phase 4 以降の Azure Container Apps
+  Job である `internal/conductor/launcher/acajob`）．クラウド固有のランチャーコードは
+  このインタフェースの背後に置き，決して Conductor のコアには置かない．
+- **API と GUI** — REST API（`internal/conductor/api`）は自由形式の入力を受け付ける
+  唯一の境界である．Phase 5 以降は OIDC ベアラートークンで呼び出し元を認証し，
+  admin または viewer のロールを持つ名前付きプリンシパルとして扱い
+  （`internal/conductor/oidc`，[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)），
+  同じ API の上で最小限の静的 GUI（`internal/conductor/ui`）を提供する．開発モード
+  `localhost-dev` はホスト 1 台向けに残る．
 
-### acme-runner (data plane)
+### acme-runner (データプレーン)
 
-- **JobSpec validation and authorization** — strict decoding (see
-  [contract](#jobspecresult-contract)) plus full semantic validation
-  (`JobSpec.Validate`, a self-consistency check of the document itself),
-  followed by authorization against the Runner's own trusted
-  `policy.RunnerAuthorizationPolicy` (Phase 1) — see
-  [Validation vs. authorization](#validation-vs-authorization) below.
-- **lego invocation** — a single subprocess call to the pinned `lego`
-  binary with an explicit argument vector built from the validated
-  `JobSpec`. No shell is ever invoked to build or run this command.
-- **Result normalization** — turns whatever `lego` produced into a
-  `Result` document: a stable error taxonomy, a certificate fingerprint,
-  an expiry timestamp, and a logical store reference. No certificate body,
-  key material or credential ever appears in a `Result`.
-- **Certificate Store adapter** — writes the private key and certificate
-  directly into the configured store (filesystem since Phase 1, Azure Key
-  Vault since Phase 3) and then destroys the local copy. This is the
-  only place in the whole system that ever holds a private key, and only
-  for the duration of one run.
+- **JobSpec の検証と認可** — 厳格なデコード（[コントラクト](#jobspecresult-コントラクト)
+  を参照）に加えて完全な意味的検証（`JobSpec.Validate`．文書そのものの自己整合性の
+  検査）を行い，続いて Runner 自身の信頼された `policy.RunnerAuthorizationPolicy`
+  （Phase 1）に照らして認可する．後述の[検証と認可](#検証と認可)を参照．
+- **lego の起動** — 検証済みの `JobSpec` から組み立てた明示的な引数ベクトルで，固定
+  バージョンの `lego` バイナリをサブプロセスとして 1 回だけ呼び出す．このコマンドの
+  組み立てにも実行にもシェルは決して使わない．
+- **Result の正規化** — `lego` が生成したものを `Result` 文書に変換する: 安定した
+  エラー分類，証明書のフィンガープリント，有効期限のタイムスタンプ，論理的な store
+  参照．証明書本体，鍵の実体，資格情報が `Result` に現れることは決してない．
+- **Certificate Store アダプタ** — 秘密鍵と証明書を設定された store（Phase 1 以降は
+  ファイルシステム，Phase 3 以降は Azure Key Vault）に直接書き込み，その後ローカルの
+  コピーを破棄する．システム全体で秘密鍵を保持する唯一の場所であり，しかも 1 回の
+  実行の間だけである．
 
-### DNS provider
+### DNS プロバイダ
 
-Resolved through `lego`'s built-in DNS provider support via a `DnsBinding`.
-The Runner holds only the credential or workload identity for the single
-provider its binding names, scoped to the challenge zone.
+`DnsBinding` を介して，`lego` 組み込みの DNS プロバイダ対応で解決される．Runner が
+持つのは，バインディングが名指しする単一のプロバイダのための資格情報または
+ワークロード ID だけであり，チャレンジ用ゾーンにスコープされる．
 
 ### Certificate Store
 
-An external system that durably holds issued certificates and their private
-keys (filesystem for dev, Azure Key Vault for deployments — see
-[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)), addressed
-through a `StoreBinding`. The Conductor never reads from it. A store
-adapter writes a bundle and reads back a certificate's public part for
-the renewal decision; no adapter reads a private key back out of its
-store.
+発行された証明書とその秘密鍵を永続的に保持する外部システム（開発ではファイルシステム，
+デプロイでは Azure Key Vault．[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)
+を参照）で，`StoreBinding` を通じて指し示す．Conductor がここから読み出すことは
+決してない．store アダプタはバンドルを書き込み，更新判断のために証明書の公開部分を
+読み戻す．store から秘密鍵を読み戻すアダプタは存在しない．
 
-## Control plane vs data plane
+## コントロールプレーンとデータプレーン
 
-| | Control plane (`acme-conductor`) | Data plane (`acme-runner`) |
+| | コントロールプレーン (`acme-conductor`) | データプレーン (`acme-runner`) |
 |---|---|---|
-| Lifetime | long-running service | one-shot job, exits after one run |
-| Holds private keys / certs | never | briefly, in a temporary area, during one run |
-| Holds DNS / Key Vault / cloud credentials | never | yes, via workload identity, scoped to the binding it was launched with |
-| Talks to ACME/DNS/Store | never directly | yes, exclusively |
-| Failure mode if down | already-scheduled Runner jobs still run to completion | a failed run is retried by the next Conductor scheduling pass |
-| Network exposure | Web UI / REST API (admin-facing) | none (batch job, no HTTP server, no cron) |
+| 寿命 | 常駐サービス | ワンショットのジョブ．1 回の実行後に終了 |
+| 秘密鍵 / 証明書の保持 | 決してない | 1 回の実行中に一時領域で短時間のみ |
+| DNS / Key Vault / クラウド資格情報の保持 | 決してない | あり．ワークロード ID 経由で，起動時のバインディングにスコープされる |
+| ACME/DNS/Store との通信 | 直接は決してない | あり．Runner のみが行う |
+| 停止時の影響 | すでにスケジュール済みの Runner ジョブは完了まで動く | 失敗した実行は Conductor の次のスケジューリングで再試行される |
+| ネットワーク露出 | Web UI / REST API（管理者向け） | なし（バッチジョブ．HTTP サーバも cron もない） |
 
-A Conductor outage must never prevent an already-launched Runner job from
-completing: the Runner does not call back into the Conductor to do its
-work, it only reports a `Result` once finished. With the Phase 2
-local-process launcher the Runner is a child of the Conductor, so a
-graceful stop waits for it (up to `server.shutdownGraceSeconds`) and then
-cancels it; a run whose outcome the Conductor missed is recorded as
-failed with "outcome unknown" at the next start, never guessed (see
-[ADR 0011](adr/0011-conductor-storage-and-run-model.md)).
+Conductor の停止が，すでに起動された Runner ジョブの完了を妨げることは決してあっては
+ならない．Runner は処理のために Conductor を呼び戻すことはなく，完了時に `Result` を
+報告するだけである．Phase 2 のローカルプロセスランチャーでは Runner は Conductor の
+子プロセスなので，正常停止はそれを（`server.shutdownGraceSeconds` まで）待ってから
+キャンセルする．Conductor が結果を取りこぼした実行は，次回起動時に「結果不明」として
+失敗と記録され，決して推測されない
+（[ADR 0011](adr/0011-conductor-storage-and-run-model.md) を参照）．
 
-## Domain model
+## ドメインモデル
 
-Implemented in Phase 2 (`internal/conductor/registry` defines the model
-and the `Registry` interface, `internal/conductor/sqlite` persists it —
-see [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and
-[`docs/conductor.md`](conductor.md)); documented here so the contract in
-Phase 0 and the storage design agree.
+Phase 2 で実装済み（`internal/conductor/registry` がモデルと `Registry` インタフェースを
+定義し，`internal/conductor/sqlite` が永続化する．
+[ADR 0011](adr/0011-conductor-storage-and-run-model.md) と
+[`docs/conductor.md`](conductor.md) を参照）．Phase 0 のコントラクトとストレージ設計が
+一致するよう，ここに記述する．
 
 - **`Target`** — `{id, fqdn (normalized ASCII, unique), enabled, owner,
   policyRef, executionBinding, dnsBinding, storeBinding, createdAt,
-  updatedAt, revision}`. One `Target` is one FQDN (MVP: one certificate per
-  FQDN, no SAN). `revision` is an optimistic-locking counter that also
-  appears in every `JobSpec` produced for that target, so a `Result` can
-  always be matched back to the exact target state it was produced for.
+  updatedAt, revision}`．1 つの `Target` は 1 つの FQDN である（MVP: FQDN ごとに
+  証明書 1 枚，SAN なし）．`revision` は楽観的ロックのカウンタで，その target 向けに
+  生成されるすべての `JobSpec` にも現れるため，`Result` は常にそれが生成された時点の
+  正確な target の状態に対応付けられる．
 - **`CertificatePolicy`** — `{id, allowedDnsSuffixes, allowWildcard,
-  acmeBinding, renewBeforeDays, keyType, maxSANs, enabled}`. `maxSANs` is
-  fixed at 1 in the MVP domain model even though it is represented, because
-  the JobSpec contract for v1alpha1 has no SAN list at all (see
-  [non-goals](#non-goals)).
-- **Bindings** — `ExecutionBinding`, `DnsBinding`, `StoreBinding`,
-  `AcmeBinding`: administrator-registered logical names loaded from startup
-  configuration. See [binding model](#binding-model).
+  acmeBinding, renewBeforeDays, keyType, maxSANs, enabled}`．`maxSANs` は表現は
+  あるものの MVP のドメインモデルでは 1 に固定される．v1alpha1 の JobSpec コントラクト
+  には SAN の一覧がそもそもないためである（[非目標](#非目標)を参照）．
+- **バインディング** — `ExecutionBinding`，`DnsBinding`，`StoreBinding`，
+  `AcmeBinding`: 管理者が登録した論理名で，起動時の設定から読み込まれる．
+  [バインディングモデル](#バインディングモデル)を参照．
 - **`Run`** — `{id, targetId, targetRevision, status
   (queued|starting|running|succeeded|failed|cancelled), requestedBy,
   requestedAt, startedAt, finishedAt, action, expiresAt, fingerprint,
-  errorCode, errorSummary, externalExecutionId}`. One `Run` corresponds to
-  one `JobSpec`/`Result` pair once it completes.
-- **`AuditEvent`** — append-only; recorded for target create/update/disable,
-  job start, job failure, and policy rejection. There is no purge operation
-  in the MVP (see
-  [ADR 0008](adr/0008-no-purge-in-mvp.md)); disabling a target is not the
-  same as deleting its history.
+  errorCode, errorSummary, externalExecutionId}`．1 つの `Run` は完了すると
+  1 組の `JobSpec`/`Result` に対応する．
+- **`AuditEvent`** — 追記専用．target の作成/更新/無効化，ジョブ開始，ジョブ失敗，
+  ポリシー拒否について記録される．MVP には purge 操作がない
+  （[ADR 0008](adr/0008-no-purge-in-mvp.md) を参照）．target の無効化はその履歴の
+  削除と同じではない．
 
-## Binding model
+## バインディングモデル
 
-API input can never specify commands, container images, cloud resource IDs,
-credentials or provider configuration directly. It can only name a logical
-binding that an administrator registered ahead of time:
+API の入力でコマンド，コンテナイメージ，クラウドリソース ID，資格情報，プロバイダ設定を
+直接指定することは決してできない．指定できるのは，管理者があらかじめ登録した論理
+バインディングの名前だけである:
 
-- **`ExecutionBinding`** — where and how a Runner job actually runs (a
-  local process, later an Azure Container Apps Job).
-- **`DnsBinding`** — which DNS provider and zone the ACME DNS-01 challenge
-  is written to.
-- **`StoreBinding`** — which Certificate Store a result is written to.
-- **`AcmeBinding`** — which ACME directory, account and (optional) External
-  Account Binding the Runner authenticates as.
+- **`ExecutionBinding`** — Runner ジョブが実際にどこでどのように動くか（ローカル
+  プロセス，のちに Azure Container Apps Job）．
+- **`DnsBinding`** — ACME DNS-01 チャレンジをどの DNS プロバイダのどのゾーンに書くか．
+- **`StoreBinding`** — 結果をどの Certificate Store に書くか．
+- **`AcmeBinding`** — Runner がどの ACME ディレクトリ，アカウント，（任意の）External
+  Account Binding として認証するか．
 
-In the MVP, all four binding types are loaded from Runner/Conductor startup
-configuration; there is no admin API to create or modify them at runtime.
-An `ExecutionBinding` or `StoreBinding` is `{ "type", "config" }`: the
-generic configuration knows the type name's shape and that `config` is
-an object, and the provider registered for that type in the binary
-(`cmd/<binary>/providers.go`) decodes and validates the object itself
-([ADR 0019](adr/0019-provider-boundary.md)).
-The Conductor's configuration (`internal/conductor/config`) defines
-`ExecutionBinding`s and lists the ACME/DNS/Store binding **names** a policy
-or target may select — names only; what a name resolves to is Runner
-configuration, and the Conductor never sees it.
-A `JobSpec` carries only the binding's name (a short DNS-label-like string,
-see `pkg/api/v1alpha1/validate.go`'s `bindingNameRe`); the Runner resolves
-that name to the actual directory URL, credential, or workload identity
-from its own configuration. This is what keeps arbitrary infrastructure
-values out of API input entirely, and is why the Conductor can be given no
-DNS write and no Certificate Store read permission at all: it never needs
-to know what a binding actually resolves to.
+MVP では 4 種類のバインディングすべてが Runner/Conductor の起動時設定から読み込まれる．
+実行時にそれらを作成・変更するための管理 API はない．
+`ExecutionBinding` と `StoreBinding` は `{ "type", "config" }` の形をとる: 汎用の設定は
+型名の形と `config` がオブジェクトであることだけを知っており，バイナリ内でその型に
+登録されたプロバイダ（`cmd/<binary>/providers.go`）がオブジェクト自体をデコードして
+検証する（[ADR 0019](adr/0019-provider-boundary.md)）．
+Conductor の設定（`internal/conductor/config`）は `ExecutionBinding` を定義し，
+ポリシーや target が選択してよい ACME/DNS/Store バインディングの **名前** を列挙する．
+名前だけである．名前が何に解決されるかは Runner の設定であり，Conductor がそれを
+見ることは決してない．
+`JobSpec` が運ぶのはバインディングの名前（DNS ラベルに似た短い文字列．
+`pkg/api/v1alpha1/validate.go` の `bindingNameRe` を参照）だけであり，Runner はその
+名前を自身の設定から実際のディレクトリ URL，資格情報，ワークロード ID に解決する．
+これにより任意のインフラ値が API 入力から完全に排除され，Conductor に DNS の
+書き込み権限も Certificate Store の読み取り権限もまったく与えずに済む．Conductor は
+バインディングが実際に何に解決されるかを知る必要が決してないからである．
 
-## JobSpec/Result contract
+## JobSpec/Result コントラクト
 
-Defined in `pkg/api/v1alpha1` (`types.go`, `validate.go`, `decode.go`) and
-mirrored as JSON Schema under `schemas/v1alpha1/` (kept in sync with the Go
-validation by tests; the Go code is always authoritative — see
-`schemas/README.md`). Schema API version:
-`acme-conductor.cits-nue.github.io/v1alpha1`.
+`pkg/api/v1alpha1`（`types.go`，`validate.go`，`decode.go`）で定義され，
+`schemas/v1alpha1/` 配下に JSON Schema として写される（テストにより Go の検証と同期が
+保たれる．常に Go のコードが正である．`schemas/README.md` を参照）．スキーマの
+API バージョン: `acme-conductor.cits-nue.github.io/v1alpha1`．
 
 ### `CertificateReconcileJob` (`JobSpec`)
 
-Produced by the Conductor, consumed exactly once by a Runner.
+Conductor が生成し，Runner がちょうど 1 回消費する．
 
 ```json
 {
@@ -247,85 +228,74 @@ Produced by the Conductor, consumed exactly once by a Runner.
 }
 ```
 
-`policy` is a **snapshot**, not a reference: it is the policy the Conductor
-applied when it created the job, copied by value so that a run can be fully
-audited from the `JobSpec` alone without calling back to the Conductor. It
-is untrusted input to the Runner, exactly like every other field in the
-document — see
-[Validation vs. authorization](#validation-vs-authorization) below.
+`policy` は参照ではなく **スナップショット** である: Conductor がジョブを作成した
+時点で適用したポリシーを値としてコピーしたもので，Conductor に問い合わせることなく
+`JobSpec` だけから実行を完全に監査できるようにする．Runner にとっては文書の他の
+すべてのフィールドとまったく同様に信頼できない入力である．後述の
+[検証と認可](#検証と認可)を参照．
 
-Forbidden in a `JobSpec`, by construction of the schema (there is simply no
-field for these, and strict decoding rejects any attempt to add one): a
-shell command, an executable path, arbitrary environment variables, a
-container image reference, a client secret / access key / private key, an
-arbitrary cloud resource ID, or an arbitrary output path. Only opaque
-identifiers, a normalized FQDN, policy values, and logical binding names
-ever appear.
+`JobSpec` において，スキーマの構成上禁止されるもの（そのためのフィールドがそもそも
+存在せず，厳格なデコードは追加しようとするあらゆる試みを拒否する）: シェルコマンド，
+実行ファイルのパス，任意の環境変数，コンテナイメージの参照，クライアントシークレット /
+アクセスキー / 秘密鍵，任意のクラウドリソース ID，任意の出力パス．現れるのは
+不透明な識別子，正規化された FQDN，ポリシーの値，論理バインディング名だけである．
 
-### Validation vs. authorization
+### 検証と認可
 
-`pkg/api/v1alpha1/validate.go` and `internal/policy` deliberately separate
-two different questions, and the docs (and code comments) never use the
-word "authorize" for the first one:
+`pkg/api/v1alpha1/validate.go` と `internal/policy` は意図的に 2 つの異なる問いを
+分離しており，文書（およびコードコメント）は前者に対して「認可」という語を決して
+使わない:
 
-- **Validation** — what `JobSpec.Validate` does. It checks that a document
-  is well-formed and **internally self-consistent**: constants and syntax,
-  ranges, that `target.fqdn` and every entry of `policy.allowedDnsSuffixes`
-  are already in canonical form, and that `target.fqdn` lies under one of
-  the suffixes in the `policy` snapshot **embedded in the same document**,
-  on a label boundary, with wildcard use only when that same snapshot
-  allows it. Every value this check compares comes from the document
-  itself. Whoever can produce or alter a `JobSpec` — including a
-  compromised Conductor — can change `target.fqdn` and the `policy`
-  snapshot together and still pass this check, or point a binding name at
-  a different, equally well-formed, registered binding. Passing `Validate`
-  means "this document is coherent," never "this issuance is permitted."
-  See `TestJobSpecValidateIsSelfConsistencyNotAuthorization` in
-  `pkg/api/v1alpha1/validate_test.go`.
-- **Authorization** — what the Runner must do, with its own trusted
-  configuration, before acting on a validated document. This is
-  `policy.RunnerAuthorizationPolicy` and its `Authorize` method
-  (`internal/policy/authorize.go`): a deny-by-default decision evaluated
-  against configuration loaded on the execution platform, never against
-  the `JobSpec`'s own `policy` snapshot. Its fields are:
-  - `AllowedDnsSuffixes` — the DNS suffixes this Runner may issue for.
-  - `AllowWildcard` — whether wildcard names under those suffixes are
-    permitted.
-  - `AllowedACMEBindings`, `AllowedDNSBindings`, `AllowedStoreBindings` —
-    allow-lists of the logical binding names this Runner may select; a
-    binding name that is well-formed but not listed is rejected even if
-    the Runner has configuration for it. Because a `JobSpec`'s binding
-    names are only selectors into this Runner-side configuration, a
-    document whose binding names have been swapped for other registered
-    names is not caught by `Validate` and is caught here instead.
+- **検証** — `JobSpec.Validate` が行うこと．文書が整形式であり **内部的に自己整合**
+  していることを検査する: 定数と構文，範囲，`target.fqdn` と
+  `policy.allowedDnsSuffixes` の各要素がすでに正準形であること，`target.fqdn` が
+  **同じ文書に埋め込まれた** `policy` スナップショット内のいずれかのサフィックスの
+  下にラベル境界で位置すること，そしてワイルドカードの使用はその同じスナップショットが
+  許可する場合に限られること．この検査が比較する値はすべて文書自身に由来する．
+  `JobSpec` を生成または改変できる者は（侵害された Conductor を含めて），
+  `target.fqdn` と `policy` スナップショットを一緒に書き換えてもこの検査を通過できるし，
+  バインディング名を別の，同じく整形式で登録済みのバインディングに向けることもできる．
+  `Validate` を通過することは「この文書は首尾一貫している」を意味するのであって，
+  「この発行は許可されている」を意味することは決してない．
+  `pkg/api/v1alpha1/validate_test.go` の
+  `TestJobSpecValidateIsSelfConsistencyNotAuthorization` を参照．
+- **認可** — 検証済みの文書に基づいて行動する前に，Runner が自身の信頼された設定を
+  用いて行わなければならないこと．これが `policy.RunnerAuthorizationPolicy` とその
+  `Authorize` メソッド（`internal/policy/authorize.go`）である: 既定拒否の判断であり，
+  実行基盤上で読み込まれた設定に照らして評価され，`JobSpec` 自身の `policy`
+  スナップショットに照らすことは決してない．フィールドは以下の通り:
+  - `AllowedDnsSuffixes` — この Runner が発行してよい DNS サフィックス．
+  - `AllowWildcard` — それらのサフィックス配下でワイルドカード名を許可するか．
+  - `AllowedACMEBindings`，`AllowedDNSBindings`，`AllowedStoreBindings` — この
+    Runner が選択してよい論理バインディング名の許可リスト．整形式だが列挙されていない
+    バインディング名は，Runner がその設定を持っていたとしても拒否される．`JobSpec` の
+    バインディング名はこの Runner 側設定へのセレクタにすぎないため，バインディング名が
+    別の登録済みの名前にすり替えられた文書は `Validate` では捕捉されず，代わりにここで
+    捕捉される．
 
-  `Authorize` requires an already-normalized FQDN (it does not normalize on
-  the caller's behalf) and matches suffixes on the same label-boundary
-  rule as validation. Phase 0 defined the policy type and the decision
-  function, with tests; as of Phase 1, the Runner loads its trusted
-  configuration (`internal/runner/config`) and wires
-  `RunnerAuthorizationPolicy` from it (`Config.Policy()`) before it acts on
-  any `JobSpec` — see [`docs/runner.md`](runner.md#execution-flow) for the
-  exact sequence and `docs/threat-model.md` (T1/T2/T5 and
-  "Assurance levels") for what this does and does not close.
-- **Signing's scope.** Since Phase 4 a `JobSpec` can travel inside a
-  `SignedCertificateReconcileJob` envelope (`pkg/api/v1alpha1/signedjob.go`,
-  [ADR 0015](adr/0015-signed-job-envelope.md)): the JWS construction with
-  Ed25519 over the exact JobSpec bytes, a strict protected header with
-  `kid`, `issuedAt`, `expiresAt` and `nonce`, verified by the Runner
-  against public keys in its trusted configuration and backed by a
-  replay ledger in its state directory. It protects the document against
-  tampering in transit and bounds replay; it does not by itself address a
-  compromised Conductor that legitimately produces (and signs) a bad
-  `JobSpec`. Only the Runner-side trusted authorization policy above
-  bounds that case, and it runs on the unwrapped document exactly as
-  before.
+  `Authorize` は正規化済みの FQDN を要求し（呼び出し元に代わって正規化はしない），
+  検証と同じラベル境界の規則でサフィックスを照合する．Phase 0 ではポリシー型と判断
+  関数をテスト付きで定義した．Phase 1 以降，Runner は信頼された設定
+  （`internal/runner/config`）を読み込み，そこから `RunnerAuthorizationPolicy` を
+  組み立てて（`Config.Policy()`）から `JobSpec` に基づいて行動する．正確な手順は
+  [`docs/runner.md`](runner.md#実行フロー) を，これが何を閉じ何を閉じないかは
+  `docs/threat-model.md`（T1/T2/T5 および「保証レベル」）を参照．
+- **署名の範囲．** Phase 4 以降，`JobSpec` は `SignedCertificateReconcileJob`
+  エンベロープ（`pkg/api/v1alpha1/signedjob.go`，
+  [ADR 0015](adr/0015-signed-job-envelope.md)）に包んで運ぶことができる: JobSpec の
+  バイト列そのものに対する Ed25519 の JWS 構成であり，`kid`，`issuedAt`，`expiresAt`，
+  `nonce` を持つ厳格な保護ヘッダを備え，Runner が信頼された設定内の公開鍵に照らして
+  検証し，状態ディレクトリ内のリプレイ台帳で裏付ける．これは転送中の改ざんから文書を
+  守り，リプレイを制限する．しかし，不正な `JobSpec` を正当に生成（そして署名）する
+  侵害された Conductor には，それ自体では対処しない．その場合を制限するのは上記の
+  Runner 側の信頼された認可ポリシーだけであり，これは従来どおり展開後の文書に対して
+  動作する．
 
 ### `CertificateReconcileResult` (`Result`)
 
-Produced by exactly one Runner execution, consumed by the Conductor.
+ちょうど 1 回の Runner 実行が生成し，Conductor が消費する．
 
-Success:
+成功:
 
 ```json
 {
@@ -344,7 +314,7 @@ Success:
 }
 ```
 
-Failure:
+失敗:
 
 ```json
 {
@@ -363,255 +333,229 @@ Failure:
 }
 ```
 
-`storeObjectRef` is a **strict logical name**
-(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, at most 128 characters
-— sized to cover Azure Key Vault certificate names, 1..127 characters — and
-`..` rejected). None of `/ \ : ? # @ % & =` or whitespace can appear, so it
-is never a URL, a URI, a path, or a query string, with or without
-credentials, by construction of the pattern, not just by convention.
+`storeObjectRef` は **厳格な論理名** である
+（`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`，最大 128 文字．Azure Key Vault
+の証明書名（1〜127 文字）を収められる長さで，`..` は拒否される）．`/ \ : ? # @ % & =`
+や空白はどれも現れ得ないため，資格情報の有無にかかわらず，URL にも URI にもパスにも
+クエリ文字列にも決してならない．これは慣習ではなくパターンの構成によって保証される．
 
-`error.summary` is a short, bounded, printable-only string additionally
-checked against the secret-marker heuristic described in
-`pkg/api/v1alpha1/validate.go` (`secretMarkers`) — markers whose meaning
-does not depend on case (`bearer `, `basic `, `authorization:`,
-`password=`, `secret=`, `token=`, `sig=`, `key=`, and similar) are matched
-case-insensitively. That check is defense-in-depth, not a secret detector:
-it cannot recognize an arbitrary secret or an unknown format. The rule that
-actually keeps a `Result` free of raw external output is a Runner
-responsibility (Phase 1): the Runner never copies a raw external
-command/SDK error, stdout, or stderr into a `Result`; `error.summary` is
-generated only from Runner-owned safe templates, and full external details
-go to redacted internal logs only. `error.code` — one of a fixed,
-append-only set (`InvalidJobSpec`, `PolicyViolation`, `BindingNotFound`,
-`AcmeFailure`, `DnsFailure`, `StoreFailure`, `Timeout`, `Cancelled`,
-`Internal`) — is the primary machine-readable signal for API consumers;
-`error.summary` is for humans and is never meant to be parsed.
+`error.summary` は短く，長さが制限され，印字可能文字のみからなる文字列で，さらに
+`pkg/api/v1alpha1/validate.go` に記述されたシークレットマーカーのヒューリスティック
+（`secretMarkers`）に照らして検査される．大文字小文字に意味が依存しないマーカー
+（`bearer `，`basic `，`authorization:`，`password=`，`secret=`，`token=`，`sig=`，
+`key=` など）は大文字小文字を区別せずに照合される．この検査は多層防御であって
+シークレット検出器ではない: 任意のシークレットや未知の形式を認識することはできない．
+`Result` に生の外部出力が入らないことを実際に保証する規則は Runner の責務である
+（Phase 1）: Runner は生の外部コマンド/SDK のエラー，stdout，stderr を `Result` に
+決してコピーしない．`error.summary` は Runner が持つ安全なテンプレートだけから生成され，
+外部の詳細はすべて秘匿処理済みの内部ログにのみ出力される．`error.code` は固定された
+追記専用の集合（`InvalidJobSpec`，`PolicyViolation`，`BindingNotFound`，
+`AcmeFailure`，`DnsFailure`，`StoreFailure`，`Timeout`，`Cancelled`，`Internal`）の
+いずれかであり，API 利用者にとって主となる機械可読なシグナルである．
+`error.summary` は人間向けであり，決して解析されることを意図していない．
 
-### Decoding rules
+### デコード規則
 
-Both documents are decoded **strictly**: unknown fields, duplicate JSON
-object keys, and trailing data after the document are all rejected, any
-document over 64 KiB is rejected outright, and nesting deeper than 8 levels
-is rejected before the walker spends CPU on it (`pkg/api/v1alpha1/decode.go`).
-Duplicate-key rejection matters because `encoding/json` silently keeps the
-last value for a repeated key, which is a classic validation-bypass vector
-if left unchecked.
+両方の文書は **厳格に** デコードされる: 未知のフィールド，重複した JSON オブジェクト
+キー，文書の後に続く余分なデータはすべて拒否され，64 KiB を超える文書は即座に拒否され，
+8 段階を超えるネストはウォーカーが CPU を費やす前に拒否される
+（`pkg/api/v1alpha1/decode.go`）．重複キーの拒否が重要なのは，`encoding/json` が
+繰り返されたキーについて黙って最後の値を採用するためで，放置すれば古典的な検証
+バイパスの経路になる．
 
-## FQDN normalization rules
+## FQDN の正規化規則
 
-Implemented in `internal/policy/fqdn.go` and applied identically by the
-Conductor and the Runner (`JobSpec.Validate()` re-runs `policy.Evaluate`).
-`v1alpha1` is ASCII-only:
+`internal/policy/fqdn.go` に実装され，Conductor と Runner で同一に適用される
+（`JobSpec.Validate()` は `policy.Evaluate` を再実行する）．`v1alpha1` は ASCII のみ
+である:
 
-- Surrounding whitespace is trimmed.
-- Exactly one trailing dot (absolute name) is removed.
-- ASCII letters are lower-cased.
-- Non-ASCII input is rejected (`ErrNonASCII`) — internationalized domain
-  names are not supported yet; see
-  [ADR 0006](adr/0006-ascii-only-fqdn-in-v1alpha1.md).
-- Labels must be 1–63 octets, contain only ASCII letters, digits and
-  hyphens, and must not start or end with a hyphen. Underscore labels are
-  rejected outright: they are not valid host names and a certificate for
-  one is never wanted.
-- A label starting with `xn--` is rejected in `v1alpha1` (`ErrIDNALabel`),
-  even though it is syntactically a valid ASCII label — see ADR 0006.
-- At least two labels are required, and the total length must not exceed
-  253 octets.
-- The top-level (right-most) label must not be all-digits.
-- A wildcard (`*`) is accepted only as the entire left-most label
-  (`*.example.ac.jp`, never `foo*.example.ac.jp` or `*foo.example.ac.jp`),
-  and only when the remaining base name still has at least two labels
-  itself (`*.ac.jp` alone is rejected: a wildcard for an entire TLD is
-  never valid).
+- 前後の空白は取り除く．
+- 末尾のドット（絶対名）はちょうど 1 つだけ取り除く．
+- ASCII の英字は小文字にする．
+- 非 ASCII の入力は拒否する（`ErrNonASCII`）．国際化ドメイン名はまだサポートしない．
+  [ADR 0006](adr/0006-ascii-only-fqdn-in-v1alpha1.md) を参照．
+- ラベルは 1〜63 オクテットで，ASCII の英字，数字，ハイフンのみを含み，ハイフンで
+  始まったり終わったりしてはならない．アンダースコアを含むラベルは即座に拒否する:
+  有効なホスト名ではなく，そのための証明書が望まれることは決してない．
+- `xn--` で始まるラベルは，構文的には有効な ASCII ラベルであっても `v1alpha1` では
+  拒否する（`ErrIDNALabel`）．ADR 0006 を参照．
+- 少なくとも 2 つのラベルが必要で，全長は 253 オクテットを超えてはならない．
+- 最上位（右端）のラベルはすべて数字であってはならない．
+- ワイルドカード（`*`）は左端のラベル全体としてのみ受け付け
+  （`*.example.ac.jp` は可．`foo*.example.ac.jp` や `*foo.example.ac.jp` は決して
+  不可），かつ残りのベース名自体が少なくとも 2 つのラベルを持つ場合に限る
+  （`*.ac.jp` 単独は拒否する: TLD 全体のワイルドカードが有効であることは決してない）．
 
-Allowed DNS suffixes in a `CertificatePolicy` go through the same
-normalization (`NormalizeSuffix`), plus a check that a suffix itself never
-contains a wildcard.
+`CertificatePolicy` の許可 DNS サフィックスも同じ正規化（`NormalizeSuffix`）を通り，
+加えてサフィックス自体がワイルドカードを決して含まないことを検査する．
 
-### Label-boundary suffix matching
+### ラベル境界でのサフィックス照合
 
-A `Target`'s FQDN is checked against a policy's allowed suffixes by
-**whole label**, never by raw string suffix. `evil-example.ac.jp` is
-**not** under the allowed suffix `example.ac.jp`, even though it ends with
-the characters `example.ac.jp`: the match requires either an exact match or
-a preceding `.` so the boundary falls exactly on a label separator
-(`example.ac.jp` or `*.example.ac.jp` matches; `evil-example.ac.jp` does
-not, because there is no `.` immediately before `example.ac.jp` in that
-name). For a wildcard target, the base name — the part after `*.` — is what
-gets matched against the suffix list.
+`Target` の FQDN はポリシーの許可サフィックスに対して **ラベル単位** で検査され，
+生の文字列サフィックスで検査されることは決してない．`evil-example.ac.jp` は
+`example.ac.jp` という文字で終わっていても，許可サフィックス `example.ac.jp` の下には
+**ない**: 照合には完全一致か，境界がちょうどラベル区切りに落ちるように直前に `.` が
+あることが必要である（`example.ac.jp` と `*.example.ac.jp` は一致する．
+`evil-example.ac.jp` は一致しない．その名前では `example.ac.jp` の直前に `.` が
+ないためである）．ワイルドカード target では，ベース名（`*.` の後の部分）が
+サフィックス一覧と照合される．
 
-## Repository layout
+## リポジトリの構成
 
 ```
 cmd/
-  acme-conductor/   control-plane binary (serve, Phase 2); providers.go registers the launcher types it ships
-  acme-runner/      data-plane binary (reconcile, Phase 1); providers.go registers the store types it ships
+  acme-conductor/   コントロールプレーンのバイナリ (serve，Phase 2)．providers.go が同梱するランチャー型を登録する
+  acme-runner/      データプレーンのバイナリ (reconcile，Phase 1)．providers.go が同梱する store 型を登録する
 internal/
-  conductor/            Conductor wiring: config, registry, scheduler, launchers, API (Phase 2)
-  conductor/api/        REST API handlers, the localhost-dev authenticator, role enforcement, GUI routes
-  conductor/oidc/       OIDC bearer-token authenticator: discovery, key set cache, JWS verification (Phase 5)
-  conductor/oidc/oidctest/ in-process OpenID provider for tests; not compiled into shipped binaries
-  conductor/ui/         the embedded GUI: index.html, app.js, app.css (Phase 5)
-  conductor/config/     Conductor configuration loading and validation; knows no launcher type
-  conductor/launchers/  composition layer: the launcher provider registry the Conductor core builds launchers through
-  conductor/launcher/localprocess/ the local-process launcher (development and tests)
-  conductor/launcher/acajob/ Azure Container Apps Job launcher (Phase 4) — the Conductor's only Azure SDK import
-  conductor/registry/   domain model (Target, CertificatePolicy, Run, AuditEvent) and Registry interface
-  conductor/scheduler/  due decision, per-target exclusion, run execution
-  conductor/sqlite/     SQLite implementation of Registry, with migrations
-  conductor/fakerunner/ test double for acme-runner used by Conductor tests; not compiled into shipped binaries
-  conductor/migration/  migration from an infrastructure-defined host list: Bicep parameter/TargetList readers, diff, idempotent import, shadow comparison (Phase 6)
-  fslock/           advisory file locks shared by the Runner's on-disk stores
-  policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
-  runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
-  runner/config/    Runner configuration loading and validation (Phase 1); knows no store type
-  runner/transport/ how a job reaches the Runner and its Result leaves: the Source contract and the two-file transport
-  runner/transport/claim/ the shared-directory (exchange) transport, given an execution identity by the command
-  runner/platform/azurecontainerapps/ the execution identity of a Container Apps Job execution; the Runner's only mention of that platform
-  runner/stores/    composition layer: the store provider registry the Runner core opens stores through
-  runner/lego/      lego argv/env construction, subprocess execution, output redaction (Phase 1)
-  runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries
-  store/            Certificate Store implementations; the contract itself is pkg/store
-  store/filesystem/ filesystem-backed Certificate Store (dev/test only, Phase 1)
-  store/keyvault/   Azure Key Vault Certificate Store (Phase 3) — the Runner's only Azure SDK import
-  version/          build metadata injected via -ldflags
-pkg/api/v1alpha1/   the versioned JobSpec/Result contract and the signed job envelope (types, validation, strict decoding)
-pkg/store/          the Certificate Store contract (Store, Bundle, Info) and the certificate helpers every store shares
-pkg/launcher/       the Job Launcher contract (Launcher, Execution, Error/Reason), job signing and result verification
-                    — pkg/ is what a provider adapter in another module imports (pkg/contracts_test.go keeps it so)
-schemas/v1alpha1/   JSON Schema mirror of the Go contract, kept in sync by tests
-deploy/examples/    example Conductor and Runner configurations and a JobSpec document
-deploy/azure/       Bicep for the Container Apps deployment: environment, identities, custom roles, Runner Job, Conductor app (Phase 4)
-docs/               this document, the threat model, the Conductor and Runner guides, and ADRs
-Dockerfile.conductor  distroless, non-root image for acme-conductor
-Dockerfile.runner     distroless, non-root image for acme-runner
-Makefile            build / verify / image targets
-.github/workflows/   CI (format, vet, build, test, race, govulncheck, container smoke test) and the release workflow (GHCR images with SBOM and provenance, Phase 5)
+  conductor/            Conductor の配線: 設定，レジストリ，スケジューラ，ランチャー，API (Phase 2)
+  conductor/api/        REST API ハンドラ，localhost-dev 認証器，ロールの強制，GUI のルート
+  conductor/oidc/       OIDC ベアラートークン認証器: ディスカバリ，鍵セットのキャッシュ，JWS 検証 (Phase 5)
+  conductor/oidc/oidctest/ テスト用のインプロセス OpenID プロバイダ．出荷するバイナリにはコンパイルされない
+  conductor/ui/         埋め込みの GUI: index.html，app.js，app.css (Phase 5)
+  conductor/config/     Conductor の設定の読み込みと検証．ランチャー型を知らない
+  conductor/launchers/  合成層: Conductor のコアがランチャーを構築する際に通るランチャープロバイダのレジストリ
+  conductor/launcher/localprocess/ ローカルプロセスのランチャー (開発とテスト)
+  conductor/launcher/acajob/ Azure Container Apps Job ランチャー (Phase 4)．Conductor 唯一の Azure SDK import
+  conductor/registry/   ドメインモデル (Target，CertificatePolicy，Run，AuditEvent) と Registry インタフェース
+  conductor/scheduler/  期限到来の判断，target ごとの排他，run の実行
+  conductor/sqlite/     Registry の SQLite 実装．マイグレーション付き
+  conductor/fakerunner/ Conductor のテストで使う acme-runner のテストダブル．出荷するバイナリにはコンパイルされない
+  conductor/migration/  インフラ定義のホスト一覧からの移行: Bicep パラメータ/TargetList の読み取り，差分，冪等な取り込み，shadow 比較 (Phase 6)
+  fslock/           Runner のディスク上の store が共有するアドバイザリファイルロック
+  policy/           FQDN の正規化とサフィックス照合 (internal/policy/fqdn.go)
+  runner/           Runner の reconcile ループ，作業ディレクトリ/状態ディレクトリの扱い，Result の書き出し (Phase 1)
+  runner/config/    Runner の設定の読み込みと検証 (Phase 1)．store 型を知らない
+  runner/transport/ ジョブが Runner に届き Result が出ていく経路: Source コントラクトと 2 ファイル方式のトランスポート
+  runner/transport/claim/ 共有ディレクトリ (交換用) のトランスポート．実行 ID はコマンドから与えられる
+  runner/platform/azurecontainerapps/ Container Apps Job 実行の実行 ID．Runner がその基盤に言及する唯一の場所
+  runner/stores/    合成層: Runner のコアが store を開く際に通る store プロバイダのレジストリ
+  runner/lego/      lego の argv/env の構築，サブプロセス実行，出力の秘匿 (Phase 1)
+  runner/fakelego/  Runner のテストで使う lego のテストダブル．出荷するバイナリにはコンパイルされない
+  store/            Certificate Store の実装．コントラクト自体は pkg/store
+  store/filesystem/ ファイルシステムを用いる Certificate Store (開発/テスト専用，Phase 1)
+  store/keyvault/   Azure Key Vault の Certificate Store (Phase 3)．Runner 唯一の Azure SDK import
+  version/          -ldflags で注入するビルド情報
+pkg/api/v1alpha1/   バージョン付きの JobSpec/Result コントラクトと署名付きジョブエンベロープ (型，検証，厳格なデコード)
+pkg/store/          Certificate Store コントラクト (Store，Bundle，Info) とすべての store が共有する証明書ヘルパー
+pkg/launcher/       Job Launcher コントラクト (Launcher，Execution，Error/Reason)，ジョブ署名と Result 検証
+                    — pkg/ は別モジュールのプロバイダアダプタが import するもの (pkg/contracts_test.go がそれを保つ)
+schemas/v1alpha1/   Go コントラクトを写した JSON Schema．テストで同期を保つ
+deploy/examples/    Conductor と Runner の設定例と JobSpec 文書の例
+deploy/azure/       Container Apps デプロイ用の Bicep: 環境，ID，カスタムロール，Runner Job，Conductor アプリ (Phase 4)
+docs/               この文書，脅威モデル，Conductor と Runner のガイド，ADR
+Dockerfile.conductor  acme-conductor 用の distroless・非 root イメージ
+Dockerfile.runner     acme-runner 用の distroless・非 root イメージ
+Makefile            build / verify / image のターゲット
+.github/workflows/   CI (フォーマット，vet，ビルド，テスト，race，govulncheck，コンテナのスモークテスト) とリリースワークフロー (SBOM と provenance 付きの GHCR イメージ，Phase 5)
 ```
 
-`pkg/` holds code meant to be importable by both binaries and, eventually,
-by external tooling that speaks the JobSpec/Result contract; `internal/`
-holds code private to this module.
+`pkg/` には両バイナリから，そしてゆくゆくは JobSpec/Result コントラクトを話す外部
+ツールからも import されることを意図したコードを置く．`internal/` にはこのモジュール
+限りのコードを置く．
 
-## Technology choices
+## 技術選定
 
-- **Go**, using the standard `net/http` (method-and-pattern `ServeMux`)
-  for the REST API — no web framework (Phase 2).
-- **SQLite** (`modernc.org/sqlite`, pure Go, so `CGO_ENABLED=0` still
-  holds) behind a `Registry` interface with versioned, explicit
-  migrations for the Conductor's state (Target, CertificatePolicy, Run,
-  AuditEvent) — see [ADR 0011](adr/0011-conductor-storage-and-run-model.md).
-  PostgreSQL and multi-replica Conductor are explicitly out of scope for
-  now (see [non-goals](#non-goals)).
-- **No SPA framework, no build step** for the GUI (Phase 5): three
-  static files embedded in the binary, DOM rendering, a strict
-  Content-Security-Policy, and OIDC authorization code + PKCE in the
-  browser as a public client. The API's token verification is written in
-  the repository on the standard library's `crypto/rsa` and
-  `crypto/ecdsa` rather than taken from a JWT library, so that what is
-  accepted is exactly what the threat model lists
-  ([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)).
-- **Runner image**: multi-stage build, pinned official `lego` binary
-  fetched and checksum-verified (Phase 1), distroless static base image.
-- **GHCR** (`ghcr.io/cits-nue/acme-conductor`,
-  `ghcr.io/cits-nue/acme-runner`) is the canonical container registry;
-  a version tag publishes both images for `linux/amd64` and
-  `linux/arm64` with an SBOM and SLSA provenance attached, from
-  digest-pinned base images ([ADR 0017](adr/0017-release-pipeline.md)).
-- **Configuration**: non-secret configuration via environment variables or
-  a config file; secrets are never part of Conductor configuration at all,
-  by design (the Conductor holds no DNS, Key Vault, or long-lived cloud
-  credential — see [security principles](#security-principles)).
-- Cloud SDKs (Azure, later AWS/GCP if ever added) live only inside launcher
-  and store adapter implementations, never in Conductor core. The
-  boundary is structural: adapters implement the public contracts
-  `pkg/store` and `pkg/launcher`, the core reaches them only through the
-  registries in `internal/runner/stores` and `internal/conductor/launchers`,
-  and the Runner core consumes a job through `internal/runner/transport`
-  without reading any platform's environment. One Go module holds all
-  of it until a second platform exists; `deploy/azure` is the reference
-  infrastructure of the Azure adapters and stays alongside them
-  ([ADR 0019](adr/0019-provider-boundary.md)).
+- **Go**．REST API には標準の `net/http`（メソッドとパターンによる `ServeMux`）を使い，
+  Web フレームワークは使わない（Phase 2）．
+- **SQLite**（`modernc.org/sqlite`．純 Go なので `CGO_ENABLED=0` を保てる）を
+  `Registry` インタフェースの背後に置き，Conductor の状態（Target，CertificatePolicy，
+  Run，AuditEvent）にバージョン付きの明示的なマイグレーションを用いる．
+  [ADR 0011](adr/0011-conductor-storage-and-run-model.md) を参照．PostgreSQL と
+  複数レプリカの Conductor は当面明示的に対象外である（[非目標](#非目標)を参照）．
+- GUI には **SPA フレームワークもビルド工程も使わない**（Phase 5）: バイナリに
+  埋め込んだ 3 つの静的ファイル，DOM による描画，厳格な Content-Security-Policy，
+  ブラウザ内でパブリッククライアントとして行う OIDC 認可コード + PKCE．API のトークン
+  検証は JWT ライブラリから取らず，標準ライブラリの `crypto/rsa` と `crypto/ecdsa` の
+  上にリポジトリ内で書かれている．受け入れるものが脅威モデルの列挙とちょうど一致する
+  ようにするためである（[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)）．
+- **Runner イメージ**: マルチステージビルド，取得しチェックサム検証した固定バージョンの
+  公式 `lego` バイナリ（Phase 1），distroless の静的ベースイメージ．
+- **GHCR**（`ghcr.io/cits-nue/acme-conductor`，`ghcr.io/cits-nue/acme-runner`）が
+  正式なコンテナレジストリである．バージョンタグを打つと，ダイジェスト固定のベース
+  イメージから `linux/amd64` と `linux/arm64` 向けの両イメージが SBOM と SLSA provenance
+  付きで公開される（[ADR 0017](adr/0017-release-pipeline.md)）．
+- **設定**: 非シークレットの設定は環境変数または設定ファイルで行う．シークレットは
+  設計上，Conductor の設定にはまったく含まれない（Conductor は DNS，Key Vault，
+  長期有効なクラウド資格情報を持たない．[セキュリティ原則](#セキュリティ原則)を参照）．
+- クラウド SDK（Azure，将来追加されるなら AWS/GCP）はランチャーと store アダプタの
+  実装の内部にのみ置き，Conductor のコアには決して置かない．この境界は構造的である:
+  アダプタは公開コントラクト `pkg/store` と `pkg/launcher` を実装し，コアは
+  `internal/runner/stores` と `internal/conductor/launchers` のレジストリを通じてのみ
+  それらに到達し，Runner のコアはいかなる基盤の環境も読まずに
+  `internal/runner/transport` を通じてジョブを受け取る．2 つ目の基盤が現れるまでは
+  単一の Go モジュールがすべてを持つ．`deploy/azure` は Azure アダプタの参照インフラで
+  あり，それらと並べて残す（[ADR 0019](adr/0019-provider-boundary.md)）．
 
-## Security principles
+## セキュリティ原則
 
-These hold across every phase and are traced to concrete mitigations in
-[`docs/threat-model.md`](threat-model.md):
+これらはすべての Phase を通じて成り立ち，[`docs/threat-model.md`](threat-model.md) で
+具体的な対策に紐付けられている:
 
-1. The Conductor never stores, retrieves or distributes certificate private
-   keys.
-2. The Conductor holds no DNS credential, Key Vault credential, or
-   long-lived cloud credential of any kind.
-3. The Runner authenticates to cloud services using the execution
-   platform's workload identity (Azure Managed Identity, AWS IAM Role, GCP
-   Service Account) — never a static secret baked into configuration.
-4. Private keys are generated in the Runner's temporary area, stored
-   directly into the Certificate Store, and then destroyed; they never
-   transit through the Conductor.
-5. Conductor identity and Runner identity are kept separate. The Conductor
-   is granted no DNS write permission and no Certificate Store read
-   permission.
-6. API input can never specify commands, container images, resource IDs,
-   credentials, or provider configuration — only the logical names of
-   administrator-registered bindings (see
-   [binding model](#binding-model)).
-7. FQDN policy is validated by the Conductor when it accepts a `Target`/
-   `CertificatePolicy`; the Runner does not trust that the Conductor
-   already did the check. The Runner both **validates** the `JobSpec`
-   document it receives (self-consistency; see
-   [Validation vs. authorization](#validation-vs-authorization)) and
-   **authorizes** it against its own trusted, Runner-side policy — the
-   validation step is not itself authorization.
-8. Production ACME certificate authorities are never called from automated
-   tests.
+1. Conductor は証明書の秘密鍵を保存・取得・配布することが決してない．
+2. Conductor は DNS の資格情報，Key Vault の資格情報，その他いかなる種類の長期有効な
+   クラウド資格情報も持たない．
+3. Runner は実行基盤のワークロード ID（Azure Managed Identity，AWS IAM Role，GCP
+   Service Account）でクラウドサービスに認証する．設定に埋め込んだ静的シークレットは
+   決して使わない．
+4. 秘密鍵は Runner の一時領域で生成され，Certificate Store に直接格納された後，
+   破棄される．Conductor を経由することは決してない．
+5. Conductor の ID と Runner の ID は分離されている．Conductor には DNS の書き込み
+   権限も Certificate Store の読み取り権限も与えない．
+6. API の入力でコマンド，コンテナイメージ，リソース ID，資格情報，プロバイダ設定を
+   指定することは決してできない．指定できるのは管理者が登録したバインディングの
+   論理名だけである（[バインディングモデル](#バインディングモデル)を参照）．
+7. FQDN ポリシーは，`Target`/`CertificatePolicy` を受け付ける際に Conductor が
+   検証する．Runner は Conductor がすでに検査したことを信頼しない．Runner は受け取った
+   `JobSpec` 文書を **検証** し（自己整合性．[検証と認可](#検証と認可)を参照），かつ
+   自身の信頼された Runner 側ポリシーに照らして **認可** する．検証の段階はそれ自体では
+   認可ではない．
+8. 本番の ACME 認証局を自動テストから呼ぶことは決してない．
 
-## Observability & logging rules
+## 可観測性とログの規則
 
-- Structured JSON logs, always in UTC.
-- Every log line for a run carries `runId` and `targetId`.
-- Logs never carry credentials, private keys, or the ACME External Account
-  Binding (EAB) HMAC — see the threat model's secret-leakage entry.
-- `/healthz` and `/readyz` exist since Phase 2 (`readyz` pings the
-  registry); a Prometheus `/metrics` endpoint follows in a later phase.
+- 構造化 JSON ログ．常に UTC．
+- 実行に関するすべてのログ行は `runId` と `targetId` を持つ．
+- ログには資格情報，秘密鍵，ACME External Account Binding（EAB）の HMAC を決して
+  含めない．脅威モデルのシークレット漏えいの項を参照．
+- `/healthz` と `/readyz` は Phase 2 以降存在する（`readyz` はレジストリに ping する）．
+  Prometheus の `/metrics` エンドポイントは後の Phase で続く．
 
-## Roadmap
+## ロードマップ
 
-**Phases 0 to 6** are implemented today. Phases are strictly
-sequential; a given pull request implements one phase's scope and no more
-(see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
+**Phase 0 から 6** が現在実装済みである．Phase は厳密に順次進める．1 つの PR は
+1 つの Phase の範囲を実装し，それ以上は実装しない
+（[`CONTRIBUTING.md`](../CONTRIBUTING.md) を参照）．
 
-| Phase | Scope |
+| Phase | 範囲 |
 |---|---|
-| 0 | Bootstrap: module layout, JobSpec/Result contract, CI. |
-| 1 | **Implemented.** Runner + filesystem Certificate Store, with a pinned `lego` CLI. See [`docs/runner.md`](runner.md), [ADR 0009](adr/0009-runner-execution-model.md) and [ADR 0010](adr/0010-pinned-lego-binary.md). |
-| 2 | **Implemented.** Conductor MVP: SQLite registry, REST API, local process launcher, localhost-only dev auth. See [`docs/conductor.md`](conductor.md), [ADR 0011](adr/0011-conductor-storage-and-run-model.md) and [ADR 0012](adr/0012-localhost-only-dev-auth.md). |
-| 3 | **Implemented.** Azure Key Vault store adapter, authenticated with the platform's managed identity (or the SDK's `DefaultAzureCredential` chain for development). See [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) and [ADR 0013](adr/0013-azure-key-vault-store-adapter.md). |
-| 4 | **Implemented.** Azure Container Apps Job launcher (the Runner as a scheduled Job under its own managed identity that takes the jobs the Conductor offers on a shared volume; the Conductor cannot start executions), provisioned via Bicep with disjoint identities and least-privilege custom roles; signed, expiring job envelope with a Runner-side replay ledger, and Runner-signed Results. See [`docs/conductor.md`](conductor.md#execution-binding-azure-container-apps-job), [`deploy/azure/README.md`](../deploy/azure/README.md), [ADR 0014](adr/0014-azure-container-apps-job-launcher.md) and [ADR 0015](adr/0015-signed-job-envelope.md). |
-| 5 | **Implemented.** OIDC bearer-token authentication with named principals and admin/viewer roles, a TLS listener or an explicit behind-ingress statement, a minimal static GUI with PKCE sign-in, and a release workflow that publishes both images to GHCR with an SBOM and provenance from digest-pinned bases. The Container Apps deployment gains an HTTPS ingress and loses the admin sidecar. See [`docs/conductor.md`](conductor.md#authentication), [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md) and [ADR 0017](adr/0017-release-pipeline.md). |
-| 6 | **Implemented.** Migration tooling from the existing cert-infra repository: the host list is read from its Bicep parameter file (or a TargetList document), compared with the registry (`added`/`changed`/`missing`/`unchanged`/`rejected`) and imported idempotently (dry run by default, never an update or a delete); a `migration.targetSource` flag (`iac`/`shadow`/`registry`) keeps the Conductor from issuing until the switch, with a shadow mode that records comparisons; rollback is the flag. See [`docs/migration.md`](migration.md) and [ADR 0020](adr/0020-migration-from-cert-infra.md). |
+| 0 | ブートストラップ: モジュール構成，JobSpec/Result コントラクト，CI． |
+| 1 | **実装済み．** Runner + ファイルシステムの Certificate Store，固定バージョンの `lego` CLI 付き．[`docs/runner.md`](runner.md)，[ADR 0009](adr/0009-runner-execution-model.md)，[ADR 0010](adr/0010-pinned-lego-binary.md) を参照． |
+| 2 | **実装済み．** Conductor MVP: SQLite レジストリ，REST API，ローカルプロセスランチャー，ローカルホスト限定の開発用認証．[`docs/conductor.md`](conductor.md)，[ADR 0011](adr/0011-conductor-storage-and-run-model.md)，[ADR 0012](adr/0012-localhost-only-dev-auth.md) を参照． |
+| 3 | **実装済み．** Azure Key Vault の store アダプタ．基盤のマネージド ID（開発では SDK の `DefaultAzureCredential` チェーン）で認証する．[`docs/runner.md`](runner.md#certificate-store-azure-key-vault) と [ADR 0013](adr/0013-azure-key-vault-store-adapter.md) を参照． |
+| 4 | **実装済み．** Azure Container Apps Job ランチャー（Runner は自身のマネージド ID で動くスケジュール実行の Job として，Conductor が共有ボリュームに差し出すジョブを受け取る．Conductor は実行を開始できない）．分離された ID と最小権限のカスタムロールで Bicep によりプロビジョニングする．署名付き・期限付きのジョブエンベロープと Runner 側のリプレイ台帳，Runner が署名した Result．[`docs/conductor.md`](conductor.md#実行バインディング-azure-container-apps-job)，[`deploy/azure/README.md`](../deploy/azure/README.md)，[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)，[ADR 0015](adr/0015-signed-job-envelope.md) を参照． |
+| 5 | **実装済み．** 名前付きプリンシパルと admin/viewer ロールによる OIDC ベアラートークン認証，TLS リスナーまたは ingress 背後にあることの明示的な宣言，PKCE サインインを備えた最小限の静的 GUI，そして両イメージをダイジェスト固定のベースから SBOM と provenance 付きで GHCR に公開するリリースワークフロー．Container Apps のデプロイは HTTPS ingress を得て，管理用サイドカーを失う．[`docs/conductor.md`](conductor.md#認証)，[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)，[ADR 0017](adr/0017-release-pipeline.md) を参照． |
+| 6 | **実装済み．** 既存の cert-infra リポジトリからの移行ツール: ホスト一覧をその Bicep パラメータファイル（または TargetList 文書）から読み，レジストリと比較し（`added`/`changed`/`missing`/`unchanged`/`rejected`），冪等に取り込む（既定は dry-run．更新も削除も決して行わない）．`migration.targetSource` フラグ（`iac`/`shadow`/`registry`）により切り替えまで Conductor は発行を行わず，shadow モードでは比較を記録する．ロールバックはこのフラグである．[`docs/migration.md`](migration.md) と [ADR 0020](adr/0020-migration-from-cert-infra.md) を参照． |
 
-## Non-goals
+## 非目標
 
-Explicitly out of scope until a future phase or ADR says otherwise:
+将来の Phase または ADR が別途定めるまで，明示的に対象外とする:
 
-- Re-implementing the ACME protocol or DNS provider integrations (`lego`
-  already does this).
-- Custom cryptography.
-- A private-key distribution API of any kind.
-- A Kubernetes operator or CRDs.
-- Multi-replica / highly-available Conductor.
-- PostgreSQL (SQLite is the store for the foreseeable future).
-- AWS or GCP providers (the binding model anticipates them, and a
-  provider is now a package plus a registration line — [ADR 0019](adr/0019-provider-boundary.md);
-  nothing is implemented yet).
-- Delivering certificates to Arc-managed hosts.
-- Automatic purge of any kind (see
-  [ADR 0008](adr/0008-no-purge-in-mvp.md)).
-- Arbitrary scripts or post-issuance hooks.
-- User-supplied container images.
-- Dynamic plugin download.
+- ACME プロトコルや DNS プロバイダ連携の再実装（`lego` がすでに行っている）．
+- 独自の暗号．
+- いかなる種類の秘密鍵配布 API．
+- Kubernetes オペレータや CRD．
+- 複数レプリカ / 高可用な Conductor．
+- PostgreSQL（当面は SQLite がストアである）．
+- AWS または GCP のプロバイダ（バインディングモデルはこれらを見越しており，プロバイダは
+  今ではパッケージ 1 つと登録行 1 行である．[ADR 0019](adr/0019-provider-boundary.md)．
+  まだ何も実装されていない）．
+- Arc 管理下のホストへの証明書配布．
+- あらゆる種類の自動 purge（[ADR 0008](adr/0008-no-purge-in-mvp.md) を参照）．
+- 任意のスクリプトや発行後フック．
+- 利用者が指定するコンテナイメージ．
+- 動的なプラグインダウンロード．
 
-## See also
+## 関連文書
 
-- [Threat model](threat-model.md)
+- [脅威モデル](threat-model.md)
 - [Architecture Decision Records](adr/README.md)

@@ -1,56 +1,53 @@
-# 0012: Localhost-only development authentication
+# 0012: ローカルホスト限定の開発用認証
 
-- Status: Accepted (since Phase 5 the development mode next to `oidc`, [ADR 0016](0016-oidc-bearer-auth-and-gui.md))
-- Date: 2026-09-22
+- ステータス: 採択（Phase 5 以降は `oidc` と並ぶ開発モード，[ADR 0016](0016-oidc-bearer-auth-and-gui.md)）
+- 日付: 2026-09-22
 
-## Context
+## 背景
 
-Phase 2 adds the REST API, and with it the first network boundary that
-accepts free-form external input (threat model, trust boundary 1). Real
-authentication — OIDC with named principals and roles — is Phase 5. The
-MVP still needs *some* rule for who may call the API, and it has to be one
-that cannot quietly become production authentication by omission.
+Phase 2 は REST API を追加し，それとともに自由形式の外部入力を受け付ける最初の
+ネットワーク境界が生まれる（脅威モデルの信頼境界 1）．本物の認証，すなわち
+名前付きプリンシパルとロールを持つ OIDC は Phase 5 である．MVP にも誰が API を
+呼んでよいかについての *何らかの* 規則は必要であり，それは省略によって
+いつの間にか本番の認証になってしまうことのないものでなければならない．
 
-## Decision
+## 決定
 
-The only authentication mode in Phase 2 is `localhost-dev`
-(`internal/conductor/api.LocalhostDev`), and it is spelled out as a
-development mode:
+Phase 2 における唯一の認証モードは `localhost-dev`
+（`internal/conductor/api.LocalhostDev`）であり，開発モードとして明示されている．
 
-- **The listener is loopback-only.** Configuration refuses a
-  `server.listen` host that is not `localhost` or a loopback IP literal
-  (a host name is rejected rather than resolved), and `Serve` re-checks
-  the bound address before accepting a connection.
-- **The peer must be loopback.** Every API request's TCP peer address must
-  be a loopback address; anything else is refused with `403`.
-- **Browsers on the same host are treated as hostile.** A page loaded in a
-  local browser can reach loopback too, so the mode refuses the ways a
-  page could drive the API: a `Host` header that is not a loopback name
-  (DNS rebinding), an `Origin` header that is not the API's own loopback
-  origin (cross-site `fetch`), a `Sec-Fetch-Site` other than
-  `same-origin`/`none`, and, for every request with a body, a
-  `Content-Type` other than `application/json` (a simple-request form
-  post cannot carry it).
-- **One principal.** Every accepted caller is the principal
-  `localhost-dev`; it is recorded as the actor of audit events and the
-  `requestedBy` of runs. There is no finer identity in this mode and the
-  audit log says so.
-- **The mode is named in configuration** (`server.auth.mode`), so a later
-  mode (OIDC) is an explicit switch and a deployment can never be running
-  with development authentication without the configuration saying so in
-  one place. `Authenticator` is an interface; only its implementation
-  changes in Phase 5.
+- **リスナーはループバックのみ．** 設定は `localhost` またはループバックの IP
+  リテラルでない `server.listen` のホストを拒否し（ホスト名は解決せずに拒否する），
+  `Serve` は接続を受け付ける前にバインドされたアドレスを再確認する．
+- **ピアはループバックでなければならない．** すべての API リクエストの TCP
+  ピアアドレスはループバックアドレスでなければならず，それ以外は `403` で
+  拒否される．
+- **同じホスト上のブラウザは敵対的とみなす．** ローカルのブラウザに読み込まれた
+  ページもループバックに到達できるので，このモードはページが API を操作し得る
+  方法を拒否する．すなわちループバック名でない `Host` ヘッダ（DNS リバイン
+  ディング），API 自身のループバックオリジンでない `Origin` ヘッダ（クロス
+  サイトの `fetch`），`same-origin`/`none` 以外の `Sec-Fetch-Site`，そして
+  ボディを持つすべてのリクエストについて `application/json` 以外の
+  `Content-Type`（simple request のフォーム送信はこれを運べない）である．
+- **プリンシパルは 1 つ．** 受け入れられたすべての呼び出し元はプリンシパル
+  `localhost-dev` であり，監査イベントのアクターおよび run の `requestedBy`
+  として記録される．このモードにそれより細かい ID はなく，監査ログもそう
+  示す．
+- **モードは設定で名指しされる**（`server.auth.mode`）．したがって後のモード
+  （OIDC）は明示的な切り替えであり，設定が 1 か所でそう述べていない限り，
+  デプロイが開発用認証で動いていることは決してない．`Authenticator` は
+  インターフェースであり，Phase 5 で変わるのはその実装だけである．
 
-## Consequences
+## 結果
 
-- The Phase 2 Conductor authenticates "a process on this host", nothing
-  finer: any local user who can open a loopback TCP connection is an
-  administrator. It must not be exposed beyond a single-user development
-  or test host, and the container image must not be published to a
-  network in this mode. `docs/conductor.md` says so in the operator
-  guide, and the threat model lists it as an accepted residual risk (T13).
-- `/healthz` and `/readyz` are not authenticated (they reveal nothing but
-  liveness/readiness), everything under `/api/` is.
-- Because the loopback and header rules are enforced by the
-  `Authenticator`, not by the handlers, no endpoint can be added that
-  bypasses them by accident; the API test suite covers each rule.
+- Phase 2 の Conductor が認証するのは「このホスト上のプロセス」であり，それ
+  以上細かくはない．ループバックの TCP 接続を開けるローカルユーザーは誰でも
+  管理者である．単一ユーザーの開発・テストホストを超えて公開してはならず，
+  このモードのコンテナイメージをネットワークに公開してはならない．
+  `docs/conductor.md` は運用ガイドでそう述べ，脅威モデルはこれを受け入れた
+  残存リスク（T13）として挙げている．
+- `/healthz` と `/readyz` は認証されない（liveness/readiness 以外は何も明かさ
+  ない）．`/api/` 配下のすべては認証される．
+- ループバックとヘッダの規則はハンドラではなく `Authenticator` が強制するので，
+  誤ってそれらを迂回するエンドポイントが追加されることはない．API のテスト
+  スイートが各規則を網羅する．

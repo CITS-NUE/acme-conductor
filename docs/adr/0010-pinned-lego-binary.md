@@ -1,99 +1,96 @@
-# 0010: Pinned lego binary
+# 0010: lego バイナリのバージョン固定
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-[ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md) decided the
-Runner invokes the official `lego` CLI as a subprocess rather than
-importing it as a Go library, specifically because a release artifact
-gives "a clear, auditable version boundary" that a `go.mod` pin of a
-library commit would blur. That boundary is only real if the exact bytes
-of the `lego` binary that end up in a Runner image are pinned and
-verified at build time, not resolved from a mutable tag or fetched
-unverified at container start.
+[ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md) は，Runner が
+`lego` を Go ライブラリとして import するのではなく公式の `lego` CLI を
+サブプロセスとして起動すると決めた．その理由はまさに，リリース成果物なら
+「明確で監査可能なバージョン境界」が得られ，ライブラリのコミットを `go.mod` で
+固定する方法ではそれが曖昧になるからである．その境界が現実のものであるのは，
+Runner イメージに入る `lego` バイナリの正確なバイト列がビルド時に固定され
+検証される場合だけであり，可変のタグから解決されたり，コンテナ起動時に
+未検証で取得されたりする場合ではない．
 
-## Decision
+## 決定
 
-`Dockerfile.runner` fetches the official, pre-built `lego` release
-artifact from its GitHub release and verifies it against a pinned SHA-256
-checksum **before it is ever extracted or run**, in a dedicated build
-stage:
+`Dockerfile.runner` は，公式のビルド済み `lego` リリース成果物を GitHub の
+リリースから取得し，**展開も実行もする前に** 固定した SHA-256 チェックサムに
+照らして検証する．これは専用のビルドステージで行う．
 
-- `LEGO_VERSION` (currently `4.35.2`) and per-architecture checksums
-  `LEGO_SHA256_AMD64` / `LEGO_SHA256_ARM64` are Dockerfile build `ARG`s.
-- The stage downloads
-  `lego_v${LEGO_VERSION}_linux_${arch}.tar.gz` over HTTPS
-  (`--proto '=https' --tlsv1.2`) from
-  `https://github.com/go-acme/lego/releases/download/...`, then runs
-  `sha256sum -c` against the pinned checksum for the resolved
-  `TARGETARCH`. The build fails outright if the checksum does not match.
-- Only after that check does the stage extract the single `lego` binary
-  from the archive and `chmod` it `0755`.
-- This build stage reuses the `golang:1.25-bookworm` image already used
-  as the Go builder (it already has `curl` and `tar`), rather than pulling
-  in another base image just for this fetch.
-- The final runtime stage (`gcr.io/distroless/static-debian12:nonroot`,
-  see [ADR 0007](0007-container-baseline.md)) only ever `COPY`s the
-  already-verified binary in from that stage, at
-  `/usr/local/bin/lego`; it never contains `curl`, `tar`, or any other
-  fetching capability.
-- The image is labeled `io.acme-conductor.lego.version` with the pinned
-  version, so `docker inspect` on a built image reports exactly which
-  `lego` release it bundles without needing to run the binary.
+- `LEGO_VERSION`（現在は `4.35.2`）とアーキテクチャごとのチェックサム
+  `LEGO_SHA256_AMD64` / `LEGO_SHA256_ARM64` は Dockerfile のビルド `ARG` で
+  ある．
+- このステージは `lego_v${LEGO_VERSION}_linux_${arch}.tar.gz` を
+  `https://github.com/go-acme/lego/releases/download/...` から HTTPS
+  （`--proto '=https' --tlsv1.2`）でダウンロードし，解決された `TARGETARCH`
+  用の固定チェックサムに対して `sha256sum -c` を実行する．チェックサムが
+  一致しなければビルドは即座に失敗する．
+- その検査を通過した後で初めて，このステージはアーカイブから単一の `lego`
+  バイナリを展開し，`chmod` で `0755` にする．
+- このビルドステージは，Go のビルダーとしてすでに使っている
+  `golang:1.25-bookworm` イメージを再利用する（`curl` と `tar` がすでに
+  ある）．この取得のためだけに別のベースイメージを引き込むことはしない．
+- 最終的な実行時ステージ（`gcr.io/distroless/static-debian12:nonroot`．
+  [ADR 0007](0007-container-baseline.md) を参照）は，そのステージから
+  検証済みのバイナリを `/usr/local/bin/lego` に `COPY` するだけである．
+  `curl`，`tar`，その他いかなる取得機能も決して含まない．
+- イメージには固定したバージョンを値とする `io.acme-conductor.lego.version`
+  ラベルが付くので，ビルド済みイメージに `docker inspect` すれば，バイナリを
+  実行することなくどの `lego` リリースを同梱しているかが正確にわかる．
 
-### Bumping the version
+### バージョンを上げる
 
-Bumping `lego` means changing `LEGO_VERSION` **and** both
-`LEGO_SHA256_AMD64`/`LEGO_SHA256_ARM64` in `Dockerfile.runner` to the new
-release's published checksums, in the same commit. CI
-(`.github/workflows/ci.yml`) builds this Dockerfile on every push and pull
-request, so a stale, missing, or wrong checksum for either architecture
-fails CI immediately — not silently at deploy time or, worse, not at all
-until an operator notices the wrong binary shipped.
+`lego` のバージョンを上げるには，`Dockerfile.runner` の `LEGO_VERSION`
+**と** `LEGO_SHA256_AMD64`/`LEGO_SHA256_ARM64` の両方を，新しいリリースの
+公開チェックサムに，同じコミットで変更する．CI
+（`.github/workflows/ci.yml`）は push と PR のたびにこの Dockerfile をビルド
+するので，どちらかのアーキテクチャのチェックサムが古い，欠けている，
+間違っているといった場合は CI が直ちに失敗する．デプロイ時に黙って失敗したり，
+さらに悪いことに，操作者が間違ったバイナリが出荷されたことに気付くまで
+まったく失敗しなかったりすることはない．
 
-## Alternatives considered
+## 検討した代替案
 
-- **Build `lego` from source in the builder stage.** Rejected: it would
-  add real build time and a much larger dependency surface (`lego`'s own
-  module graph) to every Runner image build, and it blurs exactly the
-  version boundary ADR 0003 was written to keep clear — "the Runner
-  bundles `lego` vX.Y.Z" should mean the same release artifact upstream
-  tags and publishes, not a local rebuild of that tag's source that could
-  drift for reasons upstream's own release process does not control
-  (toolchain differences, build tag differences, and so on).
-- **Fetch the release tarball at container start or at runtime instead of
-  at image build time.** Rejected on two grounds: it defers the integrity
-  check past build time, so a bad or compromised fetch would only be
-  caught (if at all) by whatever runs the container, not by CI; and it
-  requires network egress from a running container purely to bootstrap
-  itself, which sits awkwardly next to the rest of the Runner's posture
-  (its only expected egress is to the DNS provider, the Certificate
-  Store, and the ACME CA for the one binding it was launched with). It
-  would also break the "same Dockerfile + build args always yield the
-  same image" reproducibility property the checksum-verified build-time
-  fetch gives for free.
-- **Track `lego`'s `latest` release automatically (e.g. a bot that bumps
-  the pin on every upstream release).** Not adopted for Phase 1: an
-  automatic bump would still need to pass CI's checksum-and-build gate, so
-  it is compatible with this design later, but Phase 1 keeps the bump a
-  deliberate, reviewed PR like any other dependency version change.
+- **ビルダーステージで `lego` をソースからビルドする．** 却下．Runner イメージの
+  ビルドのたびに相当なビルド時間とはるかに大きな依存面（`lego` 自身の
+  モジュールグラフ）が加わり，ADR 0003 が明確に保つために書かれたまさにその
+  バージョン境界が曖昧になる．「Runner は `lego` vX.Y.Z を同梱する」は，上流が
+  タグを打ち公開するのと同じリリース成果物を意味すべきであって，上流自身の
+  リリースプロセスが制御しない理由（ツールチェーンの差異，ビルドタグの差異
+  など）で乖離しうる，そのタグのソースのローカルな再ビルドを意味すべきでは
+  ない．
+- **イメージのビルド時ではなく，コンテナ起動時または実行時にリリースの
+  tarball を取得する．** 2 つの理由で却下．完全性検査がビルド時より後に
+  先送りされるので，不正な，あるいは侵害された取得は CI ではなく，コンテナを
+  動かす何かによって（捕捉されるとしても）捕捉されることになる．また，自身を
+  ブートストラップするためだけに動作中のコンテナからのネットワーク egress が
+  必要になり，Runner の他の態勢（期待される egress は，起動時に与えられた
+  1 つのバインディングに対する DNS プロバイダ，Certificate Store，ACME CA
+  だけ）と噛み合わない．さらに，チェックサム検証付きのビルド時取得が無償で
+  与えてくれる「同じ Dockerfile とビルド引数からは常に同じイメージが得られる」
+  という再現性も壊れる．
+- **`lego` の `latest` リリースを自動的に追跡する（例えば上流のリリースの
+  たびに固定版を上げるボット）．** Phase 1 では採用しない．自動的なバージョン
+  上げも CI のチェックサムとビルドの関門を通る必要があるので，この設計と後から
+  両立はできるが，Phase 1 ではバージョン上げを他の依存バージョンの変更と同様，
+  意図的でレビューされた PR に留める．
 
-## Consequences
+## 結果
 
-- A Runner image is fully reproducible: the same `Dockerfile.runner` plus
-  the same build args always produces the same `lego` binary bytes,
-  independent of when or where the image is built.
-- Bumping `lego` is an explicit, auditable change (a diff to two or three
-  `ARG` lines) rather than an implicit one; a security fix in `lego`
-  requires that PR before it reaches a built image — there is no
-  automatic pickup.
-- If GitHub's release asset for a pinned version ever became unavailable,
-  the build would fail closed (the `curl --fail` and the `sha256sum -c`
-  both fail loudly) rather than silently falling back to something else.
-- The checksum pin is per-architecture; adding a new target architecture
-  requires adding both a `case` arm in the fetch script and a new
-  `LEGO_SHA256_<ARCH>` build arg — this is a deliberate small piece of
-  friction so an unpinned architecture can never silently be shipped
-  unverified.
+- Runner イメージは完全に再現可能である．同じ `Dockerfile.runner` と同じ
+  ビルド引数からは，イメージをいつどこでビルドしても常に同じ `lego` バイナリの
+  バイト列が得られる．
+- `lego` のバージョン上げは暗黙のものではなく，明示的で監査可能な変更
+  （2〜3 行の `ARG` 行の差分）である．`lego` のセキュリティ修正がビルド済み
+  イメージに届くにはその PR が必要であり，自動的に取り込まれることはない．
+- 固定したバージョンの GitHub リリースアセットが利用できなくなった場合，
+  ビルドは黙って別のものにフォールバックするのではなく，フェイルクローズする
+  （`curl --fail` と `sha256sum -c` がどちらも大きな音を立てて失敗する）．
+- チェックサムの固定はアーキテクチャごとである．新しい対象アーキテクチャを
+  追加するには，取得スクリプトの `case` の分岐と新しい `LEGO_SHA256_<ARCH>`
+  ビルド引数の両方を追加する必要がある．これは，固定されていない
+  アーキテクチャが未検証のまま黙って出荷されることが決してないようにするための，
+  意図的な小さな摩擦である．

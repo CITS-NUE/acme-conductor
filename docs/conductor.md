@@ -1,58 +1,53 @@
-# Conductor operator guide
+# Conductor 運用ガイド
 
-This is the operator-facing reference for `acme-conductor`, the control
-plane described in [`docs/architecture.md`](architecture.md). It covers
-the command line, the configuration file, the REST API and the GUI, how
-a `Target` becomes a `Run` and how a `Run` is driven to completion, the
-two authentication modes, the on-disk state and how to back it up, and
-what the Conductor does and does not guarantee today.
+本書は，[`docs/architecture.md`](architecture.md) で説明するコントロールプレーン
+`acme-conductor` の操作者向けリファレンスである．コマンドライン，設定ファイル，
+REST API と GUI，`Target` がどのように `Run` になり `Run` がどのように完了まで
+駆動されるか，2 つの認証モード，ディスク上の状態とそのバックアップ方法，そして
+現時点で Conductor が保証すること・しないことを扱う．
 
-Phase 2 shipped the Conductor MVP: a SQLite-backed registry of targets,
-policies, runs and audit events, a REST API, a scheduler, and a
-local-process launcher that runs `acme-runner` (see
-[`docs/runner.md`](runner.md)) as a child process — a **single-host,
-single-user development and test deployment**. Phase 4 adds a second
-launcher, `azure-container-apps-job`, which starts one execution of a
-separately provisioned Azure Container Apps Job per run (the Runner then
-holds its own managed identity and no credential ever passes through the
-Conductor), and **job signing**: every launcher can hand the Runner a
-signed, expiring envelope instead of a bare `JobSpec`, and the Container
-Apps launcher always does. Phase 5 adds the production authentication
-mode, `oidc` — bearer tokens from an OpenID Connect provider, named
-principals, an admin and a viewer role, a TLS listener or a platform
-ingress in front of it — and a minimal **GUI** served by the Conductor
-itself (see [Authentication](#authentication) and [GUI](#gui)). The
-`localhost-dev` mode remains for a single development host. Phase 6
-adds the **migration tooling**: a `migrate` command and API that read
-the host list of an existing infrastructure definition, compare it with
-the registry and import what is missing, and a `migration.targetSource`
-flag that keeps the Conductor from issuing anything until the switch
-(see [`docs/migration.md`](migration.md) and [`migration`](#migration)).
+Phase 2 では Conductor の MVP を出荷した．target・ポリシー・run・監査イベントを
+SQLite に保持するレジストリ，REST API，スケジューラ，そして `acme-runner`
+（[`docs/runner.md`](runner.md) を参照）を子プロセスとして動かすローカルプロセスの
+ランチャーであり，**単一ホスト・単一ユーザーの開発およびテスト用デプロイ** である．
+Phase 4 では第 2 のランチャー `azure-container-apps-job` が加わる．これは run ごとに，
+別途プロビジョニングされた Azure Container Apps Job の実行を 1 つ開始する
+（Runner は自身のマネージド ID を持ち，資格情報が Conductor を経由することは
+決してない）．さらに **ジョブ署名** が加わる．どのランチャーも Runner に生の
+`JobSpec` ではなく署名付き・期限付きのエンベロープを渡すことができ，Container Apps
+ランチャーは常にそうする．Phase 5 では本番の認証モード `oidc` が加わる．OpenID
+Connect プロバイダのベアラートークン，名前付きプリンシパル，admin と viewer の
+ロール，TLS リスナーまたはその前段のプラットフォーム ingress である．さらに
+Conductor 自身が配信する最小限の **GUI** が加わる（[認証](#認証)と [GUI](#gui) を
+参照）．`localhost-dev` モードは開発ホスト 1 台向けに残る．Phase 6 では
+**移行ツール** が加わる．既存のインフラ定義のホスト一覧を読み，レジストリと比較して
+足りないものを取り込む `migrate` コマンドと API，および操作者が切り替えるまで
+Conductor に何も発行させない `migration.targetSource` フラグである
+（[`docs/migration.md`](migration.md) と [`migration`](#migration) を参照）．
 
-## Overview
+## 概要
 
-`acme-conductor serve` runs, in one process:
+`acme-conductor serve` は 1 つのプロセスで次を動かす:
 
-- the **REST API** (`/api/v1alpha1/...`, plus `/healthz` and `/readyz`)
-  and the **GUI** (`/ui/`), on a loopback address in `localhost-dev`
-  mode or wherever the configuration says in `oidc` mode;
-- the **registries** — `Target`, `CertificatePolicy`, `Run` and the
-  append-only `AuditEvent` log — in one SQLite file;
-- the **scheduler**, which every `tickSeconds` (and whenever the API
-  changes something) records a queued `Run` for every enabled target that
-  is due, and starts queued runs through a launcher up to
-  `maxConcurrentRuns` at a time;
-- one **launcher** per configured execution binding — `local-process`,
-  which runs `acme-runner reconcile` as a child, or
-  `azure-container-apps-job`, which hands a job to the next scheduled
-  execution of a Container Apps Job (see [Execution binding: Azure Container Apps Job](#execution-binding-azure-container-apps-job)).
+- **REST API**（`/api/v1alpha1/...`，および `/healthz` と `/readyz`）と
+  **GUI**（`/ui/`）．`localhost-dev` モードではループバックアドレスで，`oidc`
+  モードでは設定で指定した場所で待ち受ける．
+- **レジストリ** — `Target`，`CertificatePolicy`，`Run`，追記専用の `AuditEvent`
+  ログ — を 1 つの SQLite ファイルに保持する．
+- **スケジューラ**．`tickSeconds` ごとに（および API が何かを変更するたびに），
+  有効で期限到来したすべての target について待機中（queued）の `Run` を記録し，
+  待機中の run をランチャーを通じて一度に `maxConcurrentRuns` 個まで開始する．
+- 設定された実行バインディングごとに 1 つの **ランチャー**．`local-process` は
+  `acme-runner reconcile` を子プロセスとして動かし，`azure-container-apps-job` は
+  Container Apps Job の次のスケジュール実行にジョブを差し出す
+  （[実行バインディング: Azure Container Apps Job](#実行バインディング-azure-container-apps-job) を参照）．
 
-The Conductor never talks to an ACME CA, a DNS provider or a Certificate
-Store. It produces a `JobSpec` and consumes a `Result`; everything it
-knows about a certificate (expiry, fingerprint, logical store name) is
-what the last successful `Result` said.
+Conductor が ACME CA，DNS プロバイダ，Certificate Store と通信することは決してない．
+Conductor は `JobSpec` を生成し `Result` を消費する．証明書について Conductor が
+知っていること（有効期限，フィンガープリント，論理的な store 名）はすべて，最後に
+成功した `Result` が伝えた内容である．
 
-## Command line
+## コマンドライン
 
 ```
 acme-conductor serve [--config FILE] [--log-level LEVEL]
@@ -62,114 +57,112 @@ acme-conductor --version
 acme-conductor --help
 ```
 
-`migrate` reads a host list from a Bicep parameter file or a TargetList
-document, compares it with a running Conductor's registry over the API
-and imports the names the registry lacks (a dry run unless `--apply` is
-given). It is documented in [`docs/migration.md`](migration.md#command-line).
+`migrate` は Bicep のパラメータファイルまたは TargetList 文書からホスト一覧を読み，
+稼働中の Conductor のレジストリと API 経由で比較し，レジストリにない名前を取り込む
+（`--apply` を指定しない限り dry-run）．
+[`docs/migration.md`](migration.md#コマンドライン) に説明がある．
 
-`keygen` generates the Ed25519 key pair for [job signing](#jobsigning):
-the private key is written to `--private` (created `0600`; an existing
-file is never overwritten), the public key to `--public` as PEM, and the
-key id plus the one-line form of the public key are printed for pasting
-into the Runner's `jobSigning.publicKeys`. It needs no configuration and
-touches nothing else.
+`keygen` は[ジョブ署名](#jobsigning)用の Ed25519 鍵ペアを生成する．秘密鍵は
+`--private` に書き込まれ（`0600` で作成．既存のファイルを上書きすることは決して
+ない），公開鍵は `--public` に PEM で書き込まれ，鍵 ID と公開鍵の 1 行形式が
+Runner の `jobSigning.publicKeys` に貼り付けるために出力される．設定は不要で，
+それ以外には何も触れない．
 
-- `--config FILE` — path to the configuration document. Defaults to
-  `$ACME_CONDUCTOR_CONFIG` if set, otherwise
-  `/etc/acme-conductor/config.json`.
-- `--log-level LEVEL` — `debug`, `info` (default), `warn` or `error`.
-  At `debug` the Runner's own log lines (already redacted by the Runner)
-  are relayed into the Conductor log.
+- `--config FILE` — 設定文書のパス．既定は `$ACME_CONDUCTOR_CONFIG` が設定されて
+  いればその値，そうでなければ `/etc/acme-conductor/config.json`．
+- `--log-level LEVEL` — `debug`，`info`（既定），`warn`，`error` のいずれか．
+  `debug` では Runner 自身のログ行（Runner がすでに秘匿処理済み）が Conductor の
+  ログに中継される．
 
-`serve` runs until it receives `SIGTERM` or `SIGINT`. It then stops
-accepting API requests, stops planning new runs, waits up to
-`server.shutdownGraceSeconds` for in-flight runs, cancels whatever is
-still running (the Runner then reports `Cancelled`), and exits. A second
-signal kills the process outright; see [Shutdown and recovery](#shutdown-and-recovery).
+`serve` は `SIGTERM` または `SIGINT` を受け取るまで動き続ける．受け取ると API
+リクエストの受け付けを止め，新しい run の計画を止め，実行中の run を最大
+`server.shutdownGraceSeconds` まで待ち，まだ動いているものをキャンセルし
+（Runner は `Cancelled` を報告する），終了する．2 回目のシグナルでプロセスは
+即座に強制終了される．[シャットダウンと復旧](#シャットダウンと復旧)を参照．
 
-### Exit codes
+### 終了コード
 
-| Code | Meaning |
+| コード | 意味 |
 |---|---|
-| `0` | Stopped cleanly after a signal. |
-| `1` | The configuration was rejected, a launcher could not be built from it, the bound address was not loopback in `localhost-dev` mode, or the TLS certificate could not be loaded. |
-| `2` | A fatal runtime error: another Conductor process owns the database (see [Shutdown and recovery](#shutdown-and-recovery)), the registry could not be opened or migrated, in-flight runs could not be recovered, the listener could not be bound, or the HTTP server failed. |
+| `0` | シグナルを受けて正常に停止した． |
+| `1` | 設定が拒否された，設定からランチャーを構築できなかった，`localhost-dev` モードで待ち受けアドレスがループバックでなかった，または TLS 証明書を読み込めなかった． |
+| `2` | 致命的な実行時エラー: 別の Conductor プロセスがデータベースを所有している（[シャットダウンと復旧](#シャットダウンと復旧)を参照），レジストリを開けないか移行できない，実行中だった run を復旧できない，リスナーをバインドできない，または HTTP サーバが失敗した． |
 
-## Configuration reference
+## 設定リファレンス
 
-The configuration is a strictly decoded JSON document (unknown fields,
-duplicate keys, trailing data and over-deep nesting rejected; 256 KiB cap)
-that contains **no secret**. The Conductor knows ACME, DNS and Store
-bindings **by name only**; what a name resolves to is Runner configuration
-(`docs/runner.md`). See
+設定は厳密にデコードされる JSON 文書であり（未知のフィールド，重複キー，末尾の
+余分なデータ，深すぎるネストは拒否される．上限 256 KiB），**シークレットを一切
+含まない**．Conductor は ACME・DNS・Store のバインディングを **名前だけで** 知って
+いる．名前が何に解決されるかは Runner の設定（`docs/runner.md`）である．
+バインディング名が Runner の例と一致する完全な例は
 [`deploy/examples/conductor-config.example.json`](../deploy/examples/conductor-config.example.json)
-for a complete example whose binding names match the Runner example, and
+を，Container Apps 向けの形（プラットフォームの ingress の背後で `oidc`）は
 [`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json)
-for the Container Apps shape (`oidc` behind the platform's ingress), and
+を，Conductor 自身の TLS リスナーを持つセルフホストの `oidc` デプロイは
 [`deploy/examples/conductor-config.oidc.example.json`](../deploy/examples/conductor-config.oidc.example.json)
-for a self-hosted `oidc` deployment with the Conductor's own TLS listener.
+を参照．
 
-Top level:
+トップレベル:
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `apiVersion` | string | Must equal `acme-conductor.cits-nue.github.io/v1alpha1`. |
-| `kind` | string | Must equal `ConductorConfig`. |
-| `server` | object | Listener, authentication, shutdown — see below. |
-| `database` | object | `{ "path": "..." }` — clean, absolute path of the SQLite file (created `0600` if missing; a symbolic link is refused). Its directory must exist and be writable; SQLite also creates `<path>-wal` and `<path>-shm` next to it, and `serve` holds its ownership lock at `<path>.lock` (see [Shutdown and recovery](#shutdown-and-recovery)). |
-| `scheduler` | object | Pacing — see below. |
-| `executionBindings` | map | At least one. Keys are binding names (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`, ≤63 chars). |
-| `acmeBindings` | []string | Non-empty, distinct binding names a policy may select. |
-| `dnsBindings` | []string | Non-empty, distinct binding names a target may select. |
-| `storeBindings` | []string | Non-empty, distinct binding names a target may select. |
-| `jobSigning` | object | Optional; required when an `azure-container-apps-job` binding exists. See below. |
-| `migration` | object | Optional. The migration from an infrastructure-defined host list: the `targetSource` flag, the list and the import profile. See [`migration`](#migration). Absent means `targetSource: registry` and no list. |
+| `apiVersion` | string | `acme-conductor.cits-nue.github.io/v1alpha1` と等しくなければならない． |
+| `kind` | string | `ConductorConfig` と等しくなければならない． |
+| `server` | object | リスナー，認証，シャットダウン — 後述． |
+| `database` | object | `{ "path": "..." }` — SQLite ファイルのクリーンな絶対パス（なければ `0600` で作成される．シンボリックリンクは拒否される）．そのディレクトリは存在し，書き込み可能でなければならない．SQLite はその隣に `<path>-wal` と `<path>-shm` も作成し，`serve` は所有権ロックを `<path>.lock` に保持する（[シャットダウンと復旧](#シャットダウンと復旧)を参照）． |
+| `scheduler` | object | ペース配分 — 後述． |
+| `executionBindings` | map | 1 つ以上．キーはバインディング名（`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`，63 文字以下）． |
+| `acmeBindings` | []string | ポリシーが選択できるバインディング名．空でなく，重複しないこと． |
+| `dnsBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
+| `storeBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
+| `jobSigning` | object | 省略可．`azure-container-apps-job` バインディングがある場合は必須．後述． |
+| `migration` | object | 省略可．インフラで定義されたホスト一覧からの移行: `targetSource` フラグ，一覧，取り込みプロファイル．[`migration`](#migration) を参照．省略時は `targetSource: registry` で一覧なし． |
 
 ### `server`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `listen` | string | `127.0.0.1:8080` | `host:port`. With `auth.mode: localhost-dev` the host must be `localhost` or a loopback IP literal (`127.0.0.1`, `[::1]`); any other name or address is rejected, and a name is never resolved. With `oidc` any host is allowed, but a non-loopback one needs `tls` or `behindTlsProxy`. Port `0` picks a free port (tests). |
-| `auth.mode` | string | `localhost-dev` | `localhost-dev` (one development host) or `oidc` (production). See [Authentication](#authentication). |
-| `auth.oidc` | object | — | Required for, and only allowed with, `oidc` — see below. |
-| `tls` | object | — | `oidc` only. `{ "certFile": "...", "keyFile": "..." }`, clean absolute paths of a PEM certificate chain and private key: the listener then speaks HTTPS (TLS 1.2+). Both files are read once at start. Mutually exclusive with `behindTlsProxy`. |
-| `behindTlsProxy` | bool | `false` | `oidc` only. States that a platform ingress or reverse proxy terminates TLS in front of this port and is the only route to it, so a non-loopback plaintext listener is acceptable. Never set it because it is convenient: a bearer token in the clear is a stolen session. |
-| `shutdownGraceSeconds` | int | `900` | How long in-flight runs may continue after a stop signal before they are cancelled. `1`–`86400`. |
+| `listen` | string | `127.0.0.1:8080` | `host:port`．`auth.mode: localhost-dev` ではホストは `localhost` またはループバック IP リテラル（`127.0.0.1`，`[::1]`）でなければならない．それ以外の名前やアドレスは拒否され，名前が解決されることは決してない．`oidc` では任意のホストが許されるが，ループバック以外には `tls` か `behindTlsProxy` が必要．ポート `0` は空きポートを選ぶ（テスト用）． |
+| `auth.mode` | string | `localhost-dev` | `localhost-dev`（開発ホスト 1 台）または `oidc`（本番）．[認証](#認証)を参照． |
+| `auth.oidc` | object | — | `oidc` で必須，かつ `oidc` でのみ許される — 後述． |
+| `tls` | object | — | `oidc` のみ．`{ "certFile": "...", "keyFile": "..." }`，PEM の証明書チェーンと秘密鍵のクリーンな絶対パス．リスナーは HTTPS（TLS 1.2 以上）で応答する．両ファイルは起動時に一度だけ読まれる．`behindTlsProxy` とは排他． |
+| `behindTlsProxy` | bool | `false` | `oidc` のみ．プラットフォームの ingress またはリバースプロキシがこのポートの前段で TLS を終端し，それがこのポートへの唯一の経路であることを表明する．これによりループバック以外の平文リスナーが許容される．便利だからという理由で設定してはならない．平文のベアラートークンは盗まれたセッションである． |
+| `shutdownGraceSeconds` | int | `900` | 停止シグナルの後，実行中の run がキャンセルされるまでに継続してよい時間．`1`–`86400`． |
 
 ### `server.auth.oidc`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `issuer` | string | — (required) | The provider's issuer URL, `https://…` (plain `http://` only to a loopback host, for tests); no user information, query or fragment. Its discovery document is read from `<issuer>/.well-known/openid-configuration` and must name the same issuer; every token's `iss` must equal it exactly. Entra ID v2: `https://login.microsoftonline.com/<tenant-id>/v2.0`. |
-| `audience` | string | — (required) | The value every token's `aud` must contain, as the provider writes it. Entra ID v2 access tokens carry the API app registration's **Application (client) ID** (a GUID) as `aud`, never its application ID URI, whatever scope was requested. Verification only; nothing is derived from it. Printable ASCII without whitespace, ≤256 bytes. |
-| `clientId` | string | — | The public client the GUI signs in as (Entra ID: a single-page-application registration with redirect URI `https://<host>/ui/`). Without it the GUI cannot sign in; the API still accepts tokens obtained elsewhere. |
-| `scopes` | []string | — (required with `clientId`) | What the GUI requests at sign-in; not derived from `audience`, since the scope a client requests and the audience the provider writes are different identifiers. Entra ID: `openid`, `profile` and `<application ID URI>/.default`, e.g. `api://<api-client-id>/.default`. ≤16 distinct values; only with `clientId`. |
-| `principalClaim` | string | `sub` | The claim whose value is recorded as the audit actor and `requestedBy`: a **stable identifier** of the subject, not a display name (`preferred_username`, `email` and `name` change when a user is renamed). Entra ID: set `oid` (`sub` is pairwise per client there). It must be a string of printable characters, ≤256 bytes. |
-| `rolesClaim` | string | `roles` | The claim (a string or an array of strings) whose values are matched against `roles`. |
-| `roles.admin` | []string | — (required, non-empty) | Values that grant the **admin** role: every endpoint. |
-| `roles.viewer` | []string | — | Values that grant the **viewer** role: `GET` only. A value may appear in one list only; a token carrying values from both is an admin. |
-| `clockSkewSeconds` | int | `60` | Tolerance applied to `exp`, `nbf` and `iat`. `1`–`300`. |
-| `keyCacheSeconds` | int | `3600` | How long the discovery document and signing keys are reused before they are fetched again. An unknown key id triggers an earlier refresh, at most once a minute. `60`–`86400`. |
+| `issuer` | string | —（必須） | プロバイダの issuer URL．`https://…`（平文の `http://` はテスト用にループバックホストへのみ可）．ユーザー情報，クエリ，フラグメントは不可．ディスカバリ文書は `<issuer>/.well-known/openid-configuration` から読まれ，同じ issuer を名乗っていなければならない．すべてのトークンの `iss` はこれと完全に一致しなければならない．Entra ID v2: `https://login.microsoftonline.com/<tenant-id>/v2.0`． |
+| `audience` | string | —（必須） | すべてのトークンの `aud` が含んでいなければならない値．プロバイダが書き込む形式のまま指定する．Entra ID v2 のアクセストークンは，どのスコープを要求したかにかかわらず，API アプリ登録の **Application (client) ID**（GUID）を `aud` に持ち，アプリケーション ID URI を持つことは決してない．検証にのみ使い，ここから何かを導出することはない．空白を含まない印字可能 ASCII，256 バイト以下． |
+| `clientId` | string | — | GUI がサインインに使う公開クライアント（Entra ID: リダイレクト URI `https://<host>/ui/` を持つシングルページアプリケーションの登録）．これがないと GUI はサインインできない．API は他所で取得したトークンを引き続き受け付ける． |
+| `scopes` | []string | —（`clientId` がある場合は必須） | GUI がサインイン時に要求するもの．クライアントが要求するスコープとプロバイダが書き込む audience は別の識別子なので，`audience` からは導出しない．Entra ID: `openid`，`profile`，および `<application ID URI>/.default`（例: `api://<api-client-id>/.default`）．相異なる値 16 個以下．`clientId` がある場合のみ． |
+| `principalClaim` | string | `sub` | その値が監査のアクターおよび `requestedBy` として記録されるクレーム．表示名ではなくサブジェクトの **安定した識別子** であること（`preferred_username`，`email`，`name` はユーザーの改名で変わる）．Entra ID: `oid` を設定する（Entra ID の `sub` はクライアントごとに異なるペアワイズ値）．印字可能文字の文字列で 256 バイト以下でなければならない． |
+| `rolesClaim` | string | `roles` | その値（文字列または文字列の配列）が `roles` と照合されるクレーム． |
+| `roles.admin` | []string | —（必須，空でない） | **admin** ロールを与える値: すべてのエンドポイント． |
+| `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin． |
+| `clockSkewSeconds` | int | `60` | `exp`，`nbf`，`iat` に適用する許容差．`1`–`300`． |
+| `keyCacheSeconds` | int | `3600` | ディスカバリ文書と署名鍵を再取得するまで再利用する時間．未知の鍵 ID は早期の再取得を引き起こす（最大で 1 分に 1 回）．`60`–`86400`． |
 
-The Conductor holds **no client secret**: it verifies tokens with the
-provider's published keys and performs no sign-in of its own
-([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)).
+Conductor は **クライアントシークレットを持たない**．プロバイダが公開する鍵で
+トークンを検証し，自身ではサインインを行わない
+（[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)）．
 
 ### `scheduler`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `tickSeconds` | int | `60` | How often due targets are examined and queued runs dispatched. API changes also wake the scheduler immediately. `1`–`86400`. |
-| `maxConcurrentRuns` | int | `2` | Runner executions in flight at once, across all execution bindings. `1`–`64`. |
-| `retryBackoffSeconds` | int | `300` | Wait before retrying a target after a failed or cancelled run. |
-| `maxRetryBackoffSeconds` | int | `21600` | The backoff doubles per consecutive failure up to this cap (≥ `retryBackoffSeconds`, ≤ 7 days). |
+| `tickSeconds` | int | `60` | 期限到来した target を調べ，待機中の run をディスパッチする間隔．API の変更もスケジューラを即座に起こす．`1`–`86400`． |
+| `maxConcurrentRuns` | int | `2` | すべての実行バインディングを合わせて，同時に実行中にできる Runner 実行の数．`1`–`64`． |
+| `retryBackoffSeconds` | int | `300` | 失敗またはキャンセルされた run の後，その target を再試行するまでの待ち時間． |
+| `maxRetryBackoffSeconds` | int | `21600` | バックオフは連続失敗ごとに 2 倍になり，この上限で頭打ちになる（`retryBackoffSeconds` 以上，7 日以下）． |
 
 ### `executionBindings.<name>`
 
-| Field | Type | Notes |
+| フィールド | 型 | 備考 |
 |---|---|---|
-| `type` | string | The launcher type name (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). The Conductor binary decides which types it provides: the official binary provides `local-process` and `azure-container-apps-job`. A type this binary does not provide is refused at start, before anything else happens. |
-| `config` | object | The configuration of that type, decoded strictly by the type's provider (unknown fields are refused, duplicate keys are refused, nothing else is accepted). Its content is opaque to the generic configuration: adding a launcher type adds nothing here. Whether a type needs `jobSigning`/`resultSigning` is also the provider's rule, checked when the launcher is built. |
+| `type` | string | ランチャーの型名（`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`）．どの型を提供するかは Conductor のバイナリが決める．公式バイナリは `local-process` と `azure-container-apps-job` を提供する．このバイナリが提供しない型は，他の何よりも先に，起動時に拒否される． |
+| `config` | object | その型の設定．型のプロバイダが厳密にデコードする（未知のフィールドは拒否，重複キーは拒否，それ以外は何も受け付けない）．その内容は汎用の設定からは不透明であり，ランチャーの型を追加してもここには何も加わらない．型が `jobSigning`/`resultSigning` を必要とするかどうかもプロバイダの規則であり，ランチャーの構築時に検査される． |
 
 ```json
 "executionBindings": {
@@ -180,232 +173,225 @@ provider's published keys and performs no sign-in of its own
 }
 ```
 
-### `type: local-process` — `config`
+### `type: local-process` の `config`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `runnerBinary` | string | — (required) | Clean, absolute path of the `acme-runner` executable. |
-| `runnerConfig` | string | — (required) | Clean, absolute path of the **Runner's** configuration, passed as `--config`. The Conductor never reads it. |
-| `workDir` | string | — (required) | Clean, absolute path; parent of the per-run directory (`run-<runId>/`, mode `0700`) that holds `job.json` and `result.json` while a run is in flight. It never holds certificate material — the Runner has its own `workDir`/`stateDir`. Created if missing. |
-| `timeoutSeconds` | int | `1200` | Bounds one Runner execution as seen by the Conductor. Set it above the Runner's `lego.timeoutSeconds` so the Runner's own, more precise `Timeout` result wins. `1`–`86400`. |
-| `passthroughEnv` | []string | `[]` | Names of environment variables of the **Conductor process** forwarded to the Runner child unchanged (`^[A-Z][A-Z0-9_]{0,63}$`; `PATH`, `HOME`, `TMPDIR` and `LD_*` are reserved). Everything else is withheld: the child gets only `HOME`/`TMPDIR` (its run directory), a fixed `PATH`, and these. A listed variable that is not set is logged as a warning and omitted — the Runner then fails the run closed itself (`DnsFailure`/`AcmeFailure` naming the binding). See the security note below. |
+| `runnerBinary` | string | —（必須） | `acme-runner` 実行ファイルのクリーンな絶対パス． |
+| `runnerConfig` | string | —（必須） | **Runner の** 設定のクリーンな絶対パス．`--config` として渡される．Conductor がこれを読むことは決してない． |
+| `workDir` | string | —（必須） | クリーンな絶対パス．run の実行中に `job.json` と `result.json` を保持する run ごとのディレクトリ（`run-<runId>/`，モード `0700`）の親．証明書の素材を保持することは決してない — Runner は自身の `workDir`/`stateDir` を持つ．なければ作成される． |
+| `timeoutSeconds` | int | `1200` | Conductor から見た Runner 実行 1 回の上限．Runner の `lego.timeoutSeconds` より大きく設定し，Runner 自身のより正確な `Timeout` 結果が勝つようにする．`1`–`86400`． |
+| `passthroughEnv` | []string | `[]` | **Conductor プロセス** の環境変数のうち，Runner の子プロセスへそのまま転送する変数名（`^[A-Z][A-Z0-9_]{0,63}$`．`PATH`，`HOME`，`TMPDIR`，`LD_*` は予約済み）．それ以外はすべて渡されない．子プロセスが受け取るのは `HOME`/`TMPDIR`（その run のディレクトリ），固定の `PATH`，およびここに列挙した変数だけである．列挙されているが設定されていない変数は警告としてログに記録され省略される．その場合 Runner 自身が run をフェイルクローズで失敗させる（バインディング名を示す `DnsFailure`/`AcmeFailure`）．下記のセキュリティ注記を参照． |
 
-**Security note on `passthroughEnv`.** This is the only way a DNS
-credential or an EAB secret can reach a Runner started by the local
-launcher, and it means the Conductor process's environment carries that
-credential — the opposite of security principle 2 ("the Conductor holds
-no DNS credential"). That is acceptable on a single-user development host
-and nowhere else; the Azure Container Apps Job launcher runs the Runner
-under its own managed identity and has no passthrough at all. The threat
-model records this as T10's local-launcher residual.
+**`passthroughEnv` に関するセキュリティ注記．** これは，ローカルランチャーで
+起動された Runner に DNS の資格情報や EAB シークレットが届く唯一の手段であり，
+Conductor プロセスの環境がその資格情報を抱えることを意味する — セキュリティ
+原則 2（「Conductor は DNS の資格情報を持たない」）の正反対である．これが
+許容されるのは単一ユーザーの開発ホスト上だけであり，それ以外の場所では許容
+されない．Azure Container Apps Job ランチャーは Runner を自身のマネージド ID で
+動かし，パススルーを一切持たない．脅威モデルはこれを T10 のローカルランチャーの
+残存リスクとして記録している．
 
-### Execution binding: Azure Container Apps Job
+### 実行バインディング: Azure Container Apps Job
 
-`type: azure-container-apps-job` hands each run to an **existing**,
-**scheduled** Container Apps Job — the Runner image with its own managed
-identity, its configuration, its state volume, an exchange volume and a
-fixed command `reconcile --exchange /exchange`, all provisioned in
-infrastructure ([`deploy/azure`](../deploy/azure/README.md),
-[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)). The Conductor
-never creates, changes or **starts** the Job: the platform's start
-operation accepts an execution template that can replace the image,
-command and environment of the Job's containers, so an identity allowed
-to start the Job could run any image under the Runner's identity. The
-Conductor's identity is not allowed to. For a run it:
+`type: azure-container-apps-job` は各 run を **既存の**，**スケジュール実行される**
+Container Apps Job に渡す．その Job は，自身のマネージド ID・設定・状態ボリューム・
+交換用ボリューム・固定コマンド `reconcile --exchange /exchange` を持つ Runner
+イメージであり，すべてインフラでプロビジョニングされる
+（[`deploy/azure`](../deploy/azure/README.md)，
+[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)）．Conductor が Job を
+作成・変更・**開始** することは決してない．プラットフォームの開始操作は，Job の
+コンテナのイメージ・コマンド・環境を置き換えられる実行テンプレートを受け付ける
+ため，Job を開始できる ID は Runner の ID のもとで任意のイメージを実行できてしまう．
+Conductor の ID にはそれが許されていない．1 つの run について Conductor は次を行う:
 
-1. offers the signed job on the exchange volume (a file share both
-   containers mount): it writes `<exchangeDir>/staging/run-<runId>/job.json`
-   and moves the directory to `<exchangeDir>/pending/` in one rename;
-2. waits for the next execution the platform's schedule starts (every
-   minute in the Bicep) to take the job — the Runner moves the directory
-   to `<exchangeDir>/claimed/` (exactly one execution wins) and records
-   its execution name there — and confirms with the platform that the
-   recorded name is an execution of this Job (a name the platform
-   consistently does not know, on every attempt, ends the run; a
-   platform that cannot be asked, or a 404 that does not persist, does
-   not — after a few attempts the execution is watched unconfirmed,
-   because a Runner holds the job). If none takes it within `claimTimeoutSeconds`
-   the offer is withdrawn (by the same rename, so a late taker cannot
-   race it) and the run fails; a cancelled run is withdrawn the same way
-   and ends `cancelled`;
-3. polls the execution's status every `pollIntervalSeconds` until it is
-   terminal (`Succeeded`, `Failed`, `Stopped`, `Degraded`). Whenever
-   polling ends without a terminal status — the run was cancelled,
-   `timeoutSeconds` passed, or the status could not be read any more —
-   the execution is stopped through the platform *before* the run
-   directory is removed, then given a bounded grace to end;
-4. reads `result.json` (waiting up to `resultGraceSeconds` for the share
-   to show it), which must be a `SignedCertificateReconcileResult`
-   verifying against `resultSigning.publicKeys` (see below), checks it
-   names this run and target and that its status agrees with the
-   platform's verdict (`Succeeded` with a failed `Result`, or `Failed`
-   with a succeeded one, is a mismatch → `Internal`), and removes the run
-   directory — only once the execution has been seen to end; an
-   execution whose status stayed unreadable and whose stop could not be
-   confirmed keeps its directory (a Runner may still be writing there),
-   logged as "run directory kept" for an operator to remove.
+1. 署名付きジョブを交換用ボリューム（両コンテナがマウントするファイル共有）に
+   差し出す．`<exchangeDir>/staging/run-<runId>/job.json` を書き，その
+   ディレクトリを 1 回のリネームで `<exchangeDir>/pending/` に移動する．
+2. プラットフォームのスケジュール（Bicep では毎分）が開始する次の実行がジョブを
+   取るのを待つ — Runner がディレクトリを `<exchangeDir>/claimed/` に移動し
+   （ちょうど 1 つの実行が勝つ），そこに自身の実行名を記録する — そして，記録
+   された名前がこの Job の実行であることをプラットフォームに確認する（毎回の
+   試行で一貫してプラットフォームが知らない名前は run を終わらせる．問い合わせ
+   できないプラットフォームや，持続しない 404 は終わらせない — 数回の試行の後，
+   その実行は未確認のまま監視される．Runner がジョブを保持しているからである）．
+   `claimTimeoutSeconds` 以内にどの実行も取らなければ，差し出しは取り下げられ
+   （同じリネームによるので，遅れて取ろうとするものと競合しない），run は失敗
+   する．キャンセルされた run も同じ方法で取り下げられ，`cancelled` で終わる．
+3. 実行の状態を `pollIntervalSeconds` ごとにポーリングし，終端状態（`Succeeded`，
+   `Failed`，`Stopped`，`Degraded`）になるまで続ける．終端状態に至らずに
+   ポーリングが終わった場合はいつでも — run がキャンセルされた，`timeoutSeconds`
+   が経過した，状態を読めなくなった — run ディレクトリを削除する *前に*
+   プラットフォームを通じて実行を停止し，その後，終了までの猶予を有限に与える．
+4. `result.json` を読む（共有に現れるまで最大 `resultGraceSeconds` 待つ）．これは
+   `resultSigning.publicKeys`（後述）で検証できる `SignedCertificateReconcileResult`
+   でなければならない．この run と target を名指ししていること，およびその状態が
+   プラットフォームの判定と一致すること（`Succeeded` なのに `Result` が失敗，
+   または `Failed` なのに成功，は不一致 → `Internal`）を確認し，run ディレクトリを
+   削除する — ただし実行が終了したことを確認できた場合に限る．状態を読めない
+   ままで停止も確認できなかった実行はディレクトリを残し（Runner がまだ書き込んで
+   いるかもしれない），操作者が削除できるよう「run directory kept」としてログに
+   記録する．
 
-The run's `externalExecutionId` is `azure-container-apps-job:<execution
-name>`. The Conductor's identity needs, on the Job resource only, the
-three actions the Bicep grants (`jobs/execution/read`,
-`jobs/executions/read`, `jobs/stop/execution/action`) — it cannot start
-or change the Job and holds no DNS, Key Vault or storage data
-permission. A run therefore starts up to one schedule interval plus the
-platform's start latency after it is queued, and at most one run starts
-per schedule tick (each execution runs one replica and takes one job).
+run の `externalExecutionId` は `azure-container-apps-job:<execution
+name>` である．Conductor の ID に必要なのは，Job リソースに対してのみ，Bicep が
+付与する 3 つのアクション（`jobs/execution/read`，`jobs/executions/read`，
+`jobs/stop/execution/action`）である — Job の開始や変更はできず，DNS，Key Vault，
+ストレージのデータ権限は持たない．したがって run は，待機状態になってから最大で
+スケジュール間隔 1 回分にプラットフォームの起動遅延を加えた時間の後に開始し，
+スケジュールの 1 ティックにつき最大 1 つの run が開始する（各実行は 1 レプリカで
+動き，1 つのジョブを取る）．
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `subscriptionId` | string | — (required) | GUID of the subscription holding the Job. |
-| `resourceGroup` | string | — (required) | Resource group of the Job. |
-| `jobName` | string | — (required) | Name of the Container Apps Job (2–32 lower-case letters, digits and hyphens, no `--`). |
-| `cloud` | string | `public` | `public`, `china` or `government`: selects the Resource Manager endpoint and identity authority. |
-| `credential` | string | `default` | How the Conductor authenticates to Resource Manager: `managed-identity` (the platform's identity — use this in production) or `default` (the SDK's `DefaultAzureCredential` chain, for a Conductor run on a developer host with the exchange share mounted). |
-| `managedIdentityClientId` | string | — | `managed-identity` only: the client ID of a user-assigned identity; omitted means system-assigned. |
-| `exchangeDir` | string | — (required) | Clean, absolute path where the exchange volume is mounted in the **Conductor's** filesystem (`/mnt/exchange` in the Bicep). Created if missing. The Runner is told its own mount path by its fixed arguments in infrastructure. |
-| `claimTimeoutSeconds` | int | `300` | How long to wait for a scheduled execution to take an offered job before withdrawing it. Must not exceed `jobSigning.validitySeconds` (a job taken after its expiry is refused by the Runner). `1`–`86400`. |
-| `timeoutSeconds` | int | `1200` | Bounds one execution, from the moment it took the job, as seen by the Conductor; after it the execution is stopped. Set it above the Job's `replicaTimeout`, which is above the Runner's `lego.timeoutSeconds`. `1`–`86400`. |
-| `pollIntervalSeconds` | int | `10` | How often the exchange directory and the execution's status are read. `1`–`300`. |
-| `resultGraceSeconds` | int | `30` | How long to wait for `result.json` after the execution ended (file shares propagate writes with a delay). `0`–`600`. |
+| `subscriptionId` | string | —（必須） | Job を保持するサブスクリプションの GUID． |
+| `resourceGroup` | string | —（必須） | Job のリソースグループ． |
+| `jobName` | string | —（必須） | Container Apps Job の名前（小文字・数字・ハイフンで 2–32 文字，`--` は不可）． |
+| `cloud` | string | `public` | `public`，`china`，`government` のいずれか: Resource Manager のエンドポイントと ID の authority を選ぶ． |
+| `credential` | string | `default` | Conductor が Resource Manager に認証する方法: `managed-identity`（プラットフォームの ID — 本番ではこれを使う）または `default`（SDK の `DefaultAzureCredential` チェーン．交換用共有をマウントした開発者ホストで Conductor を動かす場合向け）． |
+| `managedIdentityClientId` | string | — | `managed-identity` のみ: ユーザー割り当て ID のクライアント ID．省略時はシステム割り当て． |
+| `exchangeDir` | string | —（必須） | **Conductor の** ファイルシステムで交換用ボリュームがマウントされているクリーンな絶対パス（Bicep では `/mnt/exchange`）．なければ作成される．Runner は自身のマウントパスをインフラ側の固定引数で知らされる． |
+| `claimTimeoutSeconds` | int | `300` | 差し出したジョブをスケジュール実行が取るのを待ち，取り下げるまでの時間．`jobSigning.validitySeconds` を超えてはならない（期限切れ後に取られたジョブは Runner に拒否される）．`1`–`86400`． |
+| `timeoutSeconds` | int | `1200` | Conductor から見た実行 1 回の上限．ジョブを取った時点から数え，これを過ぎると実行は停止される．Job の `replicaTimeout` より大きく設定し，`replicaTimeout` は Runner の `lego.timeoutSeconds` より大きくする．`1`–`86400`． |
+| `pollIntervalSeconds` | int | `10` | 交換用ディレクトリと実行の状態を読む間隔．`1`–`300`． |
+| `resultGraceSeconds` | int | `30` | 実行の終了後に `result.json` を待つ時間（ファイル共有は書き込みの反映に遅延がある）．`0`–`600`． |
 
-A configuration with an `azure-container-apps-job` binding and no
-`jobSigning` or no `resultSigning` is rejected: the exchange volume is
-not a transport the Conductor owns, so every job on it is signed and
-every Result on it must be. See
-[`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json).
+`azure-container-apps-job` バインディングがあるのに `jobSigning` または
+`resultSigning` がない設定は拒否される．交換用ボリュームは Conductor が所有する
+トランスポートではないので，そこに置くジョブはすべて署名され，そこにある Result は
+すべて署名されていなければならない．
+[`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json)
+を参照．
 
 ### `migration`
 
-The migration from an existing infrastructure-defined host list
-([`docs/migration.md`](migration.md)). The whole section is optional;
-its parts are:
+既存のインフラで定義されたホスト一覧からの移行
+（[`docs/migration.md`](migration.md)）．このセクション全体が省略可であり，
+その構成要素は次の通り:
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `targetSource` | string | `registry` | Who issues. `registry`: the scheduler plans and starts runs for the registry's targets. `shadow`: it does not, and the configured list is compared with the registry every `compareIntervalSeconds`. `iac`: it does not, full stop. Under `shadow` and `iac`, `POST /targets/{id}/runs` answers `409 issuance_disabled`; the registry stays editable. |
-| `source` | object | — | Where the list is read from: exactly one of `bicepParamFile` (a clean absolute path; with `parameter`, default `targetDomains`), `jsonFile` (a TargetList document, clean absolute path) or `fqdns` (the list inline, at most 10000 names). Required under `shadow`; otherwise it is the default list of `GET /migration/diff` and of an import without `fqdns`. Needs `profile`. |
-| `profile` | object | — | What every imported target is made of besides its FQDN: `policyRef` (an identifier; the policy must exist when the profile is used), `executionBinding`, `dnsBinding` and `storeBinding` (each a binding this configuration registers) and `owner` (printable, at most 128 bytes). Required with `source`, and for any diff or import at all. |
-| `compareIntervalSeconds` | int | `300` | How often the shadow comparison runs. `10`–`86400`. |
+| `targetSource` | string | `registry` | 誰が発行するか．`registry`: スケジューラがレジストリの target について run を計画し開始する．`shadow`: 計画も開始もせず，設定された一覧を `compareIntervalSeconds` ごとにレジストリと比較する．`iac`: 計画も開始もせず，それだけである．`shadow` と `iac` のもとでは `POST /targets/{id}/runs` は `409 issuance_disabled` を返す．レジストリは編集可能なまま． |
+| `source` | object | — | 一覧の読み込み元: `bicepParamFile`（クリーンな絶対パス．`parameter` を併用可，既定は `targetDomains`），`jsonFile`（TargetList 文書，クリーンな絶対パス），`fqdns`（インラインの一覧，最大 10000 個の名前）のうちちょうど 1 つ．`shadow` では必須．それ以外では `GET /migration/diff` および `fqdns` なしの取り込みの既定の一覧となる．`profile` が必要． |
+| `profile` | object | — | 取り込まれる各 target を FQDN 以外に何で構成するか: `policyRef`（識別子．プロファイルが使われる時点でそのポリシーが存在しなければならない），`executionBinding`・`dnsBinding`・`storeBinding`（それぞれこの設定が登録するバインディング），`owner`（印字可能，最大 128 バイト）．`source` がある場合に必須で，差分や取り込みを行うには必ず必要． |
+| `compareIntervalSeconds` | int | `300` | shadow 比較を実行する間隔．`10`–`86400`． |
 
-The list contributes FQDNs and nothing else; the profile, and so the
-administrator, decides everything a target needs beyond its name.
+一覧が寄与するのは FQDN だけであり，それ以外は何も寄与しない．target が名前以外に
+必要とするものはすべて，プロファイル，すなわち管理者が決める．
 
 ### `jobSigning`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `privateKeyFile` | string | — (required) | Clean, absolute path of the PEM `PRIVATE KEY` (PKCS #8, Ed25519) file from `acme-conductor keygen`. Read once at start; an unreadable or wrong-type key is a configuration error (exit 1). |
-| `validitySeconds` | int | `900` | How long a signed job stays acceptable after it is issued; it only needs to cover the platform's start latency, because the Runner checks it before doing anything. `1`–`86400`. |
+| `privateKeyFile` | string | —（必須） | `acme-conductor keygen` が生成した PEM `PRIVATE KEY`（PKCS #8，Ed25519）ファイルのクリーンな絶対パス．起動時に一度だけ読まれる．読めない鍵や型の違う鍵は設定エラー（終了コード 1）． |
+| `validitySeconds` | int | `900` | 署名付きジョブが発行後に受け付けられる時間．Runner は何かをする前にこれを検査するので，プラットフォームの起動遅延をカバーできれば十分である．`1`–`86400`． |
 
-With `jobSigning` present, **every** launcher hands the Runner a
-`SignedCertificateReconcileJob` ([ADR 0015](adr/0015-signed-job-envelope.md)):
-the exact `JobSpec` bytes, base64url, under a strict header with the key
-id, `issuedAt`, `expiresAt` and a random nonce, signed with Ed25519. The
-Runner must then list the matching public key under its own
-`jobSigning.publicKeys` ([`docs/runner.md`](runner.md#jobsigning)) and
-refuses bare JobSpecs. Without `jobSigning` the local launcher hands over
-a bare `JobSpec` as in Phase 2. The private key is the only secret the
-Conductor ever reads; it is the Conductor's identity towards Runners, not
-a DNS, Store or cloud credential. To rotate it, add the new public key to
-the Runners first, then switch `privateKeyFile`, then remove the old
-public key. The key id appears in the `job signing enabled` log line at
-start.
+`jobSigning` があると，**すべての** ランチャーが Runner に
+`SignedCertificateReconcileJob`（[ADR 0015](adr/0015-signed-job-envelope.md)）を
+渡す．これは `JobSpec` の正確なバイト列を base64url にしたものを，鍵 ID・`issuedAt`・
+`expiresAt`・ランダムなノンスを持つ厳密なヘッダのもとに置き，Ed25519 で署名した
+ものである．Runner は対応する公開鍵を自身の `jobSigning.publicKeys`
+（[`docs/runner.md`](runner.md#jobsigning)）に列挙しなければならず，生の JobSpec を
+拒否する．`jobSigning` がなければ，ローカルランチャーは Phase 2 と同様に生の
+`JobSpec` を渡す．この秘密鍵は Conductor が読む唯一のシークレットである．これは
+Runner に対する Conductor の ID であって，DNS・Store・クラウドの資格情報ではない．
+ローテーションするには，まず新しい公開鍵を Runner に追加し，次に `privateKeyFile`
+を切り替え，最後に古い公開鍵を削除する．鍵 ID は起動時の `job signing enabled`
+ログ行に現れる．
 
 ### `resultSigning`
 
-| Field | Type | Default | Notes |
+| フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
-| `publicKeys` | []string | — (required) | 1–8 Runner result-signing public keys (Ed25519), each either a PEM `PUBLIC KEY` block or the standard base64 of its DER SubjectPublicKeyInfo — the one-line `publicKey:` that `acme-runner keygen` prints. Several keys let a Runner key rotate. Duplicates are rejected. |
-| `clockSkewSeconds` | int | `300` | How far a signed Result's `issuedAt` may lie in the future of this Conductor's clock before it is refused. Expiry has no tolerance. `1`–`3600`. |
+| `publicKeys` | []string | —（必須） | Runner の Result 署名用公開鍵（Ed25519）1–8 個．それぞれ PEM の `PUBLIC KEY` ブロック，またはその DER SubjectPublicKeyInfo の標準 base64 — `acme-runner keygen` が出力する 1 行の `publicKey:` — のどちらか．複数の鍵により Runner の鍵をローテーションできる．重複は拒否される． |
+| `clockSkewSeconds` | int | `300` | 署名付き Result の `issuedAt` が，この Conductor の時計に対してどれだけ未来にあっても拒否されないかの許容差．期限切れには許容差がない．`1`–`3600`． |
 
-With `resultSigning` present, **every** launcher accepts only a
-`SignedCertificateReconcileResult` ([ADR 0015](adr/0015-signed-job-envelope.md))
-whose signature verifies against one of these keys and whose payload is
-a valid `Result`; a bare `Result` is then "no result" and the run ends
-`Internal`. The Runner must then be configured with the matching private
-key under its `resultSigning.privateKeyFile`
-([`docs/runner.md`](runner.md#resultsigning)). Without `resultSigning`
-a signed Result is refused the same way, so signing is decided once, by
-configuration, never by the document. The Container Apps launcher
-requires it; the local launcher over a private directory may run either
-way. The Conductor holds public keys only.
+`resultSigning` があると，**すべての** ランチャーが，これらの鍵のいずれかで署名を
+検証でき，ペイロードが妥当な `Result` である `SignedCertificateReconcileResult`
+（[ADR 0015](adr/0015-signed-job-envelope.md)）だけを受け付ける．生の `Result` は
+「結果なし」となり，run は `Internal` で終わる．Runner は対応する秘密鍵を自身の
+`resultSigning.privateKeyFile`（[`docs/runner.md`](runner.md#resultsigning)）に
+設定しなければならない．`resultSigning` がなければ署名付き Result が同じように
+拒否されるので，署名するかどうかは設定によって一度だけ決まり，文書によって決まる
+ことは決してない．Container Apps ランチャーはこれを必須とする．プライベートな
+ディレクトリ越しのローカルランチャーはどちらでも動く．Conductor が保持するのは
+公開鍵だけである．
 
 ## REST API
 
-All resource endpoints live under `/api/v1alpha1`. Requests and responses
-are JSON (`Content-Type: application/json`); every request body is decoded
-strictly (unknown fields, duplicate keys, trailing data, nesting deeper
-than 8 levels all rejected) and capped at 64 KiB. Responses carry
-`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+すべてのリソースエンドポイントは `/api/v1alpha1` の下にある．リクエストと
+レスポンスは JSON（`Content-Type: application/json`）で，すべてのリクエスト本文は
+厳密にデコードされ（未知のフィールド，重複キー，末尾の余分なデータ，8 段より深い
+ネストはすべて拒否），64 KiB に制限される．レスポンスには
+`Cache-Control: no-store` と `X-Content-Type-Options: nosniff` が付く．
 
-Identifiers (`id`, `policyRef`, `targetId`, `runId`, `before`) are ULIDs
-generated by the Conductor (monotonic within one process, so they sort in
-creation order); a path or query identifier that is not
-`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` is answered `404`/`400` without
-touching the registry.
+識別子（`id`，`policyRef`，`targetId`，`runId`，`before`）は Conductor が生成する
+ULID である（1 つのプロセス内で単調増加なので，作成順にソートされる）．
+`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` に合致しないパスやクエリの識別子には，
+レジストリに触れずに `404`/`400` を返す．
 
-### Errors
+### エラー
 
 ```json
 { "error": { "code": "stale_revision", "message": "target 01J… is at revision 3, not 2", "details": { } } }
 ```
 
-| HTTP | `code` | When |
+| HTTP | `code` | 発生条件 |
 |---|---|---|
-| 400 | `invalid_request` | Malformed body, failed field validation, unknown field, unregistered binding name, invalid FQDN/suffix, bad query parameter. |
-| 400 | `policy_violation` | The target's FQDN is not allowed by the policy it names (label-boundary suffix match, wildcard rule). Audited as `policy.rejected`. |
-| 401 | `unauthenticated` | `oidc` mode: no bearer token, or one that does not verify (signature, issuer, audience, expiry, unknown key). Carries `WWW-Authenticate: Bearer realm="acme-conductor"`. |
-| 403 | `forbidden` | `localhost-dev`: refused by the mode's rules. `oidc`: the token verified but carries no role this API grants, or a viewer called anything but `GET`. |
-| 404 | `not_found` | No such policy, target, run, or endpoint. |
-| 409 | `conflict` | A second target for the same FQDN; a policy edit that would no longer cover an existing target; cancelling a run that is not cancellable. |
-| 409 | `stale_revision` | The `revision` in the request is not the target's current revision. |
-| 409 | `run_active` | A run is already queued/starting/running for the target (`details.activeRunId`, `details.status`). |
-| 409 | `target_disabled` | A run was requested for a disabled target. |
-| 409 | `issuance_disabled` | A run was requested while `migration.targetSource` is `shadow` or `iac` ([`docs/migration.md`](migration.md)). |
-| 409 | `migration_unconfigured` | A migration diff or import was requested but no `migration.profile` is configured, or the policy it names does not exist. |
-| 409 | `source_unreadable` | The configured `migration.source` could not be read (file missing, malformed, a name that is not a host name). |
-| 413 | `too_large` | Body over 64 KiB. |
-| 415 | `unsupported_media_type` | Body without `Content-Type: application/json`. |
-| 500 | `internal` | Registry or other internal failure; details are in the log only. |
+| 400 | `invalid_request` | 不正な本文，フィールド検証の失敗，未知のフィールド，未登録のバインディング名，不正な FQDN/サフィックス，不正なクエリパラメータ． |
+| 400 | `policy_violation` | target の FQDN が，指定したポリシーで許可されていない（ラベル境界でのサフィックス照合，ワイルドカード規則）．`policy.rejected` として監査される． |
+| 401 | `unauthenticated` | `oidc` モード: ベアラートークンがない，または検証に通らない（署名，issuer，audience，期限，未知の鍵）．`WWW-Authenticate: Bearer realm="acme-conductor"` を伴う． |
+| 403 | `forbidden` | `localhost-dev`: モードの規則により拒否．`oidc`: トークンは検証に通ったが，この API が与えるロールを持たない，または viewer が `GET` 以外を呼んだ． |
+| 404 | `not_found` | 該当するポリシー，target，run，エンドポイントがない． |
+| 409 | `conflict` | 同じ FQDN に対する 2 つ目の target．既存の target をカバーしなくなるポリシー編集．キャンセルできない run のキャンセル． |
+| 409 | `stale_revision` | リクエストの `revision` が target の現在のリビジョンではない． |
+| 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）． |
+| 409 | `target_disabled` | 無効化された target に run が要求された． |
+| 409 | `issuance_disabled` | `migration.targetSource` が `shadow` または `iac` の間に run が要求された（[`docs/migration.md`](migration.md)）． |
+| 409 | `migration_unconfigured` | 移行の差分または取り込みが要求されたが，`migration.profile` が設定されていない，またはそれが指すポリシーが存在しない． |
+| 409 | `source_unreadable` | 設定された `migration.source` を読めなかった（ファイルがない，形式が不正，ホスト名でない名前がある）． |
+| 413 | `too_large` | 本文が 64 KiB を超えている． |
+| 415 | `unsupported_media_type` | `Content-Type: application/json` のない本文． |
+| 500 | `internal` | レジストリまたはその他の内部障害．詳細はログにのみ記録される． |
 
-### Endpoints
+### エンドポイント
 
-| Method and path | Purpose |
+| メソッドとパス | 目的 |
 |---|---|
-| `GET /healthz` | Liveness: `{"status":"ok"}`. Unauthenticated. |
-| `GET /readyz` | Readiness: pings the registry; `503` `{"status":"unavailable"}` on failure. Unauthenticated. |
-| `GET /` | Redirects to `/ui/`. |
-| `GET /ui/`, `/ui/app.js`, `/ui/app.css` | The GUI's three static files. Unauthenticated (they contain no data). |
-| `GET /ui/config` | How the GUI signs in: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` or `{"auth":{"mode":"localhost-dev"}}`. Unauthenticated; `503` while the provider's discovery document is unavailable. |
-| `GET /api/v1alpha1/bindings` | The registered binding names: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`. |
-| `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`, oldest first. |
-| `POST /api/v1alpha1/policies` | Create a policy → `201` Policy, `Location`. |
-| `GET /api/v1alpha1/policies/{id}` | One policy. |
-| `PUT /api/v1alpha1/policies/{id}` | Replace a policy → `200`. Refused (`409`) if any target under it would no longer satisfy it. |
-| `GET /api/v1alpha1/targets[?enabled=&policyRef=]` | `{"items":[Target…]}`, oldest first. |
-| `POST /api/v1alpha1/targets` | Create a target → `201` Target, `Location`. Wakes the scheduler. |
-| `GET /api/v1alpha1/targets/{id}` | One target, with its certificate and last-run summary. |
-| `PUT /api/v1alpha1/targets/{id}` | Update mutable fields at a given `revision` → `200`. Wakes the scheduler. |
-| `POST /api/v1alpha1/targets/{id}/enable` | Set `enabled: true` → `200` Target (revision bumps if it changed). |
-| `POST /api/v1alpha1/targets/{id}/disable` | Set `enabled: false` → `200` Target. Deletes nothing; does not stop an in-flight run. |
-| `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | The target's runs, newest first. |
-| `POST /api/v1alpha1/targets/{id}/runs` | Request a run now → `202` Run, `Location`. Optional body `{"revision": N}`. |
-| `GET /api/v1alpha1/runs[?targetId=&status=&limit=&before=]` | Runs, newest first. `status` is a comma-separated list. |
-| `GET /api/v1alpha1/runs/{id}` | One run. |
-| `POST /api/v1alpha1/runs/{id}/cancel` | Cancel: a queued run is cancelled at once (`200`); a starting/running one is asked to stop (`202`, outcome recorded when the Runner reports). |
-| `GET /api/v1alpha1/audit[?targetId=&runId=&policyId=&limit=&before=]` | Audit events, newest first. |
-| `GET /api/v1alpha1/migration` | The migration state: `targetSource`, `issuanceEnabled`, the configured source and profile, and under `shadow` the latest comparison. |
-| `GET /api/v1alpha1/migration/diff` | Compare the configured list with the registry → report. |
-| `POST /api/v1alpha1/migration/diff` | Compare `{"fqdns": […]}` with the registry → report. |
-| `POST /api/v1alpha1/migration/import` | Import a list: `{"fqdns": […], "dryRun": true}`, both optional (`dryRun` defaults to `true`; without `fqdns`, the configured list) → import result. Creates targets only for names the registry lacks, never updates or deletes. Wakes the scheduler when it created something. See [`docs/migration.md`](migration.md#api). |
+| `GET /healthz` | 生存確認: `{"status":"ok"}`．認証不要． |
+| `GET /readyz` | 準備確認: レジストリに ping する．失敗時は `503` `{"status":"unavailable"}`．認証不要． |
+| `GET /` | `/ui/` にリダイレクトする． |
+| `GET /ui/`, `/ui/app.js`, `/ui/app.css` | GUI の 3 つの静的ファイル．認証不要（データを含まない）． |
+| `GET /ui/config` | GUI のサインイン方法: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` または `{"auth":{"mode":"localhost-dev"}}`．認証不要．プロバイダのディスカバリ文書が利用できない間は `503`． |
+| `GET /api/v1alpha1/bindings` | 登録されたバインディング名: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`． |
+| `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`，古い順． |
+| `POST /api/v1alpha1/policies` | ポリシーを作成 → `201` Policy，`Location`． |
+| `GET /api/v1alpha1/policies/{id}` | ポリシー 1 件． |
+| `PUT /api/v1alpha1/policies/{id}` | ポリシーを置き換え → `200`．その下のいずれかの target が満たさなくなる場合は拒否（`409`）． |
+| `GET /api/v1alpha1/targets[?enabled=&policyRef=]` | `{"items":[Target…]}`，古い順． |
+| `POST /api/v1alpha1/targets` | target を作成 → `201` Target，`Location`．スケジューラを起こす． |
+| `GET /api/v1alpha1/targets/{id}` | target 1 件．証明書と最後の run の要約を含む． |
+| `PUT /api/v1alpha1/targets/{id}` | 指定した `revision` で変更可能なフィールドを更新 → `200`．スケジューラを起こす． |
+| `POST /api/v1alpha1/targets/{id}/enable` | `enabled: true` に設定 → `200` Target（変化があればリビジョンが上がる）． |
+| `POST /api/v1alpha1/targets/{id}/disable` | `enabled: false` に設定 → `200` Target．何も削除せず，実行中の run も止めない． |
+| `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | その target の run，新しい順． |
+| `POST /api/v1alpha1/targets/{id}/runs` | 今すぐ run を要求 → `202` Run，`Location`．本文 `{"revision": N}` は省略可． |
+| `GET /api/v1alpha1/runs[?targetId=&status=&limit=&before=]` | run の一覧，新しい順．`status` はコンマ区切りの一覧． |
+| `GET /api/v1alpha1/runs/{id}` | run 1 件． |
+| `POST /api/v1alpha1/runs/{id}/cancel` | キャンセル: 待機中の run は即座にキャンセルされる（`200`）．starting/running の run には停止が要求される（`202`．結果は Runner の報告時に記録される）． |
+| `GET /api/v1alpha1/audit[?targetId=&runId=&policyId=&limit=&before=]` | 監査イベント，新しい順． |
+| `GET /api/v1alpha1/migration` | 移行の状態: `targetSource`，`issuanceEnabled`，設定されたソースとプロファイル，および `shadow` では最新の比較結果． |
+| `GET /api/v1alpha1/migration/diff` | 設定された一覧をレジストリと比較 → レポート． |
+| `POST /api/v1alpha1/migration/diff` | `{"fqdns": […]}` をレジストリと比較 → レポート． |
+| `POST /api/v1alpha1/migration/import` | 一覧を取り込む: `{"fqdns": […], "dryRun": true}`，どちらも省略可（`dryRun` の既定は `true`．`fqdns` がなければ設定された一覧）→ 取り込み結果．レジストリにない名前についてのみ target を作成し，更新も削除も決して行わない．何かを作成したときはスケジューラを起こす．[`docs/migration.md`](migration.md#api) を参照． |
 
-Lists that page (`runs`, `audit`) take `limit` (`1`–`1000`, default
-`100`) and `before=<id>` (return items whose id sorts before it; ids sort
-by creation time).
+ページングする一覧（`runs`，`audit`）は `limit`（`1`–`1000`，既定 `100`）と
+`before=<id>`（その id より前にソートされる項目を返す．id は作成時刻順にソート
+される）を取る．
 
 ### Policy
 
-Request body (`POST`, `PUT`):
+リクエスト本文（`POST`，`PUT`）:
 
 ```json
 {
@@ -419,52 +405,49 @@ Request body (`POST`, `PUT`):
 }
 ```
 
-- `allowedDnsSuffixes` — 1–64 entries, each normalized on input
-  (`internal/policy.NormalizeSuffix`: trimmed, lower-cased, trailing dot
-  removed; no wildcard; ASCII only, no `xn--`); duplicates after
-  normalization are rejected.
-- `acmeBinding` — must be listed in the configuration's `acmeBindings`.
-- `renewBeforeDays` — `1`–`365`. `keyType` — `ec256`, `ec384`, `rsa2048`,
-  `rsa3072`, `rsa4096`.
-- `maxSANs` — optional, must be `1` (one certificate per FQDN).
-- `enabled` — optional; defaults to `true` on create and to the current
-  value on update. A disabled policy holds every target under it back
-  from scheduling.
+- `allowedDnsSuffixes` — 1–64 個のエントリ．それぞれ入力時に正規化される
+  （`internal/policy.NormalizeSuffix`: 前後の空白除去，小文字化，末尾のドット除去．
+  ワイルドカード不可．ASCII のみで `xn--` 不可）．正規化後に重複するものは
+  拒否される．
+- `acmeBinding` — 設定の `acmeBindings` に列挙されていなければならない．
+- `renewBeforeDays` — `1`–`365`．`keyType` — `ec256`，`ec384`，`rsa2048`，
+  `rsa3072`，`rsa4096` のいずれか．
+- `maxSANs` — 省略可．`1` でなければならない（FQDN 1 つにつき証明書 1 枚）．
+- `enabled` — 省略可．作成時の既定は `true`，更新時の既定は現在の値．無効化された
+  ポリシーは，その下のすべての target をスケジューリングから遠ざける．
 
-Response adds `id`, `createdAt`, `updatedAt`.
+レスポンスには `id`，`createdAt`，`updatedAt` が加わる．
 
-**When a policy change takes effect.** A policy is not versioned and
-targets do not carry a policy revision; an update is accepted only if
-every existing target under the policy still satisfies it (`409
-conflict` naming the offending targets otherwise), and the new values are read at each
-target's **next run**. A run is next due when the certificate enters its
-`renewBeforeDays` window, when the target itself changes (its revision
-moves), or when an operator requests one (`POST /targets/{id}/runs`).
-Updating a policy does not by itself queue runs or bump target revisions.
-What each field does at that next run:
+**ポリシー変更が効力を持つ時点．** ポリシーはバージョン管理されず，target は
+ポリシーのリビジョンを持たない．更新は，ポリシーの下の既存の target がすべて
+なおそれを満たす場合にのみ受け付けられ（そうでなければ違反する target を示す
+`409 conflict`），新しい値は各 target の **次の run** で読まれる．次の run が
+期限到来するのは，証明書が `renewBeforeDays` の窓に入ったとき，target 自体が
+変わったとき（リビジョンが進んだとき），または操作者が要求したとき
+（`POST /targets/{id}/runs`）である．ポリシーの更新だけでは run は待機状態に
+ならず，target のリビジョンも上がらない．その次の run で各フィールドが何をするか:
 
-- `keyType` — the Runner compares the stored certificate's key type with
-  the requested one and reissues on a mismatch, even if the certificate
-  is otherwise current; so after a `keyType` change, a manual run on each
-  target rotates it now, and the renewal window rotates it later
-  otherwise.
-- `renewBeforeDays` — read by the scheduler at every due check, so a
-  larger window can make targets due at the next tick.
-- `acmeBinding` — selects the CA for the next ACME order only; a current
-  certificate from the previous CA is not reissued on account of the
-  change alone, so a target moves to the new CA at its next renewal (or
-  at a manual run that finds something else to reissue). Phase 2 does
-  not force reissue on a binding change ([ADR 0011](adr/0011-conductor-storage-and-run-model.md)).
-- `allowedDnsSuffixes`, `allowWildcard` — enforced on the update itself
-  against existing targets and on every later target create/update; the
-  Runner re-validates the snapshot it receives.
+- `keyType` — Runner は保存されている証明書の鍵種別を要求されたものと比較し，
+  不一致なら，証明書がそれ以外の点で最新であっても再発行する．したがって
+  `keyType` の変更後は，各 target への手動 run が今すぐローテーションし，
+  そうでなければ更新の窓が後でローテーションする．
+- `renewBeforeDays` — スケジューラが期限到来の検査のたびに読むので，窓を広げると
+  次のティックで target が期限到来になり得る．
+- `acmeBinding` — 次の ACME オーダーの CA を選ぶだけである．以前の CA による最新の
+  証明書がこの変更だけを理由に再発行されることはないので，target は次の更新時に
+  （または再発行すべき別の理由を見つけた手動 run で）新しい CA に移る．Phase 2 は
+  バインディング変更による強制再発行を行わない
+  （[ADR 0011](adr/0011-conductor-storage-and-run-model.md)）．
+- `allowedDnsSuffixes`，`allowWildcard` — 更新そのものにおいて既存の target に
+  対して強制され，その後の target の作成・更新のたびにも強制される．Runner は
+  受け取ったスナップショットを再検証する．
 
-The `JobSpec` handed to the Runner carries the policy values as a snapshot,
-so the audit trail of a run always shows the values it was executed with.
+Runner に渡される `JobSpec` はポリシーの値をスナップショットとして運ぶので，
+run の監査証跡には常に，その run が実行された時点の値が示される．
 
 ### Target
 
-Create:
+作成:
 
 ```json
 {
@@ -478,21 +461,21 @@ Create:
 }
 ```
 
-- `fqdn` — normalized on input (`internal/policy.NormalizeFQDN`) and
-  unique; it must satisfy the named policy (label-boundary suffix match,
-  wildcard only if the policy allows it) or the request is refused with
-  `policy_violation` and audited. The FQDN is **immutable** afterwards: a
-  target is one FQDN.
-- `owner` — 1–128 bytes of printable UTF-8; free text for humans.
-- `policyRef` — an existing policy id. The three binding names must be
-  listed in the configuration.
+- `fqdn` — 入力時に正規化され（`internal/policy.NormalizeFQDN`），一意である．
+  指定したポリシーを満たさなければならず（ラベル境界でのサフィックス照合．
+  ワイルドカードはポリシーが許す場合のみ），そうでなければリクエストは
+  `policy_violation` で拒否され，監査される．FQDN はその後 **不変** である．
+  target は 1 つの FQDN である．
+- `owner` — 印字可能な UTF-8 で 1–128 バイト．人間向けの自由記述．
+- `policyRef` — 既存のポリシー id．3 つのバインディング名は設定に列挙されて
+  いなければならない．
 
-Update (`PUT`): `{"revision": N, …}` with any of `owner`, `policyRef`,
-`executionBinding`, `dnsBinding`, `storeBinding`, `enabled`; omitted
-fields keep their value; `revision` must be the current one
-(`stale_revision` otherwise) and is incremented on success.
+更新（`PUT`）: `{"revision": N, …}` に `owner`，`policyRef`，`executionBinding`，
+`dnsBinding`，`storeBinding`，`enabled` のいずれかを添える．省略したフィールドは
+値を保つ．`revision` は現在の値でなければならず（そうでなければ
+`stale_revision`），成功時にインクリメントされる．
 
-Response:
+レスポンス:
 
 ```json
 {
@@ -507,10 +490,9 @@ Response:
 }
 ```
 
-`certificate` is `null` until a run has succeeded; it is exactly what the
-last successful `Result` reported, never anything read from the Store.
-`lastRun` is `null` until a run exists; it carries `errorCode` when the
-run failed.
+`certificate` は run が成功するまで `null` であり，最後に成功した `Result` が
+報告した内容そのものである．Store から読んだものでは決してない．`lastRun` は
+run が存在するまで `null` であり，run が失敗した場合は `errorCode` を持つ．
 
 ### Run
 
@@ -524,21 +506,21 @@ run failed.
 }
 ```
 
-`status` is one of `queued`, `starting`, `running`, `succeeded`,
-`failed`, `cancelled`. `action`, `expiresAt`, `fingerprintSha256`,
-`storeObjectRef` and `error` mirror the Runner's `Result`
-([contract](architecture.md#certificatereconcileresult-result)); `error`
-is `{ "code", "summary" }` on failure or cancellation. `requestedBy` is
-`scheduler` or the API principal (`localhost-dev`, or in `oidc` mode the
-value of `principalClaim`, an identifier such as an Entra ID `oid`), and
-`requestedByAuthority` is the namespace that value is unique in:
-`scheduler`, `localhost-dev`, or the OIDC issuer URL
-(`server.auth.oidc.issuer` at the time of the run). The pair is the
-durable identity ([ADR 0018](adr/0018-authority-qualified-principals.md));
-`requestedByAuthority` is `""` on runs recorded before the Conductor
-stored it (schema version 1).
+`status` は `queued`，`starting`，`running`，`succeeded`，`failed`，`cancelled` の
+いずれかである．`action`，`expiresAt`，`fingerprintSha256`，`storeObjectRef`，
+`error` は Runner の `Result`
+（[コントラクト](architecture.md#certificatereconcileresult-result)）を写したもので，
+`error` は失敗またはキャンセル時に `{ "code", "summary" }` となる．`requestedBy` は
+`scheduler` または API のプリンシパル（`localhost-dev`，または `oidc` モードでは
+`principalClaim` の値．Entra ID の `oid` のような識別子）であり，
+`requestedByAuthority` はその値が一意である名前空間，すなわち `scheduler`，
+`localhost-dev`，または OIDC の issuer URL（run 時点の
+`server.auth.oidc.issuer`）である．この組が永続的な ID である
+（[ADR 0018](adr/0018-authority-qualified-principals.md)）．Conductor がこれを
+保存するようになる前（スキーマバージョン 1）に記録された run では
+`requestedByAuthority` は `""` である．
 
-### Audit event
+### 監査イベント
 
 ```json
 { "id": "01JEVENT…", "time": "…", "actor": "localhost-dev", "actorAuthority": "localhost-dev",
@@ -546,39 +528,36 @@ stored it (schema version 1).
   "detail": "target created: fqdn=… policy=… …" }
 ```
 
-`actor` and `actorAuthority` identify who acted the same way
-`requestedBy` and `requestedByAuthority` do on a run: the actor value is
-unique only within its authority (an OIDC issuer URL, `localhost-dev` or
-`scheduler`), so the pair, not the actor alone, names a principal across
-a change of identity provider. `actorAuthority` is `""` on events
-recorded before the Conductor stored it; such rows are never rewritten
-(the audit log is append-only).
+`actor` と `actorAuthority` は，run の `requestedBy` と `requestedByAuthority` と
+同じ方法で，誰が行為したかを識別する．actor の値はその authority（OIDC の
+issuer URL，`localhost-dev`，`scheduler`）の中でのみ一意なので，ID プロバイダの
+変更をまたいでプリンシパルを名指しするのは actor 単独ではなくこの組である．
+Conductor がこれを保存するようになる前に記録されたイベントでは `actorAuthority` は
+`""` であり，そのような行が書き換えられることは決してない（監査ログは追記専用）．
 
-Actions: `policy.created`, `policy.updated`, `policy.rejected`,
-`target.created`, `target.updated`, `target.enabled`, `target.disabled`,
-`target.imported` (a target created by a migration import, with the list
-it came from), `run.requested`, `run.started`, `run.succeeded`,
-`run.failed`, `run.cancelled`, `migration.compared` (a shadow comparison
-whose outcome differs from the previous one; actor and authority are
-both `migration`, the Conductor's own comparison loop, the way `scheduler`
-is its own authority). `detail` is a short sentence built by the
-Conductor from validated values (at most 512 bytes); it never contains
-Runner output.
-Events are written in the same transaction as the change they describe
-and can be neither updated nor deleted.
+アクション: `policy.created`，`policy.updated`，`policy.rejected`，
+`target.created`，`target.updated`，`target.enabled`，`target.disabled`，
+`target.imported`（移行の取り込みで作成された target．由来の一覧を伴う），
+`run.requested`，`run.started`，`run.succeeded`，`run.failed`，`run.cancelled`，
+`migration.compared`（結果が前回と異なる shadow 比較．actor と authority は
+ともに `migration`，すなわち Conductor 自身の比較ループであり，`scheduler` が
+それ自身の authority であるのと同じ）．`detail` は Conductor が検証済みの値から
+組み立てる短い文（最大 512 バイト）であり，Runner の出力を含むことは決してない．
+イベントは，それが記述する変更と同じトランザクションで書き込まれ，更新も削除も
+できない．
 
-### Example session
+### セッション例
 
 ```sh
 C=http://127.0.0.1:8080/api/v1alpha1
 P=$(curl -s -H 'Content-Type: application/json' -d '{"allowedDnsSuffixes":["example.ac.jp"],"acmeBinding":"letsencrypt-staging","renewBeforeDays":30,"keyType":"ec256"}' $C/policies | jq -r .id)
 T=$(curl -s -H 'Content-Type: application/json' -d "{\"fqdn\":\"wiki.example.ac.jp\",\"owner\":\"web-team\",\"policyRef\":\"$P\",\"executionBinding\":\"local\",\"dnsBinding\":\"azure-dns-staging\",\"storeBinding\":\"filesystem-dev\"}" $C/targets | jq -r .id)
-curl -s $C/targets/$T | jq .lastRun          # the scheduler queues a run at once
-curl -s -X POST $C/targets/$T/runs             # or request one explicitly (409 while one is active)
+curl -s $C/targets/$T | jq .lastRun          # スケジューラが即座に run を待機状態にする
+curl -s -X POST $C/targets/$T/runs             # または明示的に要求する (アクティブな run がある間は 409)
 curl -s "$C/audit?targetId=$T" | jq '.items[].action'
 ```
 
-## Run lifecycle and scheduling
+## Run のライフサイクルとスケジューリング
 
 ```
  scheduler tick / API request
@@ -591,364 +570,335 @@ curl -s "$C/audit?targetId=$T" | jq '.items[].action'
         └── cancel via API ──> cancelled  └──────────> cancelled          └── cancel ──> cancelled
 ```
 
-1. **Due check** (every tick and on every wake). For each enabled target
-   whose policy is enabled and that has no active run, a run is queued if
-   the target has never succeeded, its revision differs from the one its
-   last successful run was made for, the last successful run recorded no
-   expiry, or `expiresAt - renewBeforeDays` has passed. After a failed or
-   cancelled run the target waits `retryBackoffSeconds`, doubled per
-   consecutive failure up to `maxRetryBackoffSeconds`. The reason is
-   recorded in the `run.requested` audit event.
-2. **Exclusion.** At most one run per target may be queued, starting or
-   running; the registry enforces it as a schema constraint, so a tick, an
-   operator and a restart cannot race a second Runner into existence. A
-   second API request answers `409 run_active` naming the active run.
-3. **Claim and re-check.** Up to `maxConcurrentRuns` queued runs are
-   claimed (`starting`). Each re-reads its target and policy: a disabled
-   target or policy, or a target whose revision moved on since the run was
-   requested, ends the run as `cancelled` without starting a Runner. Then
-   the `JobSpec` is built (policy copied by value as a snapshot) and
-   validated with the contract's own `Validate`; a rejection ends the run
-   as `failed`/`PolicyViolation` and is audited as `policy.rejected`.
-4. **Launch.** The `JobSpec` is serialized — as a signed envelope when
-   `jobSigning` is configured — and the execution binding's launcher
-   starts the Runner (a child process, or a Container Apps Job
-   execution); the run becomes `running` with the platform's execution
-   id recorded.
-5. **Result.** The Runner's `Result` (strictly decoded, checked to name
-   this run and target) sets the terminal status and every certificate
-   field. `Cancelled` → `cancelled`; any other error → `failed`. If the
-   launcher obtains no `Result` at all, the run fails with a
-   Conductor-owned summary: `Timeout` (launcher timeout), `Cancelled`
-   (stopped before reporting), or `Internal` (no/unusable/mismatched
-   result, could not start). Nothing the Runner printed is copied into a
-   run record.
-6. **Recording.** Every status transition is written against the status
-   the registry is known to hold, not the one the scheduler intended, and
-   each write carries its audit event in the same transaction. If the
-   `starting → running` write fails while the Runner is already executing,
-   the scheduler keeps waiting for the Runner and records the outcome
-   against `starting` (after one more attempt to record the start, so the
-   trail carries `run.started` whenever the registry is back). A terminal
-   write that fails transiently is retried with backoff for up to two
-   minutes; a conflict (the registry holds another status than expected,
-   for example after a write that committed but reported an error) is
-   resolved by re-reading the run and retrying against its actual status,
-   never by recording a transition twice. Should the outcome still not be
-   recorded, the run is left `running` by its execution and closed at the
-   next loop iteration by the **sweep**, which marks every `starting` or
-   `running` run this process is not executing as `failed`/`Internal`
-   "run outcome could not be recorded while the runner ran; outcome
-   unknown", so the target's exclusion slot is freed and its next run can
-   be registered. The sweep runs in the loop goroutine only, after
-   dispatch has registered what it claimed, so it never mistakes a run
-   claimed a moment ago for a stranded one.
+1. **期限到来の検査**（ティックごと，および起こされるたび）．ポリシーが有効で
+   アクティブな run のない各有効 target について，target が一度も成功していない，
+   リビジョンが最後に成功した run の対象リビジョンと異なる，最後に成功した run が
+   有効期限を記録しなかった，または `expiresAt - renewBeforeDays` を過ぎた場合に
+   run が待機状態になる．失敗またはキャンセルされた run の後，target は
+   `retryBackoffSeconds` 待ち，連続失敗ごとに 2 倍になって `maxRetryBackoffSeconds`
+   で頭打ちになる．理由は `run.requested` 監査イベントに記録される．
+2. **排他．** target ごとに queued・starting・running の run は最大 1 つである．
+   レジストリがこれをスキーマ制約として強制するので，ティック，操作者，再起動が
+   競合して 2 つ目の Runner を生み出すことはない．2 つ目の API リクエストには
+   アクティブな run を示す `409 run_active` を返す．
+3. **クレームと再検査．** 待機中の run を最大 `maxConcurrentRuns` 個までクレーム
+   する（`starting`）．それぞれが target とポリシーを読み直す．target または
+   ポリシーが無効，または run の要求後にリビジョンが進んだ target なら，Runner を
+   起動せずに run を `cancelled` で終える．次に `JobSpec` を組み立て（ポリシーは
+   値としてスナップショットにコピー），コントラクト自身の `Validate` で検証する．
+   拒否されれば run は `failed`/`PolicyViolation` で終わり，`policy.rejected` として
+   監査される．
+4. **起動．** `JobSpec` をシリアライズし — `jobSigning` が設定されていれば
+   署名付きエンベロープとして — 実行バインディングのランチャーが Runner
+   （子プロセス，または Container Apps Job の実行）を開始する．run は
+   プラットフォームの実行 id を記録して `running` になる．
+5. **Result．** Runner の `Result`（厳密にデコードし，この run と target を名指し
+   していることを検査）が終端状態とすべての証明書フィールドを定める．`Cancelled`
+   → `cancelled`．それ以外のエラー → `failed`．ランチャーが `Result` をまったく
+   得られなければ，run は Conductor 自身の要約で失敗する: `Timeout`（ランチャーの
+   タイムアウト），`Cancelled`（報告前に停止），`Internal`（結果がない／使えない／
+   不一致，または開始できなかった）．Runner が出力した内容が run のレコードに
+   コピーされることはない．
+6. **記録．** すべての状態遷移は，スケジューラが意図した状態ではなく，レジストリが
+   保持していると分かっている状態に対して書き込まれ，各書き込みは同じ
+   トランザクションで監査イベントを伴う．Runner がすでに実行中なのに
+   `starting → running` の書き込みが失敗した場合，スケジューラは Runner を待ち
+   続け，結果を `starting` に対して記録する（開始の記録をもう一度試みた後に．
+   レジストリが回復していれば証跡に `run.started` が残るように）．一時的に失敗
+   した終端の書き込みは，最大 2 分間バックオフ付きで再試行される．競合（レジストリ
+   が想定と異なる状態を保持している．例えばコミットされたのにエラーを報告した
+   書き込みの後）は，run を読み直して実際の状態に対して再試行することで解決し，
+   遷移を 2 度記録することは決してない．それでも結果を記録できなければ，run は
+   その実行によって `running` のまま残され，次のループ反復で **スイープ** が
+   閉じる．スイープは，このプロセスが実行していない `starting` または `running` の
+   run をすべて `failed`/`Internal`「run outcome could not be recorded while the
+   runner ran; outcome unknown」とし，target の排他スロットを解放して次の run を
+   登録できるようにする．スイープはループのゴルーチンでのみ，ディスパッチが
+   クレームしたものを登録した後に実行されるので，直前にクレームされた run を
+   取り残された run と誤認することは決してない．
 
-The Runner stays the authority on whether a certificate must actually be
-issued or renewed (it asks the Store, see [ADR 0009](adr/0009-runner-execution-model.md)):
-a run the Conductor considered due that finds the certificate current
-ends as `succeeded`/`noop` without contacting the CA.
+証明書を実際に発行または更新しなければならないかどうかの権威は Runner のままである
+（Runner が Store に問い合わせる．[ADR 0009](adr/0009-runner-execution-model.md)
+を参照）．Conductor が期限到来とみなした run が証明書が最新であることを見つければ，
+CA に接触せずに `succeeded`/`noop` で終わる．
 
-### Shutdown and recovery
+### シャットダウンと復旧
 
-On `SIGTERM`/`SIGINT`: the listener closes, planning stops, in-flight runs
-continue for up to `server.shutdownGraceSeconds`, then are cancelled (the
-Runner receives `SIGTERM` and normally reports `Cancelled`, `SIGKILL`
-follows after 10 s). A second signal kills the Conductor immediately and
-leaves any Runner child running on its own.
+`SIGTERM`/`SIGINT` を受けると: リスナーを閉じ，計画を止め，実行中の run は最大
+`server.shutdownGraceSeconds` まで継続し，その後キャンセルされる（Runner は
+`SIGTERM` を受け取り，通常は `Cancelled` を報告する．10 秒後に `SIGKILL` が続く）．
+2 回目のシグナルは Conductor を即座に強制終了し，Runner の子プロセスは単独で
+動き続ける．
 
-**Exactly one Conductor per database.** Before it opens the registry,
-recovers anything or binds its port, `serve` takes an exclusive advisory
-lock (`flock`) on `<database.path>.lock`. If another process holds it,
-`serve` logs "another conductor process owns this database; refusing to
-start" and exits with code `2` without having changed any state — in
-particular without marking the owner's in-flight runs failed. The lock is
-released when the process exits (also on a crash: the kernel drops it with
-the descriptor), so a restart owns the database again. The database path
-must be on a local filesystem for the lock to be meaningful (`flock`
-semantics on network filesystems vary; the same caveat as for the
-Runner's `internal/fslock`). A second instance on another port with the
-same `database.path` is therefore refused, not merely a port clash.
+**データベース 1 つにつき Conductor はちょうど 1 つ．** `serve` はレジストリを
+開き，何かを復旧し，ポートをバインドするより前に，`<database.path>.lock` に
+排他的なアドバイザリロック（`flock`）を取る．別のプロセスがこれを保持していれば，
+`serve` は「another conductor process owns this database; refusing to start」と
+ログに記録し，いかなる状態も変更せずに — 特に所有者の実行中の run を失敗扱いに
+せずに — 終了コード `2` で終了する．ロックはプロセスの終了時に解放される
+（クラッシュ時も同様．カーネルがディスクリプタとともに解放する）ので，再起動
+すればデータベースを再び所有できる．ロックが意味を持つためにはデータベースのパスは
+ローカルファイルシステム上になければならない（ネットワークファイルシステムでの
+`flock` の意味論はまちまちである．Runner の `internal/fslock` と同じ注意点）．
+したがって，同じ `database.path` を持つ別ポートの 2 つ目のインスタンスは，単なる
+ポートの衝突ではなく拒否される．
 
-At start, runs still `starting` or `running` in the registry are marked
-`failed` with `Internal` — "conductor stopped while the run was in flight;
-outcome unknown" — and audited; queued runs are dispatched normally. The
-Conductor never resumes a run, because it cannot know whether the Runner
-finished. A Runner orphaned by a hard kill may still complete its work in
-the Store; the next due check then schedules a fresh run, which finds the
-certificate current (`noop`) or renews.
+起動時，レジストリでまだ `starting` または `running` の run は `Internal` で
+`failed` とされ —「conductor stopped while the run was in flight; outcome
+unknown」— 監査される．待機中の run は通常通りディスパッチされる．Conductor が
+run を再開することは決してない．Runner が完了したかどうかを知り得ないからである．
+強制終了で取り残された Runner は Store での作業を完了するかもしれない．その場合，
+次の期限到来の検査が新しい run をスケジュールし，それが証明書が最新であることを
+見つける（`noop`）か，更新する．
 
-## Authentication
+## 認証
 
-Two modes, selected by `server.auth.mode`. Both authenticate every
-request under `/api/`; `/healthz`, `/readyz` and the GUI's static files
-need no credential, and every handler under `/api/` runs only behind the
-same middleware, so no endpoint can be added that bypasses it.
+`server.auth.mode` で選ぶ 2 つのモードがある．どちらも `/api/` 配下のすべての
+リクエストを認証する．`/healthz`，`/readyz`，GUI の静的ファイルには資格情報は
+不要であり，`/api/` 配下のすべてのハンドラは同じミドルウェアの後ろでのみ動くため，
+それを迂回するエンドポイントを追加することはできない．
 
-### `oidc` (production)
+### `oidc`（本番）
 
-The Conductor is an OpenID Connect **resource server**
-([ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)): it accepts an
-`Authorization: Bearer <access token>` header — never a cookie or a
-query parameter — and a token is accepted only if **all** hold:
+Conductor は OpenID Connect の **リソースサーバー** である
+（[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)）．受け付けるのは
+`Authorization: Bearer <access token>` ヘッダーのみで，Cookie やクエリパラメータは
+決して受け付けない．トークンは次の **すべて** が成り立つ場合にのみ受理される．
 
-- it is a compact JWS signed with `RS256`, `PS256` or `ES256` (`none` and
-  HMAC are refused), names a key id, uses no critical extension, and its
-  signature verifies against that key in the set the provider publishes
-  at its discovery document's `jwks_uri` (RSA ≥ 2048 bits or P-256);
-- `iss` equals `server.auth.oidc.issuer`, and `aud` contains
-  `server.auth.oidc.audience`;
-- `exp` is present and not passed (within `clockSkewSeconds`); `nbf` and
-  `iat`, if present, are not in the future;
-- its header and payload decode strictly (a duplicated claim is refused);
-- `principalClaim` is a printable string, which becomes the caller's
-  identity in the audit log and in `requestedBy`;
-- `rolesClaim` carries a value in `roles.admin` (→ **admin**, every
-  endpoint) or `roles.viewer` (→ **viewer**, `GET` only). A token with
-  neither verified but is refused with `403`.
+- `RS256`，`PS256`，`ES256` のいずれかで署名されたコンパクト JWS であること
+  （`none` と HMAC は拒否する），key id を名指ししていること，critical 拡張を
+  使っていないこと，そしてプロバイダがディスカバリ文書の `jwks_uri` で公開する
+  鍵セットの中のその鍵で署名が検証できること（RSA 2048 ビット以上，または P-256）．
+- `iss` が `server.auth.oidc.issuer` と等しく，`aud` が
+  `server.auth.oidc.audience` を含むこと．
+- `exp` があり，（`clockSkewSeconds` の範囲内で）期限切れでないこと．`nbf` と
+  `iat` は，あれば未来でないこと．
+- ヘッダーとペイロードが厳密にデコードできること（重複したクレームは拒否する）．
+- `principalClaim` が印字可能な文字列であること．これが監査ログと `requestedBy`
+  における呼び出し元の識別子になる．
+- `rolesClaim` が `roles.admin` の値（→ **admin**，すべてのエンドポイント）または
+  `roles.viewer` の値（→ **viewer**，`GET` のみ）を含むこと．どちらも含まない
+  トークンは検証には通るが `403` で拒否される．
 
-Failures answer `401` with a `WWW-Authenticate: Bearer` challenge, or
-`403` when the caller was identified but is not permitted. Error texts
-say why (expired, wrong audience, unknown key) and never echo the token.
-The log records every refusal with the method, path and reason.
+失敗は `WWW-Authenticate: Bearer` チャレンジ付きの `401` で応答し，呼び出し元は
+特定できたが許可されていない場合は `403` で応答する．エラーの文言は理由（期限切れ，
+audience の不一致，未知の鍵）を述べ，トークンをそのまま返すことは決してない．
+ログはすべての拒否をメソッド・パス・理由とともに記録する．
 
-The provider's discovery document and keys are read once at start
-(a provider that is unreachable then is a warning; tokens are refused
-until it answers, and scheduled renewals are unaffected) and again every
-`keyCacheSeconds`, or sooner when a token names a key id the cached set
-does not hold (at most once a minute). A refresh that fails keeps the
-previous keys.
+プロバイダのディスカバリ文書と鍵は起動時に一度読む（そのとき到達できなければ
+警告となり，応答があるまでトークンは拒否されるが，スケジュールされた更新には
+影響しない）．その後は `keyCacheSeconds` ごとに，またはトークンがキャッシュに
+ない key id を名指ししたときにはより早く（最大で 1 分に 1 回）読み直す．読み直しに
+失敗した場合は以前の鍵を保持する．
 
-**Transport.** A bearer token is a session; it must not travel in the
-clear. With a non-loopback `server.listen` the configuration insists on
-`server.tls` (the Conductor's own certificate and key; TLS 1.2+) or on
-`server.behindTlsProxy: true` — an explicit statement that a platform
-ingress or reverse proxy terminates TLS and is the only route to the
-port. The Container Apps deployment uses the latter with the
-environment's peer-traffic encryption
-([`deploy/azure/README.md`](../deploy/azure/README.md)).
+**トランスポート．** ベアラートークンはセッションそのものであり，平文で運んでは
+ならない．`server.listen` がループバック以外なら，設定は `server.tls`（Conductor
+自身の証明書と鍵，TLS 1.2 以上）か `server.behindTlsProxy: true` のどちらかを
+要求する．後者は，プラットフォームの ingress またはリバースプロキシが TLS を終端し，
+それがポートへの唯一の経路であることの明示的な表明である．Container Apps の
+デプロイは後者を環境のピア間トラフィック暗号化と組み合わせて使う
+（[`deploy/azure/README.md`](../deploy/azure/README.md)）．
 
-**Obtaining a token.** The GUI does it in the browser (see [GUI](#gui)).
-From a terminal, ask the provider for a token for the API's scope; with
-Microsoft Entra ID, an API app registration whose client ID (the
-`audience`) is `1111…` and whose application ID URI is the default
-`api://1111…`:
+**トークンの取得．** GUI はブラウザ内でこれを行う（[GUI](#gui) を参照）．
+ターミナルからは，API のスコープに対するトークンをプロバイダに要求する．Microsoft
+Entra ID で，API のアプリ登録のクライアント ID（`audience`）が `1111…`，
+アプリケーション ID URI が既定の `api://1111…` の場合:
 
 ```sh
 token="$(az account get-access-token --scope api://11111111-1111-1111-1111-111111111111/.default --query accessToken -o tsv)"
 curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1alpha1/targets
 ```
 
-The provider-side setup (an API app registration with app roles, a
-public client for the GUI) is described with the Azure deployment; any
-provider that publishes a discovery document and signs tokens with one
-of the three algorithms works the same way, with `principalClaim` and
-`rolesClaim` set to what it issues.
+プロバイダ側の準備（アプリロールを持つ API のアプリ登録，GUI 用のパブリック
+クライアント）は Azure のデプロイとともに説明している．ディスカバリ文書を公開し，
+上記 3 つのアルゴリズムのいずれかでトークンに署名するプロバイダなら，
+`principalClaim` と `rolesClaim` をそのプロバイダが発行するものに合わせれば，
+どれも同じように動く．
 
-### `localhost-dev` (one development host)
+### `localhost-dev`（開発ホスト 1 台）
 
-The Phase 2 mode ([ADR 0012](adr/0012-localhost-only-dev-auth.md)).
-A request to anything under `/api/` is accepted only if **all** hold:
+Phase 2 のモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
+`/api/` 配下へのリクエストは次の **すべて** が成り立つ場合にのみ受理される．
 
-- the listener is bound to a loopback address (enforced by configuration
-  and re-checked at start);
-- the TCP peer is a loopback address;
-- the `Host` header names `localhost` or a loopback IP, on the listener's
-  port if a port is given (defeats DNS rebinding);
-- an `Origin` header, if present, is `http://<loopback host>[:port]` for
-  that same port (`null` and foreign origins are refused);
-- `Sec-Fetch-Site`, if present, is `same-origin` or `none`;
-- a request with a body carries `Content-Type: application/json`.
+- リスナーがループバックアドレスにバインドされていること（設定で強制し，
+  起動時に再確認する）．
+- TCP のピアがループバックアドレスであること．
+- `Host` ヘッダーが `localhost` またはループバック IP を名指ししており，ポートが
+  あればリスナーのポートであること（DNS リバインディングを防ぐ）．
+- `Origin` ヘッダーがあれば，同じポートに対する `http://<loopback host>[:port]`
+  であること（`null` と外部のオリジンは拒否する）．
+- `Sec-Fetch-Site` があれば `same-origin` または `none` であること．
+- ボディを持つリクエストが `Content-Type: application/json` を伴うこと．
 
-Every accepted caller is the principal `localhost-dev` with the admin
-role; that name is what the audit log records. **Any local user who can
-open a loopback connection is an administrator** in this mode. Do not
-expose it beyond a single-user development or test host, and do not
-publish a container running it to a network; that is what `oidc` is
-for.
+受理された呼び出し元はすべて admin ロールのプリンシパル `localhost-dev` となり，
+監査ログにはその名前が記録される．このモードでは **ループバック接続を開ける
+ローカルユーザーは誰でも管理者である**．単一ユーザーの開発・テスト用ホストの外に
+公開してはならず，このモードで動くコンテナをネットワークに公開してもならない．
+そのためにあるのが `oidc` である．
 
 ## GUI
 
-`/ui/` is a minimal interface over the same API: targets (list, create,
-edit, enable/disable, request a run), policies (list, create, edit),
-runs (list with a status filter, detail, cancel) and the audit log. It
-is three static files embedded in the binary — one page, one script,
-one stylesheet — with no framework and no build step; everything it
-shows is rendered through DOM methods, never as markup built from data,
-and it calls the API on its own origin only.
+`/ui/` は同じ API の上に載る最小限のインターフェースである．target（一覧，作成，
+編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
+絞り込める一覧，詳細，キャンセル），監査ログを扱う．バイナリに埋め込まれた 3 つの
+静的ファイル（ページ 1 つ，スクリプト 1 つ，スタイルシート 1 つ）で，フレームワークも
+ビルド手順もない．表示するものはすべて DOM のメソッドで描画し，データからマークアップを
+組み立てることは決してなく，API の呼び出しは自身のオリジンに対してのみ行う．
 
-In `oidc` mode the page signs the operator in as a **public client**
-(`server.auth.oidc.clientId`) with the authorization code flow and PKCE:
-it reads `/ui/config`, sends the browser to the provider's
-`authorization_endpoint`, exchanges the returned code at the
-`token_endpoint` with the code verifier, and keeps the access token in
-the tab's session storage (gone when the tab closes, never in a URL or a
-cookie). The token is sent as a bearer header, so the API needs no
-cookie and no CSRF token; a `401` sends the operator back to sign-in. A
-viewer sees everything and gets `403` on any change. The page is served
-with a Content-Security-Policy that allows its own script and
-stylesheet, connections to its own origin and to the provider's token
-endpoint origin, and nothing else (`default-src 'none'`, no inline
-script, `frame-ancestors 'none'`), plus `X-Frame-Options: DENY` and
-`Referrer-Policy: no-referrer`. In `localhost-dev` mode the same page
-works without sign-in, because it is a same-origin caller on loopback.
+`oidc` モードでは，ページは **パブリッククライアント**（`server.auth.oidc.clientId`）
+として認可コードフローと PKCE で操作者をサインインさせる．`/ui/config` を読み，
+ブラウザをプロバイダの `authorization_endpoint` に送り，返ってきたコードを
+code verifier とともに `token_endpoint` で交換し，アクセストークンをタブの
+セッションストレージに保持する（タブを閉じれば消え，URL や Cookie には決して
+入れない）．トークンはベアラーヘッダーとして送るので，API には Cookie も CSRF
+トークンも不要である．`401` を受けると操作者はサインインに戻される．viewer は
+すべてを閲覧でき，変更操作には `403` を受ける．ページは，自身のスクリプトと
+スタイルシート，自身のオリジンとプロバイダのトークンエンドポイントのオリジンへの
+接続のみを許し，それ以外を許さない Content-Security-Policy（`default-src 'none'`，
+インラインスクリプトなし，`frame-ancestors 'none'`）に加え，`X-Frame-Options: DENY`
+と `Referrer-Policy: no-referrer` を付けて配信される．`localhost-dev` モードでは，
+ループバック上の同一オリジンの呼び出し元であるため，同じページがサインインなしで動く．
 
-The GUI shows only what the API returns: never a private key, a
-certificate body or a credential, because the Conductor has none.
+GUI が表示するのは API が返すものだけである．秘密鍵，証明書本体，資格情報は決して
+表示されない．Conductor がそれらを持っていないからである．
 
-## Directories and container usage
+## ディレクトリとコンテナでの利用
 
-| Path | Purpose |
+| パス | 用途 |
 |---|---|
-| `/usr/local/bin/acme-conductor` | The Conductor binary (image entrypoint). |
-| `/etc/acme-conductor/config.json` | The configuration, mounted **read-only**. |
-| `/etc/acme-conductor/job-signing.pem` | The job-signing private key (when `jobSigning` is configured), mounted **read-only** for this container only. |
-| `/etc/acme-conductor/tls.crt`, `tls.key` | The listener's certificate and key when `server.tls` is configured (a convention; the paths are what the configuration names), mounted **read-only**. |
-| `/var/lib/acme-conductor/` | Writable, **persistent**: `conductor.db` (plus `-wal`/`-shm`) and `runs/` (per-run `job.json`/`result.json`, no certificate material). |
-| `/mnt/exchange` | With the Container Apps launcher: the exchange share, holding per-run `job.json`/`result.json` while an execution is in flight. |
+| `/usr/local/bin/acme-conductor` | Conductor のバイナリ（イメージのエントリポイント）． |
+| `/etc/acme-conductor/config.json` | 設定．**読み取り専用** でマウントする． |
+| `/etc/acme-conductor/job-signing.pem` | ジョブ署名の秘密鍵（`jobSigning` を設定した場合）．このコンテナのみに **読み取り専用** でマウントする． |
+| `/etc/acme-conductor/tls.crt`, `tls.key` | `server.tls` を設定した場合のリスナーの証明書と鍵（慣例であり，実際のパスは設定が名指しするもの）．**読み取り専用** でマウントする． |
+| `/var/lib/acme-conductor/` | 書き込み可能で **永続**: `conductor.db`（および `-wal`/`-shm`）と `runs/`（run ごとの `job.json`/`result.json`．証明書の素材は含まない）． |
+| `/mnt/exchange` | Container Apps ランチャーを使う場合: 実行中の run ごとの `job.json`/`result.json` を保持する exchange 共有． |
 
-The Conductor image (`Dockerfile.conductor`) contains **no** `acme-runner`
-and no `lego`. The `local-process` launcher therefore only works where
-both binaries are on the same host — a development checkout, or a custom
-image that adds the Runner. In a container the image supports
-`--read-only` as long as `/var/lib/acme-conductor` is a writable mount.
-In `localhost-dev` mode publish the port to the host's loopback only
-(`-p 127.0.0.1:8080:8080`) and remember that the process inside the
-container sees the peer as the container's loopback only when the client
-is inside the same network namespace (`docker exec`, or `--network
-host`) — with a published port the peer is the bridge gateway, not
-loopback, and every request is refused, which is the intended
-fail-closed outcome for that mode. In `oidc` mode listen on
-`0.0.0.0:<port>` with `server.tls` (mount the certificate and key
-read-only) or behind an ingress that terminates TLS
-(`server.behindTlsProxy: true`); the peer address does not matter.
+Conductor のイメージ（`Dockerfile.conductor`）には `acme-runner` も `lego` も
+**含まれない**．したがって `local-process` ランチャーは，両方のバイナリが同じホストに
+ある場合（開発用チェックアウト，または Runner を追加したカスタムイメージ）にのみ
+動く．コンテナでは，`/var/lib/acme-conductor` が書き込み可能なマウントである限り
+`--read-only` をサポートする．`localhost-dev` モードではポートをホストの
+ループバックのみに公開し（`-p 127.0.0.1:8080:8080`），コンテナ内のプロセスが
+ピアをコンテナのループバックとして見るのは，クライアントが同じネットワーク
+名前空間にいる場合（`docker exec`，または `--network host`）だけであることに注意する．
+公開ポート経由ではピアはブリッジのゲートウェイであってループバックではないため，
+すべてのリクエストが拒否される．これはこのモードにおける意図された fail-closed の
+挙動である．`oidc` モードでは `0.0.0.0:<port>` で待ち受け，`server.tls`（証明書と鍵を
+読み取り専用でマウント）を使うか，TLS を終端する ingress の後ろに置く
+（`server.behindTlsProxy: true`）．ピアのアドレスは問わない．
 
-Released images are published to `ghcr.io/cits-nue/acme-conductor` and
-`ghcr.io/cits-nue/acme-runner` on a version tag whose commit is on
-`main` (the workflow refuses any other), for `linux/amd64` and
-`linux/arm64`, with an SBOM and provenance attached
-([ADR 0017](adr/0017-release-pipeline.md)); verify one with
+リリースされたイメージは，コミットが `main` 上にあるバージョンタグ（ワークフローは
+それ以外を拒否する）で `ghcr.io/cits-nue/acme-conductor` と
+`ghcr.io/cits-nue/acme-runner` に，`linux/amd64` と `linux/arm64` 向けに，SBOM と
+provenance を添えて公開される（[ADR 0017](adr/0017-release-pipeline.md)）．
 `gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE`
-and pin its digest.
+で検証し，そのダイジェストを固定して使うこと．
 
-### Backup, restore, rollback
+### バックアップと復元とロールバック
 
-The whole control-plane state is `database.path`. Back it up with the
-process stopped (copy the file; the `-wal` file is folded in on the next
-open) or online with `sqlite3 conductor.db ".backup out.db"`. Restore by
-stopping the process and putting the file back. A newer binary migrates
-the schema forward at start (versions are recorded in
-`schema_migrations`; version 2 added the `actorAuthority` and
-`requestedByAuthority` columns, leaving existing rows empty); an older
-binary refuses a database written by a
-newer schema, so rolling back a deployment means restoring the matching
-backup as well. Runs that were in flight at backup time are recovered as
-`failed`/"outcome unknown" on the next start.
+コントロールプレーンの状態はすべて `database.path` にある．バックアップは，プロセスを
+止めてファイルをコピーする（`-wal` ファイルは次に開いたときに取り込まれる）か，
+オンラインで `sqlite3 conductor.db ".backup out.db"` を使う．復元はプロセスを止めて
+ファイルを戻す．新しいバイナリは起動時にスキーマを前方に移行する（バージョンは
+`schema_migrations` に記録される．バージョン 2 で `actorAuthority` と
+`requestedByAuthority` の列が追加され，既存の行は空のまま残る）．古いバイナリは
+新しいスキーマで書かれたデータベースを拒否するため，デプロイのロールバックには
+対応するバックアップの復元も伴う．バックアップ時点で実行中だった run は，次の
+起動時に `failed`／「結果不明」として復旧される．
 
-## Logging
+## ログ
 
-Structured JSON on stderr, always UTC. Every line about a run carries
-`runId` and `targetId` (and `fqdn` once known). At `debug`, the Runner
-child's stderr — its own structured log, already redacted by the Runner —
-is relayed line by line (bounded to 8 KiB per line, non-printable
-characters replaced). The Conductor never logs a request body, a binding's
-resolved configuration (it has none), or anything from the Runner's
-`Result` beyond the fields the contract defines.
+stderr への構造化 JSON で，常に UTC．run に関するすべての行は `runId` と
+`targetId`（判明していれば `fqdn` も）を持つ．`debug` では，Runner の子プロセスの
+stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 行ずつ中継する
+（1 行あたり 8 KiB に制限し，印字不能な文字は置き換える）．Conductor は，リクエスト
+ボディ，binding の解決済み設定（そもそも持っていない），Runner の `Result` のうち
+コントラクトが定義するフィールド以外を，決してログに出さない．
 
-## Security boundaries
+## セキュリティ境界
 
-- The Conductor holds no private key, no certificate body, no DNS or Store
-  credential and no cloud credential; its database has no column for any
-  of them and no endpoint returns one ([ADR 0005](adr/0005-conductor-never-touches-secrets.md)).
-  The one exception a deployment can create for itself is `passthroughEnv`
-  on the local launcher (see the security note above).
-- API input can only name administrator-registered bindings; there is no
-  field for a command, image, path, environment variable, resource id or
-  credential, and unknown fields are rejected, so none can be smuggled in.
-- In `oidc` mode every caller is a named principal with a role, decided
-  from a token the provider signed and checked in one middleware for
-  every endpoint; the Conductor holds no client secret, refuses `none`
-  and HMAC algorithms, and never lets a bearer token onto a non-loopback
-  plaintext listener unless the configuration states that TLS is
-  terminated in front of it. The GUI is static, same-origin, DOM-rendered
-  and served under a strict Content-Security-Policy.
-- FQDNs and suffixes are normalized and checked on a label boundary before
-  they are stored; a target that does not satisfy its policy is refused
-  and audited, and a policy cannot be edited so that an existing target
-  stops satisfying it. The Runner re-validates the `JobSpec` and
-  authorizes it against its own trusted configuration regardless
-  ([architecture](architecture.md#validation-vs-authorization)).
-- Per-target exclusion, optimistic locking on `revision`, and the
-  re-check before start keep a stale or duplicate request from being
-  actioned (threat model T7); the database ownership lock keeps a second
-  Conductor process from planning against the same registry or marking
-  the owner's runs failed.
-- The audit log is append-only and written atomically with each change;
-  targets, runs and policies cannot be deleted ([ADR 0008](adr/0008-no-purge-in-mvp.md)).
-- The Runner child gets an explicit environment (only `passthroughEnv`
-  from the Conductor's), runs in its own process group under a timeout,
-  and its `Result` is decoded with the strict contract decoder and
-  checked to name the run it was started for. Its stderr reaches only the
-  debug log, never a record.
-- With `jobSigning`, what leaves the Conductor is a signed, expiring
-  envelope; a Runner detects a job altered on the way (a changed FQDN, a
-  swapped binding, an extended expiry) and refuses to execute the same
-  run twice. Signing authenticates the Conductor; it does not widen what
-  a Runner may do, which its own trusted policy still decides.
-- With the Container Apps launcher the Conductor's identity can start,
-  observe and stop executions of one Job and nothing else; it cannot
-  change what the Runner is, and the Runner's DNS and Key Vault access is
-  its own managed identity, provisioned in Bicep with least-privilege
-  custom roles. Platform errors reach the log as fixed wording (status
-  and error code), never as response bodies.
+- Conductor は秘密鍵，証明書本体，DNS や Store の資格情報，クラウドの資格情報を
+  持たない．データベースにはそれらの列がなく，それらを返すエンドポイントもない
+  （[ADR 0005](adr/0005-conductor-never-touches-secrets.md)）．デプロイが自ら
+  作り得る唯一の例外はローカルランチャーの `passthroughEnv` である（上記の
+  セキュリティ上の注意を参照）．
+- API の入力で指定できるのは管理者が登録した binding の名前だけである．コマンド，
+  イメージ，パス，環境変数，リソース ID，資格情報のためのフィールドはなく，未知の
+  フィールドは拒否されるため，どれも紛れ込ませることはできない．
+- `oidc` モードでは，すべての呼び出し元はプロバイダが署名したトークンから決まる
+  ロール付きの名前付きプリンシパルであり，すべてのエンドポイントに対して 1 つの
+  ミドルウェアで検査される．Conductor はクライアントシークレットを持たず，`none` と
+  HMAC アルゴリズムを拒否し，設定が前段での TLS 終端を表明しない限り，ループバック
+  以外の平文リスナーにベアラートークンを決して通さない．GUI は静的で，同一オリジン
+  で，DOM で描画され，厳格な Content-Security-Policy の下で配信される．
+- FQDN とサフィックスは保存前に正規化され，ラベル境界で検査される．ポリシーを
+  満たさない target は拒否され監査される．既存の target がポリシーを満たさなく
+  なるようなポリシーの編集はできない．Runner はそれとは無関係に `JobSpec` を
+  再検証し，自身の信頼された設定に照らして認可する
+  （[アーキテクチャ](architecture.md#検証と認可)）．
+- target ごとの排他，`revision` による楽観ロック，開始前の再確認により，古い要求や
+  重複した要求が実行されることはない（脅威モデル T7）．データベースの所有権ロックに
+  より，第 2 の Conductor プロセスが同じレジストリに対して計画したり，所有者の run を
+  failed にしたりすることはない．
+- 監査ログは追記専用で，各変更と原子的に書き込まれる．target，run，ポリシーは
+  削除できない（[ADR 0008](adr/0008-no-purge-in-mvp.md)）．
+- Runner の子プロセスには明示的な環境（Conductor の環境のうち `passthroughEnv` に
+  挙げたものだけ）が渡され，タイムアウト付きで自身のプロセスグループで動く．その
+  `Result` は厳密なコントラクトデコーダでデコードされ，開始した run を名指ししている
+  ことが確認される．その stderr はデバッグログにのみ届き，記録には決して残らない．
+- `jobSigning` を使う場合，Conductor から出ていくのは署名付き・期限付きの
+  エンベロープである．Runner は途中で改変されたジョブ（FQDN の変更，binding の
+  差し替え，期限の延長）を検知し，同じ run を 2 度実行することを拒否する．署名は
+  Conductor を認証するものであり，Runner にできることを広げはしない．それは
+  引き続き Runner 自身の信頼されたポリシーが決める．
+- Container Apps ランチャーを使う場合，Conductor の ID は 1 つの Job の実行を開始・
+  観測・停止できるだけで，それ以外は何もできない．Runner が何であるかを変えることは
+  できず，Runner の DNS と Key Vault へのアクセスは Runner 自身のマネージド ID の
+  もので，Bicep により最小権限のカスタムロールとしてプロビジョニングされる．
+  プラットフォームのエラーは固定の文言（ステータスとエラーコード）でログに届き，
+  レスポンスボディがそのまま届くことはない．
 
-## Limitations
+## 制限事項
 
-- **The provider is trusted within the audience.** Whoever the provider
-  issues an admin-role token to, for this audience, is an administrator;
-  role assignment is provider-side administration this project cannot
-  audit. A stolen access token is usable until it expires (the Conductor
-  performs no revocation or introspection check); short provider
-  lifetimes and TLS everywhere bound that. Two roles only, no
-  per-target or per-policy permissions.
-- **`localhost-dev` authenticates a host, not a person**, and is for one
-  development host only.
-- **The GUI is minimal.** Lists and forms over the API, no dashboards,
-  no bulk operations, no state of its own; it needs `clientId` and a
-  public-client registration at the provider to sign in.
-- **The local launcher is one host.** It needs `acme-runner` (and its
-  `lego`) on the same host, and a credential the Runner needs must be in
-  the Conductor's environment (`passthroughEnv`). The Container Apps
-  launcher has neither constraint.
-- **The Container Apps launcher is verified against a fake platform.**
-  Its tests exercise the whole exchange against an in-process fake of
-  the Jobs API; the Bicep compiles and lints. The platform's
-  execution-template override inheriting volume mounts, the custom role
-  action names, SQLite and `flock` on an SMB share, and the Result
-  propagation delay are documented expectations until a first real
-  deployment confirms them ([`deploy/azure/README.md`](../deploy/azure/README.md)).
-- **A hard kill can orphan a Runner.** Recovery marks such runs
-  `failed`/"outcome unknown"; the Runner may still finish, and the next
-  due run then races it (the Store and account state tolerate that; the
-  duplicate ACME order is not prevented).
-- **Single process, single connection.** The registry serializes every
-  statement; that is fine for hundreds of targets and one operator, not
-  for a busy multi-tenant API. Multi-replica is a non-goal, and the
-  ownership lock makes a second process on the same database a startup
-  error rather than a supported shape.
-- **The migration moves names, not certificates or accounts.** An
-  imported target is issued afresh under the Conductor's own object
-  name once `targetSource` is `registry`; consumers are re-pointed by
-  the operator, and the shadow comparison compares lists, not the
-  certificates in the store ([`docs/migration.md`](migration.md)).
-- **Policy changes are not versioned or pushed.** A policy update applies
-  at each target's next run (see [Policy](#policy)); an `acmeBinding`
-  change does not force reissue of current certificates, and there is no
-  policy revision on runs, only the snapshot in each `JobSpec`.
-- **Signing is optional for the local launcher.** Without `jobSigning`
-  it hands a bare `JobSpec` over a private per-run directory, which
-  nothing authenticates end to end; that is acceptable on one host only.
-- **No metrics endpoint yet**; `/healthz` and `/readyz` exist, Prometheus
-  `/metrics` does not.
-- The Runner's `renewBeforeDays`/`keyType` cost levers are still not
-  bounded on the Runner side (threat model, residual risks).
+- **プロバイダは audience の範囲内で信頼される．** この audience に対してプロバイダが
+  admin ロールのトークンを発行した相手は誰でも管理者である．ロールの割り当ては
+  プロバイダ側の管理であり，本プロジェクトが監査することはできない．盗まれた
+  アクセストークンは期限切れまで使える（Conductor は失効確認もイントロスペクションも
+  行わない）．プロバイダ側での短い有効期間と全区間の TLS がそれを抑える．ロールは
+  2 つだけで，target ごと・ポリシーごとの権限はない．
+- **`localhost-dev` は人ではなくホストを認証する．** 開発ホスト 1 台向けである．
+- **GUI は最小限である．** API の上の一覧とフォームだけで，ダッシュボードも一括操作も
+  独自の状態もない．サインインには `clientId` とプロバイダ側のパブリック
+  クライアント登録が必要である．
+- **ローカルランチャーは 1 ホストである．** 同じホストに `acme-runner`（とその
+  `lego`）が必要で，Runner が必要とする資格情報は Conductor の環境に置かなければ
+  ならない（`passthroughEnv`）．Container Apps ランチャーにはどちらの制約もない．
+- **Container Apps ランチャーは偽のプラットフォームに対して検証されている．**
+  そのテストは Jobs API のプロセス内の偽物に対して exchange 全体を動かし，Bicep は
+  コンパイルと lint を通る．実行テンプレートの上書きがボリュームマウントを継承する
+  こと，カスタムロールのアクション名，SMB 共有上の SQLite と `flock`，Result の
+  伝播遅延は，最初の実機デプロイで確認されるまでは文書化された期待にとどまる
+  （[`deploy/azure/README.md`](../deploy/azure/README.md)）．
+- **強制終了は Runner を取り残し得る．** 復旧はそのような run を `failed`／
+  「結果不明」とする．Runner はなお完了するかもしれず，次の期限到来の run がそれと
+  競合する（Store とアカウントの状態はそれに耐えるが，ACME の注文が重複することは
+  防がれない）．
+- **単一プロセス，単一コネクション．** レジストリはすべてのステートメントを直列化
+  する．数百の target と 1 人の操作者には十分だが，多忙なマルチテナント API には
+  向かない．マルチレプリカは非目標であり，所有権ロックにより同じデータベース上の
+  第 2 のプロセスはサポートされる形ではなく起動時エラーになる．
+- **移行が移すのは名前であり，証明書やアカウントではない．** 取り込まれた target は，
+  `targetSource` が `registry` になった時点で Conductor 自身のオブジェクト名の下で
+  新たに発行される．利用側の参照先の付け替えは操作者が行い，shadow 比較が比べるのは
+  一覧であって Store 内の証明書ではない（[`docs/migration.md`](migration.md)）．
+- **ポリシーの変更はバージョン管理も push もされない．** ポリシーの更新は各 target の
+  次の run で適用される（[Policy](#policy) を参照）．`acmeBinding` の変更は現在の
+  証明書の再発行を強制せず，run にポリシーのリビジョンはなく，各 `JobSpec` 内の
+  スナップショットがあるだけである．
+- **ローカルランチャーでは署名は任意である．** `jobSigning` なしでは，run ごとの
+  プライベートなディレクトリ経由で生の `JobSpec` を渡し，それを end-to-end で
+  認証するものはない．これが許容できるのは 1 ホスト上のみである．
+- **メトリクスエンドポイントはまだない．** `/healthz` と `/readyz` はあるが，
+  Prometheus の `/metrics` はない．
+- Runner の `renewBeforeDays`/`keyType` というコストのレバーは，Runner 側では
+  まだ制限されていない（脅威モデルの残存リスク）．

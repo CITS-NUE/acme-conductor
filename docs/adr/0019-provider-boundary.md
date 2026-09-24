@@ -1,105 +1,94 @@
-# 0019: Provider boundary — public contracts, composition-layer registries, one module
+# 0019: プロバイダ境界 — 公開コントラクト，合成層のレジストリ，単一モジュール
 
-- Status: Accepted
-- Date: 2026-09-24
+- ステータス: 採択
+- 日付: 2026-09-24
 
-## Context
+## 背景
 
-The domain and the wire contract were cloud-agnostic from the start
-(`JobSpec`/`Result`, the Registry, the Scheduler, the `Store` and
-`Launcher` interfaces), but the layers around them were not
-([issue #17](https://github.com/CITS-NUE/acme-conductor/issues/17)):
-both configuration packages knew the concrete Azure types and their
-field names, the Runner's reconcile loop and the Conductor's wiring
-switched on those types, the Runner core read a Container Apps
-environment variable, the contracts lived under `internal/` where no
-other module could implement them, and the root `go.mod` carried the
-Azure SDKs. Adding a provider meant editing core packages. Four pull
-requests changed that; this record states the resulting rules and the
-two decisions that were deferred to the end.
+ドメインとワイヤコントラクトは最初からクラウド非依存だった
+（`JobSpec`/`Result`，レジストリ，スケジューラ，`Store` と `Launcher` の
+インタフェース）が，その周りの層はそうではなかった
+（[issue #17](https://github.com/CITS-NUE/acme-conductor/issues/17)）．
+両方の設定パッケージは具体的な Azure の型とそのフィールド名を知っており，
+Runner の reconcile ループと Conductor の配線はそれらの型で分岐し，Runner の
+コアは Container Apps の環境変数を読み，コントラクトは他のモジュールが実装
+できない `internal/` の下にあり，ルートの `go.mod` は Azure SDK を抱えていた．
+プロバイダを追加するにはコアのパッケージを編集する必要があった．4 つの PR が
+それを変えた．この記録は，その結果としての規則と，最後まで先送りされた 2 つの
+決定を述べる．
 
-## Decision
+## 決定
 
-- **The contracts are public and carry nothing else.** `pkg/store`
-  (`Store`, `Bundle`, `Info`, the certificate helpers every store
-  shares) and `pkg/launcher` (`Launcher`, `Execution`, `Error`/`Reason`,
-  `Signer`, `Verifier`) are what a provider implements. They depend on
-  `pkg/api/v1alpha1` and the standard library only, and they carry no
-  build dependencies: what an adapter needs to construct itself is the
-  adapter's own type. `pkg/contracts_test.go` builds a throwaway module
-  against them and fails if either package stops being importable from
-  outside.
-- **Selection happens in a composition layer, once per binary.**
-  `internal/runner/stores` and `internal/conductor/launchers` are
-  registries of providers, and `cmd/acme-runner/providers.go` and
-  `cmd/acme-conductor/providers.go` are the only places the official
-  binaries name an implementation. Registration is a Go value built at
-  compile time, not an `init()` side effect and not a plugin mechanism:
-  what a binary provides is visible in one file. The core opens stores
-  and builds launchers through the registry and never names a type.
-- **The generic configuration knows no provider.** A binding is
-  `{ "type": <name>, "config": <object> }`. The generic packages check
-  the type name's shape and that `config` is an object, keep the object
-  verbatim, and never learn a provider's key name; the provider decodes
-  its object strictly (`ParseConfig`: unknown fields refused, defaults
-  applied) and validates it. A binding of a type the binary does not
-  provide is a configuration error at load (Runner) or start
-  (Conductor) that names the binding and the provided types. Rules that
-  need what the Conductor provides (the Container Apps launcher needs
-  signing; its claim timeout is bounded by the signer's validity) are
-  the provider's, checked when it is built.
-- **Transport and platform are separate pieces of the Runner.** The
-  core consumes a job through `internal/runner/transport.Source`; the
-  shared-directory claim transport (`transport/claim`) records an
-  execution identity it does not interpret; the identity's origin is a
-  platform package (`platform/azurecontainerapps`, the Runner's only
-  mention of that platform), and the command composes the two.
-- **Dependency direction, stated once.** `cmd` → composition layer →
-  {core, adapters}; adapters → `pkg/*` contracts (and the shared
-  `internal/strictjson`); core → registries and contracts; never core →
-  adapter, never contract → anything but `pkg/api` and the standard
-  library. `go list -deps` of the core packages contains no adapter and
-  no cloud SDK; that check is in the pull requests and is cheap to
-  repeat.
-- **One Go module, for now.** The official binaries ship the Azure
-  adapters, so their build depends on the Azure SDKs whatever the
-  module layout; splitting the adapters into a nested module would move
-  the SDKs out of the root `go.mod` only for a consumer that builds its
-  own binary from `pkg/`, at the price of cross-module versioning of the
-  contracts, the configuration and the tests today. That price is not
-  worth paying for one provider. The decision is revisited when a second
-  execution or store platform is implemented: then the adapters of each
-  platform become a nested module (`adapters/<platform>`, a `go.work`
-  for development) and the root module holds the core, the contracts
-  and the local adapters.
-- **`deploy/azure` stays in this repository as reference
-  infrastructure.** It is the deployment the project verifies its Azure
-  adapters against, tested by the same pull requests that change them
-  (`cmd/acme-conductor/examples_test.go` loads the example pair the
-  Bicep embeds; the Bicep is compiled and linted in review). It moves to
-  an infrastructure repository when a second platform's deployment
-  exists and the two would otherwise version together.
-- **`pkg/api/v1alpha1` keeps its two internal imports.**
-  `internal/strictjson` and `internal/policy` are implementation details
-  of the contract package; a module that imports `pkg/api/v1alpha1`
-  compiles (the importer of the internal packages is this module), as
-  the contracts test shows. They become public only if a second module
-  needs the strict decoder or the FQDN rules directly.
+- **コントラクトは公開であり，それ以外を何も持たない．** `pkg/store`
+  （`Store`，`Bundle`，`Info`，すべての store が共有する証明書ヘルパー）と
+  `pkg/launcher`（`Launcher`，`Execution`，`Error`/`Reason`，`Signer`，
+  `Verifier`）がプロバイダの実装するものである．これらは `pkg/api/v1alpha1` と
+  標準ライブラリにのみ依存し，ビルド時の依存関係を持ち込まない．アダプタが
+  自身を構築するのに必要なものはアダプタ自身の型である．`pkg/contracts_test.go`
+  はそれらに対して使い捨てのモジュールをビルドし，どちらかのパッケージが外部
+  から import できなくなれば失敗する．
+- **選択は合成層で，バイナリごとに 1 回行う．** `internal/runner/stores` と
+  `internal/conductor/launchers` はプロバイダのレジストリであり，
+  `cmd/acme-runner/providers.go` と `cmd/acme-conductor/providers.go` が，
+  公式バイナリが実装を名指しする唯一の場所である．登録はコンパイル時に組み
+  立てられる Go の値であり，`init()` の副作用でもプラグイン機構でもない．
+  バイナリが何を提供するかは 1 つのファイルで見える．コアはレジストリを通して
+  store を開き launcher を構築し，決して型を名指ししない．
+- **汎用の設定はプロバイダを知らない．** バインディングは
+  `{ "type": <name>, "config": <object> }` である．汎用パッケージは型名の形と
+  `config` がオブジェクトであることを検査し，オブジェクトをそのまま保持し，
+  プロバイダのキー名を決して知らない．プロバイダは自身のオブジェクトを厳格に
+  デコードし（`ParseConfig`: 未知のフィールドは拒否，既定値を適用），検証する．
+  バイナリが提供しない型のバインディングは，読み込み時（Runner）または起動時
+  （Conductor）の設定エラーであり，そのバインディングと提供されている型を
+  名指しする．Conductor が提供するものを必要とする規則（Container Apps
+  ランチャーは署名を必要とし，そのクレームのタイムアウトは署名者の有効期間で
+  上限が決まる）はプロバイダのものであり，構築時に検査される．
+- **トランスポートとプラットフォームは Runner の別々の部品である．** コアは
+  `internal/runner/transport.Source` を通してジョブを消費する．共有ディレクトリの
+  クレームトランスポート（`transport/claim`）は，自身では解釈しない実行 ID を
+  記録する．その ID の出所はプラットフォームパッケージ
+  （`platform/azurecontainerapps`，Runner がそのプラットフォームに言及する
+  唯一の場所）であり，コマンドがこの 2 つを合成する．
+- **依存の方向を 1 度だけ述べる．** `cmd` → 合成層 → {コア，アダプタ}．
+  アダプタ → `pkg/*` コントラクト（および共有の `internal/strictjson`）．
+  コア → レジストリとコントラクト．決してコア → アダプタにはならず，決して
+  コントラクト → `pkg/api` と標準ライブラリ以外にはならない．コアパッケージの
+  `go list -deps` にはアダプタもクラウド SDK も含まれない．この検査は PR で
+  行われており，繰り返すのは安価である．
+- **当面は 1 つの Go モジュール．** 公式バイナリは Azure アダプタを同梱するので，
+  モジュール構成がどうであれそのビルドは Azure SDK に依存する．アダプタを
+  入れ子のモジュールに分離しても，SDK をルートの `go.mod` から外せるのは `pkg/`
+  から自前のバイナリをビルドする利用者にとってだけであり，その代償として今日，
+  コントラクト・設定・テストのモジュール間バージョン管理が必要になる．その代償は
+  1 つのプロバイダのために払う価値がない．この決定は 2 つ目の実行または store
+  プラットフォームが実装されたときに見直す．そのときには各プラットフォームの
+  アダプタが入れ子のモジュール（`adapters/<platform>`，開発用の `go.work`）に
+  なり，ルートモジュールはコア，コントラクト，ローカルのアダプタを持つ．
+- **`deploy/azure` は参照インフラとしてこのリポジトリに残す．** それは
+  プロジェクトが Azure アダプタを検証する対象のデプロイであり，アダプタを
+  変更するのと同じ PR でテストされる（`cmd/acme-conductor/examples_test.go` は
+  Bicep が埋め込む設定例の対を読み込む．Bicep はレビューでコンパイルと lint を
+  行う）．2 つ目のプラットフォームのデプロイが存在し，2 つを一緒にバージョン
+  管理せざるを得なくなったときに，インフラのリポジトリへ移す．
+- **`pkg/api/v1alpha1` は 2 つの internal import を保つ．**
+  `internal/strictjson` と `internal/policy` はコントラクトパッケージの実装
+  詳細である．`pkg/api/v1alpha1` を import するモジュールはコンパイルできる
+  （internal パッケージの import 元はこのモジュールである）．コントラクトの
+  テストがそれを示している．これらが公開になるのは，2 つ目のモジュールが
+  厳格なデコーダや FQDN の規則を直接必要とする場合だけである．
 
-## Consequences
+## 結果
 
-- Adding a store or launcher provider is a new package implementing a
-  `pkg/*` contract plus one registration line in `providers.go`; no
-  core, configuration or scheduler change. Adding a platform that
-  starts Runners on its own is an identity function plus a line in
-  `cmd/acme-runner`.
-- The configuration format changed once (`config` objects, [PR #24](https://github.com/CITS-NUE/acme-conductor/pull/24));
-  a provider-specific key name will not appear in the generic format
-  again.
-- The threat model's invariant that cloud SDKs stay out of the core is
-  now structural rather than a convention: the registries are the only
-  path from core to an adapter, and the contracts test and the
-  dependency listing make a regression visible.
-- Non-goals unchanged: no AWS/GCP provider, no dynamic plugins, no
-  change to the `JobSpec`/`Result` contract, no HSM/non-exportable-key
-  store (the `Store` contract carries private-key bytes).
+- store や launcher のプロバイダの追加は，`pkg/*` のコントラクトを実装する
+  新しいパッケージ 1 つと `providers.go` の登録 1 行である．コア，設定，
+  スケジューラの変更はない．自力で Runner を起動するプラットフォームの追加は，
+  実行 ID を得る関数 1 つと `cmd/acme-runner` の 1 行である．
+- 設定形式は 1 度だけ変わった（`config` オブジェクト，[PR #24](https://github.com/CITS-NUE/acme-conductor/pull/24)）．
+  プロバイダ固有のキー名が汎用の形式に再び現れることはない．
+- クラウド SDK をコアの外に置くという脅威モデルの不変条件は，今では慣習ではなく
+  構造である．レジストリがコアからアダプタへの唯一の経路であり，コントラクトの
+  テストと依存関係の一覧がリグレッションを可視化する．
+- 非目標は変わらない．AWS/GCP プロバイダなし，動的プラグインなし，
+  `JobSpec`/`Result` コントラクトの変更なし，HSM や書き出し不可能な鍵の store
+  なし（`Store` コントラクトは秘密鍵のバイト列を運ぶ）．

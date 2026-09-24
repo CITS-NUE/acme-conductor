@@ -1,49 +1,41 @@
 # ACME Conductor
 
-*日本語版: [`README.ja.md`](README.ja.md)*
+ACME Conductor は，クラウドに依存しない証明書管理のコントロールプレーンである．
+新しい ACME クライアントではない．ACME による発行そのものは，既存でバージョン固定した
+[go-acme/lego](https://github.com/go-acme/lego) CLI に委ね，ワンショットの
+Runner ジョブがサブプロセスとして起動する．Conductor が持つのは FQDN の
+レジストリ，証明書ポリシー，追記専用の監査ログ，実行のスケジューリング，
+差し替え可能なジョブランチャーであり，秘密鍵・DNS の資格情報・Certificate Store
+の資格情報を保持することは決してない．
 
-ACME Conductor is a cloud-agnostic certificate-management control plane. It
-is not a new ACME client: ACME issuance itself is delegated to the existing,
-version-pinned [go-acme/lego](https://github.com/go-acme/lego) CLI, invoked
-as a subprocess by a one-shot Runner job. The Conductor owns the FQDN
-registry, certificate policy, an append-only audit log, run scheduling, and
-a pluggable job launcher; it never holds a private key, a DNS credential, or
-a Certificate Store credential.
+**現状: Phase 6（既存 `cert-infra` デプロイからの移行ツール）．**
+コントロールプレーン `acme-conductor` は，対象（target）・証明書ポリシー・実行（run）・
+追記専用の監査ログを SQLite のレジストリに保持し，REST API と最小限の GUI で
+公開する．本番では OIDC のベアラートークンにより操作者を名前付きプリンシパルとして
+認証し admin / viewer のロールを与え，開発時はローカルホストのみを信頼する．
+対象の更新期限を判断し，Runner を起動する．開発ではローカルの子プロセスとして，
+Phase 4 以降は自身のマネージド ID で動くスケジュール実行の Azure Container Apps Job に
+ジョブを差し出す形で（Conductor は実行を開始できない）．対象ごとに同時に
+アクティブな実行は最大 1 つ．ジョブは署名付き・期限付きのエンベロープとして運ばれ，
+Runner はこれを検証しリプレイを拒否する．Result は Runner の署名付きで返る．
+データプレーンのバイナリ `acme-runner` は，`JobSpec` を検証し，自身の信頼された設定に
+照らして認可し，固定バージョンの `lego` CLI を起動し，証明書をファイルシステムの
+Certificate Store（開発・テスト専用）または Phase 3 以降は Azure Key Vault に格納する．
+`deploy/azure` には，環境・両方の ID とその最小権限ロール・API と GUI が応答する
+HTTPS ingress をプロビジョニングする Bicep がある．バージョンタグを打つと両方の
+イメージが SBOM と provenance 付きで `ghcr.io/cits-nue` に公開される．Phase 6 以降，
+`acme-conductor migrate` は既存のインフラ定義からホスト一覧を読み，レジストリと
+比較して取り込む（既定は dry-run．更新も削除も決して行わない）．また
+`migration.targetSource` フラグにより，操作者が切り替えるまで Conductor は発行を
+行わず，フラグを戻せばロールバックになる．各部の実行・設定・デプロイ・移行の方法は
+[`docs/conductor.md`](docs/conductor.md)，[`docs/runner.md`](docs/runner.md)，
+[`deploy/azure/README.md`](deploy/azure/README.md)，
+[`docs/migration.md`](docs/migration.md) を，各フェーズで何が加わるかは
+[ロードマップ](docs/architecture.md#ロードマップ)を参照．自動テストは本物の ACME CA や
+DNS プロバイダを決して呼ばない．`lego` / `acme-runner` の偽物（テストダブル）に対して
+実行される．
 
-**Status: Phase 6 (migration tooling from the existing `cert-infra`
-deployment).** The `acme-conductor` control plane keeps
-targets, certificate policies, runs and an append-only audit log in a
-SQLite registry, exposes them over a REST API and a minimal GUI —
-authenticating operators with OIDC bearer tokens as named principals
-with an admin or viewer role in production, or trusting the local host
-only in development — decides when a target is due, and launches the Runner —
-as a local child process for development, or since Phase 4 by offering
-the job to a scheduled Azure Container Apps Job that runs under its own
-managed identity (the Conductor cannot start executions) — at most one
-active run per target. Jobs travel as signed, expiring envelopes that the
-Runner verifies and refuses to replay, and Results come back signed by
-the Runner. The
-`acme-runner` data-plane binary validates and authorizes a `JobSpec`
-against its own trusted configuration, invokes the pinned `lego` CLI, and
-stores certificates either in a filesystem Certificate Store (dev/test
-only) or, since Phase 3, in Azure Key Vault. `deploy/azure` holds the
-Bicep that provisions the environment, both identities and their
-least-privilege roles, and the HTTPS ingress the API and GUI answer at.
-A version tag publishes both images to `ghcr.io/cits-nue` with an SBOM
-and provenance. Since Phase 6, `acme-conductor migrate` reads the host
-list of an existing infrastructure definition, compares it with the
-registry and imports it (a dry run by default, never an update or a
-delete), and a `migration.targetSource` flag keeps the Conductor from
-issuing until the operator switches it — and switches it back to roll
-back. See [`docs/conductor.md`](docs/conductor.md),
-[`docs/runner.md`](docs/runner.md),
-[`deploy/azure/README.md`](deploy/azure/README.md) and
-[`docs/migration.md`](docs/migration.md) for how to run,
-configure, deploy and migrate to each part, and the
-[roadmap](docs/architecture.md#roadmap) for what each phase adds. Automated tests never call a real ACME CA or DNS provider —
-they run against fake `lego`/`acme-runner` test doubles.
-
-## Architecture
+## アーキテクチャ
 
 ```
  Web UI / REST API
@@ -68,81 +60,75 @@ they run against fake `lego`/`acme-runner` test doubles.
    (lego built-in)                  (filesystem / Key Vault / ...)
 ```
 
-Full write-up: [`docs/architecture.md`](docs/architecture.md).
+詳細: [`docs/architecture.md`](docs/architecture.md)．
 
-## Quick start
+## クイックスタート
 
 ```sh
 make verify   # gofmt, go vet, go test, go test -race
-make build    # build ./bin/acme-conductor and ./bin/acme-runner
+make build    # ./bin/acme-conductor と ./bin/acme-runner をビルド
 ./bin/acme-conductor --version
 ./bin/acme-runner --version
-make images   # build both container images (ghcr.io/cits-nue/acme-conductor, acme-runner)
+make images   # 両方のコンテナイメージをビルド (ghcr.io/cits-nue/acme-conductor, acme-runner)
 ```
 
-`acme-conductor serve --config FILE` runs the control plane (REST API on
-`127.0.0.1:8080` by default, scheduler, local-process launcher) — see
-[`docs/conductor.md`](docs/conductor.md) for the command line, the
-configuration file format and the API. `acme-runner reconcile` handles one
-`JobSpec` end to end — see [`docs/runner.md`](docs/runner.md). Example
-configurations for both, and an example job, are under
-[`deploy/examples/`](deploy/examples/).
+`acme-conductor serve --config FILE` でコントロールプレーンが動く（REST API は既定で
+`127.0.0.1:8080`，スケジューラ，ローカルプロセスのランチャー）．コマンドライン・
+設定ファイルの形式・API は [`docs/conductor.md`](docs/conductor.md) を参照．
+`acme-runner reconcile` は 1 つの `JobSpec` を最初から最後まで処理する．
+[`docs/runner.md`](docs/runner.md) を参照．両方の設定例とジョブの例は
+[`deploy/examples/`](deploy/examples/) にある．
 
-## Repository layout
+## リポジトリの構成
 
 ```
-cmd/acme-conductor/   control-plane binary
-cmd/acme-runner/      data-plane binary
-internal/conductor/   Conductor: config, registry (SQLite), scheduler, launchers, REST API
-internal/runner/      Runner: config, reconcile loop, lego invocation
-internal/store/       the filesystem store and the Azure Key Vault store
-internal/policy/      FQDN normalization and suffix-matching
-internal/version/     build metadata (injected via -ldflags)
-pkg/api/v1alpha1/     the versioned JobSpec/Result contract
-pkg/store/            the Certificate Store contract every store adapter implements
-pkg/launcher/         the Job Launcher contract every launcher adapter implements
-schemas/v1alpha1/     JSON Schema mirror of the contract
-docs/                 architecture, threat model, ADRs
+cmd/acme-conductor/   コントロールプレーンのバイナリ
+cmd/acme-runner/      データプレーンのバイナリ
+internal/conductor/   Conductor: 設定，レジストリ (SQLite)，スケジューラ，ランチャー，REST API
+internal/runner/      Runner: 設定，reconcile ループ，lego の起動
+internal/store/       ファイルシステム store と Azure Key Vault store
+internal/policy/      FQDN の正規化とサフィックス照合
+internal/version/     ビルド情報 (-ldflags で注入)
+pkg/api/v1alpha1/     バージョン付きの JobSpec/Result コントラクト
+pkg/store/            すべての store アダプタが実装する Certificate Store コントラクト
+pkg/launcher/         すべてのランチャーアダプタが実装する Job Launcher コントラクト
+schemas/v1alpha1/     コントラクトを写した JSON Schema
+docs/                 アーキテクチャ，脅威モデル，ADR
 ```
 
-## Documentation
+## ドキュメント
 
-- [Architecture](docs/architecture.md)
-- [Conductor operator guide](docs/conductor.md)
-- [Runner operator guide](docs/runner.md)
-- [Threat model](docs/threat-model.md)
+- [アーキテクチャ](docs/architecture.md)
+- [Conductor 運用ガイド](docs/conductor.md)
+- [Runner 運用ガイド](docs/runner.md)
+- [脅威モデル](docs/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)
 
-## Security principles
+## セキュリティ原則
 
-- The Conductor never stores, retrieves or distributes certificate private
-  keys.
-- The Conductor holds no DNS, Key Vault, or long-lived cloud credential.
-- The Runner authenticates using the execution platform's workload identity
-  (Azure Managed Identity, AWS IAM Role, GCP Service Account), never a
-  static secret.
-- Private keys are generated in the Runner's temporary area, written
-  directly into the Certificate Store, and then destroyed.
-- Conductor and Runner identities are separate; the Conductor is granted no
-  DNS write and no Certificate Store read permission.
-- API input can only name administrator-registered logical bindings —
-  never a command, image, resource ID, credential, or provider
-  configuration.
-- FQDN policy is validated by the Conductor; the Runner validates the
-  `JobSpec` document it receives and authorizes it against its own
-  trusted policy (Phase 1) — validating the document is not itself
-  authorization.
-- Production ACME certificate authorities are never called from automated
-  tests.
+- Conductor は証明書の秘密鍵を保存・取得・配布しない．
+- Conductor は DNS，Key Vault，長期有効なクラウド資格情報を持たない．
+- Runner は実行基盤のワークロード ID（Azure Managed Identity，AWS IAM Role，
+  GCP Service Account）で認証し，静的なシークレットは使わない．
+- 秘密鍵は Runner の一時領域で生成され，Certificate Store に直接書き込まれた後，
+  破棄される．
+- Conductor と Runner の ID は分離されている．Conductor には DNS の書き込み権限も
+  Certificate Store の読み取り権限も与えない．
+- API の入力で指定できるのは，管理者が登録した論理的な binding の名前だけである．
+  コマンド，イメージ，リソース ID，資格情報，プロバイダ設定は決して指定できない．
+- FQDN ポリシーは Conductor が検証する．Runner は受け取った `JobSpec` 文書を
+  検証し，自身の信頼されたポリシーに照らして認可する（Phase 1）．文書の検証は
+  それ自体では認可ではない．
+- 本番の ACME 認証局を自動テストから呼ぶことは決してない．
 
-Full detail, including the threat table these principles are traced to:
-[`docs/threat-model.md`](docs/threat-model.md).
+これらの原則がどの脅威に対応するかを含む詳細:
+[`docs/threat-model.md`](docs/threat-model.md)．
 
-## Contributing
+## コントリビューション
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Found a security issue? See
-[`SECURITY.md`](SECURITY.md) instead of opening a public issue.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) を参照．セキュリティ上の問題を見つけた場合は，
+公開の issue を立てずに [`SECURITY.md`](SECURITY.md) を参照．
 
-## License
+## ライセンス
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Apache License 2.0．[`LICENSE`](LICENSE) を参照．
