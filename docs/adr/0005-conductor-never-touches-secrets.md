@@ -1,66 +1,59 @@
-# 0005: Conductor never touches secrets
+# 0005: Conductor は決してシークレットに触れない
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-A single compromised process holding certificate private keys, DNS write
-credentials, and Certificate Store credentials all at once would be a
-catastrophic single point of failure — one bug anywhere in a large,
-long-running, network-facing control plane would be enough to leak every
-secret in the system. ACME Conductor's control plane (`acme-conductor`) is
-exactly that kind of process: long-running, reachable by a UI/API, and the
-most likely first target of compromise (see
-[`docs/threat-model.md`](../threat-model.md), T1).
+証明書の秘密鍵，DNS の書き込み資格情報，Certificate Store の資格情報を一度に
+すべて保持する単一のプロセスが侵害されれば，壊滅的な単一障害点となる．大きく，
+長時間動作し，ネットワークに面したコントロールプレーンのどこか 1 か所のバグ
+だけで，システム内のすべてのシークレットが漏れるには十分である．ACME Conductor
+のコントロールプレーン（`acme-conductor`）はまさにその種のプロセスである．
+長時間動作し，UI/API から到達可能で，侵害の最初の標的として最も可能性が高い
+（[`docs/threat-model.md`](../threat-model.md) の T1 を参照）．
 
-## Decision
+## 決定
 
-The Conductor is architecturally prevented from ever holding certificate
-private keys or any long-lived cloud/DNS/Key Vault credential:
+Conductor は，証明書の秘密鍵や，長期有効なクラウド／DNS／Key Vault の資格情報を
+保持することがアーキテクチャ上不可能になっている．
 
-- **Identity separation.** The Conductor and the Runner run under separate
-  identities. The Conductor's identity is granted no DNS write permission
-  and no Certificate Store read permission, ever.
-- **No secret columns.** The Conductor's database schema (`Target`,
-  `CertificatePolicy`, `Run`, `AuditEvent`) has no column for a private
-  key, a certificate body, a PFX blob, or a cloud credential. If a table
-  would need one, that is a sign the design is wrong, not a sign a column
-  should be added.
-- **No key-bearing API endpoint.** No Conductor API endpoint returns a
-  private key, ever — there is nothing to leak through an
-  authorization bug at the API layer, because the data simply is not
-  there.
-- **Private keys are Runner-only and transient.** Private keys are
-  generated in the Runner's temporary area, written directly into the
-  external Certificate Store, and then destroyed. They exist only for the
-  duration of one Runner execution and never transit through the
-  Conductor, the `JobSpec`, or the `Result`.
-- **Workload identity, not static secrets, on the Runner side.** The Runner
-  authenticates to DNS providers and the Certificate Store using the
-  execution platform's workload identity (Azure Managed Identity today's
-  target, with AWS IAM Role / GCP Service Account as the pattern for any
-  future platform) rather than a credential baked into configuration.
+- **ID の分離．** Conductor と Runner は別々の ID で動作する．Conductor の ID
+  には DNS の書き込み権限も Certificate Store の読み取り権限も決して与えない．
+- **シークレットの列を持たない．** Conductor のデータベーススキーマ（`Target`，
+  `CertificatePolicy`，`Run`，`AuditEvent`）には，秘密鍵，証明書本体，PFX の
+  blob，クラウド資格情報のための列がない．あるテーブルにそれが必要になるなら，
+  それは列を追加すべき兆候ではなく，設計が間違っている兆候である．
+- **鍵を返す API エンドポイントを持たない．** Conductor の API エンドポイントが
+  秘密鍵を返すことは決してない．データがそもそも存在しないので，API 層の認可の
+  バグを通じて漏れるものが何もない．
+- **秘密鍵は Runner のみが持ち，一時的である．** 秘密鍵は Runner の一時領域で
+  生成され，外部の Certificate Store に直接書き込まれた後，破棄される．秘密鍵は
+  1 回の Runner の実行の間だけ存在し，Conductor，`JobSpec`，`Result` を経由する
+  ことは決してない．
+- **Runner 側は静的なシークレットではなくワークロード ID を使う．** Runner は
+  DNS プロバイダと Certificate Store に対して，設定に埋め込まれた資格情報では
+  なく，実行基盤のワークロード ID（現在の対象は Azure Managed Identity で，
+  将来の基盤には AWS IAM Role / GCP Service Account が同じパターンとなる）で
+  認証する．
 
-## Consequences
+## 結果
 
-- A full compromise of the Conductor process or its database yields no
-  private key, no DNS credential, and no Store credential — the blast
-  radius of the most likely compromise target is deliberately limited to
-  "can request issuance jobs," not "can exfiltrate every certificate the
-  system manages." Requesting a job is not itself bounded by this ADR: a
-  compromised Conductor can produce any self-consistent `JobSpec`, and it
-  is the Runner-side trusted authorization policy (wired in Phase 1; see
-  `docs/threat-model.md`, T1) — not this identity-and-secrets separation —
-  that is meant to bound what such a job can actually cause to be issued.
-- This rules out several conveniences a simpler design might have: the
-  Conductor cannot show a certificate's private key or PFX in a UI, cannot
-  back up key material as part of its own database backup, and cannot
-  itself renew a certificate without going through a Runner execution.
-  These are accepted costs.
-- Enforcing this is partly a database-schema review concern (no secret
-  columns, checked per PR — see the checklist in
-  [`CONTRIBUTING.md`](../../CONTRIBUTING.md)) and partly a deployment/IAM
-  concern (the Conductor's actual granted permissions have to match this
-  decision, not just its code) — see
-  [`docs/threat-model.md`](../threat-model.md), T10.
+- Conductor のプロセスやそのデータベースが完全に侵害されても，秘密鍵も DNS の
+  資格情報も Store の資格情報も得られない．最も侵害されやすい標的の影響範囲は，
+  「システムが管理するすべての証明書を持ち出せる」ではなく「発行ジョブを
+  要求できる」に意図的に限定されている．ジョブの要求自体はこの ADR では
+  制限されない．侵害された Conductor は自己整合的な `JobSpec` を何でも生成
+  でき，そのようなジョブが実際に何を発行させうるかを抑えるのは，この ID と
+  シークレットの分離ではなく，Runner 側の信頼された認可ポリシー（Phase 1 で
+  組み込み．`docs/threat-model.md` の T1 を参照）である．
+- これにより，より単純な設計なら持てたはずのいくつかの利便性は排除される．
+  Conductor は証明書の秘密鍵や PFX を UI に表示できず，自身のデータベース
+  バックアップの一部として鍵素材をバックアップできず，Runner の実行を経ずに
+  自ら証明書を更新することもできない．これらは受け入れるコストである．
+- これを強制するのは，一部はデータベーススキーマのレビューの問題であり
+  （シークレットの列がないことを PR ごとに確認する．
+  [`CONTRIBUTING.md`](../../CONTRIBUTING.md) のチェックリストを参照），一部は
+  デプロイ／IAM の問題である（Conductor に実際に付与される権限が，コードだけで
+  なく，この決定と一致していなければならない）．
+  [`docs/threat-model.md`](../threat-model.md) の T10 を参照．

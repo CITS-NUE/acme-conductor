@@ -1,37 +1,35 @@
-# 0001: Record architecture decisions
+# 0001: アーキテクチャ決定を記録する
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-ACME Conductor makes a number of decisions early — before most of the code
-exists — that are expensive to reverse later: the binary split, how ACME is
-performed, what the control-plane/data-plane contract looks like, and how
-secrets and identities are separated. Without a record, later contributors
-(and later versions of the same contributors) will not know *why* these
-choices were made, and will be tempted to relitigate or silently violate
-them.
+ACME Conductor は，コードの大半がまだ存在しないうちに，後から覆すには
+コストの大きい決定を数多く行っている．バイナリの分割，ACME をどう実行するか，
+コントロールプレーン／データプレーン間のコントラクトがどのような形か，
+シークレットと ID をどう分離するか，などである．記録がなければ，後から
+加わるコントリビュータ（および同じコントリビュータの後の自分）は，これらの
+選択が *なぜ* なされたのかを知ることができず，蒸し返したり，気付かぬうちに
+破ったりしたくなるだろう．
 
-## Decision
+## 決定
 
-We record architecturally significant decisions as Architecture Decision
-Records (ADRs) under `docs/adr/`, using a lightweight
-[MADR](https://adr.github.io/madr/)-like format: **Status**, **Context**,
-**Decision**, **Consequences**. Each ADR is numbered sequentially and dated.
-`docs/adr/README.md` indexes them.
+アーキテクチャ上重要な決定は，`docs/adr/` 配下に Architecture Decision
+Record (ADR) として記録する．形式は軽量な
+[MADR](https://adr.github.io/madr/) 風で，**ステータス**，**背景**，
+**決定**，**結果** からなる．各 ADR には連番と日付を付ける．
+`docs/adr/README.md` がそれらの索引となる．
 
-An ADR is superseded, not edited in place, when a later decision changes
-it: the old ADR's Status is updated to note what supersedes it, and a new
-ADR is added.
+後の決定により内容が変わる場合，ADR はその場で編集するのではなく置き換える．
+古い ADR のステータスを更新して何に置き換えられたかを記し，新しい ADR を
+追加する．
 
-## Consequences
+## 結果
 
-- Every non-trivial architectural choice gets a short, durable, dated
-  record instead of living only in a pull request description or a
-  person's memory.
-- Reviewers can point to an ADR number instead of re-explaining a
-  constraint (e.g. "see ADR 0005" instead of re-arguing why the Conductor
-  has no DNS credential).
-- This adds a small amount of process overhead: a change that reverses an
-  earlier ADR needs a new ADR, not just a code diff.
+- 自明でないアーキテクチャ上の選択はすべて，PR の説明文や個人の記憶の中だけに
+  留まるのではなく，短く永続的で日付の付いた記録を得る．
+- レビュアーは制約を説明し直す代わりに ADR 番号を示せる（例えば，Conductor に
+  DNS の資格情報がない理由を再び論じる代わりに「ADR 0005 を参照」と言える）．
+- プロセス上のオーバーヘッドが少し増える．以前の ADR を覆す変更には，コードの
+  差分だけでなく新しい ADR が必要になる．

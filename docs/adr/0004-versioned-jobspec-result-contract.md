@@ -1,122 +1,110 @@
-# 0004: Versioned JobSpec/Result contract
+# 0004: バージョン付きの JobSpec/Result コントラクト
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-The Conductor and the Runner are deliberately separate processes,
-deployed and even scaled independently, with the only sanctioned
-communication between them being one document produced by the Conductor
-(`JobSpec`) and one document produced by the Runner (`Result`). This
-boundary is also the system's main security control: it is where "API
-input can never specify commands, images, resource IDs, credentials or
-provider configuration" (see
-[`docs/architecture.md`](../architecture.md#security-principles)) has to be
-enforced. It therefore needs to be a contract in the fullest sense — typed,
-versioned, and strictly validated on both sides — not an informally-agreed
-JSON shape.
+Conductor と Runner は意図的に別プロセスであり，独立にデプロイされ，
+スケールさえも独立に行われる．両者の間で認められる唯一の通信は，Conductor が
+生成する 1 つの文書（`JobSpec`）と Runner が生成する 1 つの文書（`Result`）で
+ある．この境界はシステムの主要なセキュリティ制御でもある．「API の入力で
+コマンド・イメージ・リソース ID・資格情報・プロバイダ設定を指定することは
+決してできない」（[`docs/architecture.md`](../architecture.md#セキュリティ原則)
+を参照）が強制されなければならない場所がここである．したがってこれは，非公式に
+合意された JSON の形ではなく，型付けされ，バージョン付けされ，両側で厳密に
+検証される，完全な意味でのコントラクトである必要がある．
 
-## Decision
+## 決定
 
-- The contract lives in `pkg/api/v1alpha1` as Go types (`types.go`)
-  carrying an explicit `apiVersion`
-  (`acme-conductor.cits-nue.github.io/v1alpha1`) and `kind`
-  (`CertificateReconcileJob` / `CertificateReconcileResult`) on every
-  document.
-- Documents are **strictly decoded**: unknown fields, duplicate JSON object
-  keys, and trailing data are all rejected, any document over 64 KiB is
-  rejected before decoding is even attempted, and nesting deeper than
-  8 levels is rejected in linear time (`decode.go`).
-- A `JobSpec` carries only opaque identifiers, a normalized FQDN, a policy
-  snapshot, and **logical binding names** (`ACMERef`, `DNSRef`, `StoreRef`)
-  — never a command, an image, an environment variable, a credential, or a
-  cloud resource ID. Bindings are resolved to real configuration only on
-  the Runner side, from Runner-side administrator configuration.
-- A `Result` carries a fixed, append-only `ErrorCode` enum plus a
-  length-bounded `error.summary` checked against a defense-in-depth
-  secret-marker heuristic (not a secret detector — see "Validation vs
-  authorization" below) — never a raw error, stack trace, command line, or
-  environment dump.
-- The Go validation in `pkg/api/v1alpha1` is authoritative. JSON Schemas
-  under `schemas/v1alpha1/` mirror it for external tooling and human
-  reference, and a test (`pkg/api/v1alpha1/schema_test.go` and its
-  `testdata/` fixtures) keeps the two from drifting apart; `schemas/README.md`
-  documents exactly which rules are Go-only because they are not
-  expressible in JSON Schema (label-boundary suffix matching, cross-field
-  rules, exact post-normalization duplicate detection, and so on).
-- **Compatibility policy** (from `schemas/README.md`, restated here because
-  it is part of this decision): `v1alpha1` is pre-release and may change
-  incompatibly until Phase 1 ships. From Phase 1 onward, changes within a
-  version must be additive only (new optional fields, new enum values);
-  anything that would reject a previously valid document requires a new
-  `apiVersion`/`kind` pair and a new schema file (e.g. `v1alpha2`), never an
-  in-place edit of a shipped schema.
+- コントラクトは `pkg/api/v1alpha1` に Go の型（`types.go`）として置き，
+  すべての文書に明示的な `apiVersion`
+  （`acme-conductor.cits-nue.github.io/v1alpha1`）と `kind`
+  （`CertificateReconcileJob` / `CertificateReconcileResult`）を持たせる．
+- 文書は **厳密にデコード** される．未知のフィールド，JSON オブジェクトの
+  重複キー，末尾の余分なデータはすべて拒否され，64 KiB を超える文書はデコードを
+  試みる前に拒否され，8 段より深いネストは線形時間で拒否される（`decode.go`）．
+- `JobSpec` が運ぶのは，不透明な識別子，正規化された FQDN，ポリシーの
+  スナップショット，そして **論理バインディング名**（`ACMERef`，`DNSRef`，
+  `StoreRef`）だけである．コマンド，イメージ，環境変数，資格情報，クラウドの
+  リソース ID を運ぶことは決してない．バインディングが実際の設定に解決される
+  のは Runner 側のみで，Runner 側の管理者設定から行われる．
+- `Result` が運ぶのは，固定された追記専用の `ErrorCode` 列挙と，長さが制限され
+  多層防御としてのシークレットマーカー・ヒューリスティック（シークレット検出器
+  ではない．下記の「検証と認可」を参照）で検査される `error.summary` である．
+  生のエラー，スタックトレース，コマンドライン，環境変数のダンプを運ぶことは
+  決してない．
+- `pkg/api/v1alpha1` の Go による検証が正である．`schemas/v1alpha1/` 配下の
+  JSON Schema は外部ツールと人間の参照のためにそれを写したものであり，テスト
+  （`pkg/api/v1alpha1/schema_test.go` とその `testdata/` フィクスチャ）が
+  両者の乖離を防ぐ．`schemas/README.md` は，JSON Schema では表現できないために
+  Go のみで実装されている規則（ラベル境界でのサフィックス照合，フィールド
+  横断の規則，正規化後の厳密な重複検出など）を正確に文書化している．
+- **互換性ポリシー**（`schemas/README.md` より．この決定の一部なのでここに
+  再掲する）: `v1alpha1` はプレリリースであり，Phase 1 の出荷までは非互換な
+  変更が入りうる．Phase 1 以降，1 つのバージョン内の変更は追加のみ（新しい
+  省略可能フィールド，新しい列挙値）でなければならない．以前は有効だった文書を
+  拒否するようになる変更には，新しい `apiVersion`/`kind` の組と新しいスキーマ
+  ファイル（例えば `v1alpha2`）が必要であり，出荷済みスキーマをその場で編集する
+  ことは決してない．
 
-### Validation vs authorization
+### 検証と認可
 
-The contract deliberately separates two things, and this ADR states the
-split explicitly because it is easy to conflate them:
+このコントラクトは 2 つのことを意図的に分けている．混同しやすいので，この
+ADR で分割を明示的に述べる．
 
-- **`JobSpec.Validate`** (`pkg/api/v1alpha1/validate.go`) checks
-  **structure, normalization, and self-consistency**: constants and
-  syntax, ranges, that `target.fqdn` and the `policy` snapshot's suffixes
-  are already in canonical form, and that `target.fqdn` is consistent with
-  the `policy` snapshot embedded in the same document. Every value it
-  compares comes from the document itself, so a party that can produce or
-  alter the whole document — including a compromised Conductor — can
-  change `target.fqdn` and the `policy` snapshot together, or swap a
-  binding name for another well-formed, registered one, and still pass
-  `Validate`. This method is never called authorization, in code comments
-  or here.
-- **Authorization** is `policy.RunnerAuthorizationPolicy.Authorize`
-  (`internal/policy/authorize.go`), evaluated by the Runner against
-  configuration it trusts, not against anything carried in the `JobSpec`.
-  Its five fields: `AllowedDnsSuffixes`, `AllowWildcard`,
-  `AllowedACMEBindings`, `AllowedDNSBindings`, `AllowedStoreBindings`.
-  Every list is deny-by-default. Phase 0 ships the type and the decision
-  function with tests; loading the configuration and wiring `Authorize`
-  into the Runner's execution path happened in Phase 1
-  (`internal/runner/config` loads it; `internal/runner` calls `Authorize`
-  before any binding is resolved).
-- **Signing's scope.** A future signed/authenticated `JobSpec` envelope
-  (Phase 4) protects the document against tampering in transit between
-  production and consumption. It does not address a compromised Conductor
-  that legitimately produces a self-consistent but wrongful `JobSpec` —
-  only the Runner-side `RunnerAuthorizationPolicy` bounds that case,
-  because it never trusts anything from the document itself.
-- **`storeObjectRef`** is a strict logical name
-  (`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`, at most 128
-  characters — covering Azure Key Vault certificate names, 1..127
-  characters — with `..` rejected), never a URL, URI, path, or query
-  string.
-- **`error.summary`** is bounded in length and printable-character class,
-  and checked against a defense-in-depth secret-marker heuristic
-  (`secretMarkers`, case-insensitive where the marker's meaning does not
-  depend on case) — not a secret detector. The control that actually keeps
-  raw external output out of a `Result` is a Runner responsibility (Phase
-  1): the Runner never copies a raw external command/SDK error, stdout, or
-  stderr into `error.summary`; summaries come only from Runner-owned safe
-  templates, and `error.code` is the primary machine-readable signal for
-  API consumers.
+- **`JobSpec.Validate`**（`pkg/api/v1alpha1/validate.go`）は **構造，正規化，
+  自己整合性** を検査する．定数と構文，範囲，`target.fqdn` と `policy`
+  スナップショットのサフィックスがすでに正準形であること，`target.fqdn` が
+  同じ文書に埋め込まれた `policy` スナップショットと整合していることである．
+  比較する値はすべて文書自身に由来するので，文書全体を生成または改変できる
+  当事者（侵害された Conductor を含む）は，`target.fqdn` と `policy`
+  スナップショットを一緒に変更したり，バインディング名を別の整形式で登録済みの
+  ものに差し替えたりしても，なお `Validate` を通過できる．このメソッドを
+  認可と呼ぶことは，コードのコメントでもここでも決してない．
+- **認可** は `policy.RunnerAuthorizationPolicy.Authorize`
+  （`internal/policy/authorize.go`）であり，Runner が `JobSpec` に運ばれてきた
+  ものではなく自身が信頼する設定に照らして評価する．その 5 つのフィールドは
+  `AllowedDnsSuffixes`，`AllowWildcard`，`AllowedACMEBindings`，
+  `AllowedDNSBindings`，`AllowedStoreBindings` である．すべてのリストは既定で
+  拒否である．Phase 0 では型と判定関数をテスト付きで出荷した．設定の読み込みと
+  `Authorize` の Runner の実行パスへの組み込みは Phase 1 で行われた
+  （`internal/runner/config` が読み込み，`internal/runner` がバインディングを
+  解決する前に `Authorize` を呼ぶ）．
+- **署名の範囲．** 将来の署名付き／認証付き `JobSpec` エンベロープ（Phase 4）は，
+  生成から消費までの転送中の改ざんから文書を保護する．自己整合的だが不正な
+  `JobSpec` を正当に生成する侵害された Conductor には対処しない．そのケースを
+  抑えるのは Runner 側の `RunnerAuthorizationPolicy` だけである．それは文書
+  自身に由来するものを決して信頼しないからである．
+- **`storeObjectRef`** は厳密な論理名
+  （`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`，最大 128 文字．
+  Azure Key Vault の証明書名の 1..127 文字をカバーし，`..` は拒否）であり，
+  URL，URI，パス，クエリ文字列では決してない．
+- **`error.summary`** は長さと印字可能文字クラスが制限され，多層防御としての
+  シークレットマーカー・ヒューリスティック（`secretMarkers`．マーカーの意味が
+  大文字小文字に依存しない場合は大文字小文字を区別しない）で検査される．
+  シークレット検出器ではない．生の外部出力を `Result` に入れないようにする
+  実際の制御は Runner の責務である（Phase 1）．Runner は外部コマンド／SDK の
+  生のエラー，stdout，stderr を `error.summary` に決してコピーしない．要約は
+  Runner が所有する安全なテンプレートからのみ生成され，API 利用者にとっての
+  主要な機械可読シグナルは `error.code` である．
 
-See `docs/threat-model.md` (T1, T2, T5, "Assurance levels") and
-`docs/architecture.md` ("Validation vs. authorization") for the full
-reasoning.
+完全な論拠は `docs/threat-model.md`（T1，T2，T5，「保証レベル」）と
+`docs/architecture.md`（「検証と認可」）を参照．
 
-## Consequences
+## 結果
 
-- A `JobSpec` or `Result` is either fully valid per this contract or
-  rejected outright; there is no partial or best-effort acceptance path
-  that a caller could exploit to smuggle in unsupported fields.
-- Strict decoding closes the classic "two parsers disagree on a duplicate
-  key" class of validation bypass, since the contract is checked once, in
-  one place, before either side acts on it.
-- Every wire-visible change to the contract must go through
-  `pkg/api/v1alpha1`, its tests, and (once Phase 1 ships) the additive-only
-  compatibility rule — this is intentionally more process than editing a
-  loosely-typed JSON blob, in exchange for the contract being a reliable
-  security boundary.
-- Keeping the JSON Schema in sync with Go by test, rather than generating
-  one from the other, means both have to be hand-maintained together; the
-  sync test is what keeps that from silently drifting.
+- `JobSpec` や `Result` は，このコントラクトに完全に適合するか，さもなければ
+  即座に拒否される．呼び出し元が未サポートのフィールドを紛れ込ませるために
+  悪用できるような，部分的あるいはベストエフォートの受け入れ経路は存在しない．
+- 厳密なデコードにより，古典的な「2 つのパーサが重複キーについて意見を異に
+  する」類の検証バイパスは閉じられる．コントラクトはどちらの側が行動する
+  前にも，1 か所で 1 回だけ検査されるからである．
+- ワイヤ上で見えるコントラクトの変更はすべて，`pkg/api/v1alpha1` とその
+  テスト，そして（Phase 1 の出荷後は）追加のみの互換性規則を経なければ
+  ならない．これは緩く型付けされた JSON の塊を編集するより意図的に手間の
+  かかるプロセスであり，その代わりにコントラクトが信頼できるセキュリティ境界と
+  なる．
+- JSON Schema と Go の同期を，一方から他方を生成するのではなくテストで保つ
+  ということは，両方を手で一緒に保守しなければならないということである．
+  同期テストが，それが気付かぬうちに乖離するのを防ぐ．

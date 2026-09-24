@@ -1,154 +1,149 @@
-# 0009: Runner execution model
+# 0009: Runner の実行モデル
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-Phase 1 gives `acme-runner` an actual `reconcile` implementation
-(`internal/runner`). It needs answers to several coupled questions before
-it can safely call the pinned `lego` binary (see
-[ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md)):
+Phase 1 で `acme-runner` は実際の `reconcile` 実装（`internal/runner`）を
+得る．固定バージョンの `lego` バイナリ
+（[ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md) を参照）を安全に
+呼び出せるようになる前に，互いに結び付いたいくつかの問いに答える必要がある．
 
-- Where does the Runner learn whether a certificate needs to be issued or
-  renewed at all — from its own local state, or from somewhere else?
-- Where does a certificate private key exist while `lego` is running, and
-  when exactly is it destroyed?
-- ACME accounts are rate-limited to create; does the Runner keep reusing
-  the same account across runs, and if so, where does that state live
-  relative to the private key above?
-- Does the Runner ever invoke `lego`'s `renew` subcommand, or always
-  `run`? How does it then know whether the outcome was an issuance or a
-  renewal for the `Result.action` field?
-- How is the `lego` subprocess bounded so a hung or slow DNS provider
-  cannot hang the Runner process indefinitely, and so no helper process it
-  spawns can outlive the run?
+- Runner は，証明書の発行や更新がそもそも必要かどうかをどこから知るのか．
+  自身のローカルな状態からか，それとも他のどこかからか．
+- `lego` の実行中，証明書の秘密鍵はどこに存在し，正確にいつ破棄されるのか．
+- ACME アカウントの作成にはレート制限がある．Runner は run をまたいで同じ
+  アカウントを使い続けるのか．そうだとすれば，その状態は上記の秘密鍵に対して
+  どこに置かれるのか．
+- Runner は `lego` の `renew` サブコマンドを使うことがあるのか，それとも常に
+  `run` なのか．その場合，`Result.action` フィールドのために結果が発行だった
+  のか更新だったのかをどう知るのか．
+- ハングした，あるいは遅い DNS プロバイダが Runner プロセスを無期限にハング
+  させないように，また `lego` が spawn したヘルパープロセスが run より長く
+  生き残らないように，`lego` サブプロセスをどう制限するのか．
 
-## Decision
+## 決定
 
-- **The Certificate Store is the sole source of truth for the renewal
-  decision.** The Runner keeps no local database or cache of previously
-  issued certificates. Every `reconcile` call asks the configured `Store`
-  for the certificate currently stored under `store.ObjectName(fqdn)`
-  (`Store.Current`) and decides from that alone: issue if there is none,
-  its SANs do not cover the target FQDN, or its `NotAfter` is within
-  `renewBeforeDays`; otherwise stop as a noop without invoking `lego` at
-  all.
-- **The per-run work directory is destroyed after the bundle is stored,
-  unconditionally.** `prepareWorkDir` creates
-  `<workDir>/run-<runId>-<rand>` (mode `0700`) and returns a cleanup
-  function that is `defer`red immediately, so it runs on every return path
-  — success, every failure branch, and a panic. A certificate private key
-  exists on disk only inside this directory (transiently, for the
-  duration of one run) and inside the Store; nowhere else, ever.
-- **ACME account state is persisted separately from the certificate
-  private key**, in `lego.stateDir` (an explicitly different, persistent
-  directory — `config.Lego.validate` rejects a configuration where
-  `stateDir` equals `workDir`). Only the `accounts` subtree lego writes
-  under `--path` is copied in before the run and published back after —
-  regardless of whether the run succeeded — as a new versioned directory
-  under `stateDir/accounts.d/` that `stateDir/accounts` (a symbolic link)
-  is atomically re-pointed to (`persistAccounts`). A directory cannot be
-  replaced atomically with `rename(2)`, but a symbolic link can, so there
-  is no window in which the account state is absent; the files, the
-  version directory, `accounts.d` and `stateDir` are fsynced in that
-  order, so the same holds across a power loss. Publishing holds an
-  exclusive `flock` on `stateDir/.lock` (the copy-in at run start holds
-  it shared), so two Runners sharing a `stateDir` cannot prune each
-  other's freshly referenced version: the last publisher wins. ACME account
-  continuity across runs therefore does not depend on this run's private
-  key, which is destroyed with the work directory either way. Losing the
-  account would mean registering a new one (rate-limited, and with EAB
-  possibly impossible without a new credential), which is why this is
-  treated as durable state rather than a cache.
-- **The Runner always invokes `lego run`, never `lego renew`.** Because
-  the work directory is fresh on every run and never carries a previous
-  `certificates` resource across runs (only `accounts` is persisted), a
-  `renew` invocation would have nothing on disk to compare against and
-  would always behave like a fresh issuance anyway; `run` gives one
-  execution path for both issuance and renewal. `Result.action`
-  (`issued`/`renewed`/`noop`) is derived by the Runner itself, by
-  comparing the store's previous certificate fingerprint (if any) to the
-  newly issued one — never by parsing what `lego` printed.
-- **The `lego` invocation is `argv`-only with a from-scratch
-  environment**, built entirely from the resolved `ACMEBinding`/
-  `DNSBinding` and the validated, authorized `JobSpec` fields (`fqdn`,
-  `keyType`) — see [`docs/runner.md`](../runner.md#lego-invocation). No
-  shell is ever invoked; nothing is inherited from the Runner process
-  except what a binding's `env`/`passthroughEnv` explicitly names.
-- **Timeouts and process-group isolation.** `lego` runs under
-  `context.WithTimeout(ctx, lego.timeoutSeconds)`, in its own process
-  group (`Setpgid: true`). On timeout or parent cancellation,
-  `cmd.Cancel` sends `SIGTERM` to the whole process group; `cmd.WaitDelay`
-  (a configurable grace period, 10s by default) bounds how long the Runner
-  waits after that before the process is force-killed, and the Runner
-  additionally sends `SIGKILL` to the whole group when the run ends so
-  helper processes that stay in the group cannot survive it. `lego`'s
-  output is consumed through `io.Writer` sinks that `os/exec` drives with
-  its own goroutines rather than through `StdoutPipe`, because only then
-  does `WaitDelay` also bound the case where a descendant inherited the
-  pipes and keeps them open after `lego` exits (otherwise the Runner would
-  wait for that descendant, not for `lego`). A descendant that leaves the
-  group (`setsid`) cannot be killed by a group signal; that is contained
-  by running one job per container (PID namespace), not by this code.
+- **Certificate Store が更新判断の唯一の信頼できる情報源である．** Runner は
+  過去に発行した証明書のローカルなデータベースやキャッシュを持たない．
+  `reconcile` の呼び出しはすべて，設定された `Store` に
+  `store.ObjectName(fqdn)` の下に現在格納されている証明書を問い合わせ
+  （`Store.Current`），それだけから判断する．証明書がない，その SAN が
+  対象 FQDN をカバーしていない，または `NotAfter` が `renewBeforeDays` 以内で
+  あれば発行する．そうでなければ `lego` をまったく起動せずに noop として
+  終了する．
+- **run ごとの作業ディレクトリは，バンドルが格納された後，無条件に破棄
+  される．** `prepareWorkDir` は `<workDir>/run-<runId>-<rand>`（モード
+  `0700`）を作り，クリーンアップ関数を返す．この関数は直ちに `defer` される
+  ので，成功，すべての失敗分岐，panic のいずれのリターン経路でも実行される．
+  証明書の秘密鍵がディスク上に存在するのは，このディレクトリの中
+  （1 回の run の間だけ，一時的に）と Store の中だけであり，それ以外の場所には
+  決して存在しない．
+- **ACME アカウントの状態は証明書の秘密鍵とは別に永続化される．** 場所は
+  `lego.stateDir`（明示的に別の，永続的なディレクトリ．`config.Lego.validate`
+  は `stateDir` が `workDir` と等しい設定を拒否する）である．lego が `--path`
+  の下に書く `accounts` サブツリーだけが，run の前にコピーインされ，run の後に
+  （run の成否にかかわらず）`stateDir/accounts.d/` 配下の新しいバージョン付き
+  ディレクトリとして公開され，`stateDir/accounts`（シンボリックリンク）が
+  そこへアトミックに付け替えられる（`persistAccounts`）．ディレクトリは
+  `rename(2)` でアトミックに置き換えられないが，シンボリックリンクなら
+  できるので，アカウント状態が存在しない瞬間はない．ファイル，バージョン
+  ディレクトリ，`accounts.d`，`stateDir` はこの順に fsync されるので，電源断を
+  またいでも同じことが成り立つ．公開の際は `stateDir/.lock` に排他的な `flock`
+  を取る（run 開始時のコピーインは共有ロックを取る）ので，`stateDir` を共有
+  する 2 つの Runner が互いの参照されたばかりのバージョンを prune することは
+  できない．最後に公開した側が勝つ．したがって run をまたいだ ACME アカウントの
+  継続性は，作業ディレクトリとともにいずれにせよ破棄されるこの run の秘密鍵に
+  依存しない．アカウントを失えば新しいアカウントを登録することになり
+  （レート制限があり，EAB では新しい資格情報なしには不可能かもしれない），
+  だからこそこれはキャッシュではなく永続的な状態として扱われる．
+- **Runner は常に `lego run` を起動し，`lego renew` は決して起動しない．**
+  作業ディレクトリは run のたびに新しく作られ，以前の `certificates`
+  リソースを run をまたいで持ち越すことは決してない（永続化されるのは
+  `accounts` だけ）ので，`renew` を起動してもディスク上に比較対象がなく，
+  結局は常に新規発行のように振る舞うことになる．`run` なら発行と更新の両方に
+  1 つの実行経路で済む．`Result.action`（`issued`/`renewed`/`noop`）は，
+  Store にあった以前の証明書のフィンガープリント（あれば）と新しく発行された
+  ものを比較して Runner 自身が導出する．`lego` の出力をパースして得ることは
+  決してない．
+- **`lego` の起動は `argv` のみで，環境は一から構築する．** 解決済みの
+  `ACMEBinding`/`DNSBinding` と，検証・認可済みの `JobSpec` のフィールド
+  （`fqdn`，`keyType`）だけから組み立てる．
+  [`docs/runner.md`](../runner.md#lego-の起動) を参照．シェルは決して起動
+  されない．バインディングの `env`/`passthroughEnv` が明示的に名指しするもの
+  以外，Runner プロセスから継承されるものは何もない．
+- **タイムアウトとプロセスグループの分離．** `lego` は
+  `context.WithTimeout(ctx, lego.timeoutSeconds)` の下で，自身のプロセス
+  グループ（`Setpgid: true`）で動作する．タイムアウトまたは親のキャンセル時に
+  `cmd.Cancel` がプロセスグループ全体に `SIGTERM` を送る．`cmd.WaitDelay`
+  （設定可能な猶予期間．既定は 10 秒）がその後プロセスを強制終了するまで
+  Runner が待つ時間を制限し，さらに Runner は run の終了時にグループ全体に
+  `SIGKILL` を送るので，グループに留まったヘルパープロセスが run より長く
+  生き残ることはできない．`lego` の出力は，`StdoutPipe` ではなく，`os/exec`
+  が自身の goroutine で駆動する `io.Writer` のシンクを通じて消費する．そうして
+  初めて，子孫プロセスがパイプを継承して `lego` の終了後も開いたままにする
+  ケースも `WaitDelay` で制限できるからである（そうでなければ Runner は `lego`
+  ではなくその子孫を待つことになる）．グループを離れた子孫（`setsid`）は
+  グループへのシグナルでは kill できない．それはこのコードではなく，コンテナ
+  1 つにつきジョブ 1 つを動かすこと（PID 名前空間）によって封じ込める．
 
-## Alternatives considered
+## 検討した代替案
 
-- **Persist `lego`'s full state directory (`--path`), including
-  `certificates`, across runs, and use `lego renew`.** Rejected: this
-  would require reproducing `lego`'s own on-disk "is this near expiry"
-  logic and keeping a copy of certificate private keys resident in
-  persistent state for longer than a single run needs them, which
-  conflicts directly with "a private key exists nowhere but the Store and
-  a transient work directory" (`docs/architecture.md`, security principle
-  4). It would also need per-target state subdirectories to avoid two
-  targets' certificate resources colliding.
-- **Use `lego renew` because the command name matches the operation.**
-  Rejected on the same grounds: since the Runner already asks the Store,
-  not `lego`'s on-disk state, whether renewal is due, `renew`'s own
-  expiry bookkeeping would be redundant with (and could disagree with)
-  the Store-based decision this ADR makes authoritative, for no benefit —
-  `run` gives a single, simpler code path.
-- **Use `lego` as a Go library instead of the CLI subprocess.** Already
-  decided against in [ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md)
-  for version-boundary reasons; this ADR's per-run isolation, from-scratch
-  environment, and timeout/process-group handling would be needed in
-  either shape, so it does not change the calculus here.
+- **`lego` の状態ディレクトリ全体（`--path`）を `certificates` も含めて run を
+  またいで永続化し，`lego renew` を使う．** 却下．これでは `lego` 自身の
+  ディスク上の「有効期限が近いか」のロジックを再現する必要があり，証明書の
+  秘密鍵のコピーを 1 回の run が必要とするより長く永続的な状態に常駐させる
+  ことになる．これは「秘密鍵は Store と一時的な作業ディレクトリ以外のどこにも
+  存在しない」（`docs/architecture.md` のセキュリティ原則 4）と真っ向から
+  衝突する．また 2 つの target の証明書リソースが衝突しないように target ごとの
+  状態サブディレクトリも必要になる．
+- **操作と名前が一致するので `lego renew` を使う．** 同じ理由で却下．Runner は
+  更新期限が来ているかを `lego` のディスク上の状態ではなくすでに Store に
+  問い合わせているので，`renew` 自身の有効期限管理は，この ADR が正とする
+  Store ベースの判断と冗長になり（食い違うこともありうる），利点がない．
+  `run` なら単一のより単純なコードパスで済む．
+- **CLI サブプロセスの代わりに `lego` を Go ライブラリとして使う．** バージョン
+  境界の理由からすでに
+  [ADR 0003](0003-use-lego-cli-as-subprocess-in-runner.md) で不採用と決定
+  済み．この ADR の run ごとの分離，一から構築する環境，タイムアウト／プロセス
+  グループの扱いはどちらの形でも必要になるので，ここでの計算は変わらない．
 
-## Consequences
+## 結果
 
-- Every actual `lego` invocation performs a brand-new ACME order (a fresh
-  key, a fresh certificate resource) — there is no "renewal order"
-  discount to rely on, because `renew` is never used. Rate-limit exposure
-  is therefore bounded the same way it would be for any tool that only
-  ever issues: by not calling `lego` (and thus the ACME CA) at all when
-  the Store-based decision says the certificate is not yet due, which is
-  the normal case for a healthy target.
-- ACME account reuse still works correctly across runs (new-account /
-  accounts-per-IP limits are not hit repeatedly), because the account key
-  and registration are the one piece of state this design does persist,
-  independently of certificate material.
-- Because certificate private keys are never persisted outside the Store
-  and a destroyed-after-use work directory, a leaked or backed-up
-  `stateDir` contains no certificate private key material — only the ACME
-  account key.
-- Two Runner processes sharing the same `stateDir` are serialized on the
-  state itself by an advisory `flock` (`internal/fslock`; publisher
-  exclusive, reader shared; lock waits honour the run's context so a
-  signal still ends the run). What remains unserialized is the run
-  itself: both processes can still execute `lego` and place two ACME
-  orders. Per-target mutual exclusion across runs is Phase 2 work (see
-  `docs/threat-model.md`, T7) and is a residual risk until then.
-- The account state layout is a checked invariant (`validateAccountsLayout`
-  in `internal/runner/workdir.go`): `accounts.d` must be a real directory,
-  each version a real directory named `<unix-nanos>-<8 hex>`, and
-  `accounts` absent or a link whose target is exactly `accounts.d/<v>`.
-  Anything else is refused before any write, so a pre-planted link cannot
-  make the Runner write to, read from, or prune anything outside
-  `stateDir`. A plain `accounts` directory is refused rather than
-  migrated, since no released layout ever used one and an in-place
-  migration cannot be made crash-safe with `rename` alone.
-- `Result.action` correctness depends entirely on the Store's `Current`
-  read being accurate and on `store.ObjectName` being a stable, collision-
-  resistant function of the FQDN; both already hold by construction (see
-  [`docs/runner.md`](../runner.md#certificate-store-filesystem)).
+- 実際の `lego` の起動はすべて真新しい ACME オーダーを行う（新しい鍵，新しい
+  証明書リソース）．`renew` は決して使わないので，頼れる「更新オーダー」の
+  割引はない．したがってレート制限への露出は，発行しかしないどのツールとも
+  同じ方法で抑えられる．すなわち，Store ベースの判断が証明書はまだ期限到来
+  していないと言うときは `lego`（ひいては ACME CA）をまったく呼ばないことで
+  あり，健全な target ではそれが通常のケースである．
+- run をまたいだ ACME アカウントの再利用は引き続き正しく働く（新規アカウント／
+  IP ごとのアカウント数の制限に繰り返し引っかかることはない）．アカウントの
+  鍵と登録は，この設計が証明書の素材とは独立に永続化する唯一の状態だから
+  である．
+- 証明書の秘密鍵は Store と使用後に破棄される作業ディレクトリの外には決して
+  永続化されないので，漏洩した，あるいはバックアップされた `stateDir` には
+  証明書の秘密鍵の素材は含まれない．含まれるのは ACME アカウントの鍵だけ
+  である．
+- 同じ `stateDir` を共有する 2 つの Runner プロセスは，状態そのものについては
+  アドバイザリの `flock`（`internal/fslock`．公開側は排他，読み取り側は共有．
+  ロック待ちは run のコンテキストを尊重するので，シグナルで run を終了
+  できる）で直列化される．直列化されずに残るのは run 自体である．両方の
+  プロセスがなお `lego` を実行して 2 つの ACME オーダーを出すことができる．
+  run をまたいだ target ごとの相互排他は Phase 2 の作業であり
+  （`docs/threat-model.md` の T7 を参照），それまでは残存リスクである．
+- アカウント状態のレイアウトは検査される不変条件である
+  （`internal/runner/workdir.go` の `validateAccountsLayout`）．`accounts.d` は
+  実ディレクトリでなければならず，各バージョンは `<unix-nanos>-<8 hex>` という
+  名前の実ディレクトリでなければならず，`accounts` は存在しないか，リンク先が
+  正確に `accounts.d/<v>` であるリンクでなければならない．それ以外はあらゆる
+  書き込みの前に拒否されるので，事前に仕込まれたリンクによって Runner に
+  `stateDir` の外への書き込み・読み取り・prune をさせることはできない．
+  通常のディレクトリである `accounts` は移行されず拒否される．リリース済みの
+  レイアウトでそれを使ったものはなく，その場での移行は `rename` だけでは
+  クラッシュ安全にできないからである．
+- `Result.action` の正しさは，Store の `Current` の読み取りが正確であること，
+  および `store.ObjectName` が FQDN の安定した衝突耐性のある関数であることに
+  完全に依存する．どちらも構造上すでに成り立っている
+  （[`docs/runner.md`](../runner.md#certificate-store-ファイルシステム) を
+  参照）．

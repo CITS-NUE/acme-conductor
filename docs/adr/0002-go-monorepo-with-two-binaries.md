@@ -1,48 +1,49 @@
-# 0002: Go monorepo with two binaries
+# 0002: 2 つのバイナリを持つ Go モノレポ
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-ACME Conductor is split into a control plane (`acme-conductor`) and a data
-plane (`acme-runner`) that must never share a process, a set of
-credentials, or a deploy lifecycle (see
-[`docs/architecture.md`](../architecture.md#control-plane-vs-data-plane)).
-They do, however, need to share a versioned wire contract
-(`pkg/api/v1alpha1`) and FQDN policy logic (`internal/policy`) byte-for-byte
-— the Runner validates the document and authorizes it against its own
-trusted policy with the *same* normalization and suffix-matching code the
-Conductor uses, not a reimplementation of it that could drift.
+ACME Conductor は，コントロールプレーン（`acme-conductor`）とデータプレーン
+（`acme-runner`）に分かれており，両者はプロセス，資格情報の集合，デプロイの
+ライフサイクルを決して共有してはならない
+（[`docs/architecture.md`](../architecture.md#コントロールプレーンとデータプレーン)
+を参照）．しかし両者は，バージョン付きのワイヤコントラクト
+（`pkg/api/v1alpha1`）と FQDN ポリシーのロジック（`internal/policy`）を
+バイト単位で同一のものとして共有する必要がある．Runner は文書を検証し，
+自身の信頼されたポリシーに照らして認可するが，そのとき使うのは Conductor が
+使うのと *同じ* 正規化・サフィックス照合のコードであり，乖離しうる再実装では
+ない．
 
-## Decision
+## 決定
 
-Both binaries live in one Go module (`github.com/CITS-NUE/acme-conductor`),
-as two `cmd/` entry points (`cmd/acme-conductor`, `cmd/acme-runner`) sharing
-`internal/` and `pkg/` packages. Each binary is built and containerized
-independently (`Dockerfile.conductor`, `Dockerfile.runner`) and each ships
-its own image, but the source lives in one repository and one module.
+両方のバイナリは 1 つの Go モジュール（`github.com/CITS-NUE/acme-conductor`）
+に置き，`internal/` と `pkg/` のパッケージを共有する 2 つの `cmd/` エントリ
+ポイント（`cmd/acme-conductor`，`cmd/acme-runner`）とする．各バイナリは
+独立にビルドされコンテナ化され（`Dockerfile.conductor`，`Dockerfile.runner`），
+それぞれ独自のイメージとして出荷されるが，ソースは 1 つのリポジトリ・1 つの
+モジュールに置く．
 
-## Consequences
+## 結果
 
-- The contract and policy code the Conductor and Runner both depend on
-  cannot drift out of sync the way it could across two repositories with
-  two copies of the same logic, or two dependency versions of a shared
-  library.
-- A single `go build ./...`, `go test ./...`, and `go vet ./...` cover both
-  binaries; CI is one workflow (`.github/workflows/ci.yml`) with a matrix
-  over the two container images.
-  `internal/` is enforced by the Go compiler to be unimportable outside
-  this module, which keeps helper packages from leaking into an external
-  API by accident.
-- The two binaries must still be deployed and operated as if they were
-  separate services with separate identities (see
-  [ADR 0005](0005-conductor-never-touches-secrets.md)) — sharing a
-  repository and a module must never become an excuse to blur that
-  operational boundary, and code review treats any import that would let
-  Conductor-only code reach into Runner-only secret handling (or vice
-  versa) as a defect.
-- A future split into separate repositories, if ever needed (for example
-  for independent release cadences), would require re-vendoring or
-  publishing `pkg/api/v1alpha1` and `internal/policy` as their own module;
-  this ADR does not rule that out, it just says it is not needed now.
+- Conductor と Runner の両方が依存するコントラクトとポリシーのコードは，
+  同じロジックのコピーを 2 つ持つ 2 つのリポジトリや，共有ライブラリの 2 つの
+  依存バージョンで起こりうるような形で，同期からずれることがない．
+- 1 回の `go build ./...`，`go test ./...`，`go vet ./...` で両方のバイナリを
+  カバーできる．CI は 2 つのコンテナイメージにわたるマトリクスを持つ 1 つの
+  ワークフロー（`.github/workflows/ci.yml`）である．
+  `internal/` はこのモジュールの外から import できないことが Go コンパイラに
+  よって強制されるので，ヘルパーパッケージが誤って外部 API に漏れ出すことを
+  防げる．
+- 2 つのバイナリは，それでもなお，別々の ID を持つ別々のサービスであるかの
+  ようにデプロイ・運用しなければならない
+  （[ADR 0005](0005-conductor-never-touches-secrets.md) を参照）．リポジトリと
+  モジュールを共有することが，この運用上の境界を曖昧にする言い訳になることは
+  決してあってはならず，コードレビューでは Conductor 専用のコードから Runner
+  専用のシークレット処理へ（またはその逆に）手を伸ばせるような import は
+  どれも欠陥として扱う．
+- 将来（例えば独立したリリース周期のために）別々のリポジトリへ分割する必要が
+  生じた場合は，`pkg/api/v1alpha1` と `internal/policy` を再 vendor するか
+  独自のモジュールとして公開する必要がある．この ADR はそれを排除するものでは
+  なく，今は必要ないと言っているだけである．

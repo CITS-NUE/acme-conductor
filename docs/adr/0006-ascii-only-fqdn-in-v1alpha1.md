@@ -1,58 +1,55 @@
-# 0006: ASCII-only FQDN in v1alpha1
+# 0006: v1alpha1 では ASCII のみの FQDN
 
-- Status: Accepted
-- Date: 2026-09-20
+- ステータス: 採択
+- 日付: 2026-09-20
 
-## Context
+## 背景
 
-Real-world DNS increasingly includes internationalized domain names (IDNs):
-names typed and displayed in Unicode (U-labels) and encoded on the wire as
-ASCII `xn--` labels (A-labels) per IDNA. Supporting them correctly requires
-more than accepting Unicode bytes in a string field — it requires choosing
-an IDNA processing profile (IDNA2008 vs. the older IDNA2003, and the
-Unicode Technical Standard 46 (UTS-46) mapping that bridges them),
-deciding how a name is displayed and compared (U-label vs. A-label, and
-what "the same name" even means when mixed-script confusables are
-possible), and closing the homograph/confusable-character attack class
-where a visually similar Unicode label is used to impersonate an ASCII one
-(a classic phishing technique against IDN-aware systems). None of that
-design work has been done yet.
+現実の DNS には国際化ドメイン名（IDN）がますます増えている．Unicode で入力・
+表示され（U-label），IDNA に従ってワイヤ上では ASCII の `xn--` ラベル
+（A-label）として符号化される名前である．これを正しくサポートするには，文字列
+フィールドで Unicode のバイト列を受け付けるだけでは足りない．IDNA の処理
+プロファイル（IDNA2008 か，より古い IDNA2003 か，そして両者を橋渡しする
+Unicode Technical Standard 46 (UTS-46) のマッピング）を選び，名前をどう表示し
+比較するか（U-label か A-label か，また混合スクリプトの紛らわしい文字が
+ありうるときに「同じ名前」が何を意味するのか）を決め，見た目の似た Unicode
+ラベルを使って ASCII のラベルになりすますホモグラフ／紛らわしい文字による
+攻撃の類（IDN 対応システムに対する古典的なフィッシング手法）を閉じる必要が
+ある．その設計作業はまだ何も行われていない．
 
-## Decision
+## 決定
 
-`v1alpha1` accepts **ASCII host names only**. `internal/policy/fqdn.go`
-rejects any input containing a non-ASCII byte (`ErrNonASCII`), and
-separately rejects any label starting with `xn--` (`ErrIDNALabel`), even
-though such a label is syntactically valid ASCII — accepting `xn--` labels
-without having designed how they are displayed, compared, and
-de-duplicated against their Unicode form would be worse than rejecting
-them outright, since it would silently invite exactly the confusion this
-ADR is deferring.
+`v1alpha1` は **ASCII のホスト名のみ** を受け付ける．`internal/policy/fqdn.go`
+は非 ASCII のバイトを含む入力をすべて拒否し（`ErrNonASCII`），それとは別に，
+`xn--` で始まるラベルを構文上は有効な ASCII であるにもかかわらず拒否する
+（`ErrIDNALabel`）．`xn--` ラベルをその表示・比較・Unicode 形との重複排除を
+設計しないまま受け付けることは，端から拒否するより悪い．この ADR が先送り
+しているまさにその混乱を，気付かぬうちに招くことになるからである．
 
-## Consequences
+## 結果
 
-- Internationalized domain names cannot be managed by ACME Conductor until
-  a future version explicitly adds support for them. This is a real
-  functional limitation, not an oversight: it exists to avoid shipping IDN
-  handling with an undesigned security posture.
-- A future ADR that adds IDN support must address, at minimum:
-  - which IDNA processing profile is used (IDNA2008, with its UTS-46
-    mapping for compatibility with the more permissive matching real
-    browsers and registries use) and exactly which mapping/validation
-    steps are applied before a name is considered normalized;
-  - whether and how a name is displayed to administrators as a U-label
-    (human-readable Unicode) versus stored/compared as its canonical
-    A-label (`xn--...`) form, and how the two are kept from disagreeing;
-  - how homograph/confusable-character risk is mitigated (for example,
-    restricting allowed scripts per label, or requiring an explicit
-    administrator acknowledgement for mixed-script names) rather than
-    accepting any Unicode code point IDNA syntax alone would allow;
-  - that uniqueness in the `Target` registry is defined on the canonical
-    A-label form, so that two differently-typed Unicode inputs which
-    normalize to the same A-label are recognized as the same target rather
-    than silently creating two.
-- Because this is a new `apiVersion` concern (loosening what `NormalizeFQDN`
-  accepts is a compatibility-relevant change once Phase 1 ships — see
-  [ADR 0004](0004-versioned-jobspec-result-contract.md)), IDN support is
-  expected to arrive as a new contract version, not a silent tightening or
-  loosening of `v1alpha1`'s existing behavior.
+- 将来のバージョンが明示的にサポートを追加するまで，国際化ドメイン名は ACME
+  Conductor で管理できない．これは見落としではなく実際の機能上の制限である．
+  設計されていないセキュリティ態勢のまま IDN の処理を出荷することを避けるために
+  存在する．
+- IDN サポートを追加する将来の ADR は，少なくとも次の点に対処しなければ
+  ならない．
+  - どの IDNA 処理プロファイルを使うか（IDNA2008 と，実際のブラウザや
+    レジストリが使うより寛容な照合との互換性のための UTS-46 マッピング），
+    および名前が正規化済みとみなされる前にどのマッピング／検証ステップが
+    正確に適用されるか．
+  - 名前を管理者に U-label（人間が読める Unicode）として表示するかどうか，
+    またどのように表示するか．一方で保存／比較は正準の A-label（`xn--...`）
+    形で行うのか，そして両者が食い違わないようにどう保つか．
+  - ホモグラフ／紛らわしい文字のリスクをどう軽減するか（例えば，ラベルごとに
+    許可するスクリプトを制限する，混合スクリプトの名前には管理者の明示的な
+    承認を要求するなど）．IDNA の構文だけなら許す任意の Unicode コードポイントを
+    受け付けるのではなく．
+  - `Target` レジストリにおける一意性は正準の A-label 形で定義され，入力の
+    仕方が異なる 2 つの Unicode 入力が同じ A-label に正規化される場合，気付かぬ
+    うちに 2 つの target を作るのではなく，同じ target として認識されること．
+- これは新しい `apiVersion` に関わる事柄なので（`NormalizeFQDN` が受け付ける
+  ものを緩めることは，Phase 1 の出荷後は互換性に関わる変更である．
+  [ADR 0004](0004-versioned-jobspec-result-contract.md) を参照），IDN サポート
+  は `v1alpha1` の既存の振る舞いを黙って厳しくしたり緩めたりするのではなく，
+  新しいコントラクトのバージョンとして到来することが期待される．

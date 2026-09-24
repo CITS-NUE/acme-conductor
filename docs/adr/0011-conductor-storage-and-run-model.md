@@ -1,162 +1,156 @@
-# 0011: Conductor storage and run model
+# 0011: Conductor のストレージと run モデル
 
-- Status: Accepted
-- Date: 2026-09-22
+- ステータス: 採択
+- 日付: 2026-09-22
 
-## Context
+## 背景
 
-Phase 2 gives `acme-conductor` its first real state: the `Target`,
-`CertificatePolicy`, `Run` and `AuditEvent` registries described in
-[`docs/architecture.md`](../architecture.md#domain-model), a scheduler that
-decides when a target is due, and a launcher that starts a Runner job. It
-needs answers to several coupled questions:
+Phase 2 は `acme-conductor` に初めての本物の状態を与える．すなわち
+[`docs/architecture.md`](../architecture.md#ドメインモデル) に記述された
+`Target`，`CertificatePolicy`，`Run`，`AuditEvent` のレジストリ，対象（target）の
+更新期限が来ているかを判断するスケジューラ，そして Runner ジョブを開始する
+ランチャーである．これには互いに結びついた複数の問いに答える必要がある．
 
-- Where does that state live, and how is it kept consistent with the
-  audit log that is supposed to describe it?
-- How is double execution for one target prevented (threat model T7), and
-  how is a run that was requested against an older version of a target
-  kept from being actioned once the target has moved on?
-- How does a Runner job actually get started in this phase, and what does
-  the Conductor do about runs that were in flight when it stopped?
-- What can the Conductor know about an issued certificate without ever
-  reading the Certificate Store?
+- その状態はどこに置き，それを記述するはずの監査ログとどのように整合させるか．
+- 1 つの target に対する二重実行をどう防ぐか（脅威モデル T7），また target の
+  古いリビジョンに対して要求された run を，target が先に進んだ後に実行して
+  しまわないようどう防ぐか．
+- この Phase では Runner ジョブを実際にどのように開始するか，また Conductor が
+  停止した時点で進行中だった run をどう扱うか．
+- Conductor は Certificate Store を一切読まずに，発行済み証明書について何を
+  知り得るか．
 
-## Decision
+## 決定
 
-- **SQLite, one file, one connection, explicit migrations.** The registry
-  is a SQLite database (`modernc.org/sqlite`, pure Go, so the binaries stay
-  `CGO_ENABLED=0` and distroless-static) behind the
-  `registry.Registry` interface (`internal/conductor/registry`). Only
-  `internal/conductor/sqlite` knows SQL. `database/sql` is limited to a
-  single open connection, so every statement is serialized in process
-  order and there are no lock-upgrade deadlocks to reason about; the MVP's
-  write volume does not need more and a multi-replica Conductor is a
-  non-goal. Migrations are a numbered list applied at open and recorded in
-  `schema_migrations`; a database at a newer version than the binary is
-  refused rather than downgraded. The file is created `0600` and a
-  symbolic link at its path is refused. Identifiers are ULIDs, monotonic
-  within one process, so every "newest first" listing and the "oldest
-  queued run" claim order by id alone.
-- **The schema enforces the model's invariants.** At most one active
-  (`queued`/`starting`/`running`) run per target is a partial unique index,
-  so a scheduler tick, an operator request and a restart cannot race a
-  second Runner into existence for the same target whatever the code
-  above the registry does. Audit events cannot be updated or deleted, and
-  targets, runs and policies cannot be deleted — triggers abort those
-  statements (see [ADR 0008](0008-no-purge-in-mvp.md)). No column can hold
-  a secret (see [ADR 0005](0005-conductor-never-touches-secrets.md)).
-- **Audit in the same transaction as the change.** Every mutating registry
-  method takes the `AuditEvent` describing it and appends it in the same
-  transaction, so the audit log can never describe a change that was
-  rolled back or miss one that committed.
-- **Optimistic locking on `Target.revision`.** Every update names the
-  revision it was made against and fails with `stale_revision` otherwise;
-  every successful update increments the revision. A run records the
-  revision it was requested for, the `JobSpec` carries it, and before a
-  queued run is started the target is re-read: a disabled target or a
-  changed revision cancels the run instead of starting it. An operator
-  request may also name the revision it acts on.
-- **Run lifecycle.** `queued` (requested by the scheduler or an operator)
-  → `starting` (claimed by the scheduler; target and policy re-checked,
-  `JobSpec` built and validated) → `running` (a Runner execution exists;
-  its platform id is recorded) → `succeeded` / `failed` / `cancelled`.
-  The terminal state and every certificate-related field come from the
-  Runner's `Result` only; the Conductor never derives them from anything
-  else. A `Result` whose error code is `Cancelled` ends the run as
-  `cancelled`; any other failure ends it as `failed`. When a launcher
-  cannot produce a `Result` at all the run fails with a Conductor-owned
-  summary (`Internal`, `Timeout` or `Cancelled` by cause); nothing the
-  Runner printed is ever copied into a run record.
-- **Due decision.** A target is due when it has never succeeded, when its
-  revision differs from the one its last successful run was made for,
-  when the last successful run reported no expiry, or when
-  `expiresAt - renewBeforeDays` has passed. After a failed or cancelled
-  run the target is held back for `retryBackoffSeconds`, doubled per
-  consecutive failure up to `maxRetryBackoffSeconds`. The Runner remains
-  the authority on whether anything needs to be issued (it asks the
-  Store); a due run that finds the certificate current is a cheap `noop`.
-- **Local-process launcher.** Phase 2 ships one `Launcher`: it writes the
-  `JobSpec` into a private per-run directory, executes
-  `acme-runner reconcile --job … --result … --config …` in its own process
-  group with an explicit, from-scratch environment, reads the `Result`
-  back with the strict contract decoder, checks that it names the run and
-  target it was started for, and removes the directory. On cancellation
-  the Runner receives `SIGTERM` (and normally reports `Cancelled`),
-  `SIGKILL` after a grace period. It is a development shape: the only way
-  a DNS credential can reach the Runner through it is `passthroughEnv`,
-  which means the Conductor's own environment carries that credential.
-- **One process owns a registry.** `serve` takes an exclusive advisory
-  lock on `<database.path>.lock` before it opens the database, recovers
-  anything or binds a port, and exits (code 2) without touching state
-  when another process holds it. SQLite itself would let two processes
-  share the file; what must be exclusive is the scheduler's view of which
-  runs are in flight, since a second process would otherwise mark the
-  first one's runs failed at its own startup and both would plan and
-  dispatch against the same targets. The lock is `flock`-based like the
-  Runner's (`internal/fslock`), so a crashed owner leaves nothing stale.
-- **Recording follows the registry, not the scheduler's intent.** Each
-  transition is written against the status the registry is known to hold
-  (`expectedStatus`) and carries its audit event in the same transaction.
-  A failed `starting → running` write while the Runner is already running
-  is not fatal to the run: the outcome is later recorded against
-  `starting`, after one more attempt to record the start. Terminal writes
-  that fail transiently are retried with backoff for a bounded window;
-  `ErrConflict` is resolved by re-reading the run and retrying against its
-  actual status (a transition found already committed is not recorded
-  twice). A run whose outcome still cannot be recorded is closed by the
-  loop's sweep — every `starting`/`running` run the process is not
-  executing becomes `failed`/"outcome unknown" — which is the same
-  operation startup recovery performs, so a stranded run never holds a
-  target's exclusion slot until the next restart.
-- **Shutdown and recovery.** On shutdown the API stops, planning stops,
-  and in-flight runs are given `server.shutdownGraceSeconds` to finish
-  before they are cancelled. Runs still `starting` or `running` when a
-  process starts (a crash, a hard kill, an expired grace) are marked
-  `failed` with `Internal` "outcome unknown" and audited; they are never
-  resumed, because the Conductor cannot know whether the Runner finished.
-- **Policy changes apply at the next run.** Policies are not versioned;
-  an update must keep every existing target valid, and its values are
-  read when a target's next run is planned (`renewBeforeDays`) and
-  executed (`keyType`, `acmeBinding`, copied into the `JobSpec`
-  snapshot). The Runner reissues a current certificate whose key type
-  differs from the requested one, so a `keyType` change rotates a target
-  at its next run (manual or renewal). An `acmeBinding` change only
-  selects the CA for the next order; forcing reissue of current
-  certificates on a CA change is deferred until a phase needs it.
-- **What the Conductor knows about a certificate** is exactly the last
-  successful `Result` for the target: expiry, fingerprint and logical
-  store object name. It never opens the Store.
+- **SQLite，1 ファイル，1 コネクション，明示的なマイグレーション．** レジストリは
+  `registry.Registry` インターフェース（`internal/conductor/registry`）の背後にある
+  SQLite データベースである（`modernc.org/sqlite`，純 Go なのでバイナリは
+  `CGO_ENABLED=0` かつ distroless-static のまま）．SQL を知るのは
+  `internal/conductor/sqlite` だけである．`database/sql` は開くコネクションを
+  1 つに制限しているので，すべての文はプロセス内の順序で直列化され，ロック
+  昇格のデッドロックを考える必要がない．MVP の書き込み量にそれ以上は不要で，
+  複数レプリカの Conductor は非目標である．マイグレーションは番号付きの一覧で，
+  オープン時に適用され `schema_migrations` に記録される．バイナリより新しい
+  バージョンのデータベースはダウングレードせず拒否する．ファイルは `0600` で
+  作成され，そのパスにあるシンボリックリンクは拒否する．識別子は ULID で，
+  1 プロセス内では単調増加なので，「新しい順」の一覧も「最も古い queued な run」
+  の claim も id だけで順序付けできる．
+- **スキーマがモデルの不変条件を強制する．** target ごとにアクティブな run
+  （`queued`/`starting`/`running`）は最大 1 つ，という制約は部分ユニーク
+  インデックスなので，レジストリより上のコードが何をしようと，スケジューラの
+  tick，操作者の要求，再起動が競合して同じ target に 2 つ目の Runner を生み出す
+  ことはできない．監査イベントは更新も削除もできず，target・run・ポリシーは
+  削除できない．トリガーがそれらの文を中断する（[ADR 0008](0008-no-purge-in-mvp.md)
+  を参照）．どの列もシークレットを保持できない（[ADR 0005](0005-conductor-never-touches-secrets.md)
+  を参照）．
+- **監査は変更と同じトランザクションで行う．** レジストリの変更を伴うメソッドは
+  すべて，それを記述する `AuditEvent` を受け取り，同じトランザクションで追記する．
+  したがって監査ログがロールバックされた変更を記述したり，コミットされた変更を
+  取りこぼしたりすることは決してない．
+- **`Target.revision` による楽観的ロック．** すべての更新は，それが基づいた
+  リビジョンを指定し，一致しなければ `stale_revision` で失敗する．成功した更新は
+  すべてリビジョンを増やす．run は要求されたときのリビジョンを記録し，`JobSpec`
+  もそれを運ぶ．queued な run を開始する前に target を読み直し，target が無効化
+  されているかリビジョンが変わっていれば，開始する代わりに run をキャンセルする．
+  操作者の要求も，対象とするリビジョンを指定してよい．
+- **Run のライフサイクル．** `queued`（スケジューラまたは操作者が要求）→
+  `starting`（スケジューラが claim．target とポリシーを再確認し，`JobSpec` を
+  組み立てて検証）→ `running`（Runner の実行が存在する．そのプラットフォーム id
+  を記録）→ `succeeded` / `failed` / `cancelled`．終端状態と証明書に関する
+  すべてのフィールドは Runner の `Result` だけに由来する．Conductor が他の
+  何かから導出することは決してない．エラーコードが `Cancelled` の `Result` は
+  run を `cancelled` で終え，それ以外の失敗は `failed` で終える．ランチャーが
+  `Result` をまったく生成できない場合，run は Conductor 自身の要約（原因に応じて
+  `Internal`，`Timeout`，`Cancelled`）で失敗する．Runner が出力したものが run
+  レコードにコピーされることは決してない．
+- **期限到来の判断．** target は，一度も成功していないとき，リビジョンが最後に
+  成功した run の対象リビジョンと異なるとき，最後に成功した run が有効期限を
+  報告しなかったとき，または `expiresAt - renewBeforeDays` を過ぎたときに
+  期限到来となる．失敗またはキャンセルされた run の後，target は
+  `retryBackoffSeconds` の間保留され，連続失敗ごとに倍増して
+  `maxRetryBackoffSeconds` を上限とする．何かを発行する必要があるかどうかの
+  権威は Runner のままである（Runner が Store に問い合わせる）．期限到来の run
+  が証明書を最新と判断すれば，安価な `noop` となる．
+- **ローカルプロセスのランチャー．** Phase 2 が出荷する `Launcher` は 1 つで，
+  `JobSpec` を run ごとの非公開ディレクトリに書き，
+  `acme-runner reconcile --job … --result … --config …` を独自のプロセス
+  グループで，明示的にゼロから組み立てた環境で実行し，厳格なコントラクト
+  デコーダで `Result` を読み戻し，それが開始時の run と target を指している
+  ことを確認し，ディレクトリを削除する．キャンセル時には Runner に `SIGTERM`
+  を送り（通常は `Cancelled` を報告する），猶予期間の後に `SIGKILL` を送る．
+  これは開発向けの形態である．これを通じて DNS の資格情報が Runner に届く
+  唯一の方法は `passthroughEnv` であり，それは Conductor 自身の環境がその
+  資格情報を持っていることを意味する．
+- **レジストリを所有するプロセスは 1 つ．** `serve` は，データベースを開き，
+  何かを復旧し，ポートをバインドする前に `<database.path>.lock` の排他的
+  アドバイザリロックを取り，別のプロセスがそれを保持していれば状態に触れずに
+  終了する（終了コード 2）．SQLite 自体は 2 つのプロセスがファイルを共有する
+  ことを許すが，排他的でなければならないのは，どの run が進行中かという
+  スケジューラの見え方である．さもなければ 2 つ目のプロセスは自身の起動時に
+  1 つ目のプロセスの run を失敗とマークし，両方が同じ target に対して計画・
+  ディスパッチしてしまう．ロックは Runner のもの（`internal/fslock`）と同様に
+  `flock` ベースなので，所有者がクラッシュしても古いものは残らない．
+- **記録はスケジューラの意図ではなくレジストリに従う．** 各遷移はレジストリが
+  保持していると分かっている状態（`expectedStatus`）に対して書き込まれ，同じ
+  トランザクションで監査イベントを伴う．Runner がすでに動いている間に
+  `starting → running` の書き込みが失敗しても，run にとって致命的ではない．
+  開始の記録をもう一度試みた後，結果は後で `starting` に対して記録される．
+  一時的に失敗した終端の書き込みは，限られた時間の間バックオフ付きで再試行
+  される．`ErrConflict` は run を読み直してその実際の状態に対して再試行する
+  ことで解決する（すでにコミット済みと分かった遷移は二重には記録しない）．
+  それでも結果を記録できない run はループのスイープによって閉じられる．
+  すなわち，プロセスが実行していないすべての `starting`/`running` の run は
+  `failed`/「結果不明」となる．これは起動時の復旧が行うのと同じ操作なので，
+  取り残された run が次の再起動まで target の排他スロットを占有することは
+  決してない．
+- **シャットダウンと復旧．** シャットダウン時には API が停止し，計画が停止し，
+  進行中の run にはキャンセルされる前に完了するための
+  `server.shutdownGraceSeconds` が与えられる．プロセス起動時（クラッシュ，
+  強制終了，猶予の超過）に依然として `starting` または `running` の run は
+  `Internal` の「結果不明」で `failed` とマークされ，監査される．Conductor は
+  Runner が完了したかどうかを知り得ないので，それらが再開されることは
+  決してない．
+- **ポリシーの変更は次の run で適用される．** ポリシーはバージョン管理されない．
+  更新は既存のすべての target を有効なままに保たなければならず，その値は
+  target の次の run が計画されるとき（`renewBeforeDays`）と実行されるとき
+  （`keyType`，`acmeBinding`．`JobSpec` のスナップショットにコピーされる）に
+  読まれる．Runner は，鍵種別が要求されたものと異なる最新の証明書を再発行する
+  ので，`keyType` の変更は次の run（手動または更新）で target をローテーション
+  する．`acmeBinding` の変更は次のオーダーの CA を選ぶだけである．CA 変更時に
+  最新の証明書の再発行を強制することは，必要とする Phase が来るまで先送りする．
+- **Conductor が証明書について知ること** は，その target の最後に成功した
+  `Result` そのものである．すなわち有効期限，フィンガープリント，論理的な store
+  オブジェクト名．Store を開くことは決してない．
 
-## Alternatives considered
+## 検討した代替案
 
-- **PostgreSQL or another server database.** Explicitly out of scope
-  (docs/architecture.md, non-goals); SQLite keeps the MVP a single
-  process with a single file to back up.
-- **An in-process mutex for per-target exclusion instead of a schema
-  constraint.** Rejected: it would hold only for one process and would
-  not survive a restart with runs left in the database; the partial unique
-  index holds regardless of which code path creates a run.
-- **Resuming in-flight runs after a restart** by re-reading a `Result`
-  file the Runner may have written. Rejected for the MVP: the Runner may
-  still be running when the Conductor restarts, and marking it either way
-  without knowing is a guess. Failing closed with an explicit "outcome
-  unknown" and letting the next due check schedule a fresh run keeps the
-  record honest; the on-disk stores tolerate the overlap (Phase 1 locks).
-- **Letting the Conductor read the Store to learn expiry.** Rejected by
-  [ADR 0005](0005-conductor-never-touches-secrets.md): the Conductor has
-  no Store credential.
+- **PostgreSQL などのサーバー型データベース．** 明示的に対象外である
+  （docs/architecture.md の非目標）．SQLite なら MVP は単一プロセス・単一
+  ファイルのバックアップで済む．
+- **スキーマ制約の代わりに，target ごとの排他をプロセス内ミューテックスで行う．**
+  却下．1 プロセスにしか効かず，データベースに run が残ったままの再起動を
+  乗り越えられない．部分ユニークインデックスなら，どのコードパスが run を
+  作ろうと成立する．
+- **再起動後に進行中だった run を再開する．** Runner が書いたかもしれない
+  `Result` ファイルを読み直す方法．MVP では却下．Conductor の再起動時に Runner
+  はまだ動いているかもしれず，知らないままどちらかにマークするのは推測である．
+  明示的な「結果不明」でフェイルクローズし，次の期限到来判定に新しい run を
+  スケジュールさせる方が記録は正直なままである．ディスク上の store は重複を
+  許容する（Phase 1 のロック）．
+- **有効期限を知るために Conductor に Store を読ませる．**
+  [ADR 0005](0005-conductor-never-touches-secrets.md) により却下．Conductor は
+  Store の資格情報を持たない．
 
-## Consequences
+## 結果
 
-- Double issuance for one target from within one Conductor is prevented
-  by construction. What remains (threat model T7) is a Runner orphaned by
-  a hard kill of the Conductor still finishing while a later run for the
-  same target starts; the Store and account state tolerate that, the
-  duplicate ACME order does not go away.
-- The database file is the whole state of the control plane: backup and
-  restore are a file copy taken while the process is stopped (or a
-  `sqlite3 .backup`), and rollback of a Phase 2 deployment is "stop,
-  restore the file, start the previous binary" — a newer schema version is
-  refused by an older binary, never silently downgraded.
-- Every future schema change is a new numbered migration; shipped entries
-  are never edited.
+- 1 つの Conductor 内から 1 つの target を二重発行することは構造上防がれる．
+  残るのは（脅威モデル T7）Conductor の強制終了で孤児となった Runner がまだ
+  処理を終えつつある間に，同じ target の後続の run が開始する場合である．Store
+  とアカウント状態はそれを許容するが，重複した ACME オーダーはなくならない．
+- データベースファイルがコントロールプレーンの状態のすべてである．バックアップ
+  と復元はプロセス停止中のファイルコピー（または `sqlite3 .backup`）であり，
+  Phase 2 デプロイのロールバックは「停止し，ファイルを復元し，前のバイナリを
+  起動する」である．新しいスキーマバージョンは古いバイナリに拒否され，黙って
+  ダウングレードされることは決してない．
+- 今後のスキーマ変更はすべて新しい番号付きマイグレーションとする．出荷済みの
+  エントリは決して編集しない．
