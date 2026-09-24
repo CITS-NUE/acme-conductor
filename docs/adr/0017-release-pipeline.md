@@ -1,96 +1,94 @@
-# 0017: Release pipeline — GHCR images with SBOM and provenance, digest-pinned bases
+# 0017: リリースパイプライン — SBOM と provenance 付きの GHCR イメージとダイジェスト固定のベース
 
-- Status: Accepted
-- Date: 2026-09-23
+- ステータス: 採択
+- 日付: 2026-09-23
 
-## Context
+## 背景
 
-Until Phase 5 nothing published an image: CI built both Dockerfiles and
-smoke-tested them, and a deployer built and pushed images by hand to a
-registry of their choice. The threat model's supply-chain entry (T8) left
-three things open for this phase: releases with an SBOM and provenance,
-digest pinning of base images, and a canonical registry that
-`deploy/azure` can pin digests from. Any release mechanism also has to
-keep the property that a published image is exactly what CI verified.
+Phase 5 までは何もイメージを公開していなかった．CI は両方の Dockerfile を
+ビルドしてスモークテストし，デプロイする者はイメージを手作業でビルドして
+各自の選んだレジストリに push していた．脅威モデルのサプライチェーンの項目
+（T8）は，この Phase に向けて 3 つのことを未解決にしていた．SBOM と provenance
+付きのリリース，ベースイメージのダイジェスト固定，そして `deploy/azure` が
+ダイジェストを固定する元にできる正規のレジストリである．どのリリース機構も，
+公開されたイメージが CI の検証したものと厳密に同一であるという性質を
+保たなければならない．
 
-## Decision
+## 決定
 
-- **A version tag on `main` is a release, and CI gates it.** `release.yml`
-  runs on a `v*.*.*` tag, first as the CI workflow itself
-  (`workflow_call`) and, in parallel, as a check that the tagged commit
-  is in the history of `origin/main` (`git merge-base --is-ancestor`,
-  on a full clone); a tag on any other commit publishes nothing, so a
-  feature branch cannot be released by tagging it, whatever the
-  repository's tag rules say. Only then does it build and push `ghcr.io/cits-nue/acme-conductor` and
-  `ghcr.io/cits-nue/acme-runner` for `linux/amd64` and `linux/arm64`,
-  tagged `<major>.<minor>.<patch>`, `<major>.<minor>` and, for a
-  non-prerelease, `latest`. The published image is smoke-tested by
-  digest (`--version` must name the tag) and the digest is written to
-  the run's summary, which is where a deployer copies it from.
-- **Two attestations per image.** BuildKit attaches an SPDX SBOM and SLSA
-  provenance (`mode=max`, including the build definition) to the image
-  index in the registry; GitHub's artifact attestation adds a second,
-  GitHub-signed provenance statement, pushed to the registry under the
-  image digest and verifiable with `gh attestation verify
-  oci://<image>:<tag> --owner CITS-NUE`. The registry copy is what a
-  cluster-side policy can read; the GitHub statement is what an operator
-  can verify from a workstation with nothing but the CLI.
-- **Least permissions, no long-lived secret.** The job's token holds
-  `packages: write`, `id-token: write` (for the signed attestation) and
-  `attestations: write`; the CI workflow it calls holds `contents: read`.
-  There is no registry credential to rotate.
-- **Base images are pinned by digest in the Dockerfiles**, tag and digest
-  side by side (`golang:1.25-bookworm@sha256:…`,
-  `gcr.io/distroless/static-debian12:nonroot@sha256:…`), and Dependabot
-  proposes updates to Docker bases, Go modules and GitHub Actions as
-  pull requests that CI builds and tests. A mutable tag cannot silently
-  change what a release is built from.
-- **Actions stay pinned by major version tag for now.** Pinning them by
-  commit digest is the stronger form; it was not done in this phase
-  because the digests were not verified against the upstream
-  repositories from where this change was made, and an unverified digest
-  is worse than a tag. Dependabot keeps the tags current; switching to
-  digests is a one-line-per-action follow-up that the same Dependabot
-  configuration then maintains.
+- **`main` 上のバージョンタグがリリースであり，CI がそれを門番する．**
+  `release.yml` は `v*.*.*` のタグで動く．まず CI ワークフローそのもの
+  （`workflow_call`）として，そして並行して，タグの付いたコミットが
+  `origin/main` の履歴に含まれているかの検査（フルクローンでの
+  `git merge-base --is-ancestor`）として動く．それ以外のコミットに付いたタグは
+  何も公開しないので，リポジトリのタグ規則がどうであれ，フィーチャーブランチに
+  タグを付けてもリリースはできない．その後に初めて `ghcr.io/cits-nue/acme-conductor` と
+  `ghcr.io/cits-nue/acme-runner` を `linux/amd64` と `linux/arm64` 向けに
+  ビルドして push し，`<major>.<minor>.<patch>`，`<major>.<minor>`，そして
+  プレリリースでなければ `latest` のタグを付ける．公開されたイメージは
+  ダイジェストでスモークテストされ（`--version` がタグを名乗らなければならない），
+  ダイジェストは実行のサマリーに書き出される．デプロイする者はそこから
+  コピーする．
+- **イメージごとに 2 つの証明（attestation）．** BuildKit は SPDX の SBOM と
+  SLSA provenance（`mode=max`，ビルド定義を含む）をレジストリ内のイメージ
+  インデックスに添付する．GitHub のアーティファクト証明は，GitHub が署名した
+  第 2 の provenance ステートメントを加え，イメージのダイジェストの下で
+  レジストリに push する．これは `gh attestation verify
+  oci://<image>:<tag> --owner CITS-NUE` で検証できる．レジストリ側の複製は
+  クラスタ側のポリシーが読めるものであり，GitHub のステートメントは操作者が
+  CLI だけを使ってワークステーションから検証できるものである．
+- **最小の権限，長期有効なシークレットなし．** ジョブのトークンは
+  `packages: write`，`id-token: write`（署名付き証明のため），
+  `attestations: write` を持ち，それが呼ぶ CI ワークフローは `contents: read` を
+  持つ．ローテーションすべきレジストリの資格情報は存在しない．
+- **ベースイメージは Dockerfile 内でダイジェスト固定する．** タグとダイジェストを
+  並べて書き（`golang:1.25-bookworm@sha256:…`，
+  `gcr.io/distroless/static-debian12:nonroot@sha256:…`），Dependabot が
+  Docker のベース，Go モジュール，GitHub Actions の更新を PR として提案し，
+  CI がそれをビルドしテストする．可変なタグがリリースのビルド元を黙って
+  変えることはできない．
+- **Actions は当面メジャーバージョンのタグで固定したままにする．** コミット
+  ダイジェストで固定するほうが強い形だが，この Phase では行わなかった．
+  この変更を行った場所からは上流リポジトリに対してダイジェストを検証して
+  おらず，検証されていないダイジェストはタグより悪いからである．Dependabot が
+  タグを最新に保つ．ダイジェストへの切り替えは Action ごとに 1 行の後続作業で
+  あり，その後は同じ Dependabot の設定が維持する．
 
-## Consequences
+## 結果
 
-- `deploy/azure/main.bicepparam` pins image digests from a release, and
-  the deploy README says how to verify a release before pinning it.
-- A release is reproducible from its provenance: the workflow, the
-  commit and the Dockerfile inputs are in the attestation; the SBOM lists
-  what is in the image (both Go binaries' modules, the pinned `lego`
-  binary, the distroless base).
-- The `main` check is enforced in the workflow, where the invariant is
-  reviewed with the code; a repository ruleset restricting who may
-  create `v*` tags is a second layer an administrator can add, not a
-  substitute. The check is `scripts/release-guard.sh`, and the
-  dispatch-only workflow `release-guard-check.yml` runs the same script
-  against any ref with an expected outcome, so both the positive case
-  (a `main` commit passes) and the negative case (a branch commit is
-  refused) can be verified on demand without a tag and without a
-  publish. A version tag on a branch is never the way to test it: that
-  runs the real release workflow.
-- The pipeline was verified by the first release, `v0.5.0`
-  (2026-09-24, [issue #19](https://github.com/CITS-NUE/acme-conductor/issues/19)).
-  Observed as designed: the guard passed for a tag on `main` and, in
-  the dispatch-only check, refused a branch commit; both images were
-  published for `linux/amd64` and `linux/arm64` with an SPDX SBOM and
-  SLSA provenance attestation manifest per platform in the index; the
-  GitHub attestation was created, recorded in Rekor, pushed to the
-  registry under a `sha256-<digest>` tag, and verified with
-  `gh attestation verify`; the images ran by digest and reported the
-  tag. Observed and not designed: (1) GitHub created both packages
-  **private** on the first push, whatever the repository's visibility,
-  so anonymous pulls and `gh attestation verify` against the registry
-  failed until an organization owner set them public, a one-time step
-  per package that the workflow cannot perform; (2) the first tag,
-  pushed before a date-dependent test fix reached `main`, failed the
-  CI gate and published nothing, exactly the property the gate exists
-  for, and the tag was deleted and re-created on the fixed commit.
-- Rollback of a release is deleting or re-tagging in GHCR by hand; a
-  digest that was published stays valid and verifiable, so a deployer
-  pinned to it is unaffected either way. A version tag is re-pointed
-  only while nothing has been published under it (the image jobs were
-  skipped); once an image carries the version, the next version is the
-  only way forward.
+- `deploy/azure/main.bicepparam` はリリースからイメージのダイジェストを固定し，
+  デプロイの README は固定する前にリリースを検証する方法を述べる．
+- リリースはその provenance から再現できる．ワークフロー，コミット，Dockerfile の
+  入力が証明に含まれ，SBOM はイメージの中身（両方の Go バイナリのモジュール，
+  固定された `lego` バイナリ，distroless のベース）を列挙する．
+- `main` の検査はワークフロー内で強制され，そこでは不変条件がコードとともに
+  レビューされる．誰が `v*` タグを作れるかを制限するリポジトリのルールセットは
+  管理者が加えられる第 2 の層であって，代替ではない．検査は
+  `scripts/release-guard.sh` であり，dispatch 専用のワークフロー
+  `release-guard-check.yml` が同じスクリプトを任意の ref に対して期待される
+  結果付きで実行するので，肯定のケース（`main` のコミットは通る）も否定の
+  ケース（ブランチのコミットは拒否される）も，タグなしで，公開なしで，
+  要求に応じて検証できる．ブランチにバージョンタグを付けるのは決してテストの
+  方法ではない．それは本物のリリースワークフローを動かす．
+- パイプラインは最初のリリース `v0.5.0`（2026-09-24，
+  [issue #19](https://github.com/CITS-NUE/acme-conductor/issues/19)）で検証した．
+  設計どおりに観測されたこと: ガードは `main` 上のタグを通し，dispatch 専用の
+  検査ではブランチのコミットを拒否した．両方のイメージが `linux/amd64` と
+  `linux/arm64` 向けに公開され，インデックスにはプラットフォームごとに SPDX
+  SBOM と SLSA provenance の証明マニフェストがあった．GitHub の証明は作成され，
+  Rekor に記録され，`sha256-<digest>` タグの下でレジストリに push され，
+  `gh attestation verify` で検証された．イメージはダイジェストで実行され
+  タグを報告した．観測されたが設計にはなかったこと: (1) GitHub はリポジトリの
+  可視性がどうであれ，最初の push で両方のパッケージを **非公開** として作成
+  したので，組織のオーナーがそれらを公開に設定するまで匿名の pull と
+  レジストリに対する `gh attestation verify` は失敗した．これはパッケージごとに
+  1 回だけ必要な手順で，ワークフローには実行できない．(2) 日付に依存する
+  テストの修正が `main` に届く前に push された最初のタグは CI の門で失敗し，
+  何も公開しなかった．まさにこの門が存在する理由である性質であり，タグは削除
+  して修正済みのコミットに作り直した．
+- リリースのロールバックは GHCR での手作業による削除またはタグの付け替えで
+  ある．公開されたダイジェストは有効かつ検証可能なままなので，それに固定した
+  デプロイはどちらにしても影響を受けない．バージョンタグを付け替えるのは，
+  その下に何も公開されていない間（イメージのジョブがスキップされた場合）だけで
+  ある．イメージがそのバージョンを持ってしまえば，次のバージョンが唯一の
+  進む道である．

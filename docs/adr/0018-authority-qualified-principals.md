@@ -1,63 +1,58 @@
-# 0018: Audit principals are qualified by their authority
+# 0018: 監査プリンシパルは権威で修飾する
 
-- Status: Accepted
-- Date: 2026-09-24
+- ステータス: 採択
+- 日付: 2026-09-24
 
-## Context
+## 背景
 
-Phase 5 ([ADR 0016](0016-oidc-bearer-auth-and-gui.md)) records a stable
-claim of the caller's token as the audit actor and as `requestedBy`:
-`sub` by default, `oid` for Microsoft Entra ID. That value is stable, but
-it is unique only within the provider that asserted it. Two issuers can
-each assert the same subject string; an Entra ID `oid` is scoped to its
-tenant; `sub` is often pairwise per client. One Conductor trusts one
-issuer at a time, so this is not an authorization problem today. It is a
-record-keeping problem the moment a deployment changes tenant or
-provider, restores an old registry under a new configuration, or
-compares records from two deployments: the actor string alone no longer
-says who acted. `localhost-dev` and the scheduler write actors too, and
-they are not OIDC subjects at all.
+Phase 5（[ADR 0016](0016-oidc-bearer-auth-and-gui.md)）は呼び出し元の
+トークンの安定したクレームを監査アクターおよび `requestedBy` として記録する．
+既定では `sub`，Microsoft Entra ID では `oid` である．この値は安定しているが，
+それを主張したプロバイダの中でしか一意でない．2 つの issuer がそれぞれ同じ
+subject 文字列を主張しうる．Entra ID の `oid` はテナントに閉じている．`sub` は
+しばしばクライアントごとにペアワイズである．1 つの Conductor は一度に 1 つの
+issuer を信頼するので，今日これは認可の問題ではない．デプロイがテナントや
+プロバイダを変えたとき，古いレジストリを新しい設定の下で復元したとき，2 つの
+デプロイの記録を比較したときに，記録管理の問題になる．アクター文字列だけでは
+誰が操作したかを言い表せなくなる．`localhost-dev` とスケジューラもアクターを
+書くが，それらはそもそも OIDC の subject ではない．
 
-## Decision
+## 決定
 
-- **A principal is `(authority, name)`, and both are recorded.**
-  `api.Principal` carries `Authority` next to `Name`; every audit event
-  stores `actorAuthority` next to `actor`, every run
-  `requestedByAuthority` next to `requestedBy`. The authority is the
-  namespace within which the name is unique: the OIDC issuer URL
-  (`server.auth.oidc.issuer`, which for Entra ID contains the tenant),
-  the fixed string `localhost-dev` for that mode, and the fixed string
-  `scheduler` for automatic runs. The term is *authority* rather than
-  *issuer* because two of the three are not issuers; it is the thing
-  that vouches for the name.
-- **Structured, not concatenated.** The authority is its own column and
-  its own JSON field, not a prefix folded into the actor string. A
-  concatenation would need an escaping rule, would break every existing
-  consumer of `actor`, and would make "same subject, different
-  authority" a string-parsing question.
-- **Additive API.** `actorAuthority` and `requestedByAuthority` are new
-  fields; `actor` and `requestedBy` keep their meaning and shape. The
-  GUI shows the authority next to the actor in the audit log and on the
-  run page.
-- **Legacy rows stay empty.** Schema version 2 adds the two columns with
-  default `''`. Rows written under version 1 are not backfilled: the
-  audit log is append-only by trigger, and inventing an authority for a
-  row that was recorded without one would be a fabrication. `''` means
-  "recorded before the Conductor stored the authority"; an operator who
-  needs to attribute such rows knows which issuer the deployment used
-  then. New rows always carry the authority.
-- **Rollback is the schema rule that already exists.** A binary older
-  than schema version 2 refuses to open a version-2 database; restore
-  the backup taken before the upgrade, as `docs/conductor.md` says.
+- **プリンシパルは `(authority, name)` であり，両方を記録する．**
+  `api.Principal` は `Name` の隣に `Authority` を持つ．すべての監査イベントは
+  `actor` の隣に `actorAuthority` を，すべての run は `requestedBy` の隣に
+  `requestedByAuthority` を保存する．権威（authority）とは，その中で名前が
+  一意となる名前空間である．OIDC の issuer URL（`server.auth.oidc.issuer`，
+  Entra ID ではテナントを含む），そのモードでは固定文字列 `localhost-dev`，
+  自動実行では固定文字列 `scheduler` である．用語を *issuer* ではなく
+  *authority*（権威）としたのは，3 つのうち 2 つが issuer ではないからで
+  ある．それは名前を保証するものである．
+- **連結ではなく構造化する．** 権威は独自の列であり独自の JSON フィールドで
+  あって，アクター文字列に折り込まれた接頭辞ではない．連結にはエスケープ規則が
+  必要になり，`actor` の既存の消費者をすべて壊し，「同じ subject，異なる
+  権威」を文字列解析の問題にしてしまう．
+- **追加のみの API．** `actorAuthority` と `requestedByAuthority` は新しい
+  フィールドである．`actor` と `requestedBy` は意味も形も保つ．GUI は監査
+  ログと run のページでアクターの隣に権威を表示する．
+- **古い行は空のままにする．** スキーマバージョン 2 は既定値 `''` でこの
+  2 つの列を追加する．バージョン 1 の下で書かれた行は埋め戻さない．監査ログは
+  トリガーにより追記専用であり，権威なしで記録された行に権威をでっち上げる
+  のは捏造になる．`''` は「Conductor が権威を保存するようになる前に記録
+  された」ことを意味する．そのような行の帰属を必要とする操作者は，当時
+  デプロイがどの issuer を使っていたかを知っている．新しい行は常に権威を持つ．
+- **ロールバックはすでに存在するスキーマ規則である．** スキーマバージョン 2 より
+  古いバイナリはバージョン 2 のデータベースを開くことを拒否する．
+  `docs/conductor.md` にあるとおり，アップグレード前に取ったバックアップを
+  復元する．
 
-## Consequences
+## 結果
 
-- Audit and run attribution is self-contained: a record names its
-  principal unambiguously after `server.auth.oidc.issuer` changes, and
-  two deployments' records can be compared. Tests cover two issuers
-  asserting the same subject and show the recorded actors differ in the
-  authority.
-- The threat model's T14 attribution argument now rests on the pair.
-- Filtering the audit log by authority is not offered; there is one
-  authority per deployment at a time, and the column exists to keep old
-  records honest, not to partition current ones.
+- 監査と run の帰属は自己完結する．`server.auth.oidc.issuer` が変わった後も
+  記録はそのプリンシパルを曖昧さなく名指しし，2 つのデプロイの記録を比較
+  できる．テストは 2 つの issuer が同じ subject を主張する場合を扱い，記録
+  されたアクターが権威で異なることを示す．
+- 脅威モデルの T14 の帰属の議論は今ではこの対に基づく．
+- 監査ログの権威によるフィルタは提供しない．一度に存在する権威はデプロイ
+  ごとに 1 つであり，この列は古い記録を正直に保つためにあるのであって，
+  現在の記録を分割するためではない．
