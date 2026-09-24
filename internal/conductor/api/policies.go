@@ -132,8 +132,9 @@ func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
-	ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditPolicyCreated, Detail: "policy created: " + policyDetail(&p)}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditPolicyCreated, Detail: "policy created: " + policyDetail(&p)}
 	if err := s.reg.CreatePolicy(r.Context(), &p, ev); err != nil {
 		s.fail(w, r, err)
 		return
@@ -198,8 +199,9 @@ func (s *Server) handleUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, &apiError{status: http.StatusConflict, code: "conflict", message: "policy would no longer cover existing targets: " + strings.Join(offending, ", ")})
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
-	ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditPolicyUpdated, Detail: "policy updated: " + policyDetail(p)}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditPolicyUpdated, Detail: "policy updated: " + policyDetail(p)}
 	if err := s.reg.UpdatePolicy(r.Context(), p, ev); err != nil {
 		s.fail(w, r, err)
 		return

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -442,5 +443,76 @@ func TestAuditIsAppendOnlyAndNothingIsDeletable(t *testing.T) {
 	page, err := db.ListAudit(ctx, registry.ListAuditOptions{Before: got[0].ID, Limit: 1})
 	if err != nil || len(page) != 1 || page[0].ID >= got[0].ID {
 		t.Fatalf("page = %v, %v", page, err)
+	}
+}
+
+// TestMigrationV2LeavesLegacyRowsUnqualified opens a database written at
+// schema version 1, checks that Open migrates it to the current version,
+// that rows recorded before the authority existed read back with an
+// empty authority (they are not rewritten: the audit log is append-only
+// and ” is the documented meaning), and that rows written afterwards
+// carry theirs.
+func TestMigrationV2LeavesLegacyRowsUnqualified(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		migrations[0],
+		`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-09-01T00:00:00Z')`,
+		`INSERT INTO policies (id, allowed_dns_suffixes, allow_wildcard, acme_binding, renew_before_days, key_type, max_sans, enabled, created_at, updated_at)
+		   VALUES ('01JPOLICY0000000000000000A', '["example.ac.jp"]', 0, 'fake-ca', 30, 'ec256', 1, 1, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')`,
+		`INSERT INTO targets (id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision)
+		   VALUES ('01JTARGET0000000000000000A', 'wiki.example.ac.jp', 1, 'web', '01JPOLICY0000000000000000A', 'local', 'fake-dns', 'filesystem-dev', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 1)`,
+		`INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_at)
+		   VALUES ('01JRUN000000000000000000A', '01JTARGET0000000000000000A', 1, 'succeeded', 'localhost-dev', '2026-09-01T00:00:00Z')`,
+		`INSERT INTO audit_events (id, time, actor, action, target_id, run_id, policy_id, detail)
+		   VALUES ('01JEVENT00000000000000000A', '2026-09-01T00:00:00Z', 'localhost-dev', 'run.requested', '01JTARGET0000000000000000A', '01JRUN000000000000000000A', '', 'run requested')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("v1 setup: %v\n%s", err, stmt)
+		}
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open v1 database: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if v, err := db.Version(ctx); err != nil || v != SchemaVersion || v < 2 {
+		t.Fatalf("version = %d, %v; want %d", v, err, SchemaVersion)
+	}
+	run, err := db.GetRun(ctx, "01JRUN000000000000000000A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.RequestedBy != "localhost-dev" || run.RequestedByAuthority != "" {
+		t.Fatalf("legacy run = %+v", run)
+	}
+	events, err := db.ListAudit(ctx, registry.ListAuditOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Actor != "localhost-dev" || events[0].ActorAuthority != "" {
+		t.Fatalf("legacy audit = %+v", events)
+	}
+
+	// New rows carry the authority.
+	newRun := &registry.Run{TargetID: "01JTARGET0000000000000000A", TargetRevision: 1, RequestedBy: "3333", RequestedByAuthority: "https://idp.example/v2.0"}
+	ev := &registry.AuditEvent{Actor: "3333", ActorAuthority: "https://idp.example/v2.0", Action: registry.AuditRunRequested, Detail: "run requested"}
+	if err := db.CreateRun(ctx, newRun, ev); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetRun(ctx, newRun.ID)
+	if err != nil || got.RequestedByAuthority != "https://idp.example/v2.0" {
+		t.Fatalf("new run = %+v, %v", got, err)
+	}
+	events, err = db.ListAudit(ctx, registry.ListAuditOptions{RunID: newRun.ID})
+	if err != nil || len(events) != 1 || events[0].ActorAuthority != "https://idp.example/v2.0" {
+		t.Fatalf("new audit = %+v, %v", events, err)
 	}
 }

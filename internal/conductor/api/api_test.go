@@ -326,7 +326,7 @@ func TestPolicyEndpoints(t *testing.T) {
 	if len(events) < 3 {
 		t.Fatalf("audit events = %d", len(events))
 	}
-	if events[len(events)-1]["action"] != "policy.created" || events[len(events)-1]["actor"] != LocalhostDevPrincipal {
+	if events[len(events)-1]["action"] != "policy.created" || events[len(events)-1]["actor"] != LocalhostDevPrincipal || events[len(events)-1]["actorAuthority"] != LocalhostDevAuthority {
 		t.Fatalf("oldest event = %v", events[len(events)-1])
 	}
 }
@@ -455,7 +455,7 @@ func TestRunEndpoints(t *testing.T) {
 	id := e.createTarget(pid, "wiki.example.ac.jp")
 	e.sched.wakes = 0
 	r := e.do("POST", Prefix+"/targets/"+id+"/runs", nil, nil)
-	if r.status != 202 || r.str("status") != "queued" || r.str("requestedBy") != LocalhostDevPrincipal || r.body["targetRevision"] != float64(1) || r.header.Get("Location") == "" {
+	if r.status != 202 || r.str("status") != "queued" || r.str("requestedBy") != LocalhostDevPrincipal || r.str("requestedByAuthority") != LocalhostDevAuthority || r.body["targetRevision"] != float64(1) || r.header.Get("Location") == "" {
 		t.Fatalf("request run: %d %s", r.status, r.raw)
 	}
 	runID := r.str("id")
@@ -592,7 +592,7 @@ func (bearerFake) Challenge() string { return `Bearer realm="test"` }
 func (bearerFake) Authenticate(r *http.Request) (Principal, error) {
 	switch r.Header.Get("Authorization") {
 	case "Bearer admin":
-		return Principal{Name: "alice@example.ac.jp", Role: RoleAdmin}, nil
+		return Principal{Name: "alice@example.ac.jp", Authority: "https://idp.example/v2.0", Role: RoleAdmin}, nil
 	case "Bearer viewer":
 		return Principal{Name: "bob@example.ac.jp", Role: RoleViewer}, nil
 	case "Bearer norole":
@@ -671,12 +671,12 @@ func TestRolesAndBearerChallenge(t *testing.T) {
 	}
 	defer res.Body.Close()
 	var audit struct {
-		Items []struct{ Actor, Action string }
+		Items []struct{ Actor, ActorAuthority, Action string }
 	}
 	if err := json.NewDecoder(res.Body).Decode(&audit); err != nil {
 		t.Fatal(err)
 	}
-	if len(audit.Items) != 1 || audit.Items[0].Actor != "alice@example.ac.jp" || audit.Items[0].Action != "policy.created" {
+	if len(audit.Items) != 1 || audit.Items[0].Actor != "alice@example.ac.jp" || audit.Items[0].ActorAuthority != "https://idp.example/v2.0" || audit.Items[0].Action != "policy.created" {
 		t.Fatalf("audit: %+v", audit.Items)
 	}
 	// Health stays unauthenticated.

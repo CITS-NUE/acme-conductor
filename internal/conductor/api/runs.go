@@ -11,26 +11,30 @@ import (
 
 // RunResource is the response representation of a run.
 type RunResource struct {
-	ID                  string                `json:"id"`
-	TargetID            string                `json:"targetId"`
-	TargetRevision      int64                 `json:"targetRevision"`
-	Status              registry.RunStatus    `json:"status"`
-	RequestedBy         string                `json:"requestedBy"`
-	RequestedAt         time.Time             `json:"requestedAt"`
-	StartedAt           *time.Time            `json:"startedAt"`
-	FinishedAt          *time.Time            `json:"finishedAt"`
-	Action              v1alpha1.ResultAction `json:"action,omitempty"`
-	ExpiresAt           *time.Time            `json:"expiresAt,omitempty"`
-	FingerprintSha256   string                `json:"fingerprintSha256,omitempty"`
-	StoreObjectRef      string                `json:"storeObjectRef,omitempty"`
-	Error               *v1alpha1.ResultError `json:"error"`
-	ExternalExecutionID string                `json:"externalExecutionId,omitempty"`
+	ID             string             `json:"id"`
+	TargetID       string             `json:"targetId"`
+	TargetRevision int64              `json:"targetRevision"`
+	Status         registry.RunStatus `json:"status"`
+	RequestedBy    string             `json:"requestedBy"`
+	// RequestedByAuthority is the namespace RequestedBy is unique in: an
+	// OIDC issuer URL, "localhost-dev" or "scheduler"; "" on runs
+	// recorded before the Conductor stored it.
+	RequestedByAuthority string                `json:"requestedByAuthority"`
+	RequestedAt          time.Time             `json:"requestedAt"`
+	StartedAt            *time.Time            `json:"startedAt"`
+	FinishedAt           *time.Time            `json:"finishedAt"`
+	Action               v1alpha1.ResultAction `json:"action,omitempty"`
+	ExpiresAt            *time.Time            `json:"expiresAt,omitempty"`
+	FingerprintSha256    string                `json:"fingerprintSha256,omitempty"`
+	StoreObjectRef       string                `json:"storeObjectRef,omitempty"`
+	Error                *v1alpha1.ResultError `json:"error"`
+	ExternalExecutionID  string                `json:"externalExecutionId,omitempty"`
 }
 
 func runResource(r *registry.Run) RunResource {
 	res := RunResource{
 		ID: r.ID, TargetID: r.TargetID, TargetRevision: r.TargetRevision, Status: r.Status,
-		RequestedBy: r.RequestedBy, RequestedAt: r.RequestedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
+		RequestedBy: r.RequestedBy, RequestedByAuthority: r.RequestedByAuthority, RequestedAt: r.RequestedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 		Action: r.Action, ExpiresAt: r.ExpiresAt, FingerprintSha256: r.FingerprintSha256, StoreObjectRef: r.StoreObjectRef,
 		ExternalExecutionID: r.ExternalExecutionID,
 	}
@@ -137,9 +141,10 @@ func (s *Server) handleRequestRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, &apiError{status: http.StatusConflict, code: "target_disabled", message: "target is disabled"})
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
-	run := &registry.Run{TargetID: t.ID, TargetRevision: t.Revision, RequestedBy: actor}
-	ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditRunRequested, Detail: "run requested by " + actor + " for fqdn=" + t.FQDN}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	run := &registry.Run{TargetID: t.ID, TargetRevision: t.Revision, RequestedBy: actor, RequestedByAuthority: caller.Authority}
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditRunRequested, Detail: "run requested by " + actor + " for fqdn=" + t.FQDN}
 	if err := s.reg.CreateRun(r.Context(), run, ev); err != nil {
 		if active := s.activeRun(r, t.ID); active != nil {
 			writeError(w, http.StatusConflict, "run_active", "a run is already active for this target", map[string]string{"activeRunId": active.ID, "status": string(active.Status)})
@@ -176,7 +181,8 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	actor := PrincipalFrom(r.Context()).Name
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
 	switch run.Status {
 	case registry.RunQueued:
 		now := s.now().UTC()
@@ -185,7 +191,7 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		run.Action = v1alpha1.ActionFailed
 		run.ErrorCode = v1alpha1.ErrorCodeCancelled
 		run.ErrorSummary = "run cancelled by " + actor + " while queued"
-		ev := &registry.AuditEvent{Actor: actor, Action: registry.AuditRunCancelled, Detail: "run cancelled: " + run.ErrorSummary}
+		ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditRunCancelled, Detail: "run cancelled: " + run.ErrorSummary}
 		if err := s.reg.UpdateRun(r.Context(), run, registry.RunQueued, ev); err != nil {
 			s.fail(w, r, err)
 			return
@@ -206,14 +212,18 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 
 // AuditResource is the response representation of an audit event.
 type AuditResource struct {
-	ID       string               `json:"id"`
-	Time     time.Time            `json:"time"`
-	Actor    string               `json:"actor"`
-	Action   registry.AuditAction `json:"action"`
-	TargetID string               `json:"targetId,omitempty"`
-	RunID    string               `json:"runId,omitempty"`
-	PolicyID string               `json:"policyId,omitempty"`
-	Detail   string               `json:"detail"`
+	ID    string    `json:"id"`
+	Time  time.Time `json:"time"`
+	Actor string    `json:"actor"`
+	// ActorAuthority is the namespace Actor is unique in: an OIDC issuer
+	// URL, "localhost-dev" or "scheduler"; "" on events recorded before
+	// the Conductor stored it.
+	ActorAuthority string               `json:"actorAuthority"`
+	Action         registry.AuditAction `json:"action"`
+	TargetID       string               `json:"targetId,omitempty"`
+	RunID          string               `json:"runId,omitempty"`
+	PolicyID       string               `json:"policyId,omitempty"`
+	Detail         string               `json:"detail"`
 }
 
 func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +248,7 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]AuditResource, 0, len(list))
 	for _, ev := range list {
-		items = append(items, AuditResource{ID: ev.ID, Time: ev.Time, Actor: ev.Actor, Action: ev.Action, TargetID: ev.TargetID, RunID: ev.RunID, PolicyID: ev.PolicyID, Detail: ev.Detail})
+		items = append(items, AuditResource{ID: ev.ID, Time: ev.Time, Actor: ev.Actor, ActorAuthority: ev.ActorAuthority, Action: ev.Action, TargetID: ev.TargetID, RunID: ev.RunID, PolicyID: ev.PolicyID, Detail: ev.Detail})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

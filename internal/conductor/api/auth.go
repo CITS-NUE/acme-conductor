@@ -12,12 +12,18 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 )
 
-// Principal is the authenticated caller of a request. Name is recorded as
-// the actor of audit events and the requestedBy of runs; Role decides
-// what the caller may do.
+// Principal is the authenticated caller of a request. Name identifies the
+// caller within Authority, the namespace that vouches for the name: an
+// OIDC issuer URL, or one of the fixed non-OIDC authorities. Both are
+// recorded, as actor and actorAuthority of audit events and as
+// requestedBy and requestedByAuthority of runs, so that a record stays
+// unambiguous when the deployment's identity provider changes: a
+// subject is unique only within its authority. Role decides what the
+// caller may do.
 type Principal struct {
-	Name string
-	Role Role
+	Name      string
+	Authority string
+	Role      Role
 }
 
 // Role is what a principal may do. There are two: an admin may call
@@ -57,8 +63,13 @@ var ErrUnauthenticated = errors.New("unauthenticated")
 // ErrForbidden is wrapped when the caller is identified but not permitted.
 var ErrForbidden = errors.New("forbidden")
 
-// LocalhostDevPrincipal is the name every caller gets under LocalhostDev.
-const LocalhostDevPrincipal = "localhost-dev"
+// LocalhostDevPrincipal is the name every caller gets under LocalhostDev,
+// and LocalhostDevAuthority the authority: the mode itself, a namespace
+// that no OIDC issuer URL can collide with.
+const (
+	LocalhostDevPrincipal = "localhost-dev"
+	LocalhostDevAuthority = "localhost-dev"
+)
 
 // LocalhostDev is the Phase 2 development authentication mode: the caller
 // is trusted if and only if the TCP peer is a loopback address. Because
@@ -99,7 +110,7 @@ func (a LocalhostDev) Authenticate(r *http.Request) (Principal, error) {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return Principal{}, fmt.Errorf("%w: Sec-Fetch-Site %q is not accepted", ErrUnauthenticated, site)
 	}
-	return Principal{Name: LocalhostDevPrincipal, Role: RoleAdmin}, nil
+	return Principal{Name: LocalhostDevPrincipal, Authority: LocalhostDevAuthority, Role: RoleAdmin}, nil
 }
 
 func (a LocalhostDev) checkHost(hostport, header string) error {

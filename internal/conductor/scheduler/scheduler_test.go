@@ -175,7 +175,7 @@ func TestPlanAndExecuteSuccess(t *testing.T) {
 		t.Fatalf("planned %d started %d", planned, started)
 	}
 	run := f.lastRun(t)
-	if run.Status != registry.RunSucceeded || run.Action != v1alpha1.ActionIssued || run.ExpiresAt == nil || run.StartedAt == nil || run.FinishedAt == nil || run.ExternalExecutionID != "fake:"+run.ID || run.RequestedBy != Actor || run.TargetRevision != 1 {
+	if run.Status != registry.RunSucceeded || run.Action != v1alpha1.ActionIssued || run.ExpiresAt == nil || run.StartedAt == nil || run.FinishedAt == nil || run.ExternalExecutionID != "fake:"+run.ID || run.RequestedBy != Actor || run.RequestedByAuthority != Authority || run.TargetRevision != 1 {
 		t.Fatalf("run = %+v", run)
 	}
 	got := f.auditActions(t, run.ID)

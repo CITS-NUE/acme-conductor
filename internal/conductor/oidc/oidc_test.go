@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc/oidctest"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
 )
 
 type fixture struct {
@@ -467,5 +470,61 @@ func TestParseJWKSAlgorithms(t *testing.T) {
 		if _, err := parseJWKS([]byte(set)); err == nil {
 			t.Fatalf("%s: accepted", name)
 		}
+	}
+}
+
+// TestTwoIssuersSameSubjectStayDistinguishable is the reason a principal
+// carries its authority: two providers can each assert the same subject
+// value, and the Conductor configured for either records an actor that
+// differs from the other's in the authority, so audit records written
+// under one issuer configuration are not confused with the other's.
+func TestTwoIssuersSameSubjectStayDistinguishable(t *testing.T) {
+	const subject = "shared-subject"
+	var principals []api.Principal
+	for range 2 {
+		is := oidctest.New(t)
+		now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+		auth, err := New(Config{
+			Issuer: is.URL(), Audience: "api://acme-conductor",
+			PrincipalClaim: "sub", RolesClaim: "roles", AdminValues: []string{"ACME.Admin"},
+			ClockSkew: time.Minute, KeyCache: time.Hour,
+		}, &Options{HTTPClient: is.Srv.Client(), Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest("GET", "/api/v1alpha1/targets", nil)
+		r.Header.Set("Authorization", "Bearer "+is.Token(map[string]any{
+			"iss": is.URL(), "aud": "api://acme-conductor", "sub": subject, "exp": now.Unix() + 600, "roles": []string{"ACME.Admin"},
+		}))
+		p, err := auth.Authenticate(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Name != subject || p.Authority != is.URL() {
+			t.Fatalf("principal %+v for issuer %s", p, is.URL())
+		}
+		principals = append(principals, p)
+	}
+	if principals[0].Name != principals[1].Name || principals[0].Authority == principals[1].Authority {
+		t.Fatalf("principals %+v and %+v are not distinguished by authority alone", principals[0], principals[1])
+	}
+	// Recorded, the two remain two actors.
+	reg, err := sqlite.Open(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	ctx := context.Background()
+	for _, p := range principals {
+		if err := reg.AppendAudit(ctx, &registry.AuditEvent{Actor: p.Name, ActorAuthority: p.Authority, Action: registry.AuditPolicyCreated, Detail: "policy created"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := reg.ListAudit(ctx, registry.ListAuditOptions{})
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %+v, %v", events, err)
+	}
+	if events[0].Actor != events[1].Actor || events[0].ActorAuthority == events[1].ActorAuthority || events[0].ActorAuthority == "" {
+		t.Fatalf("recorded actors are not distinguishable: %+v / %+v", events[0], events[1])
 	}
 }
