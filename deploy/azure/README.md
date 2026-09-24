@@ -200,8 +200,12 @@ Job の環境に `AZURE_CLIENT_ID` を設定する．store バインディング
 エンベロープのルートに置かれたフィールドは Runner が未知のものとして拒否する．
 `cmd/acme-runner/deploy_azure_test.go` は，テンプレートがこの設定例に加える
 編集を Runner の設定ローダと store プロバイダのレジストリに通し，この形が
-保たれていることを検査する．`lego` の `azuredns` プロバイダは，
-DNS バインディングが `AZURE_AUTH_METHOD=msi` を指定していれば同じ ID を使う．
+保たれていることを検査する．`lego` の `azuredns` プロバイダも同じ ID を
+使うが，DNS バインディングは `AZURE_AUTH_METHOD` を **設定しない** こと．
+`msi` を指定すると `lego` はクライアント ID なしの `ManagedIdentityCredential`
+を作り，`AZURE_CLIENT_ID` を無視してシステム割り当て ID を求める（この Job には
+ない）．未設定の `DefaultAzureCredential` 経路なら `AZURE_CLIENT_ID` が効く
+（[`docs/runner.md`](../../docs/runner.md#dnsbindingsname)）．
 Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変数を
 通して ID を公開し，Runner は `lego` の環境を一から組み立てるので，
 バインディングはちょうどこれらの名前を転送しなければならない:
@@ -322,8 +326,9 @@ store プロバイダのレジストリで読み込める（`cmd/acme-runner/dep
   割り当てるアプリの FQDN である．
 - **`lego` のマネージド ID．** Container Apps の ID エンドポイント
   （`IDENTITY_ENDPOINT`/`IDENTITY_HEADER`）を通し，`AZURE_CLIENT_ID` で選択
-  したユーザー割り当て ID を使う `AZURE_AUTH_METHOD=msi` は，`azuredns`
-  プロバイダの SDK がサポートするものである．この Job からは試していない．
+  したユーザー割り当て ID を `DefaultAzureCredential` の経路で使うことは，
+  `azuredns` プロバイダの SDK がサポートし，`cert-infra` の本番ジョブが同じ
+  環境変数で動いていることで裏付けられているが，この Job からは試していない．
 - **シークレットのサイズ．** Runner の設定はファイルとしてマウントされる
   Container Apps のシークレットとして届けられる．非常に大きな設定は
   プラットフォームのシークレット値の上限を超えるかもしれない．

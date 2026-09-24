@@ -32,7 +32,6 @@
     "azure-dns-staging": {
       "provider": "azuredns",
       "env": {
-        "AZURE_AUTH_METHOD": "msi",
         "AZURE_ZONE_NAME": "example.ac.jp",
         "AZURE_RESOURCE_GROUP": "rg-dns-example",
         "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000"
