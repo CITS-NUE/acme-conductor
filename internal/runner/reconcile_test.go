@@ -28,7 +28,9 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/platform/azurecontainerapps"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/stores"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/transport/claim"
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
@@ -1362,12 +1364,19 @@ func TestReconcileClaimMode(t *testing.T) {
 	if err := exchange.Publish(root, "01JABCDEFGHJKMNPQRSTVWXYZ0", job); err != nil {
 		t.Fatal(err)
 	}
+	lookup := func(k string) (string, bool) { v, ok := h.env[k]; return v, ok }
 	run := func(execName string) int {
 		h.stdout.Reset()
 		h.logs.Reset()
 		logger := slog.New(slog.NewJSONHandler(&h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		// As the CLI composes it: --execution-name when given, else the
+		// platform's variable.
+		identity := azurecontainerapps.ExecutionIdentity(lookup)
+		if execName != "" {
+			identity = func() (string, error) { return execName, nil }
+		}
 		return Reconcile(context.Background(), Options{Stores: testStores(),
-			ConfigPath: h.cfgPath, ExchangeDir: root, ExecutionName: execName, Stdout: &h.stdout, Logger: logger,
+			ConfigPath: h.cfgPath, Source: claim.New(root, identity), Stdout: &h.stdout, Logger: logger,
 			Now: func() time.Time { return h.now }, LookupEnv: func(k string) (string, bool) { v, ok := h.env[k]; return v, ok },
 			GracePeriod: 300 * time.Millisecond,
 		})
@@ -1406,7 +1415,7 @@ func TestReconcileClaimMode(t *testing.T) {
 	if err := exchange.Publish(root, "01JABCDEFGHJKMNPQRSTVWXYZ9", bytes.Replace(job, []byte("01JABCDEFGHJKMNPQRSTVWXYZ0"), []byte("01JABCDEFGHJKMNPQRSTVWXYZ9"), 1)); err != nil {
 		t.Fatal(err)
 	}
-	h.env[EnvExecutionName] = "acme-runner-env0001"
+	h.env[azurecontainerapps.EnvExecutionName] = "acme-runner-env0001"
 	if code := run(""); code != ExitSucceeded {
 		t.Fatalf("code = %d\n%s", code, h.logs.String())
 	}
@@ -1415,7 +1424,7 @@ func TestReconcileClaimMode(t *testing.T) {
 	}
 	// Without any execution name the job is left claimed without a result
 	// and nothing runs: the Conductor cannot observe such an execution.
-	delete(h.env, EnvExecutionName)
+	delete(h.env, azurecontainerapps.EnvExecutionName)
 	if err := exchange.Publish(root, "01JABCDEFGHJKMNPQRSTVWXYZ8", bytes.Replace(job, []byte("01JABCDEFGHJKMNPQRSTVWXYZ0"), []byte("01JABCDEFGHJKMNPQRSTVWXYZ8"), 1)); err != nil {
 		t.Fatal(err)
 	}

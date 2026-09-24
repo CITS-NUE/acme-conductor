@@ -86,6 +86,11 @@ Go modules and GitHub Actions; treat those pull requests like any other
   (signer, verifier, logger), and anything one adapter alone needs is
   bound in the registering closure in `providers.go`. The public
   contracts (`pkg/store`, `pkg/launcher`) carry no build dependencies.
+  Likewise the Runner core consumes a job through
+  `internal/runner/transport.Source` and never reads a platform's
+  environment: a transport (`internal/runner/transport/claim`) and a
+  platform's execution identity (`internal/runner/platform/azurecontainerapps`)
+  are separate pieces that `cmd/acme-runner` composes.
   Keep the SDK's pinned versions within the Go version `go.mod` declares.
 - **Strict decoders.** Any new wire format follows the same rule the
   `v1alpha1` contract does: reject unknown fields, duplicate keys, and

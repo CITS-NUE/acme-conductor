@@ -459,6 +459,9 @@ internal/
   policy/           FQDN normalization and suffix-matching (internal/policy/fqdn.go)
   runner/           Runner reconcile loop, work-dir/state-dir handling, Result writer (Phase 1)
   runner/config/    Runner configuration loading and validation (Phase 1); knows no store type
+  runner/transport/ how a job reaches the Runner and its Result leaves: the Source contract and the two-file transport
+  runner/transport/claim/ the shared-directory (exchange) transport, given an execution identity by the command
+  runner/platform/azurecontainerapps/ the execution identity of a Container Apps Job execution; the Runner's only mention of that platform
   runner/stores/    composition layer: the store provider registry the Runner core opens stores through
   runner/lego/      lego argv/env construction, subprocess execution, output redaction (Phase 1)
   runner/fakelego/  test double for lego used by Runner tests; not compiled into shipped binaries

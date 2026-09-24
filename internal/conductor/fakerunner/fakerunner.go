@@ -23,7 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/CITS-NUE/acme-conductor/internal/exchange"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/platform/azurecontainerapps"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/transport/claim"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
@@ -85,22 +86,19 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		}
 	}
 	if exchangeDir != "" {
-		// Claim mode, as acme-runner does it: take the oldest pending job
-		// and record the execution name the platform gave this process.
-		claim, err := exchange.Take(exchangeDir)
+		// Claim mode, as acme-runner composes it: the claim transport with
+		// the Container Apps execution identity.
+		lookup := func(k string) (string, bool) { v := getenv(k); return v, v != "" }
+		job, err := claim.New(exchangeDir, azurecontainerapps.ExecutionIdentity(lookup)).Acquire()
 		if err != nil {
 			fmt.Fprintln(stderr, "fake runner:", err)
 			return 2
 		}
-		if claim == nil {
+		if job == nil {
 			fmt.Fprintln(stderr, "fake runner: nothing pending")
 			return 0
 		}
-		if err := claim.MarkExecution(getenv("CONTAINER_APP_JOB_EXECUTION_NAME")); err != nil {
-			fmt.Fprintln(stderr, "fake runner:", err)
-			return 2
-		}
-		jobPath, resultPath = claim.JobPath, claim.ResultPath
+		jobPath, resultPath = job.JobPath, job.ResultPath
 	}
 	raw, err := os.ReadFile(jobPath)
 	if err != nil {

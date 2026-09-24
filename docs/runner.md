@@ -39,26 +39,33 @@ process per run.
 
 ```
 acme-runner reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]
-acme-runner reconcile --exchange DIR [--config FILE] [--log-level LEVEL]
+acme-runner reconcile --exchange DIR [--execution-name NAME] [--config FILE] [--log-level LEVEL]
 acme-runner keygen --private FILE --public FILE
 acme-runner --version
 acme-runner --help
 ```
 
-- `--exchange DIR` — *claim mode*, instead of `--job`/`--result`: take
-  the oldest job a Conductor has offered under `DIR/pending/`, move it
-  to `DIR/claimed/`, record this process's platform execution name
-  (`CONTAINER_APP_JOB_EXECUTION_NAME`) next to it, and write the Result
-  next to the job. With nothing pending the process logs so and exits
-  `0` without a Result. This is how a scheduled Container Apps Job
-  execution finds its work ([Running as a Container Apps Job](#running-as-a-container-apps-job));
-  it cannot be combined with `--job`/`--result`. Claim mode requires
-  [`resultSigning`](#resultsigning) in the configuration: without it the
-  process takes no job and exits `2`, since the Conductor on the other
-  side of a shared volume accepts signed Results only. Without an
-  execution name the job is left taken with no Result and the process
-  exits `2`, because the Conductor could neither observe nor stop that
-  execution.
+- `--exchange DIR` — the *claim transport*, instead of `--job`/`--result`:
+  take the oldest job a Conductor has offered under `DIR/pending/`, move
+  it to `DIR/claimed/`, record this process's **execution identity**
+  next to it, and write the Result next to the job. With nothing pending
+  the process logs so and exits `0` without a Result. It cannot be
+  combined with `--job`/`--result`. The transport is shared with other
+  writers, so it requires [`resultSigning`](#resultsigning) in the
+  configuration: without it the process takes no job and exits `2`,
+  since the Conductor on the other side accepts signed Results only.
+- `--execution-name NAME` — with `--exchange`: the identity recorded for
+  the claimed job, the name under which the Conductor can observe and
+  stop this process on its platform. When omitted it is read from the
+  platform: the official binary knows one platform that starts Runners
+  on its own, Azure Container Apps, whose `CONTAINER_APP_JOB_EXECUTION_NAME`
+  names the execution ([Running as a Container Apps Job](#running-as-a-container-apps-job)).
+  Without any identity the job is left taken with no Result and the
+  process exits `2`, because the Conductor could neither observe nor
+  stop that execution. The transport (`internal/runner/transport/claim`)
+  and the platform (`internal/runner/platform/azurecontainerapps`) are
+  separate pieces composed by the command; the reconciliation core knows
+  neither.
 - `keygen` — generate the Ed25519 result-signing key pair
   ([`resultSigning`](#resultsigning)); the private key file is created
   `0600` and never overwritten, and the one-line public key for the
@@ -287,7 +294,8 @@ The Job is **scheduled** (every minute) with the fixed command
 `reconcile --exchange /exchange`, never started by the Conductor
 ([ADR 0014](adr/0014-azure-container-apps-job-launcher.md)): each
 execution takes at most one offered job or exits at once, records its
-execution name for the Conductor, and signs its Result with the
+execution identity (the platform's execution name) for the Conductor,
+and signs its Result with the
 result-signing key mounted at `/etc/acme-runner/result-signing.pem`.
 [`deploy/examples/runner-config.aca.example.json`](../deploy/examples/runner-config.aca.example.json)
 is the complete, validated example for that deployment (paths `/state`
