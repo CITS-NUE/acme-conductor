@@ -498,7 +498,7 @@ Azure Key Vault の Certificate Store（`internal/store/keyvault`，
 vault は利用者が（証明書のシークレットを通じて）証明書を読み出す場所であり，
 独自のアクセス制御と監査を持ち，Runner 自身の vault へのアクセスは狭く
 短命である．この store が書くのは **PEM** の証明書であり，どの利用者がそれを
-使えるかは後述の [利用者とコンテンツタイプ](#利用者とコンテンツタイプ) に
+使えるかは後述の [利用者とコンテンツタイプ](#certificate-store-azure-key-vault) に
 まとめる．
 
 **オブジェクト名．** Result の `storeObjectRef` は Key Vault の証明書名である．
@@ -853,7 +853,7 @@ docker run --rm \
 - Key Vault store は PEM のみを書く．App Service と Azure Front Door の
   組み込みの Key Vault 連携は PKCS #12 を必要とし，この store では役立たない．
   PKCS #12 での取り込みは Phase 3 の範囲外である
-  （[利用者とコンテンツタイプ](#利用者とコンテンツタイプ) を参照）．
+  （[利用者とコンテンツタイプ](#certificate-store-azure-key-vault) を参照）．
 - `credential: default` では，SDK の `DefaultAzureCredential` チェーンが
   Runner の環境からサービスプリンシパルの変数を読み，`PATH` から開発者
   ツールを実行することがある．これは開発上の利便性であって本番の姿勢では
