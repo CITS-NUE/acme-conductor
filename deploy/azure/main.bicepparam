@@ -17,18 +17,18 @@
 using 'main.bicep'
 
 param namePrefix = 'acme'
-// Pin both images by digest to one release. The digests below are v0.5.0
-// (https://github.com/CITS-NUE/acme-conductor/actions/runs/35945554057),
-// the last release before the {type, config} binding format this template
-// emits, so they do not run with the configuration this template produces.
-// Replace them with the digests of the first release cut after this
-// template (CITS-NUE/acme-conductor#30), read from that release run's
-// summary and verified before trusting:
-//   gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:<version> --owner CITS-NUE
-//   gh attestation verify oci://ghcr.io/cits-nue/acme-runner:<version> --owner CITS-NUE
-//   docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:<version>
-param conductorImage = 'ghcr.io/cits-nue/acme-conductor@sha256:97198bc1d338ec0ce9748120b4b2b9645b881c40b58d40920f11781fa4558ed3'
-param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:760a2e9f906b4b85ec5fe92c34e2f13c1fdf61abef2ea48504de70e511c1a6d2'
+// Pin both images by digest to one release. The digests below are v0.6.0
+// (https://github.com/CITS-NUE/acme-conductor/actions/runs/36006087963),
+// the first release that emits and accepts the {type, config} binding
+// format this template produces. Verify before trusting, and read the
+// multi-arch index (linux/amd64, linux/arm64, plus the attestation
+// manifests) to confirm the digest:
+//   gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:0.6.0 --owner CITS-NUE
+//   gh attestation verify oci://ghcr.io/cits-nue/acme-runner:0.6.0 --owner CITS-NUE
+//   docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:0.6.0
+//   docker buildx imagetools inspect ghcr.io/cits-nue/acme-runner:0.6.0
+param conductorImage = 'ghcr.io/cits-nue/acme-conductor@sha256:fbdef0b8731a22847294fd057656551e7ecb4d130e47c4ca638a590a1235f1fd'
+param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:fec1410b1c631d4d74738e8b814c8cede06038da51a3cac6fd3c95d3b0e64e60'
 
 param acmeBindings = ['letsencrypt-staging']
 param dnsBindings = ['azure-dns-staging']
