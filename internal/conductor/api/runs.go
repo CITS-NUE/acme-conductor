@@ -141,6 +141,10 @@ func (s *Server) handleRequestRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, &apiError{status: http.StatusConflict, code: "target_disabled", message: "target is disabled"})
 		return
 	}
+	if !s.issuanceEnabled() {
+		s.fail(w, r, &apiError{status: http.StatusConflict, code: "issuance_disabled", message: fmt.Sprintf("the conductor issues nothing while migration.targetSource is %q", s.migration.TargetSource)})
+		return
+	}
 	caller := PrincipalFrom(r.Context())
 	actor := caller.Name
 	run := &registry.Run{TargetID: t.ID, TargetRevision: t.Revision, RequestedBy: actor, RequestedByAuthority: caller.Authority}

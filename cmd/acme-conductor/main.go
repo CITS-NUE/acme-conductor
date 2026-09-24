@@ -5,6 +5,7 @@
 //	acme-conductor --version
 //	acme-conductor serve [--config /etc/acme-conductor/config.json] [--log-level LEVEL]
 //	acme-conductor keygen --private FILE --public FILE
+//	acme-conductor migrate (list|diff|import) [flags]
 //
 // serve runs the REST API and the GUI, the SQLite-backed registries
 // (targets, policies, runs, audit) and the scheduler that launches
@@ -15,6 +16,11 @@
 //
 // keygen generates the Ed25519 key pair with which the Conductor signs
 // the jobs it hands to Runners (docs/conductor.md, "Job signing").
+//
+// migrate reads a host list from an infrastructure definition (a Bicep
+// parameter file or a TargetList document), compares it with a running
+// Conductor's registry over the API, and imports the names the registry
+// lacks; a dry run unless --apply is given (docs/migration.md).
 package main
 
 import (
@@ -46,7 +52,7 @@ func main() {
 }
 
 func usage(stderr io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s serve [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component)
+	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s serve [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n  %s migrate (list|diff|import) [flags]   (see: %s migrate --help)\n\n", component, component, component, component, component)
 	fmt.Fprintln(stderr, "ACME Conductor control plane (target registry, policy, audit, run scheduling).")
 	fmt.Fprintln(stderr, "\nFlags:")
 	fs.PrintDefaults()
@@ -78,6 +84,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 		return runServe(ctx, fs.Args()[1:], stderr, getenv)
 	case "keygen":
 		return runKeygen(fs.Args()[1:], stdout, stderr)
+	case "migrate":
+		return runMigrate(ctx, fs.Args()[1:], stdout, stderr, getenv)
 	default:
 		fmt.Fprintf(stderr, "%s: unknown command %q\n\n", component, fs.Arg(0))
 		fs.Usage()

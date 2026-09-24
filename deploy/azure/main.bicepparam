@@ -50,3 +50,15 @@ param oidcAdminRoles = ['ACME.Admin']
 param oidcViewerRoles = ['ACME.Viewer']
 param ingressExternal = true
 param ingressAllowedCidrs = []
+
+// Migration from the existing cert-infra deployment (docs/migration.md):
+// start in shadow mode with its targetDomains pasted here, import the
+// list with `acme-conductor migrate import --apply`, and switch
+// targetSource to 'registry' when the Conductor is to issue. A rollback
+// is 'iac' (the Conductor issues nothing; the Container Apps Job of
+// cert-infra keeps renewing).
+// param migration = {
+//   targetSource: 'shadow'
+//   source: { fqdns: ['leaf.cerdad.example.ac.jp'] }
+//   profile: { policyRef: '<policy id>', executionBinding: 'azure', dnsBinding: 'azure-dns-staging', storeBinding: 'keyvault-staging', owner: 'cert-infra migration' }
+// }

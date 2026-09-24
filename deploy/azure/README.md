@@ -252,6 +252,17 @@ its status unreadable and the stop not confirmed — the Conductor keeps
 writing there) and logs "run directory kept". Remove such directories by
 hand once the execution has ended (`az containerapp job execution list`).
 
+**Migrating from `cert-infra`.** The `migration` parameter is the
+`migration` section of the Conductor configuration, verbatim
+([`docs/migration.md`](../../docs/migration.md)): set `targetSource` to
+`shadow` and paste the `targetDomains` of `cert-infra`'s
+`infra/main.bicepparam` into `source.fqdns` to deploy a Conductor that
+issues nothing and compares that list with its registry; import the
+list with `acme-conductor migrate import --apply` (or from the same
+file, `--bicepparam`); switch to `registry` when the Conductor is to
+issue, and back to `iac` to roll back. The Conductor never touches the
+`cert-infra` deployment; stopping its job is the operator's step.
+
 ## Not verified by this repository
 
 This template compiles (`bicep build`, `bicep lint`) and its configuration

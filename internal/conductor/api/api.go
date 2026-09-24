@@ -76,6 +76,9 @@ type Options struct {
 	Ready func(ctx context.Context) error
 	// UI, when set, serves the embedded GUI under /ui/; nil serves none.
 	UI *UIOptions
+	// Migration, when set, exposes the migration endpoints and the
+	// target source flag; nil means target source registry and no list.
+	Migration *MigrationOptions
 }
 
 // Server is the API handler.
@@ -89,6 +92,8 @@ type Server struct {
 	ready func(ctx context.Context) error
 	ui    *UIOptions
 	mux   *http.ServeMux
+
+	migration *MigrationOptions
 }
 
 // New builds the handler.
@@ -105,7 +110,7 @@ func New(o Options) *Server {
 	if o.Scheduler == nil {
 		o.Scheduler = noScheduler{}
 	}
-	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux()}
+	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), migration: o.Migration}
 	s.routes()
 	return s
 }
@@ -139,6 +144,10 @@ func (s *Server) routes() {
 	api("GET "+Prefix+"/runs/{id}", s.handleGetRun)
 	api("POST "+Prefix+"/runs/{id}/cancel", s.handleCancelRun)
 	api("GET "+Prefix+"/audit", s.handleListAudit)
+	api("GET "+Prefix+"/migration", s.handleGetMigration)
+	api("GET "+Prefix+"/migration/diff", s.handleMigrationDiff)
+	api("POST "+Prefix+"/migration/diff", s.handleMigrationDiff)
+	api("POST "+Prefix+"/migration/import", s.handleMigrationImport)
 	if s.ui != nil {
 		s.uiRoutes()
 	}

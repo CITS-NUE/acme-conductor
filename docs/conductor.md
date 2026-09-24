@@ -22,7 +22,12 @@ mode, `oidc` — bearer tokens from an OpenID Connect provider, named
 principals, an admin and a viewer role, a TLS listener or a platform
 ingress in front of it — and a minimal **GUI** served by the Conductor
 itself (see [Authentication](#authentication) and [GUI](#gui)). The
-`localhost-dev` mode remains for a single development host.
+`localhost-dev` mode remains for a single development host. Phase 6
+adds the **migration tooling**: a `migrate` command and API that read
+the host list of an existing infrastructure definition, compare it with
+the registry and import what is missing, and a `migration.targetSource`
+flag that keeps the Conductor from issuing anything until the switch
+(see [`docs/migration.md`](migration.md) and [`migration`](#migration)).
 
 ## Overview
 
@@ -52,9 +57,15 @@ what the last successful `Result` said.
 ```
 acme-conductor serve [--config FILE] [--log-level LEVEL]
 acme-conductor keygen --private FILE --public FILE
+acme-conductor migrate (list|diff|import) [flags]
 acme-conductor --version
 acme-conductor --help
 ```
+
+`migrate` reads a host list from a Bicep parameter file or a TargetList
+document, compares it with a running Conductor's registry over the API
+and imports the names the registry lacks (a dry run unless `--apply` is
+given). It is documented in [`docs/migration.md`](migration.md#command-line).
 
 `keygen` generates the Ed25519 key pair for [job signing](#jobsigning):
 the private key is written to `--private` (created `0600`; an existing
@@ -112,6 +123,7 @@ Top level:
 | `dnsBindings` | []string | Non-empty, distinct binding names a target may select. |
 | `storeBindings` | []string | Non-empty, distinct binding names a target may select. |
 | `jobSigning` | object | Optional; required when an `azure-container-apps-job` binding exists. See below. |
+| `migration` | object | Optional. The migration from an infrastructure-defined host list: the `targetSource` flag, the list and the import profile. See [`migration`](#migration). Absent means `targetSource: registry` and no list. |
 
 ### `server`
 
@@ -262,6 +274,22 @@ not a transport the Conductor owns, so every job on it is signed and
 every Result on it must be. See
 [`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json).
 
+### `migration`
+
+The migration from an existing infrastructure-defined host list
+([`docs/migration.md`](migration.md)). The whole section is optional;
+its parts are:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `targetSource` | string | `registry` | Who issues. `registry`: the scheduler plans and starts runs for the registry's targets. `shadow`: it does not, and the configured list is compared with the registry every `compareIntervalSeconds`. `iac`: it does not, full stop. Under `shadow` and `iac`, `POST /targets/{id}/runs` answers `409 issuance_disabled`; the registry stays editable. |
+| `source` | object | — | Where the list is read from: exactly one of `bicepParamFile` (a clean absolute path; with `parameter`, default `targetDomains`), `jsonFile` (a TargetList document, clean absolute path) or `fqdns` (the list inline, at most 10000 names). Required under `shadow`; otherwise it is the default list of `GET /migration/diff` and of an import without `fqdns`. Needs `profile`. |
+| `profile` | object | — | What every imported target is made of besides its FQDN: `policyRef` (an identifier; the policy must exist when the profile is used), `executionBinding`, `dnsBinding` and `storeBinding` (each a binding this configuration registers) and `owner` (printable, at most 128 bytes). Required with `source`, and for any diff or import at all. |
+| `compareIntervalSeconds` | int | `300` | How often the shadow comparison runs. `10`–`86400`. |
+
+The list contributes FQDNs and nothing else; the profile, and so the
+administrator, decides everything a target needs beyond its name.
+
 ### `jobSigning`
 
 | Field | Type | Default | Notes |
@@ -333,6 +361,9 @@ touching the registry.
 | 409 | `stale_revision` | The `revision` in the request is not the target's current revision. |
 | 409 | `run_active` | A run is already queued/starting/running for the target (`details.activeRunId`, `details.status`). |
 | 409 | `target_disabled` | A run was requested for a disabled target. |
+| 409 | `issuance_disabled` | A run was requested while `migration.targetSource` is `shadow` or `iac` ([`docs/migration.md`](migration.md)). |
+| 409 | `migration_unconfigured` | A migration diff or import was requested but no `migration.profile` is configured, or the policy it names does not exist. |
+| 409 | `source_unreadable` | The configured `migration.source` could not be read (file missing, malformed, a name that is not a host name). |
 | 413 | `too_large` | Body over 64 KiB. |
 | 415 | `unsupported_media_type` | Body without `Content-Type: application/json`. |
 | 500 | `internal` | Registry or other internal failure; details are in the log only. |
@@ -363,6 +394,10 @@ touching the registry.
 | `GET /api/v1alpha1/runs/{id}` | One run. |
 | `POST /api/v1alpha1/runs/{id}/cancel` | Cancel: a queued run is cancelled at once (`200`); a starting/running one is asked to stop (`202`, outcome recorded when the Runner reports). |
 | `GET /api/v1alpha1/audit[?targetId=&runId=&policyId=&limit=&before=]` | Audit events, newest first. |
+| `GET /api/v1alpha1/migration` | The migration state: `targetSource`, `issuanceEnabled`, the configured source and profile, and under `shadow` the latest comparison. |
+| `GET /api/v1alpha1/migration/diff` | Compare the configured list with the registry → report. |
+| `POST /api/v1alpha1/migration/diff` | Compare `{"fqdns": […]}` with the registry → report. |
+| `POST /api/v1alpha1/migration/import` | Import a list: `{"fqdns": […], "dryRun": true}`, both optional (`dryRun` defaults to `true`; without `fqdns`, the configured list) → import result. Creates targets only for names the registry lacks, never updates or deletes. Wakes the scheduler when it created something. See [`docs/migration.md`](migration.md#api). |
 
 Lists that page (`runs`, `audit`) take `limit` (`1`–`1000`, default
 `100`) and `before=<id>` (return items whose id sorts before it; ids sort
@@ -521,9 +556,14 @@ recorded before the Conductor stored it; such rows are never rewritten
 
 Actions: `policy.created`, `policy.updated`, `policy.rejected`,
 `target.created`, `target.updated`, `target.enabled`, `target.disabled`,
-`run.requested`, `run.started`, `run.succeeded`, `run.failed`,
-`run.cancelled`. `detail` is a short sentence built by the Conductor from
-validated values (at most 512 bytes); it never contains Runner output.
+`target.imported` (a target created by a migration import, with the list
+it came from), `run.requested`, `run.started`, `run.succeeded`,
+`run.failed`, `run.cancelled`, `migration.compared` (a shadow comparison
+whose outcome differs from the previous one; actor and authority are
+both `migration`, the Conductor's own comparison loop, the way `scheduler`
+is its own authority). `detail` is a short sentence built by the
+Conductor from validated values (at most 512 bytes); it never contains
+Runner output.
 Events are written in the same transaction as the change they describe
 and can be neither updated nor deleted.
 
@@ -896,6 +936,11 @@ resolved configuration (it has none), or anything from the Runner's
   for a busy multi-tenant API. Multi-replica is a non-goal, and the
   ownership lock makes a second process on the same database a startup
   error rather than a supported shape.
+- **The migration moves names, not certificates or accounts.** An
+  imported target is issued afresh under the Conductor's own object
+  name once `targetSource` is `registry`; consumers are re-pointed by
+  the operator, and the shadow comparison compares lists, not the
+  certificates in the store ([`docs/migration.md`](migration.md)).
 - **Policy changes are not versioned or pushed.** A policy update applies
   at each target's next run (see [Policy](#policy)); an `acmeBinding`
   change does not force reissue of current certificates, and there is no

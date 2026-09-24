@@ -603,6 +603,54 @@
     );
   }
 
+  // Migration (docs/migration.md): the target source flag and, in shadow
+  // mode, the latest comparison of the infrastructure list with the
+  // registry. Read-only: importing is done with `acme-conductor migrate`.
+
+  function reportTable(rep) {
+    const rows = [];
+    const push = (kind, e, note) => rows.push([statusBadge(kind), td(e.fqdn, 'mono'), e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), e.targetId), 'mono') : '—', note || '—']);
+    for (const e of rep.added) push('added', e, 'not in the registry: an import would create it');
+    for (const e of rep.changed) push('changed', e, (e.differences || []).map((d) => d.field + ': ' + d.registry + ' (expected ' + d.expected + ')').join('; '));
+    for (const e of rep.missing) push('missing', e, 'not in the list' + (e.enabled === false ? ' (disabled)' : ''));
+    for (const e of rep.rejected) push('rejected', e, e.reason);
+    for (const e of rep.unchanged) push('unchanged', e, '');
+    return table(['Category', 'FQDN', 'Target', 'Note'], rows);
+  }
+
+  async function viewMigration() {
+    setNav('migration');
+    const m = await api('GET', '/migration');
+    const src = m.source ? (m.source.kind === 'inline' ? 'inline list (' + m.source.count + ' entries)' : m.source.kind + ' ' + m.source.path + (m.source.parameter ? ' (param ' + m.source.parameter + ')' : '')) : '—';
+    const prof = m.profile ? m.profile.policyRef + ' / ' + m.profile.executionBinding + ' / ' + m.profile.dnsBinding + ' / ' + m.profile.storeBinding + ' / ' + m.profile.owner : '—';
+    const parts = [
+      el('h1', { text: 'Migration' }),
+      m.issuanceEnabled ? null : notice('ok', 'Issuance is disabled: the Conductor plans and starts no runs while the target source is "' + m.targetSource + '".'),
+      props([
+        ['Target source', statusBadge(m.targetSource)],
+        ['Issuance', m.issuanceEnabled ? 'enabled' : 'disabled'],
+        ['Configured list', src],
+        ['Import profile (policy / execution / dns / store / owner)', prof],
+      ]),
+    ];
+    const lc = m.lastComparison;
+    if (lc) {
+      parts.push(el('h2', { text: 'Shadow comparison' }));
+      if (lc.error) parts.push(notice('error', 'The latest comparison (' + when(lc.attemptedAt) + ') failed: ' + lc.error));
+      if (lc.report) {
+        const s = lc.report.summary;
+        parts.push(props([
+          ['Compared', when(lc.report.comparedAt)],
+          ['Source', lc.report.source],
+          ['Summary', 'added ' + s.added + ', changed ' + s.changed + ', missing ' + s.missing + ', unchanged ' + s.unchanged + ', rejected ' + s.rejected],
+        ]), reportTable(lc.report));
+      }
+    } else if (m.targetSource === 'shadow') {
+      parts.push(el('p', { class: 'empty', text: 'No comparison has been made yet.' }));
+    }
+    show(...parts);
+  }
+
   // ---- routing --------------------------------------------------------------
 
   const routes = [
@@ -615,6 +663,7 @@
     [/^#\/runs\/([A-Za-z0-9_-]+)$/, (m) => viewRun(m[1])],
     [/^#\/runs(\?.*)?$/, () => viewRuns()],
     [/^#\/audit$/, () => viewAudit()],
+    [/^#\/migration$/, () => viewMigration()],
   ];
 
   function route() {

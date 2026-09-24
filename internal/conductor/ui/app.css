@@ -74,6 +74,10 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 .status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
 .status.cancelled { color: var(--muted); }
+.status.added, .status.registry { color: var(--ok); border-color: var(--ok); }
+.status.changed, .status.rejected, .status.missing { color: var(--warn); border-color: var(--warn); }
+.status.shadow, .status.iac { color: var(--warn); border-color: var(--warn); }
+.status.unchanged { color: var(--muted); }
 button, .button {
   font: inherit;
   padding: 5px 12px;
