@@ -1,95 +1,96 @@
-# ACME Conductor JSON Schemas
+# ACME Conductor の JSON Schema
 
-This directory holds JSON Schema (draft 2020-12) documents that describe the
-wire contract defined in Go by `pkg/api/v1alpha1`: the `JobSpec`
-(`jobspec.schema.json`), the `Result` (`result.schema.json`) and, since
-Phase 4, the signed job envelope (`signedjob.schema.json`), whose
-`payload` is a base64url-encoded `JobSpec` document.
+このディレクトリには，Go の `pkg/api/v1alpha1` で定義されたワイヤコントラクトを
+記述する JSON Schema（draft 2020-12）文書を置く．`JobSpec`
+（`jobspec.schema.json`），`Result`（`result.schema.json`），そして Phase 4
+以降は署名付きジョブエンベロープ（`signedjob.schema.json`）であり，その
+`payload` は base64url エンコードされた `JobSpec` 文書である．
 
-## Version policy
+## バージョンポリシー
 
-- `v1alpha1` is a pre-release contract version: it may change **incompatibly**
-  (fields renamed or removed, validation tightened or loosened, new required
-  fields) at any time until Phase 1 ships and the contract reaches `v1`.
-- Once Phase 1 ships, changes within a version (e.g. further `v1alpha1`
-  revisions, and every version from `v1` onward) must be **additive only**:
-  new optional fields and new enum values are fine; removing or renaming a
-  field, or narrowing an existing constraint in a way that rejects previously
-  valid documents, requires a new version.
-- A breaking change always means a new `kind`/`apiVersion` pair and a new
-  schema file (e.g. `v1alpha2`), never an in-place edit of a shipped schema.
+- `v1alpha1` はプレリリースのコントラクトバージョンである．Phase 1 が出荷され
+  コントラクトが `v1` に達するまでは，いつでも **非互換な** 変更（フィールドの
+  改名や削除，検証の厳格化や緩和，新しい必須フィールド）が入りうる．
+- Phase 1 の出荷後は，バージョン内の変更（たとえば `v1alpha1` のさらなる改訂，
+  および `v1` 以降のすべてのバージョン）は **追加のみ** でなければならない．
+  新しい任意フィールドと新しい列挙値は問題ない．フィールドの削除や改名，
+  既存の制約をそれまで有効だった文書を拒否するように狭めることは，新しい
+  バージョンを必要とする．
+- 破壊的変更は常に新しい `kind`/`apiVersion` の組と新しいスキーマファイル
+  （たとえば `v1alpha2`）を意味し，出荷済みスキーマをその場で編集することは
+  決してない．
 
-## Go validation is authoritative
+## Go の検証が正である
 
-These schemas are a **best-effort, human- and tool-readable approximation**
-of the rules enforced by `pkg/api/v1alpha1/validate.go` and
-`internal/policy/fqdn.go`. The Go code is the source of truth and is
-strictly stricter than the schema. In particular, the following are checked
-only by Go, not by JSON Schema:
+これらのスキーマは，`pkg/api/v1alpha1/validate.go` と
+`internal/policy/fqdn.go` が強制する規則の **ベストエフォートな，人間とツールが
+読める近似** である．Go のコードが正（source of truth）であり，スキーマより
+厳密に厳しい．特に，以下は Go だけが検査し，JSON Schema は検査しない:
 
-- FQDN normalization (a value must already be in canonical form).
-- Label-boundary suffix matching (`evil-example.ac.jp` is not under
-  `example.ac.jp`, even though it matches the suffix as a raw string).
-- Rejection of an all-numeric top-level label and of `xn--` (IDNA) labels.
-- The cross-field rule that a wildcard FQDN requires `policy.allowWildcard`.
-- Exact (post-normalization) duplicate detection in
-  `policy.allowedDnsSuffixes` (JSON Schema's `uniqueItems` only catches
-  duplicates that are already byte-identical strings).
-- The `finishedAt >= startedAt` ordering rule on `Result`.
-- Rejection of the zero `time.Time` value for `expiresAt`.
-- Rejection of non-printable characters (control characters, Unicode
-  line/paragraph separators, bidi/format characters) and known secret
-  markers (PEM headers, bearer tokens, `password=`, `sig=`, etc.) in
-  free-text fields such as `error.summary`. Header- and key=value-shaped
-  markers (`bearer `, `basic `, `authorization:`, `password=`, `sig=`, and
-  similar) are matched case-insensitively; token-prefix markers whose case
-  is part of the format (`eyJ`, `AKIA`, `ghp_`, ...) are matched exactly.
-  This marker check is a best-effort, defense-in-depth heuristic, not a
-  secret detector: it cannot recognize an arbitrary secret or an unknown
-  format, and it does not by itself make a free-text field safe to fill
-  with raw external output. The real control is that a Runner never copies
-  raw external output into a Result at all; `error.summary` must come from
-  Runner-owned templates.
-- Everything inside the signed envelope's `protected` header (the fixed
-  `alg`, the `kid` format, the validity window, the nonce), the
-  signature itself, and the decoding of `payload` as a `JobSpec`: the
-  schema sees `protected`, `payload` and `signature` as opaque base64url
-  strings (`TestSignedJobFixtures`, with its own `schema-accepts.txt`).
-- Strict decoding: unknown fields, duplicate JSON object keys and trailing
-  data after the document are always rejected by
-  `pkg/api/v1alpha1/decode.go`, regardless of what a particular JSON Schema
-  validator implementation enforces for `additionalProperties` or malformed
-  JSON.
+- FQDN の正規化（値はすでに正準形でなければならない）．
+- ラベル境界でのサフィックス照合（`evil-example.ac.jp` は，生の文字列としては
+  サフィックスに一致するものの，`example.ac.jp` の配下ではない）．
+- すべて数字のトップレベルラベルと `xn--`（IDNA）ラベルの拒否．
+- ワイルドカード FQDN には `policy.allowWildcard` が必要であるという
+  フィールド横断の規則．
+- `policy.allowedDnsSuffixes` における（正規化後の）厳密な重複検出
+  （JSON Schema の `uniqueItems` は，すでにバイト単位で同一な文字列の重複しか
+  捕捉しない）．
+- `Result` における `finishedAt >= startedAt` の順序規則．
+- `expiresAt` に対するゼロ値の `time.Time` の拒否．
+- `error.summary` などの自由テキストフィールドにおける，印字不能文字
+  （制御文字，Unicode の行・段落区切り，双方向・書式文字）と既知のシークレット
+  マーカー（PEM ヘッダ，ベアラートークン，`password=`，`sig=` など）の拒否．
+  ヘッダ形および key=value 形のマーカー（`bearer `，`basic `，
+  `authorization:`，`password=`，`sig=`，および類似のもの）は大文字小文字を
+  区別せずに照合し，大文字小文字が書式の一部であるトークン接頭辞マーカー
+  （`eyJ`，`AKIA`，`ghp_`，...）は厳密に照合する．
+  このマーカー検査はベストエフォートの多層防御ヒューリスティックであり，
+  シークレット検出器ではない．任意のシークレットや未知の書式を認識することは
+  できず，それだけで自由テキストフィールドに生の外部出力を入れても安全に
+  なるわけではない．本当の統制は，Runner が生の外部出力を Result に決して
+  コピーしないことである．`error.summary` は Runner が所有するテンプレート
+  から生成しなければならない．
+- 署名付きエンベロープの `protected` ヘッダ内のすべて（固定の `alg`，`kid` の
+  書式，有効期間，ノンス），署名そのもの，および `payload` の `JobSpec` としての
+  デコード．スキーマは `protected`，`payload`，`signature` を不透明な
+  base64url 文字列として見る（`TestSignedJobFixtures`，独自の
+  `schema-accepts.txt` を持つ）．
+- 厳密なデコード: 未知のフィールド，重複する JSON オブジェクトキー，文書の後ろに
+  続く末尾データは，特定の JSON Schema バリデータ実装が
+  `additionalProperties` や不正な JSON に対して何を強制するかにかかわらず，
+  `pkg/api/v1alpha1/decode.go` により常に拒否される．
 
-A document that fails the JSON Schema is never expected to be accepted by
-Go. The converse is not guaranteed: some invalid documents are rejected by
-Go but accepted by the schema, because the rule above is not expressible in
-JSON Schema. Never treat "passes the schema" as "valid" on its own.
+JSON Schema に失敗する文書が Go に受理されることは決して期待されない．逆は
+保証されない．上記の規則は JSON Schema では表現できないため，Go は拒否するが
+スキーマは受理する無効な文書が存在する．「スキーマを通った」をそれだけで
+「有効」と決して扱ってはならない．
 
-## The sync test
+## 同期テスト
 
-`pkg/api/v1alpha1/schema_test.go` keeps the schemas and the Go code from
-drifting apart:
+`pkg/api/v1alpha1/schema_test.go` は，スキーマと Go のコードが乖離しないように
+保つ:
 
-- Every fixture under `pkg/api/v1alpha1/testdata/jobspec/valid/` and
-  `testdata/result/valid/` must pass both the JSON Schema and
-  `v1alpha1.DecodeJobSpec` / `v1alpha1.DecodeResult`.
-- Every fixture under `.../invalid/` must be rejected by Go decoding, and
-  must also be rejected by the JSON Schema **unless** it is listed in the
-  matching `schema-accepts.txt` allowlist next to it. That allowlist
-  documents, file by file, exactly which Go-only semantic rule (from the
-  list above) makes the fixture invalid even though the schema alone would
-  accept it. The test fails if an allowlisted fixture is *not* actually
-  accepted by the schema (a stale allowlist entry).
-- `TestSchemaInvariants` walks all three schema documents and asserts every
-  `object` node sets `additionalProperties: false`, that no property name
-  looks like it could carry a secret, a command, an image reference or a
-  cloud resource identifier, and that `apiVersion`/`kind` are pinned with
-  `const`.
-- A further test asserts the schema's `keyType` and `error.code` enums are
-  exactly the sets in `v1alpha1.KeyTypes` and `v1alpha1.ErrorCodes`.
+- `pkg/api/v1alpha1/testdata/jobspec/valid/` と `testdata/result/valid/` 配下の
+  すべてのフィクスチャは，JSON Schema と
+  `v1alpha1.DecodeJobSpec` / `v1alpha1.DecodeResult` の両方を通らなければならない．
+- `.../invalid/` 配下のすべてのフィクスチャは Go のデコードに拒否されなければ
+  ならず，隣にある対応する `schema-accepts.txt` 許可リストに載っている
+  **場合を除き**，JSON Schema にも拒否されなければならない．この許可リストは，
+  スキーマ単体なら受理するにもかかわらず（上記の一覧の）どの Go 固有の意味規則が
+  そのフィクスチャを無効にしているかを，ファイルごとに正確に記録する．
+  許可リストに載ったフィクスチャが実際にはスキーマに受理され *ない* 場合
+  （古くなった許可リスト項目），テストは失敗する．
+- `TestSchemaInvariants` は 3 つのスキーマ文書すべてを走査し，すべての `object`
+  ノードが `additionalProperties: false` を設定していること，シークレット・
+  コマンド・イメージ参照・クラウドリソース識別子を運びうるように見える
+  プロパティ名がないこと，`apiVersion`/`kind` が `const` で固定されていることを
+  表明する．
+- さらに別のテストが，スキーマの `keyType` と `error.code` の列挙が
+  `v1alpha1.KeyTypes` と `v1alpha1.ErrorCodes` の集合と正確に一致することを
+  表明する．
 
-Run it with:
+実行方法:
 
 ```sh
 go test ./pkg/api/v1alpha1/...
