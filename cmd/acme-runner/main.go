@@ -4,7 +4,7 @@
 //
 //	acme-runner --version
 //	acme-runner reconcile --job /input/job.json --result /output/result.json [--config /etc/acme-runner/config.json]
-//	acme-runner reconcile --exchange /exchange [--config /etc/acme-runner/config.json]
+//	acme-runner reconcile --exchange /exchange [--execution-name NAME] [--config /etc/acme-runner/config.json]
 //	acme-runner keygen --private FILE --public FILE
 //
 // reconcile handles exactly one JobSpec: it validates the document,
@@ -31,6 +31,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/keygen"
 	"github.com/CITS-NUE/acme-conductor/internal/runner"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/platform/azurecontainerapps"
 	"github.com/CITS-NUE/acme-conductor/internal/version"
 )
 
@@ -47,7 +48,7 @@ func main() {
 }
 
 func usage(stderr io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n  %s reconcile --exchange DIR [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component, component)
+	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n  %s reconcile --exchange DIR [--execution-name NAME] [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component, component)
 	fmt.Fprintln(stderr, "ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate).")
 	fmt.Fprintln(stderr, "\nFlags:")
 	fs.PrintDefaults()
@@ -95,6 +96,7 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	job := fs.String("job", "", "path of the CertificateReconcileJob document (required)")
 	result := fs.String("result", "", "path where the CertificateReconcileResult is written atomically (required)")
 	exchangeDir := fs.String("exchange", "", "exchange directory to take the oldest pending job from (instead of --job/--result)")
+	executionName := fs.String("execution-name", "", "with --exchange: the identity recorded for the claimed job (default: the platform's, "+azurecontainerapps.EnvExecutionName+")")
 	cfg := fs.String("config", defaultConfig, "path of the runner configuration ($"+envConfigPath+")")
 	level := fs.String("log-level", "info", "log level: debug, info, warn or error")
 	if err := fs.Parse(args); err != nil {
@@ -117,13 +119,11 @@ func runReconcile(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: lvl, ReplaceAttr: utcTime}))
 	logger = logger.With("component", component, "version", version.Version)
 	return runner.Reconcile(ctx, runner.Options{
-		ConfigPath:  *cfg,
-		JobPath:     *job,
-		ResultPath:  *result,
-		ExchangeDir: *exchangeDir,
-		Stores:      officialStores(),
-		Stdout:      stdout,
-		Logger:      logger,
+		ConfigPath: *cfg,
+		Source:     jobSource(*job, *result, *exchangeDir, *executionName),
+		Stores:     officialStores(),
+		Stdout:     stdout,
+		Logger:     logger,
 	})
 }
 

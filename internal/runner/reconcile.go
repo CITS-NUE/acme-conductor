@@ -29,11 +29,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/stores"
+	"github.com/CITS-NUE/acme-conductor/internal/runner/transport"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
@@ -61,10 +61,6 @@ func classifyCtx(ctx context.Context, f *failure) *failure {
 	return f
 }
 
-// EnvExecutionName is the variable Azure Container Apps sets to the name
-// of the job execution a container runs in.
-const EnvExecutionName = "CONTAINER_APP_JOB_EXECUTION_NAME"
-
 // clockSkewTolerance is how far in the future a certificate's NotBefore may
 // lie and still be treated as valid now. CAs backdate NotBefore by about an
 // hour; a larger offset indicates a wrong clock or a malformed certificate.
@@ -84,20 +80,18 @@ const (
 // Options configure one reconcile.
 type Options struct {
 	ConfigPath string
+	// Source is the transport the job arrives on and the Result leaves by
+	// (internal/runner/transport). Nil means the two-file transport
+	// JobPath/ResultPath. The core does not know which transport it runs
+	// on; a shared transport (the claim transport of platforms that
+	// start Runners on their own, docs/adr/0014) declares that it
+	// requires signed Results, and a Runner that cannot sign then takes
+	// no job.
+	Source transport.Source
+	// JobPath and ResultPath are the two-file transport when Source is
+	// nil. ResultPath empty means stdout only.
 	JobPath    string
-	// ResultPath is where the Result is written atomically. Empty means
-	// stdout only.
 	ResultPath string
-	// ExchangeDir, when set, selects the claim mode used on platforms that
-	// start Runners on their own (docs/adr/0014): instead of JobPath and
-	// ResultPath the Runner takes the oldest pending job from the exchange
-	// directory (internal/exchange), records its platform execution name
-	// there, and writes the Result next to the job. When nothing is
-	// pending the Runner exits 0 without a Result.
-	ExchangeDir string
-	// ExecutionName is the platform execution name recorded for a claimed
-	// job; empty selects the CONTAINER_APP_JOB_EXECUTION_NAME variable.
-	ExecutionName string
 	// Stores provides the Certificate Store types this Runner can open
 	// (internal/runner/stores). Required: a configuration naming a type
 	// the registry does not provide is refused before any job is handled.
@@ -123,6 +117,9 @@ func (o *Options) defaults() {
 	}
 	if o.LookupEnv == nil {
 		o.LookupEnv = os.LookupEnv
+	}
+	if o.Source == nil {
+		o.Source = transport.Files{JobPath: o.JobPath, ResultPath: o.ResultPath}
 	}
 }
 
@@ -160,42 +157,30 @@ func Reconcile(ctx context.Context, opts Options) int {
 	started := opts.Now().UTC()
 	log := opts.Logger
 
-	if opts.ExchangeDir != "" {
-		// Claim mode is for a shared transport, on which the Conductor
-		// accepts signed Results only: a Runner that could not sign would
-		// take jobs and fail every one of them, so it refuses to take any.
+	if opts.Source.RequiresSignedResults() {
+		// On a shared transport the Conductor accepts signed Results
+		// only: a Runner that could not sign would take jobs and fail
+		// every one of them, so it refuses to take any.
 		cfg, err := loadConfig(&opts)
 		if err != nil {
 			log.Error("runner configuration could not be loaded; taking no job", "error", err.Error())
 			return ExitNoResult
 		}
 		if cfg.ResultSigning == nil {
-			log.Error("claim mode requires resultSigning in the runner configuration; taking no job")
+			log.Error("this transport requires resultSigning in the runner configuration; taking no job")
 			return ExitNoResult
 		}
-		claim, err := exchange.Take(opts.ExchangeDir)
-		if err != nil {
-			log.Error("cannot take a job from the exchange directory", "error", err.Error())
-			return ExitNoResult
-		}
-		if claim == nil {
-			log.Info("no pending job in the exchange directory; nothing to do")
-			return ExitSucceeded
-		}
-		name := opts.ExecutionName
-		if name == "" {
-			name, _ = opts.LookupEnv(EnvExecutionName)
-		}
-		if err := claim.MarkExecution(name); err != nil {
-			// Without a valid execution name the Conductor can neither
-			// observe nor stop this execution; the job is left claimed
-			// with no result so the Conductor fails the run.
-			log.Error("cannot record the execution name for the claimed job", "runId", claim.RunID, "error", err.Error())
-			return ExitNoResult
-		}
-		log.Info("claimed job", "runId", claim.RunID, "execution", name)
-		opts.JobPath, opts.ResultPath = claim.JobPath, claim.ResultPath
 	}
+	job, err := opts.Source.Acquire()
+	if err != nil {
+		log.Error("no job could be acquired", "error", err.Error())
+		return ExitNoResult
+	}
+	if job == nil {
+		log.Info("no pending job; nothing to do")
+		return ExitSucceeded
+	}
+	opts.JobPath, opts.ResultPath = job.JobPath, job.ResultPath
 
 	jobData, err := readBounded(opts.JobPath, v1alpha1.MaxSignedDocumentSize+1)
 	if err != nil {
