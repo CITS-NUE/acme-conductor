@@ -263,7 +263,13 @@ DNS と Key Vault の両方がこの ID で認証する．store バインディ�
 `managedIdentityClientId` に設定した上で** 指定し（Bicep が注入する．
 クライアント ID のないマネージド ID 資格情報はシステム割り当て ID を
 要求するが，Job はそれを持たない），`azuredns` の DNS バインディングは
-`env` で `AZURE_AUTH_METHOD=msi` を指定する．Container Apps は
+**`AZURE_AUTH_METHOD` を設定しない**．`lego` の `azuredns` プロバイダは
+`AZURE_AUTH_METHOD=msi` では `ManagedIdentityCredential` をクライアント ID
+なしで生成するため（`providers/dns/azuredns/credentials.go`，4.35 と 5.3 で
+同じ），`AZURE_CLIENT_ID` が無視されてシステム割り当て ID が要求され，この
+Job では失敗する．未設定なら `DefaultAzureCredential` の経路になり，
+`AZURE_CLIENT_ID` が選ぶユーザー割り当て ID で認証する（`cert-infra` の
+本番ジョブが同じ経路で動いている）．Container Apps は
 `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` の環境変数を通じて ID をコンテナに
 公開する（また Job テンプレートは `AZURE_CLIENT_ID` に ID のクライアント ID
 を設定する）．Runner は `lego` の環境をゼロから組み立てるため，DNS
@@ -273,7 +279,6 @@ DNS と Key Vault の両方がこの ID で認証する．store バインディ�
 "azure-dns-staging": {
   "provider": "azuredns",
   "env": {
-    "AZURE_AUTH_METHOD": "msi",
     "AZURE_ZONE_NAME": "example.ac.jp",
     "AZURE_RESOURCE_GROUP": "rg-dns-example",
     "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000"
