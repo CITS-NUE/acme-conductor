@@ -118,7 +118,11 @@ target のポリシー，実行・DNS・store のバインディング，所有�
 [`deploy/azure/README.md`](../deploy/azure/README.md) のとおりにデプロイされた
 Conductor（またはリハーサル用の 1 台のホスト）があり，Runner が `cert-infra` の
 委任先と同じゾーンでチャレンジを完了でき，Key Vault に書き込めることを前提と
-する．
+する．`cert-infra` のジョブの環境変数のうち，`AZURE_ZONE_NAME`，
+`AZURE_RESOURCE_GROUP`，`AZURE_SUBSCRIPTION_ID` は DNS バインディングの `env` に，
+`AZURE_CLIENT_ID` は `passthroughEnv` に対応する．`LEGO_DISABLE_CNAME_SUPPORT`
+などの `LEGO_*` は予約済みで持ち込めず，CNAME をたどる動作は既定なので不要である
+（[`docs/runner.md`](runner.md#dnsbindingsname)）．
 
 1. **暗転状態で始める．** `targetSource: shadow`（または `iac`），
    `migration.source` としての `cert-infra` の一覧，そして移行対象ホストの
