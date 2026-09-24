@@ -38,7 +38,7 @@ Container Apps 環境の作成（5〜10 分）が占める．
 | Azure リソースの作成（手順 4, 8） | デプロイ先 RG の `Contributor` | |
 | サブスクリプションスコープのネストしたデプロイ（手順 8） | サブスクリプションの `Microsoft.Resources/deployments/*`（サブスクリプションの `Contributor` や `Owner` に含まれる） | `main.bicep` はカスタムロールを `scope: subscription()` の module（`modules/roles.bicep`）で作るため，**RG の `Contributor` だけでは足りない**．`User Access Administrator` にも含まれない |
 | カスタムロール定義の作成（手順 8） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`） | `Contributor` と `Role Based Access Control Administrator` には **含まれない** |
-| ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任では事前検証で落ちる．[手順 8](#8-デプロイ) を参照 |
+| ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任でもよい（#37 以降）．[手順 8](#8-デプロイ) を参照 |
 | アプリ登録の作成（手順 5） | Entra の `Application Developer` 以上 | テナント設定で一般ユーザーのアプリ作成が禁止されている場合 |
 | 管理者の同意，アプリロールの割り当て（手順 5） | Entra の `Application Administrator` / `Cloud Application Administrator` | 自テナントの API への委任許可の同意ならこれで足りる |
 
@@ -297,7 +297,8 @@ az deployment group create -g rg-acme-staging -n acme-stg \
 
 **ロール割り当て権限が ABAC 条件付きの場合**（「`Owner` などの特権ロールは
 割り当て不可」という条件付きの `Role Based Access Control Administrator`
-など）は，事前検証が次のエラーで失敗する．何も作成されずに止まる:
+など）の注意．[#37](https://github.com/CITS-NUE/acme-conductor/pull/37) より前の
+テンプレートでは，事前検証が次のエラーで失敗し，何も作成されずに止まる:
 
 ```
 InvalidTemplateDeployment: Authorization failed for template resource '<guid>' of type
@@ -305,12 +306,14 @@ InvalidTemplateDeployment: Authorization failed for template resource '<guid>' o
 'Microsoft.Authorization/roleAssignments/write' ...
 ```
 
-`--validation-level ProviderNoRbac` でも同じエラーになる．直接の
-`az role assignment create` は通る．この場合は，手順 7 の `what-if` で差分を
-確認したうえで，`--validation-level Template` を付けて実行する
-（[#34](https://github.com/CITS-NUE/acme-conductor/issues/34)）．事前検証が
-省かれるので，途中で失敗すると一部のリソースが作られた状態で止まる．同じ
-コマンドを再実行すれば揃う．
+原因は，ロール割り当ての `roleDefinitionId` が roles モジュールの出力で，
+事前検証の時点では未確定なことにある．条件が参照するロール定義 ID が
+わからないため，拒否される（[#34](https://github.com/CITS-NUE/acme-conductor/issues/34)）．
+#37 以降のテンプレートはこの ID を事前検証の時点で確定させるので，既定の
+検証レベルのままでデプロイできる．古いテンプレートでは，手順 7 の `what-if`
+で差分を確認したうえで `--validation-level Template` を付けて実行する
+（`ProviderNoRbac` では回避できない）．事前検証が省かれるので，途中で
+失敗すると一部のリソースが作られた状態で止まる．同じコマンドを再実行すれば揃う．
 
 出力のうち，`conductorUrl` と `conductorGuiRedirectUri` は次の手順で使う．
 
@@ -363,8 +366,8 @@ API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) �
 ## 再デプロイ
 
 パラメタや Runner 設定を変えたら，手順 7 の環境変数を設定して手順 8 のコマンドを
-再実行する．内容が同じなら何度実行しても結果は変わらない．ABAC 条件付きの権限の場合は
-毎回 `--validation-level Template` が要る．
+再実行する．内容が同じなら何度実行しても結果は変わらない．#37 より前のテンプレートで，
+ABAC 条件付きの権限の場合は，毎回 `--validation-level Template` が要る．
 
 ## 片付け（staging を捨てるとき）
 
@@ -388,7 +391,7 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 
 | 症状 | 原因 | 対処 |
 |---|---|---|
-| preflight で `roleAssignments/write` が拒否される | ABAC 条件付きの RBAC 委任．事前検証では条件を評価できない | `what-if` で確認後，`--validation-level Template`（#34） |
+| preflight で `roleAssignments/write` が拒否される | ABAC 条件付きの RBAC 委任で，`roleDefinitionId` が事前検証の時点で未確定（#34） | #37 以降のテンプレートを使う．古いものは `what-if` で確認後に `--validation-level Template` |
 | デプロイ時にロール定義の作成で失敗する（想定） | `roleDefinitions/write` がない | PIM で `User Access Administrator` などを有効化する |
 | サブスクリプションスコープの `roles` デプロイで失敗する（想定） | RG の `Contributor` だけで，サブスクリプションで `Microsoft.Resources/deployments/*` を持たない | サブスクリプションの `Contributor` などを用意する |
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
