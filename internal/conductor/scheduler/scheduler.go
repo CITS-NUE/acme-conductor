@@ -30,9 +30,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 // Actor is the audit actor and requestedBy value of automatic runs, and

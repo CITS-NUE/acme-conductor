@@ -28,9 +28,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/appcontainers/armappcontainers/v3"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/fakerunner"
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/exchange"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 func TestMain(m *testing.M) {

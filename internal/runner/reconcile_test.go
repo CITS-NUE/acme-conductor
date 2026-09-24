@@ -29,9 +29,9 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/fakelego"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
-	"github.com/CITS-NUE/acme-conductor/internal/store"
 	"github.com/CITS-NUE/acme-conductor/internal/store/filesystem"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/store"
 )
 
 func TestMain(m *testing.M) {

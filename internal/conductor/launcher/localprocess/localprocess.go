@@ -1,14 +1,8 @@
-// Package launcher defines how the Conductor starts one Runner execution
-// and collects its Result, and provides the local-process implementation
-// used for development and tests.
-//
-// A Launcher is the only place cloud- or platform-specific code may live
-// in the Conductor (docs/architecture.md, "Job Launcher interface"); the
-// scheduler talks to it exclusively through this interface. A launcher
-// hands the Runner a JobSpec and gets back a Result — nothing else ever
-// crosses that boundary, and in particular no credential travels from the
-// Conductor to the Runner through it.
-package launcher
+// Package localprocess runs acme-runner as a child process of the
+// Conductor: the local-process launcher (execution binding type
+// "local-process"), meant for development and tests. Its contract is
+// pkg/launcher.
+package localprocess
 
 import (
 	"bytes"
@@ -27,76 +21,8 @@ import (
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
-
-// Launcher starts Runner executions.
-type Launcher interface {
-	// Type names the launcher kind (for logs and the run record).
-	Type() string
-	// Start begins one execution for spec. The execution is bounded by ctx:
-	// cancelling it asks the Runner to stop, which normally yields a
-	// Result with error code Cancelled.
-	Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execution, error)
-}
-
-// Execution is one started Runner execution.
-type Execution interface {
-	// ID identifies the execution on its platform (recorded as the run's
-	// externalExecutionId).
-	ID() string
-	// Wait blocks until the execution has ended and returns the Result it
-	// reported. A nil Result comes with an *Error describing why none
-	// could be obtained.
-	Wait() (*v1alpha1.Result, error)
-}
-
-// Reason classifies why an execution produced no usable Result.
-type Reason string
-
-// Reasons.
-const (
-	// ReasonStart: the execution could not be started at all.
-	ReasonStart Reason = "start"
-	// ReasonNoResult: the Runner ended without a valid Result document.
-	ReasonNoResult Reason = "no-result"
-	// ReasonTimeout: the launcher's own timeout elapsed and the Runner did
-	// not report a Result before it was terminated.
-	ReasonTimeout Reason = "timeout"
-	// ReasonCancelled: the context given to Start was cancelled and the
-	// Runner did not report a Result before it was terminated.
-	ReasonCancelled Reason = "cancelled"
-	// ReasonMismatch: the Runner reported a Result for another run or
-	// target than the one it was started for.
-	ReasonMismatch Reason = "mismatch"
-)
-
-// Error is returned by Start and Wait. Err carries the underlying detail
-// for the log only; callers translate Reason into a Conductor-owned
-// summary and never copy Err's text into a run record.
-type Error struct {
-	Reason Reason
-	Err    error
-}
-
-func (e *Error) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("%s: %v", e.Reason, e.Err)
-	}
-	return string(e.Reason)
-}
-
-// Unwrap exposes the underlying error.
-func (e *Error) Unwrap() error { return e.Err }
-
-// ReasonOf returns the Reason of err, or ReasonNoResult for an error that
-// is not an *Error.
-func ReasonOf(err error) Reason {
-	var e *Error
-	if errors.As(err, &e) {
-		return e.Reason
-	}
-	return ReasonNoResult
-}
 
 // DefaultGracePeriod is how long a local execution waits after SIGTERM
 // before the process group is killed.
@@ -131,10 +57,10 @@ type LocalProcess struct {
 	GracePeriod time.Duration
 	// Signer, when set, wraps every JobSpec in a signed envelope; the
 	// Runner must then be configured with the matching public key.
-	Signer *Signer
+	Signer *launcher.Signer
 	// Verifier, when set, makes this launcher accept signed Results only;
 	// the Runner must then be configured with a result signing key.
-	Verifier *Verifier
+	Verifier *launcher.Verifier
 	Logger   *slog.Logger
 	// LookupEnv is os.LookupEnv unless a test injects one.
 	LookupEnv func(string) (string, bool)
@@ -144,7 +70,7 @@ type LocalProcess struct {
 func (l *LocalProcess) Type() string { return "local-process" }
 
 // Start implements Launcher.
-func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execution, error) {
+func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (launcher.Execution, error) {
 	logger := l.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -153,28 +79,28 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	data, err := JobDocument(spec, l.Signer)
+	data, err := launcher.JobDocument(spec, l.Signer)
 	if err != nil {
-		return nil, &Error{Reason: ReasonStart, Err: err}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: err}
 	}
 	if !filepath.IsAbs(l.RunnerBinary) || !filepath.IsAbs(l.RunnerConfig) || !filepath.IsAbs(l.WorkDir) {
-		return nil, &Error{Reason: ReasonStart, Err: errors.New("runner binary, runner config and work directory must be absolute paths")}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: errors.New("runner binary, runner config and work directory must be absolute paths")}
 	}
 	if err := os.MkdirAll(l.WorkDir, 0o700); err != nil {
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("create work directory: %w", err)}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("create work directory: %w", err)}
 	}
 	dir := filepath.Join(l.WorkDir, "run-"+spec.RunID)
 	// The run id is unique, so an existing directory is a leftover of an
 	// earlier attempt and is refused rather than reused.
 	if err := os.Mkdir(dir, 0o700); err != nil {
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("create run directory: %w", err)}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("create run directory: %w", err)}
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	jobPath := filepath.Join(dir, JobFile)
 	resultPath := filepath.Join(dir, ResultFile)
 	if err := os.WriteFile(jobPath, data, 0o600); err != nil {
 		cleanup()
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("write job spec: %w", err)}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("write job spec: %w", err)}
 	}
 
 	env := []string{"HOME=" + dir, "TMPDIR=" + dir, "PATH=/usr/local/bin:/usr/bin:/bin"}
@@ -213,7 +139,7 @@ func (l *LocalProcess) Start(ctx context.Context, spec *v1alpha1.JobSpec) (Execu
 	if err := cmd.Start(); err != nil {
 		cancel()
 		cleanup()
-		return nil, &Error{Reason: ReasonStart, Err: fmt.Errorf("start runner: %w", err)}
+		return nil, &launcher.Error{Reason: launcher.ReasonStart, Err: fmt.Errorf("start runner: %w", err)}
 	}
 	logger.Info("runner started", "runId", spec.RunID, "targetId", spec.Target.ID, "pid", cmd.Process.Pid, "binary", l.RunnerBinary)
 	return &localExecution{
@@ -233,7 +159,7 @@ type localExecution struct {
 	stderr     *lineSink
 	spec       *v1alpha1.JobSpec
 	logger     *slog.Logger
-	verifier   *Verifier
+	verifier   *launcher.Verifier
 
 	once sync.Once
 	res  *v1alpha1.Result
@@ -260,39 +186,24 @@ func (e *localExecution) wait() (*v1alpha1.Result, error) {
 	}
 	var exitErr *exec.ExitError
 	if waitErr != nil && !errors.Is(waitErr, exec.ErrWaitDelay) && !errors.As(waitErr, &exitErr) {
-		return nil, &Error{Reason: ReasonNoResult, Err: fmt.Errorf("wait for runner: %w", waitErr)}
+		return nil, &launcher.Error{Reason: launcher.ReasonNoResult, Err: fmt.Errorf("wait for runner: %w", waitErr)}
 	}
 	e.logger.Info("runner finished", "runId", e.spec.RunID, "targetId", e.spec.Target.ID, "exitCode", exitCode)
 
-	res, rerr := ReadResultFile(e.resultPath, e.verifier)
+	res, rerr := launcher.ReadResultFile(e.resultPath, e.verifier)
 	if rerr == nil {
 		if res.RunID != e.spec.RunID || res.TargetID != e.spec.Target.ID {
-			return nil, &Error{Reason: ReasonMismatch, Err: fmt.Errorf("result names run %s target %s", res.RunID, res.TargetID)}
+			return nil, &launcher.Error{Reason: launcher.ReasonMismatch, Err: fmt.Errorf("result names run %s target %s", res.RunID, res.TargetID)}
 		}
 		return res, nil
 	}
 	switch {
 	case errors.Is(e.runCtx.Err(), context.DeadlineExceeded) && e.parent.Err() == nil:
-		return nil, &Error{Reason: ReasonTimeout, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
+		return nil, &launcher.Error{Reason: launcher.ReasonTimeout, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
 	case e.parent.Err() != nil:
-		return nil, &Error{Reason: ReasonCancelled, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
+		return nil, &launcher.Error{Reason: launcher.ReasonCancelled, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
 	}
-	return nil, &Error{Reason: ReasonNoResult, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
-}
-
-// ReadResultFile reads a Runner's result document from path and decodes
-// it with ResultDocument.
-func ReadResultFile(path string, v *Verifier) (*v1alpha1.Result, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, v1alpha1.MaxSignedDocumentSize+1))
-	if err != nil {
-		return nil, err
-	}
-	return ResultDocument(data, v)
+	return nil, &launcher.Error{Reason: launcher.ReasonNoResult, Err: fmt.Errorf("exit code %d: %w", exitCode, rerr)}
 }
 
 // maxLogLine bounds one relayed Runner log line.

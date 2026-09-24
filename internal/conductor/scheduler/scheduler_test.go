@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 // fakeLauncher answers every Start with a scripted behaviour.

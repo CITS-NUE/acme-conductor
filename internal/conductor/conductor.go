@@ -28,13 +28,14 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/acajob"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/launcher/localprocess"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
 	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 // Exit codes of Serve.
@@ -320,7 +321,7 @@ func buildLaunchers(cfg *config.Config, signer *launcher.Signer, verifier *launc
 			if err := os.MkdirAll(lp.WorkDir, 0o700); err != nil {
 				return nil, fmt.Errorf("execution binding %q: work directory: %w", name, err)
 			}
-			out[name] = &launcher.LocalProcess{
+			out[name] = &localprocess.LocalProcess{
 				RunnerBinary: lp.RunnerBinary, RunnerConfig: lp.RunnerConfig, WorkDir: lp.WorkDir,
 				Timeout: time.Duration(lp.TimeoutSeconds) * time.Second, PassthroughEnv: lp.PassthroughEnv,
 				Signer: signer, Verifier: verifier, Logger: log.With("component", "launcher", "executionBinding", name), LookupEnv: lookup,
