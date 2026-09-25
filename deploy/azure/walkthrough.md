@@ -26,6 +26,7 @@
  8. デプロイ
  9. デプロイ後の確認とリダイレクト URI の登録
 10. 最初の target で発行テスト（staging CA）
+11. 利用側への組み込み（本番 CA の証明書を実際のサービスで使う）  ← 利用側の管理者と行う
 ```
 
 所要時間の目安は半日である．待ち時間のほとんどは，権限の有効化と
@@ -380,6 +381,120 @@ run が `AcmeFailure lego exited with status 1` で失敗した場合，lego 自
 委任を確かめ，次に Runner のログで `fqdn` が意図した名前かを確かめる．失敗した
 target は GUI で無効化しておく．有効なままだと再試行が続き，CA のレート制限を消費する．
 
+## 11. 利用側への組み込み
+
+Conductor は証明書を Key Vault に **格納するところまで** しか行わない．
+それを実際のサービス（Application Gateway など）で使うには，次の 2 つが要る．
+
+- 利用側の ID に読み取り権限を付ける
+- 利用側の参照先を付け替える
+
+どちらもテンプレートの外の作業であり，利用側の管理者と行う．
+Runner の ID が持つのは証明書の書き込み権限だけで，誰に読ませるかは
+利用側の判断である（[`docs/migration.md`](../../docs/migration.md)）．
+
+**staging CA の証明書は，稼働中のサービスに決して付けない．** 信頼されない CA の
+証明書なので，クライアントはエラーになる．この節は，本番 CA で発行した後の作業である．
+
+### 11-1. 本番 CA で発行する
+
+- Runner 設定の `acmeBindings` に本番 CA のバインディングを追加する（例: `letsencrypt-prod`）．
+  このバインディングには `allowProductionCA: true` が **必要** である．ステージングと
+  認識されないディレクトリは，これがないと拒否される
+  （[`docs/runner.md`](../../docs/runner.md)）．
+- あわせて `authorization.allowedAcmeBindings` とパラメタの `acmeBindings` にも追加し，
+  再デプロイする（手順 8）．
+- ポリシーの `acmeBinding` をそのバインディングにして，target の run が `succeeded` に
+  なるのを待つ．
+
+### 11-2. オブジェクトと利用側の要件を確かめる
+
+run の画面の **Store object** が Key Vault の証明書名である．たとえば
+`leaf-cerdad-naruto-u-ac-jp-0d438f060aa6c48a` のように，FQDN の `.` を `-` にし，
+16 桁の接尾辞を付けたものになる．利用側が参照するのは，同名の **シークレット** の
+バージョンなしの URI である:
+
+```
+https://<vault>.vault.azure.net/secrets/<Store object>
+```
+
+Conductor は証明書を **PEM**（`application/x-pem-file`）で，鍵は既定で **EC（P-256）** で
+格納する．利用側がこの形式を受け付けるかを先に確認する:
+
+| 利用側 | 可否 | 根拠 |
+|---|---|---|
+| Application Gateway v2 | 使える見込み | Microsoft の文書は Key Vault のシークレットとして PEM も有効としている．EC 鍵の証明書は，既存の本番 Application Gateway で提示の実績がある（PFX 形式での格納）．PEM と Conductor の組み合わせは **未検証** なので，最初の 1 件で確かめる |
+| App Service，Azure Front Door | **使えない** | PKCS #12（PFX）しか取り込まない．Front Door は EC 鍵も受け付けない（[`docs/runner.md`](../../docs/runner.md#certificate-store-azure-key-vault)） |
+| シークレットを自分で読むアプリ，VM，コンテナ | 使える | PEM を読めればよい |
+
+### 11-3. 利用側の ID に読み取り権限を付ける
+
+利用側は **自分の ID** で Key Vault のシークレットを読む．その ID に
+`Key Vault Secrets User` を付ける．スコープは Key Vault 全体ではなく，
+**シークレット単位** にするのが最小権限である．シークレット単位にするには，
+先に証明書ができている必要がある．
+
+まず，利用側の ID を確かめる（Application Gateway の例）:
+
+```sh
+az network application-gateway show -g <agw rg> -n <agw> --query identity -o json
+# 既存の証明書の参照先と，その ID が持つ権限
+az network application-gateway ssl-cert list -g <agw rg> --gateway-name <agw> --query "[].{name:name,kv:keyVaultSecretId}" -o table
+az role assignment list --assignee <principalId> --all -o table
+```
+
+次に権限を付ける（ポータルでも CLI でもよい）:
+
+```sh
+KV=$(az keyvault show -n <vault> --query id -o tsv)
+az role assignment create --role "Key Vault Secrets User" \
+  --assignee-object-id <利用側 ID の principalId> --assignee-principal-type ServicePrincipal \
+  --scope "$KV/secrets/<Store object>"
+```
+
+ポータルで行う場合は，Key Vault →「証明書」ではなく「シークレット」→ 該当の
+シークレット →「アクセス制御 (IAM)」→「ロールの割り当ての追加」で
+`Key Vault Secrets User` を選び，メンバーに利用側のマネージド ID を指定する．
+
+割り当てる人には，そのスコープでの `roleAssignments/write` が要る．
+`Key Vault Secrets User` は特権ロールではないので，条件付きの RBAC 委任でも
+割り当てられる．Key Vault にファイアウォールを設定している場合は，利用側からの
+ネットワーク到達性も確認する．
+
+### 11-4. 参照先を付け替える（Application Gateway の例）
+
+付け替える前に，戻せるように現在の参照先を控えておく（11-3 の `ssl-cert list`）．
+
+```sh
+az network application-gateway ssl-cert update -g <agw rg> --gateway-name <agw> -n <ssl cert name> \
+  --key-vault-secret-id "https://<vault>.vault.azure.net/secrets/<Store object>"
+```
+
+- **バージョンなしの URI** にする．Application Gateway はおよそ 4 時間ごとに Key Vault を
+  確認し，新しいバージョンを無停止で取り込む．Conductor の更新はこの経路で反映される．
+  バージョンを含む URI では更新が反映されない．
+- 更新の間，Application Gateway の `provisioningState` が `Updating` になる．
+  `Failed` になった場合は，活動ログのエラーを確認する（権限，形式，到達性のいずれか）．
+
+### 11-5. 確かめる
+
+```sh
+echo | openssl s_client -connect <fqdn>:443 -servername <fqdn> 2>/dev/null \
+  | openssl x509 -noout -issuer -enddate -fingerprint -sha256
+```
+
+- 発行者が本番 CA であることを確認する．
+- SHA-256 フィンガープリントが run の画面の **Fingerprint** と一致することを確認する
+  （コロンの有無と大文字・小文字の違いは無視する）．
+
+### 11-6. 戻し方と後片付け
+
+- **戻す**: 11-4 で控えた元の `keyVaultSecretId` で，同じ `ssl-cert update` を実行する．
+- **古い経路を止める**: 旧基盤（`cert-infra` など）の更新ジョブは，新しい経路で
+  少なくとも 1 回の更新が反映されたことを確かめてから止める．
+- **古い権限と証明書を片付ける**: 利用側の旧シークレットへの権限と，旧 Key Vault の証明書は，
+  自動では消えない．不要になったら手で外す．
+
 ## 再デプロイ
 
 パラメタや Runner 設定を変えたら，手順 7 の環境変数を設定して手順 8 のコマンドを
@@ -414,4 +529,6 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |
+| 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
+| 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
