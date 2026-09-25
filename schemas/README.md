@@ -3,8 +3,10 @@
 このディレクトリには，Go の `pkg/api/v1alpha1` で定義されたワイヤコントラクトを
 記述する JSON Schema（draft 2020-12）文書を置く．`JobSpec`
 （`jobspec.schema.json`），`Result`（`result.schema.json`），そして Phase 4
-以降は署名付きジョブエンベロープ（`signedjob.schema.json`）であり，その
-`payload` は base64url エンコードされた `JobSpec` 文書である．
+以降は署名付きジョブエンベロープ（`signedjob.schema.json`．その `payload` は
+base64url エンコードされた `JobSpec` 文書）と，Runner が返す署名付き Result
+エンベロープ（`signedresult.schema.json`．その `payload` は base64url
+エンコードされた `Result` 文書）である．
 
 ## バージョンポリシー
 

@@ -117,6 +117,7 @@ acme-runner --help
 | `dnsBindings` | map | 1 件以上必要．キーの規則は同じ． |
 | `storeBindings` | map | 1 件以上必要．キーの規則は同じ． |
 | `jobSigning` | object | 任意．存在する場合，署名付きジョブエンベロープだけを受け付ける．後述． |
+| `resultSigning` | object | 任意．存在する場合，Runner はすべての Result に署名する．後述． |
 
 ### `authorization`
 
@@ -887,10 +888,6 @@ docker run --rm \
   文書化されているが，CI で検証されてはいない．取り込みを妨げる論理削除
   済みの証明書を復旧も purge も決して行わず，自身の ID のロール割り当てが
   文書通りに狭いことを検証することもできない．
-- Key Vault store は PEM のみを書く．App Service と Azure Front Door の
-  組み込みの Key Vault 連携は PKCS #12 を必要とし，この store では役立たない．
-  PKCS #12 での取り込みは Phase 3 の範囲外である
-  （[利用者とコンテンツタイプ](#certificate-store-azure-key-vault) を参照）．
 - `credential: default` では，SDK の `DefaultAzureCredential` チェーンが
   Runner の環境からサービスプリンシパルの変数を読み，`PATH` から開発者
   ツールを実行することがある．これは開発上の利便性であって本番の姿勢では

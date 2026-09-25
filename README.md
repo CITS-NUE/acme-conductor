@@ -88,6 +88,10 @@ internal/conductor/   Conductor: 設定，レジストリ (SQLite)，スケジ�
 internal/runner/      Runner: 設定，reconcile ループ，lego の起動
 internal/store/       ファイルシステム store と Azure Key Vault store
 internal/policy/      FQDN の正規化とサフィックス照合
+internal/exchange/    自ら起動する Runner にジョブを渡すディスク上の受け渡しプロトコル
+internal/keygen/      両バイナリ共通の keygen サブコマンド (Ed25519 の署名鍵)
+internal/fslock/      Runner のディスク上の store が使うアドバイザリファイルロック
+internal/strictjson/  未知フィールド・重複キー・末尾データを拒否する厳密な JSON デコーダ
 internal/version/     ビルド情報 (-ldflags で注入)
 pkg/api/v1alpha1/     バージョン付きの JobSpec/Result コントラクト
 pkg/store/            すべての store アダプタが実装する Certificate Store コントラクト
