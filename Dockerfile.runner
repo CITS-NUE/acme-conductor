@@ -14,7 +14,7 @@
 # Base images are pinned by digest: the tag says what the
 # digest is expected to be, the digest is what is built from. Dependabot
 # (.github/dependabot.yml) proposes updates to both together.
-FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS builder
+FROM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
 
 WORKDIR /src
 
@@ -57,7 +57,7 @@ RUN go build \
 #
 # Reuses the golang:1.25-bookworm image as the fetch environment (it
 # already has curl and tar) rather than pulling in another base image.
-FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS lego
+FROM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS lego
 
 ARG LEGO_VERSION=4.35.2
 ARG LEGO_SHA256_AMD64=ee5be4bf457de8e3efa86a51651c75c87f0ee0e4e9f3ae14f6034d68365770f3
