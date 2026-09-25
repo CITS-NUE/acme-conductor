@@ -40,6 +40,26 @@ func TestHelpFlag(t *testing.T) {
 	}
 }
 
+func TestProvisioningKeygenDispatch(t *testing.T) {
+	dir := t.TempDir()
+	priv := filepath.Join(dir, "private.pem")
+	pub := filepath.Join(dir, "public.pem")
+	var out, errb bytes.Buffer
+	code := run(context.Background(), []string{"provisioning-keygen", "--private", priv, "--public", pub}, &out, &errb, noEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "keyId: ") || !strings.Contains(out.String(), "publicKey: ") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if _, err := os.Stat(priv); err != nil {
+		t.Fatalf("private key not written: %v", err)
+	}
+	if _, err := os.Stat(pub); err != nil {
+		t.Fatalf("public key not written: %v", err)
+	}
+}
+
 func TestNoArgsShowsUsageAndFails(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run(context.Background(), nil, &out, &errb, noEnv); code != 2 {

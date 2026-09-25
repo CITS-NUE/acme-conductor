@@ -129,6 +129,19 @@ type failure struct {
 	code    v1alpha1.ErrorCode
 	summary string
 	err     error
+	// accountProvisioning is attached once a job carrying a provisioning
+	// payload has passed authorization and binding resolution; it is nil
+	// otherwise, so Result.AccountProvisioning stays omitted (see
+	// buildResult).
+	accountProvisioning *v1alpha1.AccountProvisioningResult
+}
+
+// withAP attaches ap (which may be nil, a no-op) to the failure and
+// returns it, so a single fail() call can be annotated at its call site
+// without an extra local variable.
+func (f *failure) withAP(ap *v1alpha1.AccountProvisioningResult) *failure {
+	f.accountProvisioning = ap
+	return f
 }
 
 func (f *failure) Error() string {
@@ -149,6 +162,9 @@ type outcome struct {
 	objectRef   string
 	storeType   string
 	legoOutcome *lego.Outcome
+	// accountProvisioning mirrors failure.accountProvisioning for a
+	// succeeded run.
+	accountProvisioning *v1alpha1.AccountProvisioningResult
 }
 
 // Reconcile runs one job and returns the process exit code.
@@ -376,9 +392,43 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	if !ok {
 		return nil, fail(v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("store binding %q is not defined in runner configuration", spec.Store.Binding), nil)
 	}
+
+	// Account generations and provisioning (issue #42). spec.ACME.Account
+	// nil is the legacy, unversioned account state: every step below
+	// behaves exactly as it did before this feature existed. Account
+	// non-nil selects a generation; ap (the Result's AccountProvisioning)
+	// is populated only when the job also carries a sealed provisioning
+	// payload, and only from this point on — a failure above (policy,
+	// unknown binding) never mentions account provisioning at all.
+	account := spec.ACME.Account
+	provisioning := account != nil && account.Provisioning != nil
+	var ap *v1alpha1.AccountProvisioningResult
+	if provisioning {
+		ap = &v1alpha1.AccountProvisioningResult{
+			Binding:    spec.ACME.Binding,
+			Generation: account.Generation,
+			Status:     v1alpha1.AccountProvisioningFailed,
+		}
+	}
+	// failAP is fail(), annotated with the current account-provisioning
+	// outcome; ap is nil outside a provisioning run, so it is then exactly
+	// fail() and every Result.AccountProvisioning stays omitted, as before.
+	failAP := func(code v1alpha1.ErrorCode, summary string, err error) *failure {
+		return fail(code, summary, err).withAP(ap)
+	}
+	accountRoot := cfg.Lego.StateDir
+	if account != nil {
+		root, err := accountsRoot(cfg.Lego.StateDir, spec.ACME.Binding, account)
+		if err != nil {
+			return nil, failAP(v1alpha1.ErrorCodeInternal, "acme account state directory could not be prepared", err)
+		}
+		accountRoot = root
+		log = log.With("acmeAccountGeneration", account.Generation)
+	}
+
 	st, err := opts.Stores.Open(storeBinding)
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store could not be opened", err)
+		return nil, failAP(v1alpha1.ErrorCodeStoreFailure, "certificate store could not be opened", err)
 	}
 	object := st.ObjectName(spec.Target.FQDN)
 	log = log.With("storeObjectRef", object, "storeType", st.Type())
@@ -390,7 +440,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		current = nil
 		log.Info("no certificate in store; issuing")
 	case err != nil:
-		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store read failed", err))
+		return nil, classifyCtx(ctx, failAP(v1alpha1.ErrorCodeStoreFailure, "certificate store read failed", err))
 	default:
 		renewBefore := time.Duration(spec.Policy.RenewBeforeDays) * 24 * time.Hour
 		covers := containsFold(current.DNSNames, spec.Target.FQDN)
@@ -401,7 +451,10 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		// Likewise a store binding whose form changed (a Key Vault content
 		// type): the stored private key is never read back to re-encode.
 		formOK := !current.Stale
-		if covers && valid && keyOK && formOK && current.NotAfter.After(now.Add(renewBefore)) {
+		// A provisioning run always invokes lego: lego registers the ACME
+		// account only inside "run", so the noop shortcut (which never
+		// starts lego) would silently skip registration.
+		if !provisioning && covers && valid && keyOK && formOK && current.NotAfter.After(now.Add(renewBefore)) {
 			log.Info("certificate is current; nothing to do", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 			return &outcome{action: v1alpha1.ActionNoop, info: current, objectRef: object, storeType: st.Type()}, nil
 		}
@@ -414,12 +467,14 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 			log.Info("stored certificate key type differs from the policy; reissuing", "fingerprintSha256", current.FingerprintSHA256, "storedKeyType", string(current.KeyType), "keyType", string(spec.Policy.KeyType))
 		case !formOK:
 			log.Info("stored certificate is in another form than the store binding writes; reissuing", "fingerprintSha256", current.FingerprintSHA256)
+		case provisioning:
+			log.Info("account provisioning run; invoking lego to register the account", "fingerprintSha256", current.FingerprintSHA256)
 		default:
 			log.Info("certificate is due for renewal", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 		}
 	}
 	if ctx.Err() != nil {
-		return nil, fail(v1alpha1.ErrorCodeCancelled, "run was cancelled before lego started", ctx.Err())
+		return nil, failAP(v1alpha1.ErrorCodeCancelled, "run was cancelled before lego started", ctx.Err())
 	}
 
 	grace := opts.GracePeriod
@@ -433,30 +488,77 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	staleAfter := 2*time.Duration(cfg.Lego.TimeoutSeconds)*time.Second + grace + staleMargin
 	work, cleanup, err := prepareWorkDir(cfg.Lego.WorkDir, spec.RunID, staleAfter)
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)
+		return nil, failAP(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)
 	}
 	defer cleanup()
-	if err := loadAccounts(ctx, cfg.Lego.StateDir, work); err != nil {
-		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err))
+	if err := loadAccounts(ctx, accountRoot, work); err != nil {
+		return nil, classifyCtx(ctx, failAP(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err))
+	}
+
+	// legoEAB and disableEAB resolve to exactly one of: the sealed
+	// provisioning payload (a provisioning run), no EAB at all (a
+	// generation reusing an already-registered account, case a), or
+	// neither (legacy: the ACME binding's own env-named EAB, if any,
+	// applies exactly as before).
+	var legoEAB *lego.EABValues
+	disableEAB := false
+	if account != nil {
+		switch {
+		case provisioning:
+			if cfg.AccountProvisioning == nil {
+				err := errors.New("no accountProvisioning key configured on this runner")
+				return nil, failAP(v1alpha1.ErrorCodeInvalidJobSpec, "this runner has no account provisioning key", err)
+			}
+			if accountRegistered(work) {
+				err := fmt.Errorf("acme account generation %d of binding %q is already registered", account.Generation, spec.ACME.Binding)
+				return nil, failAP(v1alpha1.ErrorCodeInvalidJobSpec, fmt.Sprintf("acme account generation %d of binding %q is already provisioned", account.Generation, spec.ACME.Binding), err)
+			}
+			keys, err := loadProvisioningKeys(cfg.AccountProvisioning)
+			if err != nil {
+				return nil, failAP(v1alpha1.ErrorCodeInternal, "account provisioning keys could not be loaded", err)
+			}
+			eab, err := account.Provisioning.Open(keys, spec.ACME.Binding, account.Generation)
+			if err != nil {
+				return nil, failAP(v1alpha1.ErrorCodeInvalidJobSpec, "account provisioning payload could not be opened", err)
+			}
+			legoEAB = &lego.EABValues{KID: eab.KID, HMAC: eab.HMAC}
+			// The decrypted values now live only in legoEAB (about to be
+			// consumed by lego.Build) and the invocation's own redacted
+			// secrets list; drop this copy as soon as possible. Go strings
+			// cannot be zeroed in place, so this only stops this local
+			// reference from being the reason the backing bytes survive.
+			eab = v1alpha1.ProvisioningEAB{}
+		default:
+			// Case a): the generation must already be registered; lego
+			// gets no EAB at all, regardless of what the binding configures
+			// (the binding's env-named EAB is for the legacy account only).
+			if !accountRegistered(work) {
+				err := fmt.Errorf("acme account generation %d of binding %q has no registered account on this runner", account.Generation, spec.ACME.Binding)
+				return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme account generation %d of binding %q is not provisioned on this runner", account.Generation, spec.ACME.Binding), err)
+			}
+			disableEAB = true
+		}
 	}
 
 	inv, err := lego.Build(lego.Params{
-		Binary:    cfg.Lego.Binary,
-		WorkDir:   work,
-		FQDN:      spec.Target.FQDN,
-		KeyType:   spec.Policy.KeyType,
-		ACME:      acme,
-		DNS:       dns,
-		LookupEnv: opts.LookupEnv,
+		Binary:     cfg.Lego.Binary,
+		WorkDir:    work,
+		FQDN:       spec.Target.FQDN,
+		KeyType:    spec.Policy.KeyType,
+		ACME:       acme,
+		DNS:        dns,
+		LookupEnv:  opts.LookupEnv,
+		EAB:        legoEAB,
+		DisableEAB: disableEAB,
 	})
 	if err != nil {
 		if errors.Is(err, lego.ErrMissingEnv) && strings.Contains(err.Error(), "dns binding") {
-			return nil, fail(v1alpha1.ErrorCodeDNSFailure, fmt.Sprintf("dns binding %q requires an environment variable that is not set", spec.DNS.Binding), err)
+			return nil, failAP(v1alpha1.ErrorCodeDNSFailure, fmt.Sprintf("dns binding %q requires an environment variable that is not set", spec.DNS.Binding), err)
 		}
 		if errors.Is(err, lego.ErrMissingEnv) {
-			return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q requires EAB credentials that are not set", spec.ACME.Binding), err)
+			return nil, failAP(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q requires EAB credentials that are not set", spec.ACME.Binding), err)
 		}
-		return nil, fail(v1alpha1.ErrorCodeInternal, "lego invocation could not be built", err)
+		return nil, failAP(v1alpha1.ErrorCodeInternal, "lego invocation could not be built", err)
 	}
 	log.Info("starting lego", "binary", cfg.Lego.Binary, "provider", dns.Provider, "directory", acme.DirectoryURL, "keyType", string(spec.Policy.KeyType))
 	exec := &lego.Executor{
@@ -468,61 +570,70 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	// Whatever happened, keep the account state lego may have created or
 	// updated, so the next run reuses the same ACME account. This runs even
 	// after a cancellation (an account registered by the killed lego must
-	// not be lost), but with its own bound so it cannot hang.
+	// not be lost), but with its own bound so it cannot hang. A
+	// provisioning run is the one exception: until lego has actually
+	// registered the account, nothing is published for this generation, so
+	// a failed or partial attempt never makes the generation look claimed.
+	registered := accountRegistered(work)
 	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
-	if perr := persistAccounts(persistCtx, work, cfg.Lego.StateDir); perr != nil {
-		log.Warn("ACME account state could not be persisted", "error", perr.Error())
+	if !provisioning || registered {
+		if perr := persistAccounts(persistCtx, work, accountRoot); perr != nil {
+			log.Warn("ACME account state could not be persisted", "error", perr.Error())
+		}
 	}
 	cancelPersist()
+	if provisioning && registered {
+		ap.Status = v1alpha1.AccountProvisioningRegistered
+	}
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeInternal, "lego could not be executed", err)
+		return nil, failAP(v1alpha1.ErrorCodeInternal, "lego could not be executed", err)
 	}
 	switch {
 	case res.Cancelled:
-		return nil, fail(v1alpha1.ErrorCodeCancelled, "run was cancelled by signal while lego was running", nil)
+		return nil, failAP(v1alpha1.ErrorCodeCancelled, "run was cancelled by signal while lego was running", nil)
 	case res.TimedOut:
-		return nil, fail(v1alpha1.ErrorCodeTimeout, fmt.Sprintf("lego did not finish within %d seconds", cfg.Lego.TimeoutSeconds), nil)
+		return nil, failAP(v1alpha1.ErrorCodeTimeout, fmt.Sprintf("lego did not finish within %d seconds", cfg.Lego.TimeoutSeconds), nil)
 	case res.ExitCode != 0:
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("lego exited with status %d", res.ExitCode), nil)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("lego exited with status %d", res.ExitCode), nil)
 	}
 
 	certPEM, keyPEM, issuerPEM, err := lego.ReadOutputs(work, spec.Target.FQDN)
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "lego exited successfully but produced no usable certificate", err)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "lego exited successfully but produced no usable certificate", err)
 	}
 	defer zero(keyPEM)
 	leafPEM, chainPEM, err := store.SplitChain(certPEM)
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "lego produced an unreadable certificate", err)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "lego produced an unreadable certificate", err)
 	}
 	if len(chainPEM) == 0 {
 		chainPEM = issuerPEM
 	}
 	leaf, err := store.ParseLeaf(leafPEM)
 	if err != nil {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "lego produced an unreadable certificate", err)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "lego produced an unreadable certificate", err)
 	}
 	if !store.Covers(leaf, spec.Target.FQDN) {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not cover the target fqdn", nil)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not cover the target fqdn", nil)
 	}
 	if err := store.PrivateKeyMatches(leaf, keyPEM); err != nil {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate and private key do not match", err)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate and private key do not match", err)
 	}
 	if !leaf.NotAfter.After(now) {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate is already expired", nil)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate is already expired", nil)
 	}
 	if leaf.NotBefore.After(now.Add(clockSkewTolerance)) {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate is not yet valid", nil)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate is not yet valid", nil)
 	}
 	if len(leaf.DNSNames) != 1 {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not contain exactly one subject alternative name", nil)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not contain exactly one subject alternative name", nil)
 	}
 	if err := store.KeyMatchesType(leaf, spec.Policy.KeyType); err != nil {
-		return nil, fail(v1alpha1.ErrorCodeACMEFailure, "issued certificate key does not match the requested key type", err)
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate key does not match the requested key type", err)
 	}
 	info := store.InfoOf(leaf)
 	if err := st.Put(ctx, object, store.Bundle{Certificate: leafPEM, Chain: chainPEM, PrivateKey: keyPEM}); err != nil {
-		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeStoreFailure, "certificate store write failed", err))
+		return nil, classifyCtx(ctx, failAP(v1alpha1.ErrorCodeStoreFailure, "certificate store write failed", err))
 	}
 	action := v1alpha1.ActionIssued
 	if current != nil {
@@ -531,7 +642,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 			action = v1alpha1.ActionNoop
 		}
 	}
-	return &outcome{action: action, info: info, objectRef: object, storeType: st.Type(), legoOutcome: res}, nil
+	return &outcome{action: action, info: info, objectRef: object, storeType: st.Type(), legoOutcome: res, accountProvisioning: ap}, nil
 }
 
 // loadConfig loads the trusted configuration and has the store registry
@@ -608,6 +719,7 @@ func buildResult(ids identity, started, finished time.Time, status v1alpha1.Resu
 	if f != nil {
 		res.Action = v1alpha1.ActionFailed
 		res.Error = &v1alpha1.ResultError{Code: f.code, Summary: f.summary}
+		res.AccountProvisioning = f.accountProvisioning
 		return res
 	}
 	res.Action = out.action
@@ -615,6 +727,7 @@ func buildResult(ids identity, started, finished time.Time, status v1alpha1.Resu
 	res.ExpiresAt = &exp
 	res.FingerprintSha256 = out.info.FingerprintSHA256
 	res.StoreObjectRef = out.objectRef
+	res.AccountProvisioning = out.accountProvisioning
 	return res
 }
 

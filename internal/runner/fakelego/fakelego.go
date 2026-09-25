@@ -50,6 +50,12 @@ const (
 	// EnvSentinel is a marker variable tests use to prove that only the
 	// configured environment reaches lego.
 	EnvSentinel = "FAKE_LEGO_SENTINEL"
+	// EnvExpectEABKID, when set, makes the fake require LEGO_EAB_KID to
+	// equal this exact value before registering an account; a mismatch
+	// exits 1 first. This lets a test prove that the decrypted kid from an
+	// opened provisioning payload actually reached lego, without the fake
+	// ever logging or returning the value itself.
+	EnvExpectEABKID = "FAKE_LEGO_EXPECT_EAB_KID"
 )
 
 // LeakedSecret is a value the "fail" mode prints on stderr, so tests can
@@ -97,9 +103,32 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		return 1
 	}
 	accountFile := filepath.Join(accountDir, "account.json")
+	accountKeyFile := filepath.Join(accountDir, "keys", flags["email"]+".key")
 	if _, err := os.Stat(accountFile); err != nil {
-		os.WriteFile(accountFile, []byte(`{"registration":{"fake":true}}`), 0o600)
-		os.WriteFile(filepath.Join(accountDir, "keys", flags["email"]+".key"), []byte("-----BEGIN EC PRIVATE KEY-----\nZmFrZS1hY2NvdW50LWtleQ==\n-----END EC PRIVATE KEY-----\n"), 0o600)
+		// A new account: exercise the same EAB checks the real newAccount
+		// request would (a Runner that built the request from a decrypted
+		// provisioning payload must actually have passed it through), and
+		// the "registerfail" mode below, before ever writing account.json.
+		if _, eab := flags["eab"]; eab {
+			if getenv("LEGO_EAB_KID") == "" || getenv("LEGO_EAB_HMAC") == "" {
+				fmt.Fprintln(stderr, "fake lego: --eab given but LEGO_EAB_KID/LEGO_EAB_HMAC are empty")
+				return 1
+			}
+			if want := getenv(EnvExpectEABKID); want != "" && getenv("LEGO_EAB_KID") != want {
+				fmt.Fprintln(stderr, "fake lego: LEGO_EAB_KID does not match FAKE_LEGO_EXPECT_EAB_KID")
+				return 1
+			}
+		}
+		if mode == "registerfail" {
+			// As if lego generated the account private key and then the CA
+			// rejected newAccount: only the key file exists, never
+			// account.json.
+			os.WriteFile(accountKeyFile, []byte("-----BEGIN EC PRIVATE KEY-----\nZmFrZS1hY2NvdW50LWtleQ==\n-----END EC PRIVATE KEY-----\n"), 0o600)
+			fmt.Fprintln(stderr, "fake lego: Could not register account: acme: error: 400 :: urn:ietf:params:acme:error:unauthorized")
+			return 1
+		}
+		os.WriteFile(accountFile, []byte(`{"email":"`+flags["email"]+`","registration":{"body":{"status":"valid"},"uri":"https://fake-ca.invalid/acct/1"}}`), 0o600)
+		os.WriteFile(accountKeyFile, []byte("-----BEGIN EC PRIVATE KEY-----\nZmFrZS1hY2NvdW50LWtleQ==\n-----END EC PRIVATE KEY-----\n"), 0o600)
 		fmt.Fprintln(stdout, "fake lego: registered new account")
 	} else {
 		fmt.Fprintln(stdout, "fake lego: reusing existing account")

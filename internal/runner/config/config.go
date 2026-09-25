@@ -59,6 +59,10 @@ const (
 	// resultSigning.validitySeconds.
 	DefaultResultValiditySeconds = 3600
 	MaxResultValiditySeconds     = 86400
+
+	// MaxProvisioningKeys bounds accountProvisioning.privateKeyFiles (a
+	// rotation needs two).
+	MaxProvisioningKeys = 8
 )
 
 // Errors.
@@ -138,6 +142,46 @@ type Config struct {
 	// Runner's Results from anything else written there (docs/adr/0015).
 	// When absent, bare Results are written.
 	ResultSigning *ResultSigning `json:"resultSigning,omitempty"`
+	// AccountProvisioning, when present, names the private key file(s) this
+	// Runner uses to open a sealed EAB provisioning payload
+	// (acme.account.provisioning, issue #42). When absent, a job that
+	// carries a provisioning payload fails: this Runner has no key to open
+	// it with. The keys themselves are read lazily, only for a job that
+	// actually carries a provisioning payload.
+	AccountProvisioning *AccountProvisioning `json:"accountProvisioning,omitempty"`
+}
+
+// AccountProvisioning locates the Runner's account-provisioning private
+// key(s) (X25519, crypto/ecdh). Several files let the Conductor's
+// configured public key rotate without a simultaneous change here: the
+// Runner tries every key it holds, selecting the one a payload names by
+// keyId.
+type AccountProvisioning struct {
+	// PrivateKeyFiles are clean, absolute, unique paths of PEM
+	// "PRIVATE KEY" (PKCS #8) files, each holding an X25519 key: this
+	// Runner's provisioning identity, never an ACME, DNS or Store
+	// credential.
+	PrivateKeyFiles []string `json:"privateKeyFiles"`
+}
+
+func (a *AccountProvisioning) validate() error {
+	if len(a.PrivateKeyFiles) == 0 {
+		return invalid("accountProvisioning.privateKeyFiles must list at least one file")
+	}
+	if len(a.PrivateKeyFiles) > MaxProvisioningKeys {
+		return invalid("accountProvisioning.privateKeyFiles: at most %d files", MaxProvisioningKeys)
+	}
+	seen := make(map[string]bool, len(a.PrivateKeyFiles))
+	for i, p := range a.PrivateKeyFiles {
+		if p == "" || !filepath.IsAbs(p) || filepath.Clean(p) != p {
+			return invalid("accountProvisioning.privateKeyFiles[%d] must be a clean absolute path", i)
+		}
+		if seen[p] {
+			return invalid("accountProvisioning.privateKeyFiles[%d]: %q is listed twice", i, p)
+		}
+		seen[p] = true
+	}
+	return nil
 }
 
 // ResultSigning locates the Runner's result-signing key.
@@ -393,6 +437,11 @@ func (c *Config) Validate() error {
 	}
 	if c.ResultSigning != nil {
 		if err := c.ResultSigning.validate(); err != nil {
+			return err
+		}
+	}
+	if c.AccountProvisioning != nil {
+		if err := c.AccountProvisioning.validate(); err != nil {
 			return err
 		}
 	}

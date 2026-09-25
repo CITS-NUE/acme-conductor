@@ -47,6 +47,22 @@ type Params struct {
 	// LookupEnv resolves passthrough and EAB environment variables from the
 	// Runner's own environment (os.LookupEnv in production).
 	LookupEnv func(string) (string, bool)
+	// EAB, when set, overrides the ACME binding's own env-named EAB (if
+	// any) with explicit values the caller has already resolved (a
+	// decrypted account-provisioning payload, issue #42). Mutually
+	// exclusive with DisableEAB; EAB wins if both are somehow set.
+	EAB *EABValues
+	// DisableEAB suppresses the ACME binding's env-named EAB entirely,
+	// even when the binding configures one: a generation-scoped account
+	// that reuses an already-registered account must never send an EAB.
+	DisableEAB bool
+}
+
+// EABValues is an explicit External Account Binding to pass to lego,
+// bypassing the ACME binding's own env-named EAB.
+type EABValues struct {
+	KID  string
+	HMAC string
 }
 
 // Invocation is a fully built lego command line and environment.
@@ -107,14 +123,26 @@ func Build(p Params) (*Invocation, error) {
 		inv.Env = append(inv.Env, name+"="+v)
 		inv.secrets = append(inv.secrets, v)
 	}
-	if p.ACME.EAB != nil {
+	// EAB material travels through lego's own environment variables, never
+	// through argv, so it is not visible in a process listing. Exactly one
+	// of three things happens: an explicit override (a decrypted
+	// provisioning payload) wins outright; DisableEAB suppresses the
+	// binding's own EAB even if it configures one (a generation-scoped
+	// account reusing an already-registered account); otherwise the
+	// binding's env-named EAB, if any, is used as before.
+	switch {
+	case p.EAB != nil:
+		inv.Argv = append(inv.Argv, "--eab")
+		inv.Env = append(inv.Env, "LEGO_EAB_KID="+p.EAB.KID, "LEGO_EAB_HMAC="+p.EAB.HMAC)
+		inv.secrets = append(inv.secrets, p.EAB.KID, p.EAB.HMAC)
+	case p.DisableEAB:
+		// No EAB at all, regardless of what the binding configures.
+	case p.ACME.EAB != nil:
 		kid, ok1 := p.LookupEnv(p.ACME.EAB.KIDEnv)
 		hmac, ok2 := p.LookupEnv(p.ACME.EAB.HMACEnv)
 		if !ok1 || !ok2 {
 			return nil, fmt.Errorf("%w: EAB credentials", ErrMissingEnv)
 		}
-		// EAB material travels through lego's own environment variables,
-		// never through argv, so it is not visible in a process listing.
 		inv.Argv = append(inv.Argv, "--eab")
 		inv.Env = append(inv.Env, "LEGO_EAB_KID="+kid, "LEGO_EAB_HMAC="+hmac)
 		inv.secrets = append(inv.secrets, kid, hmac)
