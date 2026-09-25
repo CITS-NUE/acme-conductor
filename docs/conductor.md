@@ -875,12 +875,12 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
 - **ローカルランチャーは 1 ホストである．** 同じホストに `acme-runner`（とその
   `lego`）が必要で，Runner が必要とする資格情報は Conductor の環境に置かなければ
   ならない（`passthroughEnv`）．Container Apps ランチャーにはどちらの制約もない．
-- **Container Apps ランチャーは偽のプラットフォームに対して検証されている．**
-  そのテストは Jobs API のプロセス内の偽物に対して exchange 全体を動かし，Bicep は
-  コンパイルと lint を通る．実行テンプレートの上書きがボリュームマウントを継承する
-  こと，カスタムロールのアクション名，SMB 共有上の SQLite と `flock`，Result の
-  伝播遅延は，最初の実機デプロイで確認されるまでは文書化された期待にとどまる
-  （[`deploy/azure/README.md`](../deploy/azure/README.md)）．
+- **Container Apps ランチャーの一部は実デプロイで観測していない．** CI の
+  テストは Jobs API のプロセス内の偽物に対して exchange 全体を動かし，Bicep は
+  コンパイルと lint を通る．staging の実デプロイで 1 つの target の発行が端から
+  端まで通ることは確認したが，同時に取り合うときの SMB 上のリネームの原子性，
+  実行の停止，SMB 上の `flock` はまだ観測していない
+  （[`deploy/azure/README.md`](../deploy/azure/README.md#実デプロイで確認したこととまだ確認していないこと)）．
 - **強制終了は Runner を取り残し得る．** 復旧はそのような run を `failed`／
   「結果不明」とする．Runner はなお完了するかもしれず，次の期限到来の run がそれと
   競合する（Store とアカウントの状態はそれに耐えるが，ACME の注文が重複することは

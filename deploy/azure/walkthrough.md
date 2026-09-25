@@ -379,6 +379,23 @@ API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) �
 - チャレンジ用ゾーンに `_acme-challenge` の TXT が残っていない
   （`az network dns record-set txt list -g <zone rg> -z <challenge zone>`）．
 
+Conductor と Runner の間でジョブが受け渡されたことは，両方のログから確かめられる．
+1 つの `runId` について，`job offered to the runner job`（conductor），
+`signed job envelope verified`（runner），`job taken by an execution`（conductor．
+`execution` に実行名が付く），`reconcile succeeded`（runner），`job execution ended`
+（conductor．`status` が `Succeeded`）が並べばよい．Conductor のトークンは要らない:
+
+```sh
+WS=$(az containerapp env show -g $RG -n $P-cae \
+  --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+az monitor log-analytics query -w "$WS" -t P1D -o table --analytics-query '
+ContainerAppConsoleLogs_CL
+| where Log_s has_any ("job offered to the runner job", "job taken by an execution",
+                       "signed job envelope verified", "reconcile succeeded", "job execution ended")
+| project TimeGenerated, ContainerName_s, Log_s
+| order by TimeGenerated asc'
+```
+
 run が `AcmeFailure lego exited with status 1` で失敗した場合，lego 自身のメッセージは
 今のところ debug ログにしか出ず，Azure のテンプレートでは debug を有効にできない
 （[#38](https://github.com/CITS-NUE/acme-conductor/issues/38)）．まず上の `dig` で

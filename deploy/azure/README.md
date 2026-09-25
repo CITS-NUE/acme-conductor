@@ -292,59 +292,63 @@ Conductor がデプロイされる．一覧は `acme-conductor migrate import --
 `cert-infra` のデプロイに決して触れない．そのジョブを止めるのは操作者の作業で
 ある．
 
-## このリポジトリでは検証していないこと
+## 実デプロイで確認したことと，まだ確認していないこと
 
 このテンプレートはコンパイルが通り（`bicep build`，`bicep lint`，
 `bicep build-params`．CI の `bicep` ジョブが実行する），その設定文書はバイナリが
 使うのと同じ検証器（`internal/conductor/config`，`internal/runner/config`）と
 store プロバイダのレジストリで読み込める（`cmd/acme-runner/deploy_azure_test.go`）．
-しかしプロジェクトとしてサブスクリプションにデプロイ **していない** ため，
-以下はプラットフォームのリファレンスドキュメントに基づく記述であり，観測した
-ものではない:
+CI はサブスクリプションにデプロイしない．
 
-- **スケジュールの意味論．** 1 レプリカの実行は毎分開始し，前の tick のまだ
-  動いている実行と重なることが想定されている．代わりに tick をスキップする
-  プラットフォームでは run が遅れるだけである（`claimTimeoutSeconds` が待ち
-  時間を制限し，その run は失敗してスケジューラにより再試行される）．
-  `CONTAINER_APP_JOB_EXECUTION_NAME` はすべての実行のコンテナに設定されると
-  文書化されている．Runner はこれがなければ動作を拒否する．
-- **Azure Files (SMB) でのリネームの原子性．** ジョブの取得と返却は
-  ディレクトリのリネームであり，ローカルファイルシステムでは原子的で，SMB 共有
-  でもそうであると想定している（サーバがそれを実行する）．もし 2 つの実行が
-  両方とも成功しうるなら，両方が同じジョブを実行し，Runner のリプレイ台帳が
-  2 つ目を拒否する．観測はしていない．
-- **ロールのアクション名．** `Microsoft.App/jobs/execution/read`，
-  `Microsoft.App/jobs/executions/read`，
-  `Microsoft.App/jobs/stop/execution/action`（単数形が get-execution と
-  stop-execution の操作に必要なもの），
-  `Microsoft.KeyVault/vaults/certificates/import/action`，および DNS TXT の
-  アクションはプロバイダの操作一覧から取ったものである．名前が誤っていれば
-  デプロイが失敗する（ロール定義は検証される）のであって，黙って通ることはない．
-- **Azure Files (SMB) での SQLite と `flock`．** レジストリの共有は SQLite の
-  バイト範囲ロックが SMB で失敗しないよう `nobrl` でマウントしている．プロセス
-  が 1 つなら安全だが，Conductor が取る所有権ロック（`<db>.lock`）の信頼性は，
+2026-09-25 に `v0.6.0` のイメージで staging のデプロイを行い（手順は
+[`walkthrough.md`](walkthrough.md)），staging CA で 1 つの target の発行が
+端から端まで通ることを確かめた．Conductor が交換用の共有にジョブを置き，
+スケジュール実行の Runner の 1 つがそれを取り，署名を検証して発行し，Key Vault に
+格納し，Conductor が実行の終了と署名付きの Result を受け取った．両方のログが
+同じ `runId` でこの順に並ぶことで確認できる（手順 10）．これにより次のことは
+観測済みである．
+
+- **スケジュールと実行名．** 毎分の実行が始まり，`CONTAINER_APP_JOB_EXECUTION_NAME`
+  が設定され，Conductor がその実行名をプラットフォームに照会して確認できる．
+- **ジョブの受け渡し．** 共有上のディレクトリのリネームで，1 つの実行がジョブを
+  取れる．
+- **ロールのアクション名（読み取りと書き込み）．** Conductor の ID は実行の
+  状態を読め，Runner の ID は DNS の TXT レコードを書き，Key Vault に証明書を
+  取り込める．
+- **`lego` のマネージド ID．** Container Apps の ID エンドポイント
+  （`IDENTITY_ENDPOINT`/`IDENTITY_HEADER`）と `AZURE_CLIENT_ID` で，`azuredns`
+  プロバイダが認証できる．
+- **Azure Files (SMB) 上の SQLite．** `nobrl` でマウントしたレジストリが動き，
+  Result は既定の `resultGraceSeconds`（30 秒）以内に共有上に現れる．
+- **ingress．** API と GUI が HTTPS の ingress で応答し，GUI のリダイレクト
+  URI にはプラットフォームが割り当てるアプリの FQDN を使える．
+- **シークレットのサイズ．** 1 つの target 向けの Runner 設定は，ファイルとして
+  マウントされるシークレットに収まる．
+
+次のことはまだ観測していない．プラットフォームのリファレンスドキュメントに
+基づく想定である．
+
+- **同時に取り合うときのリネームの原子性．** 観測したのは 1 つの実行がジョブを
+  取る場合だけである．2 つの実行が同じジョブを同時に取ろうとしたとき，SMB 上でも
+  片方だけが成功すると想定している（サーバがリネームを実行する）．もし両方とも
+  成功しうるなら，両方が同じジョブを実行し，Runner のリプレイ台帳が 2 つ目を
+  拒否する．
+- **実行の停止．** `Microsoft.App/jobs/stop/execution/action`（キャンセルと
+  タイムアウトで使う）はまだ使われていない．名前が誤っていればデプロイが失敗する
+  （ロール定義は検証される）ので，黙って通ることはない．
+- **SMB 上の `flock`．** Conductor が取る所有権ロック（`<db>.lock`）の信頼性は，
   そのマウントでの `flock` の信頼性と同じにしかならない．アプリは単一リビジョン
   モードで 1 レプリカに固定されているが，リビジョン更新の際には一時的に 2 つの
   レプリカが重なりうる．ロックが効いていれば 2 つ目は起動を拒否し，効いて
   いなければそのまま起動すると想定している．NFS の Azure Files（VNet 統合
   環境）の方が堅牢であり，1 行の変更（`NfsAzureFile` ストレージタイプ）で
   済む．
-- **Result 伝播の遅延．** Conductor は実行終了後，`result.json` が共有上に
-  現れるまで `resultGraceSeconds`（30 秒）待つ．SMB のキャッシュによっては
-  この値の調整が必要かもしれない．
-- **ingress とピア暗号化．** `allowInsecure: false` と `transport: http` の
-  組み合わせは HTTP を HTTPS にリダイレクトし平文をコンテナへ転送すると文書化
-  されている．`peerTrafficConfiguration.encryption.enabled` はそのホップを
-  暗号化すると文書化されている．GUI のリダイレクト URI はプラットフォームが
-  割り当てるアプリの FQDN である．
-- **`lego` のマネージド ID．** Container Apps の ID エンドポイント
-  （`IDENTITY_ENDPOINT`/`IDENTITY_HEADER`）を通し，`AZURE_CLIENT_ID` で選択
-  したユーザー割り当て ID を `DefaultAzureCredential` の経路で使うことは，
-  `azuredns` プロバイダの SDK がサポートし，`cert-infra` の本番ジョブが同じ
-  環境変数で動いていることで裏付けられているが，この Job からは試していない．
-- **シークレットのサイズ．** Runner の設定はファイルとしてマウントされる
-  Container Apps のシークレットとして届けられる．非常に大きな設定は
-  プラットフォームのシークレット値の上限を超えるかもしれない．
+- **Result 伝播の遅延の幅．** 今回は既定値で足りたが，SMB のキャッシュによっては
+  `resultGraceSeconds` の調整が必要かもしれない．
+- **ピア暗号化．** `peerTrafficConfiguration.encryption.enabled` が ingress から
+  レプリカへのホップを暗号化することは，文書化されているが観測していない．
+- **大きな設定．** 多数のバインディングを持つ Runner 設定は，プラットフォームの
+  シークレット値の上限を超えるかもしれない．
 
-したがって初回のデプロイは最初から最後まで見守るべきである．ステージング CA，
-1 つの target，Conductor の `--log-level debug` から始めること．
+新しい環境へのデプロイは，最初から最後まで見守ること．ステージング CA と
+1 つの target から始める．
