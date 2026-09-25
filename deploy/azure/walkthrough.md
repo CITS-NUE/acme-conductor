@@ -351,7 +351,14 @@ az rest --method patch --url "https://graph.microsoft.com/v1.0/applications(appI
 GUI（`<conductorUrl>/ui/`）に `ACME.Admin` でサインインし，次の順で登録する．
 
 1. ポリシーを作る．`allowedDnsSuffixes` は target を覆うもの，`acmeBinding` は `letsencrypt-staging` にする．
-2. target を 1 つ登録する．
+2. target を 1 つ登録する．**その名前の `_acme-challenge` がチャレンジ用ゾーンへ
+   委任済みであること** を先に確かめる．Runner の ID が書けるのはチャレンジ用
+   ゾーンだけなので，委任のない名前（本番と分けるつもりで付けた `test.` 付きの
+   名前など）は必ず失敗する:
+
+   ```sh
+   dig +short CNAME _acme-challenge.<target fqdn>   # チャレンジ用ゾーン内の名前が返ればよい
+   ```
 
 API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) を参照．
 既存の証明書基盤と同じホストを扱う場合は，その定期実行の時間帯を避ける．
@@ -361,7 +368,17 @@ API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) �
 - target の画面で run が `succeeded` になり，証明書の概要が表示されている．
 - Runner のログに発行と格納の記録がある．
 - Key Vault に証明書オブジェクトができている（`az keyvault certificate list --vault-name kv-acme-stg-<org>`）．
-- チャレンジ用ゾーンに `_acme-challenge` の TXT が残っていない．
+  RBAC の Key Vault なので，確認する人にデータプレーンの読み取り権限（`Key Vault Reader`
+  など）がなければ読めない．その場合は Runner のログの `reconcile succeeded` と
+  `storeObjectRef` で代える．
+- チャレンジ用ゾーンに `_acme-challenge` の TXT が残っていない
+  （`az network dns record-set txt list -g <zone rg> -z <challenge zone>`）．
+
+run が `AcmeFailure lego exited with status 1` で失敗した場合，lego 自身のメッセージは
+今のところ debug ログにしか出ず，Azure のテンプレートでは debug を有効にできない
+（[#38](https://github.com/CITS-NUE/acme-conductor/issues/38)）．まず上の `dig` で
+委任を確かめ，次に Runner のログで `fqdn` が意図した名前かを確かめる．失敗した
+target は GUI で無効化しておく．有効なままだと再試行が続き，CA のレート制限を消費する．
 
 ## 再デプロイ
 
@@ -397,3 +414,4 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |
+| run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
