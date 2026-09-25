@@ -130,7 +130,7 @@ type Config struct {
 	// SignedCertificateReconcileJob whose signature verifies against one
 	// of these keys, whose validity window includes now, and whose runId
 	// it has not executed before. When absent, only bare JobSpecs are
-	// accepted (the Phase 2 local launcher over a private directory).
+	// accepted (the local launcher over a private directory).
 	JobSigning *JobSigning `json:"jobSigning,omitempty"`
 	// ResultSigning, when present, makes the Runner wrap every Result in a
 	// SignedCertificateReconcileResult signed with the named key, so a

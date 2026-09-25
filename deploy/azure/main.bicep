@@ -1,4 +1,4 @@
-// ACME Conductor on Azure Container Apps (Phase 4, OIDC and ingress Phase 5).
+// ACME Conductor on Azure Container Apps.
 //
 // Deploys, in one resource group:
 //   - a Container Apps environment with a Log Analytics workspace;

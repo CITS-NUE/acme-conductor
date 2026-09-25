@@ -1,4 +1,4 @@
-# Azure Container Apps へのデプロイ (Phase 4，OIDC ingress は Phase 5)
+# Azure Container Apps へのデプロイ
 
 `main.bicep` は Azure Container Apps 上に ACME Conductor の完全なデプロイを
 プロビジョニングする．すなわち，環境の HTTPS ingress の背後で単一レプリカの
@@ -56,7 +56,7 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   アカウント名は，そこからハイフンを除いたものの先頭 11 文字に 13 文字の一意な
   サフィックスを付けて作られるため，受理されるどのプレフィックスからも 24 文字
   以内の有効な名前が得られる．
-- ダイジェストで固定された両バイナリのコンテナイメージ．Phase 5 以降，バージョン
+- ダイジェストで固定された両バイナリのコンテナイメージ．バージョン
   タグを打つと `ghcr.io/cits-nue/acme-conductor` と
   `ghcr.io/cits-nue/acme-runner` が `linux/amd64` と `linux/arm64` 向けに
   SBOM と SLSA provenance 付きで公開される

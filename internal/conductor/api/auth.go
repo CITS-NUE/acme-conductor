@@ -38,9 +38,8 @@ const (
 	RoleViewer Role = "viewer"
 )
 
-// Authenticator decides who a request comes from. LocalhostDev (Phase 2)
-// and the OIDC bearer-token authenticator (Phase 5,
-// internal/conductor/oidc) implement it.
+// Authenticator decides who a request comes from. LocalhostDev and the
+// OIDC bearer-token authenticator (internal/conductor/oidc) implement it.
 type Authenticator interface {
 	// Authenticate returns the caller or an error describing why the
 	// request is refused. The error text is sent to the client; it must
@@ -71,7 +70,7 @@ const (
 	LocalhostDevAuthority = "localhost-dev"
 )
 
-// LocalhostDev is the Phase 2 development authentication mode: the caller
+// LocalhostDev is the development authentication mode: the caller
 // is trusted if and only if the TCP peer is a loopback address. Because
 // browsers on the same host can reach loopback too, the mode also refuses
 // the classic ways a web page could drive the API: a Host header that is
