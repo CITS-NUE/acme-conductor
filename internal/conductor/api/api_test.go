@@ -724,7 +724,7 @@ func TestUIRoutes(t *testing.T) {
 	if bytes.Contains(body, []byte("<script>")) || bytes.Contains(body, []byte("onclick=")) {
 		t.Fatal("index carries inline script, which the policy forbids")
 	}
-	for path, ct := range map[string]string{"/ui/app.js": "text/javascript", "/ui/app.css": "text/css"} {
+	for path, ct := range map[string]string{"/ui/app.js": "text/javascript", "/ui/provision.js": "text/javascript", "/ui/app.css": "text/css"} {
 		res, body := get(path)
 		if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), ct) || len(body) == 0 {
 			t.Fatalf("%s: %d %s", path, res.StatusCode, res.Header.Get("Content-Type"))

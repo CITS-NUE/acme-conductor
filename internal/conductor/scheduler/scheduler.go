@@ -22,6 +22,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -493,8 +494,57 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		cancelled("policy was disabled before the run started")
 		return
 	}
-	spec := BuildJobSpec(run, target, policy)
+	// ACME account provisioning (issue #42): claim a pending, unattached
+	// generation for this binding if one exists (spec then carries the
+	// sealed payload for the Runner to open), else fall back to the
+	// binding's active generation (legacy, unversioned account state
+	// otherwise). claimedRunID is cleared once the claim is resolved
+	// (released or completed) so it is only released/completed once.
+	var account *v1alpha1.ACMEAccountRef
+	claimedGeneration := int64(0)
+	claimedRunID := ""
+	release := func() {
+		if claimedRunID == "" {
+			return
+		}
+		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, policy.ACMEBinding, claimedGeneration, claimedRunID); err != nil {
+			log.Error("acme account provisioning could not be released", "binding", policy.ACMEBinding, "generation", claimedGeneration, "error", err.Error())
+		}
+		claimedRunID = ""
+	}
+	acct, sealedJSON, err := s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, run.ID)
+	if err != nil {
+		failed(v1alpha1.ErrorCodeInternal, "acme account provisioning could not be claimed")
+		return
+	}
+	switch {
+	case acct != nil:
+		var sealed v1alpha1.SealedProvisioning
+		if err := json.Unmarshal([]byte(sealedJSON), &sealed); err != nil {
+			// Releasing would hand the same corrupt payload to every later
+			// run of this binding; burn the generation instead (the active
+			// one, if any, stays active) so the operator provisions anew.
+			log.Error("stored acme account sealed payload is corrupt", "binding", policy.ACMEBinding, "generation", acct.Generation, "error", err.Error())
+			s.finishProvisioning(ctx, log, policy.ACMEBinding, acct.Generation, run.ID, nil, errors.New("stored sealed payload is corrupt"))
+			failed(v1alpha1.ErrorCodeInternal, "acme account provisioning payload is corrupt")
+			return
+		}
+		claimedGeneration = acct.Generation
+		claimedRunID = run.ID
+		account = &v1alpha1.ACMEAccountRef{Generation: acct.Generation, Provisioning: &sealed}
+	default:
+		active, err := s.reg.ActiveACMEAccountGeneration(ctx, policy.ACMEBinding)
+		if err != nil {
+			failed(v1alpha1.ErrorCodeInternal, "acme account active generation could not be loaded")
+			return
+		}
+		if active > 0 {
+			account = &v1alpha1.ACMEAccountRef{Generation: active}
+		}
+	}
+	spec := BuildJobSpec(run, target, policy, account)
 	if err := spec.Validate(); err != nil {
+		release()
 		summary := sanitize("job spec rejected: " + err.Error())
 		rej := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditPolicyRejected, TargetID: target.ID, RunID: run.ID, PolicyID: policy.ID, Detail: summary}
 		if aerr := s.reg.AppendAudit(ctx, rej); aerr != nil {
@@ -505,15 +555,18 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	}
 	l, ok := s.launchers[target.ExecutionBinding]
 	if !ok {
+		release()
 		failed(v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("execution binding %q is not configured", target.ExecutionBinding))
 		return
 	}
 	if runCtx.Err() != nil {
+		release()
 		cancelled("run was cancelled before the runner started")
 		return
 	}
 	exec, err := l.Start(runCtx, spec)
 	if err != nil {
+		release()
 		if launcher.ReasonOf(err) == launcher.ReasonCancelled {
 			log.Warn("run cancelled before the runner started", "launcher", l.Type(), "error", err.Error())
 			cancelled("run was cancelled before the runner started")
@@ -544,6 +597,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 			log.Warn("run start still could not be recorded", "error", rerr.Error())
 		}
 	}
+	s.finishProvisioning(ctx, log, policy.ACMEBinding, claimedGeneration, claimedRunID, res, err)
 	if err != nil {
 		log.Error("runner produced no result", "launcher", l.Type(), "error", err.Error())
 		switch launcher.ReasonOf(err) {
@@ -577,6 +631,55 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		return
 	}
 	finish(registry.RunFailed, registry.AuditRunFailed, "run failed: "+string(res.Error.Code)+": "+res.Error.Summary)
+}
+
+// finishProvisioning resolves the outcome of an ACME account provisioning
+// payload once the Runner has finished (or failed to report), independent
+// of the run's own outcome (Result.Status/Action are independent of
+// AccountProvisioning.Status). runID is the run that claimed generation
+// of binding, or "" if this run carried no provisioning payload.
+func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, binding string, generation int64, runID string, res *v1alpha1.Result, waitErr error) {
+	if runID == "" {
+		if res != nil && res.AccountProvisioning != nil {
+			log.Warn("result reported account provisioning though none was requested; ignored", "binding", res.AccountProvisioning.Binding, "generation", res.AccountProvisioning.Generation)
+		}
+		return
+	}
+	complete := func(registered bool) {
+		action, verb := registry.AuditACMEAccountActivated, "activated"
+		if !registered {
+			action, verb = registry.AuditACMEAccountProvisioningFailed, "failed"
+		}
+		ev := &registry.AuditEvent{
+			Actor: Actor, ActorAuthority: Authority, Action: action, RunID: runID,
+			Detail: fmt.Sprintf("acme account provisioning %s: binding=%s generation=%d runId=%s", verb, binding, generation, runID),
+		}
+		if err := s.reg.CompleteACMEAccountProvisioning(ctx, binding, generation, runID, registered, ev); err != nil {
+			log.Error("acme account provisioning outcome could not be recorded", "binding", binding, "generation", generation, "registered", registered, "error", err.Error())
+		}
+	}
+	switch {
+	case waitErr != nil:
+		// The Runner's outcome is unknown: the generation is burnt so it
+		// is never silently reused against an account that may or may
+		// not have been registered.
+		complete(false)
+	case res.AccountProvisioning != nil && res.AccountProvisioning.Binding == binding && res.AccountProvisioning.Generation == generation:
+		complete(res.AccountProvisioning.Status == v1alpha1.AccountProvisioningRegistered)
+	case res.AccountProvisioning != nil:
+		// A report about something this run was not sent never activates
+		// anything, and the outcome of what it was sent is unknown: burn
+		// the generation rather than leave it attached to this run forever.
+		log.Warn("result reported account provisioning for another binding/generation; generation marked failed", "binding", res.AccountProvisioning.Binding, "generation", res.AccountProvisioning.Generation, "expectedBinding", binding, "expectedGeneration", generation)
+		complete(false)
+	default:
+		// The Runner never attempted the payload (it failed before that
+		// step, or the job did not reach the provisioning path): the
+		// generation is still available to a later run.
+		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, binding, generation, runID); err != nil {
+			log.Error("acme account provisioning could not be released", "binding", binding, "generation", generation, "error", err.Error())
+		}
+	}
 }
 
 // record writes run (whose Status is the status to reach) to the registry
@@ -645,10 +748,13 @@ func (s *Scheduler) record(ctx context.Context, log *slog.Logger, run *registry.
 	}
 }
 
-// BuildJobSpec produces the JobSpec for run against the current target and
-// policy. The policy is copied by value (a snapshot), so the run can be
-// audited from the document alone.
-func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy) *v1alpha1.JobSpec {
+// BuildJobSpec produces the JobSpec for run against the current target,
+// policy and (issue #42) ACME account reference: nil for the legacy,
+// unversioned account state, otherwise the generation the Runner must use
+// (with a sealed provisioning payload only on the run that registers it).
+// The policy is copied by value (a snapshot), so the run can be audited
+// from the document alone.
+func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy, account *v1alpha1.ACMEAccountRef) *v1alpha1.JobSpec {
 	return &v1alpha1.JobSpec{
 		APIVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindCertificateReconcileJob,
@@ -660,7 +766,7 @@ func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy) *v1
 			RenewBeforeDays:    p.RenewBeforeDays,
 			KeyType:            p.KeyType,
 		},
-		ACME:  v1alpha1.ACMERef{Binding: p.ACMEBinding},
+		ACME:  v1alpha1.ACMERef{Binding: p.ACMEBinding, Account: account},
 		DNS:   v1alpha1.DNSRef{Binding: t.DNSBinding},
 		Store: v1alpha1.StoreRef{Binding: t.StoreBinding},
 	}

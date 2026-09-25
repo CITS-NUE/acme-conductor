@@ -651,6 +651,102 @@
     show(...parts);
   }
 
+  // ---- ACME account provisioning (issue #42) --------------------------------
+  //
+  // The kid/hmac an operator types here are sealed to the Runner's
+  // provisioning key in this tab (provision.js) before anything is sent:
+  // the Conductor never sees them, and this page never renders one back.
+
+  async function provisioningKey() {
+    try {
+      return await api('GET', '/account-provisioning/key');
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  function nextGeneration(b) {
+    return b.generations.length ? b.generations[0].generation + 1 : 1;
+  }
+
+  function provisioningForm(keyInfo, b, onDone) {
+    const kid = input('text', '', { autocomplete: 'off' });
+    const hmac = input('password', '', { autocomplete: 'off' });
+    const status = el('div');
+    const clearInputs = () => { kid.value = ''; hmac.value = ''; };
+    return el('form', {
+      class: 'panel',
+      onsubmit: async (ev) => {
+        ev.preventDefault();
+        clear(status);
+        const k = kid.value, h = hmac.value;
+        try {
+          const generation = nextGeneration(b);
+          const encryptedCredential = await acmeConductorSealEAB(keyInfo, b.name, generation, k, h);
+          clearInputs();
+          await api('POST', '/acme-bindings/' + encodeURIComponent(b.name) + '/provisioning', { accountGeneration: generation, encryptedCredential });
+          onDone();
+        } catch (err) {
+          clearInputs();
+          status.append(notice('error', describe(err)));
+        }
+      },
+    },
+    status,
+    el('p', { class: 'hint', text: 'Sealed in this browser to Runner key ' + keyInfo.keyId + ' before it is sent; the Conductor never sees the key id or HMAC.' }),
+    field('EAB key id (kid)', kid),
+    field('EAB HMAC key', hmac, 'Never displayed once submitted.'),
+    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, 'Provision / replace EAB (generation ' + nextGeneration(b) + ')')),
+    );
+  }
+
+  function acmeBindingPanel(keyInfo, b, x25519Ok, refresh) {
+    const parts = [
+      el('h2', { text: b.name }),
+      props([
+        ['Active generation', b.activeGeneration || '—'],
+        ['Pending', b.pending ? b.pending.generation + ' (' + b.pending.status + (b.pending.runId ? ', attached to run ' + b.pending.runId : '') + ')' : '—'],
+      ]),
+      table(['Generation', 'Status', 'Key id', 'Requested by', 'Created', 'Activated'],
+        b.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), g.requestedBy, when(g.createdAt), when(g.activatedAt)])),
+    ];
+    if (b.pending && !b.pending.runId) {
+      parts.push(el('div', { class: 'actions' }, el('button', {
+        class: 'danger',
+        onclick: async () => {
+          try {
+            await api('DELETE', '/acme-bindings/' + encodeURIComponent(b.name) + '/provisioning/' + encodeURIComponent(b.pending.generation));
+            refresh();
+          } catch (err) {
+            parts.push(notice('error', describe(err)));
+          }
+        },
+      }, 'Cancel pending provisioning (generation ' + b.pending.generation + ')')));
+    }
+    if (!keyInfo) {
+      parts.push(notice('error', 'Account provisioning is not configured on this Conductor.'));
+    } else if (b.pending) {
+      parts.push(el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' }));
+    } else if (!x25519Ok) {
+      parts.push(notice('error', 'This browser has no WebCrypto X25519 support; account provisioning needs a browser that does.'));
+    } else {
+      parts.push(el('h3', { text: 'Provision / replace EAB' }), provisioningForm(keyInfo, b, refresh));
+    }
+    return el('div', { class: 'panel' }, ...parts);
+  }
+
+  async function viewACMEBindings() {
+    setNav('acme-bindings');
+    const [keyInfo, res, x25519Ok] = await Promise.all([provisioningKey(), api('GET', '/acme-bindings'), acmeConductorX25519Supported()]);
+    const refresh = () => withErrors(() => viewACMEBindings());
+    show(
+      el('h1', { text: 'ACME accounts' }),
+      el('p', { class: 'notice', text: 'External Account Binding credentials are sealed in this browser and never displayed once submitted.' }),
+      ...res.items.map((b) => acmeBindingPanel(keyInfo, b, x25519Ok, refresh)),
+    );
+  }
+
   // ---- routing --------------------------------------------------------------
 
   const routes = [
@@ -664,6 +760,7 @@
     [/^#\/runs(\?.*)?$/, () => viewRuns()],
     [/^#\/audit$/, () => viewAudit()],
     [/^#\/migration$/, () => viewMigration()],
+    [/^#\/acme-bindings$/, () => viewACMEBindings()],
   ];
 
   function route() {

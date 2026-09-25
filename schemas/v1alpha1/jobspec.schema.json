@@ -73,7 +73,7 @@
       }
     },
     "acme": {
-      "$ref": "#/$defs/bindingRef",
+      "$ref": "#/$defs/acmeRef",
       "description": "Administrator-registered ACME binding (directory URL, account and optional EAB reference live in Runner configuration)."
     },
     "dns": {
@@ -101,6 +101,73 @@
           "maxLength": 63,
           "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
           "description": "Logical name resolved from administrator-provided configuration on the Runner side. Never a credential, connection string or resource identifier."
+        }
+      }
+    },
+    "acmeRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding"],
+      "properties": {
+        "binding": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Logical name resolved from administrator-provided configuration on the Runner side. Never a credential, connection string or resource identifier."
+        },
+        "account": {
+          "$ref": "#/$defs/acmeAccountRef",
+          "description": "Selects a generation-scoped ACME account on the Runner. Absent means the legacy, unversioned account state."
+        }
+      }
+    },
+    "acmeAccountRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation"],
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "description": "1..MaxAccountGeneration. Generations are never reused."
+        },
+        "provisioning": {
+          "$ref": "#/$defs/sealedProvisioning",
+          "description": "Present only on the run that registers this generation."
+        }
+      }
+    },
+    "sealedProvisioning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "keyId", "ephemeralPublicKey", "nonce", "ciphertext"],
+      "description": "An EAB (kid + hmac) sealed to a Runner provisioning key. Opaque to everything but the Runner holding the matching private key; the exact scheme is Go-only (pkg/api/v1alpha1/provisioning.go) and not expressible in JSON Schema.",
+      "properties": {
+        "version": {
+          "const": "x25519-hkdf-sha256-a256gcm/v1"
+        },
+        "keyId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "16 lower-case hex characters identifying the Runner provisioning key this was sealed to."
+        },
+        "ephemeralPublicKey": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$",
+          "description": "base64url (no padding) of a 32-byte X25519 public key (32 raw bytes = 43 unpadded base64url characters)."
+        },
+        "nonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16}$",
+          "description": "base64url (no padding) of a 12-byte AES-GCM nonce (12 raw bytes = 16 unpadded base64url characters)."
+        },
+        "ciphertext": {
+          "type": "string",
+          "minLength": 23,
+          "maxLength": 5483,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "base64url (no padding) AES-256-GCM ciphertext with the authentication tag appended. minLength/maxLength bound the character count (23..5483 characters, i.e. roughly 17..4112 decoded bytes); Go validation checks the exact decoded byte range, which this schema cannot express."
         }
       }
     }

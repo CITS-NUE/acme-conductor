@@ -317,6 +317,28 @@ Runner に対する Conductor の ID であって，DNS・Store・クラウド�
 ディレクトリ越しのローカルランチャーはどちらでも動く．Conductor が保持するのは
 公開鍵だけである．
 
+### `accountProvisioning`
+
+| フィールド | 型 | 既定値 | 備考 |
+|---|---|---|---|
+| `publicKey` | string | —（必須） | Runner の account-provisioning 用 X25519 公開鍵．PEM の `PUBLIC KEY` ブロック，その DER SubjectPublicKeyInfo の標準 base64，または生の 32 バイト鍵の base64url（無パディング）のいずれか（`acme-runner provisioning-keygen` が出力する 1 行の `publicKey:` を含む）． |
+
+`accountProvisioning` は省略可であり，省略すると暗号化 EAB プロビジョニングの
+機能全体が無効になる: `GET /account-provisioning/key` と
+`GET /acme-bindings…` は `404`（`not_configured`）を返し，
+`POST …/provisioning` も同様に拒否され，スケジューラは未着手のプロビジョニング
+要求を決して claim しない（要求を作れる経路自体が API しかないので，設定
+なしでは要求そのものが作られない）．設定すると，Conductor はブラウザが
+Runner の公開鍵に封じた暗号文を受け取り，検証し，`acme_accounts` テーブルに
+保存する ―― **これを復号する手段は Conductor に一切ない**．Conductor が
+持つのは公開鍵だけであり，秘密鍵も EAB の平文も決して持たない
+（[ADR 0005](adr/0005-conductor-never-touches-secrets.md)，
+[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+EAB は ACME の `newAccount` にしか使われない起動用の資格情報であり，通常の
+発行・更新には関与しない ―― 詳細は
+[`docs/runner.md`](runner.md#accountprovisioning) を参照．
+[ACME アカウントプロビジョニング](#acme-アカウントプロビジョニング) を参照．
+
 ## REST API
 
 すべてのリソースエンドポイントは `/api/v1alpha1` の下にある．リクエストと
@@ -364,6 +386,11 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /ui/`, `/ui/app.js`, `/ui/app.css` | GUI の 3 つの静的ファイル．認証不要（データを含まない）． |
 | `GET /ui/config` | GUI のサインイン方法: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` または `{"auth":{"mode":"localhost-dev"}}`．認証不要．プロバイダのディスカバリ文書が利用できない間は `503`． |
 | `GET /api/v1alpha1/bindings` | 登録されたバインディング名: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`． |
+| `GET /api/v1alpha1/account-provisioning/key` | Runner の provisioning 公開鍵: `{"version":…,"keyId":…,"publicKey":…}`．`accountProvisioning` が未設定なら `404` `not_configured`． |
+| `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","activeGeneration","pending","generations":[…]}…]}`． |
+| `GET /api/v1alpha1/acme-bindings/{binding}` | 1 つの binding の世代状態． |
+| `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代），`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．スケジューラを起こす． |
+| `DELETE /api/v1alpha1/acme-bindings/{binding}/provisioning/{generation}` | 未着手（run にまだ添付されていない）プロビジョニング要求をキャンセル → `200`． |
 | `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`，古い順． |
 | `POST /api/v1alpha1/policies` | ポリシーを作成 → `201` Policy，`Location`． |
 | `GET /api/v1alpha1/policies/{id}` | ポリシー 1 件． |
@@ -520,6 +547,86 @@ run が存在するまで `null` であり，run が失敗した場合は `error
 保存するようになる前（スキーマバージョン 1）に記録された run では
 `requestedByAuthority` は `""` である．
 
+### ACME アカウントプロビジョニング
+
+`accountProvisioning`（[`accountProvisioning`](#accountprovisioning)）が
+設定されているときだけ動く（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+1 つの ACME binding について，Conductor が持つ「アカウント」は
+`acme_accounts` テーブルの行であり，1 つの binding × 1 つの世代番号
+（`generation`，1 以上の整数，binding ごとに単調に増える）につき 1 行ある:
+
+```json
+{
+  "generation": 3, "status": "active", "keyId": "0123456789abcdef",
+  "requestedBy": "alice", "requestedByAuthority": "https://login.microsoftonline.com/…/v2.0",
+  "createdAt": "…", "updatedAt": "…", "activatedAt": "…"
+}
+```
+
+**状態機械**（`registry.ACMEAccountStatus`）:
+
+```
+provisioning ──(登録に成功した run)──> active ──(新しい世代が active になる)──> retired
+     │                                    ^
+     │──(未着手のままキャンセル)──> cancelled
+     │
+     └──(登録に失敗した run／結果不明のまま終わった run)──> failed
+```
+
+- `provisioning` — 暗号化された payload が保存され，まだ run に添付されて
+  いない（または添付済みでその run の結果を待っている）．binding ごとに
+  同時に 1 行だけ（一意索引で強制）．
+- `active` — 登録され，この binding の現在のアカウントとして使われる．
+  binding ごとに同時に 1 行だけ．
+- `retired` — 以前 `active` だった世代．新しい世代が `active` になった
+  ときに，直前の `active` 行がここに落ちる．
+- `failed` — プロビジョニングを試みたが登録に至らなかった（`lego` の失敗，
+  タイムアウト，Runner が拒否，run が結果を返さずに終わった）．この
+  世代番号は二度と再利用されない．
+- `cancelled` — 未着手のまま操作者が取り下げた．
+
+行が `active` 以外の終端状態（`retired`／`failed`／`cancelled`）に達すると
+`sealed_payload` は `NULL` に落とされる．`active` になった行も同様に
+`sealed_payload` は `NULL`（登録が終わった時点でもう要らない）．
+`ACMEAccountResource`（API レスポンス）はどの状態でも `sealed_payload` を
+一切運ばない ―― フィールドとして存在しない．
+
+**投入から適用までの経路．** 操作者（またはその代理の GUI）は，Runner の
+公開鍵に EAB をブラウザの中で封じ，`POST /acme-bindings/{binding}/provisioning`
+する．Conductor は暗号文の形（`SealedProvisioning.Validate`）と `keyId` が
+設定された鍵と一致することだけを検査し（**平文は決して見ない**），
+`accountGeneration` が binding の最大世代 + 1 であること（そうでなければ
+`409` 競合）を確認して行を `provisioning` で作り，スケジューラを起こす．
+以後は完全にスケジューラ主導である:
+
+1. スケジューラは，その binding を使う **いずれかの** target の次の run を
+   組み立てる際，未着手の `provisioning` 行があれば
+   `ClaimACMEAccountProvisioning` でそれをアトミックにその run へ添付し
+   （`JobSpec.acme.account.provisioning` に暗号文をそのまま積む），無ければ
+   現在の `active` 世代（あれば）を `JobSpec.acme.account.generation` に積む．
+   **admin は「今すぐ run を要求する」（`POST /targets/{id}/runs`）ことで，
+   この添付が起こる run を早められる** ―― 次の定期スケジュールを待つ必要
+   はない．
+2. その run が Runner から `Result` を受け取ると，スケジューラは
+   `Result.accountProvisioning` を見る: 要求した binding／generation と
+   一致し `status: "registered"` なら `CompleteACMEAccountProvisioning(registered=true)`
+   が行を `active` にし（直前の `active` 行を `retired` に落とす）．一致
+   するが `"failed"` なら，あるいは run が結果をまったく返さずに終わった
+   （クラッシュ，期限切れ）なら，行は `failed` になる．別の binding／世代を
+   指す `accountProvisioning` は何も活性化せず，送った世代の結末が不明なので
+   やはりその行を `failed` にする．どの場合も直前の `active` 世代は変更
+   されない．`Result` が `accountProvisioning` を持たない（Runner が
+   プロビジョニングの段階に達する前に失敗した）ときは，payload は開かれて
+   いないので `ReleaseACMEAccountProvisioning` が添付を外し，行は
+   `provisioning` のまま次の run に再び claim される．run が要求していない
+   のに `accountProvisioning` を含む `Result` は無視され，ログに残るだけで
+   ある．
+3. run が Runner に到達する前に失敗した場合（ランチャーの起動失敗）は
+   `ReleaseACMEAccountProvisioning` が添付を外し，行は `provisioning` の
+   ままで次の機会にまた claim される．
+
+すべての遷移は，同じトランザクションで監査イベント（後述）を書く．
+
 ### 監査イベント
 
 ```json
@@ -541,7 +648,12 @@ Conductor がこれを保存するようになる前に記録されたイベン�
 `run.requested`，`run.started`，`run.succeeded`，`run.failed`，`run.cancelled`，
 `migration.compared`（結果が前回と異なる shadow 比較．actor と authority は
 ともに `migration`，すなわち Conductor 自身の比較ループであり，`scheduler` が
-それ自身の authority であるのと同じ）．`detail` は Conductor が検証済みの値から
+それ自身の authority であるのと同じ），`acme_account.provisioning_requested`，
+`acme_account.provisioning_attached`，`acme_account.activated`，
+`acme_account.provisioning_failed`，`acme_account.provisioning_cancelled`，
+`acme_account.retired`（[ACME アカウントプロビジョニング](#acme-アカウントプロビジョニング)を参照．
+`detail` は binding，generation，keyId，runId のみで EAB の値を一切含まない）．
+`detail` は Conductor が検証済みの値から
 組み立てる短い文（最大 512 バイト）であり，Runner の出力を含むことは決してない．
 イベントは，それが記述する変更と同じトランザクションで書き込まれ，更新も削除も
 できない．
@@ -742,10 +854,21 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
 絞り込める一覧，詳細，キャンセル），監査ログ，移行の状態（target source，設定された
 ソース，shadow モードでの直近の比較．読み取り専用で，取り込みは
-`acme-conductor migrate` で行う）を扱う．バイナリに埋め込まれた 3 つの
-静的ファイル（ページ 1 つ，スクリプト 1 つ，スタイルシート 1 つ）で，フレームワークも
-ビルド手順もない．表示するものはすべて DOM のメソッドで描画し，データからマークアップを
-組み立てることは決してなく，API の呼び出しは自身のオリジンに対してのみ行う．
+`acme-conductor migrate` で行う），そして `accountProvisioning` が設定されて
+いれば ACME アカウントプロビジョニングのページ（"#/acme-bindings"）を扱う．
+このページは binding ごとに活性世代・保留中の状態・登録時刻を表示し（EAB の
+値はいつも決して表示しない），admin には「Provision / Replace EAB」フォーム
+（KID 入力，HMAC 入力は `type="password"`／`autocomplete="off"`，Runner の
+`keyId` を比較用に表示）を出す．暗号化は専用ファイル `provision.js`（WebCrypto
+で X25519／HKDF-SHA-256／AES-256-GCM を実装し，`acmeConductorSealEAB` を
+唯一のグローバル関数として公開する．[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）で
+行われ，暗号化された結果だけが `POST` される．入力欄はどの経路でも（成功，
+失敗，キャンセル）送信後にクリアされ，X25519 に対応しないブラウザではその旨を
+表示するだけで失敗する．未着手の保留分には Cancel ボタンがある．
+バイナリに埋め込まれた静的ファイル（ページ，`app.js`，`provision.js`，
+スタイルシート）で，フレームワークもビルド手順もない．表示するものはすべて
+DOM のメソッドで描画し，データからマークアップを組み立てることは決してなく，
+API の呼び出しは自身のオリジンに対してのみ行う．
 
 `oidc` モードでは，ページは **パブリッククライアント**（`server.auth.oidc.clientId`）
 として認可コードフローと PKCE で操作者をサインインさせる．`/ui/config` を読み，
@@ -823,7 +946,12 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
   持たない．データベースにはそれらの列がなく，それらを返すエンドポイントもない
   （[ADR 0005](adr/0005-conductor-never-touches-secrets.md)）．デプロイが自ら
   作り得る唯一の例外はローカルランチャーの `passthroughEnv` である（上記の
-  セキュリティ上の注意を参照）．
+  セキュリティ上の注意を参照）．`accountProvisioning` が設定されているときも
+  この不変条件は変わらない: `acme_accounts.sealed_payload` は EAB を Runner
+  の公開鍵に封じた暗号文であり，Conductor は対応する秘密鍵を持たないので
+  これを復号できない（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+  侵害された Conductor が偽の公開鍵を提示して投入前の EAB を横取りする残存
+  リスクは，`keyId` を帯外で比較する運用手順に依存する（[制限事項](#制限事項)）．
 - API の入力で指定できるのは管理者が登録した binding の名前だけである．コマンド，
   イメージ，パス，環境変数，リソース ID，資格情報のためのフィールドはなく，未知の
   フィールドは拒否されるため，どれも紛れ込ませることはできない．
@@ -904,3 +1032,10 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
   Prometheus の `/metrics` はない．
 - Runner の `renewBeforeDays`/`keyType` というコストのレバーは，Runner 側では
   まだ制限されていない（脅威モデルの残存リスク）．
+- **侵害された Conductor は EAB プロビジョニングの公開鍵を偽装できる．**
+  GUI は `GET /account-provisioning/key` が返す `keyId`／`publicKey` を信じて
+  ブラウザ内で暗号化する．Conductor 自体が侵害されていれば，これを攻撃者の
+  鍵に差し替えて，操作者が投入する EAB を横取りできる．コードでこれを閉じる
+  手段はなく，GUI が表示する `keyId` を `acme-runner provisioning-keygen`
+  が生成時に出力した `keyId` と，Conductor を経由しない経路で比較する運用
+  手順が唯一の対策である（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．

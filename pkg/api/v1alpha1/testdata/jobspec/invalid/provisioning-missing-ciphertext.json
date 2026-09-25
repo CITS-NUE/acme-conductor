@@ -1,0 +1,30 @@
+{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileJob",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "target": {
+    "id": "01JABCDEFGHJKMNPQRSTVWXYZ1",
+    "fqdn": "wiki.example.ac.jp",
+    "revision": 3
+  },
+  "policy": {
+    "allowedDnsSuffixes": ["example.ac.jp"],
+    "allowWildcard": false,
+    "renewBeforeDays": 30,
+    "keyType": "ec256"
+  },
+  "acme": {
+    "binding": "letsencrypt-staging",
+    "account": {
+      "generation": 1,
+      "provisioning": {
+        "version": "x25519-hkdf-sha256-a256gcm/v1",
+        "keyId": "1a92f23852dc908d",
+        "ephemeralPublicKey": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+        "nonce": "AwMDAwMDAwMDAwMD"
+      }
+    }
+  },
+  "dns": { "binding": "azure-dns-staging" },
+  "store": { "binding": "filesystem-dev" }
+}

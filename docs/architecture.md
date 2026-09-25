@@ -244,6 +244,17 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
 アクセスキー / 秘密鍵，任意のクラウドリソース ID，任意の出力パス．現れるのは
 不透明な識別子，正規化された FQDN，ポリシーの値，論理バインディング名だけである．
 
+`acme.account`（任意）は世代スコープの ACME アカウントを選ぶ:
+`{ "generation": N, "provisioning": {...} }`．`provisioning` は，そのアカウント
+世代を登録する run にだけ現れる `SealedProvisioning`（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）
+であり，Runner の X25519 provisioning 鍵に封じた ACME External Account Binding
+の暗号文だけを運ぶ．「シークレットのためのフィールドがそもそも存在しない」という
+上記の不変条件はこれで破られない: このフィールドが運ぶのは，Conductor 自身が
+一度も見ていない暗号文である．`Result.accountProvisioning` はその登録試行の
+結果（`registered`/`failed`）を報告する．詳細は
+[`docs/runner.md`](runner.md#acme-アカウントの世代とプロビジョニング) と
+[`docs/conductor.md`](conductor.md#acme-アカウントプロビジョニング) を参照．
+
 ### 検証と認可
 
 `pkg/api/v1alpha1/validate.go` と `internal/policy` は意図的に 2 つの異なる問いを
@@ -563,6 +574,15 @@ Makefile            build / verify / image のターゲット
 - **リリースパイプライン** — 両イメージをダイジェスト固定のベースから SBOM と
   provenance 付きで GHCR に公開するリリースワークフロー．
   [ADR 0017](adr/0017-release-pipeline.md) を参照．
+- **暗号化された EAB プロビジョニングと ACME アカウントの世代** — 操作者が
+  ブラウザの中で ACME External Account Binding を Runner の X25519 鍵に封じ，
+  Conductor は暗号文とメタデータだけを保存・中継する（復号する手段を持たない）．
+  Runner はアカウントを世代（`stateDir/acme-accounts/<binding>/<generation>`）
+  で管理し，登録に成功した世代だけを活性化する．EAB は ACME の `newAccount`
+  にのみ使う起動用の資格情報であり，通常の発行・更新には関与しない．
+  [`docs/runner.md`](runner.md#accountprovisioning)，
+  [`docs/conductor.md`](conductor.md#acme-アカウントプロビジョニング)，
+  [ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md) を参照．
 - **cert-infra からの移行** — 既存の cert-infra リポジトリからの移行ツール:
   ホスト一覧をその Bicep パラメータファイル（または TargetList 文書）から読み，
   レジストリと比較し（`added`/`changed`/`missing`/`unchanged`/`rejected`），冪等に

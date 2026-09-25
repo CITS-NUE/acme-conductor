@@ -40,6 +40,7 @@ Azure Container Apps Job として動く
 acme-runner reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]
 acme-runner reconcile --exchange DIR [--execution-name NAME] [--config FILE] [--log-level LEVEL]
 acme-runner keygen --private FILE --public FILE
+acme-runner provisioning-keygen --private FILE --public FILE
 acme-runner --version
 acme-runner --help
 ```
@@ -69,6 +70,14 @@ acme-runner --help
   （[`resultSigning`](#resultsigning)）．秘密鍵ファイルは `0600` で作成され
   決して上書きされず，Conductor の `resultSigning.publicKeys` 用の 1 行の
   公開鍵が表示される．
+- `provisioning-keygen` — X25519 の account-provisioning 鍵ペアを生成する
+  （[`accountProvisioning`](#accountprovisioning)，
+  [ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+  `keygen` と同じファイル書き込みの安全性（秘密鍵は `0600`，既存ファイルは
+  決して上書きしない）で，表示される `keyId:` と `publicKey:` を Conductor の
+  `accountProvisioning.publicKey`（[`docs/conductor.md`](conductor.md#accountprovisioning)）に
+  貼り付ける．署名用の Ed25519 鍵（`keygen`）とは別の鍵種別であり，互いに
+  流用できない．
 - `--job FILE`（必須）— `CertificateReconcileJob` 文書のパス．
 - `--result FILE`（必須）— `CertificateReconcileResult` をアトミックに
   書き出すパス（同じディレクトリ内の一時ファイル，`fsync`，`rename`）．
@@ -119,6 +128,7 @@ acme-runner --help
 | `storeBindings` | map | 1 件以上必要．キーの規則は同じ． |
 | `jobSigning` | object | 任意．存在する場合，署名付きジョブエンベロープだけを受け付ける．後述． |
 | `resultSigning` | object | 任意．存在する場合，Runner はすべての Result に署名する．後述． |
+| `accountProvisioning` | object | 任意．存在する場合，暗号化された EAB プロビジョニング payload を開ける．後述． |
 
 ### `authorization`
 
@@ -271,6 +281,33 @@ key could not be loaded"），`lego` は実行されない．Container Apps の�
 必須である．プライベートなディレクトリを介するローカルランチャーは
 これなしで動かしてもよい．
 
+### `accountProvisioning`
+
+| フィールド | 型 | 既定値 | 備考 |
+|---|---|---|---|
+| `privateKeyFiles` | []string | —（必須） | 1〜8 個の，PEM の `PRIVATE KEY`（PKCS #8）ブロックとして X25519 鍵を持つファイルへの，クリーンな絶対パス．`acme-runner provisioning-keygen` で生成する．重複は拒否される． |
+
+**EAB は起動専用の資格情報であり，通常の発行・更新には使われない．** EAB が
+意味を持つのは ACME の `newAccount`（アカウント登録）だけであり，登録済みの
+アカウントによるその後の発行・更新はアカウント鍵で行われる ACME オーダーで
+あって EAB を必要としない．したがって登録済みのアカウント世代を使う run では，
+`acmeBindings.<name>.eab` が設定されていても，Runner は `lego` に EAB を渡さない．
+EAB が `lego` の環境に現れるのは，[Result とエラーコード](#result-とエラーコード)
+の `accountProvisioning` を運ぶプロビジョニング run だけである
+（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+
+`accountProvisioning` が設定されていると，Runner はブラウザ（Conductor の
+GUI，`provision.js`）が Runner の X25519 公開鍵に封じた
+`SealedProvisioning` payload（`pkg/api/v1alpha1/provisioning.go`）を開ける
+ようになる．鍵は `keyId`（生の公開鍵の SHA-256 の先頭 16 桁の 16 進）で
+選ばれ，複数のファイルを列挙すれば Conductor の
+`accountProvisioning.publicKey`（[`docs/conductor.md`](conductor.md#accountprovisioning)）
+を切り替える前に新しい鍵をここへ先に追加できる（ローテーション）．鍵の
+ファイルは，実際にプロビジョニング payload を運ぶジョブが来たときにだけ
+遅延して読み込まれ，通常の発行・更新の run では一切ディスクに触れない．
+未設定のまま payload を運ぶジョブが来た場合は `InvalidJobSpec`（"this
+runner has no account provisioning key"）で失敗する．
+
 ### Container Apps Job として動かす
 
 Container Apps のデプロイ（[`deploy/azure`](../deploy/azure/README.md)）では，
@@ -331,7 +368,11 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
 `filesystem` store と，システム割り当てマネージド ID で認証する
 `azure-keyvault` store）．対応する `JobSpec` の例は
 [`deploy/examples/job.example.json`](../deploy/examples/job.example.json)
-にある．
+にある．どちらの例も `accountProvisioning`／`acme.account` は含まない
+（レガシーな，世代のないアカウント経路のままである）．暗号化 EAB
+プロビジョニングを使うデプロイでは，`acme-runner provisioning-keygen` が
+生成した鍵ファイルへのパスを [`accountProvisioning`](#accountprovisioning) に，
+`jobSigning`/`resultSigning` と同じ書式で追加する．
 
 ## 実行フロー
 
@@ -420,6 +461,53 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
   格納済みのものと変わらなかった場合（実際には `lego` は発行のたびに新しい
   鍵を生成するのでこれは起きないが，Runner はそれを前提にしない）．
 
+### ACME アカウントの世代とプロビジョニング
+
+`JobSpec.acme.account` が無ければ，この節は何も変えない ―― アカウント状態は
+`stateDir` 直下のこれまでどおりの，世代のないレイアウトである．`account` が
+ある場合，Runner はステップ 5（バインディング解決）の後，ステップ 9（作業
+ディレクトリの作成）の前に次を行う（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）:
+
+- **アカウントルートの選択．** `stateDir/acme-accounts/<binding>/<generation>`
+  を，ステップ 10 でコピーし，ステップ 13 で公開する先として使う（すべての
+  パス構成要素は `Lstat` で実ディレクトリと確認され，シンボリックリンクは
+  決して辿らない）．
+- **`account.provisioning` が無い（世代の再利用）．** その世代のディレクトリが
+  すでに登録済み（`accounts/<host>/<email>/account.json` の
+  `registration.uri` が非空）でなければ，`lego` を起動する前に
+  `AcmeFailure`（"acme account generation \<g\> of binding \"\<b\>\" is not
+  provisioned on this runner"）で失敗する．登録済みなら発行・更新へ進み，
+  `lego` には EAB を一切渡さない（バインディングの `eab` 設定は無視される）．
+- **`account.provisioning` がある（プロビジョニング run）．** その世代が
+  すでに登録済みなら，何も変更せず `InvalidJobSpec`（"…is already
+  provisioned"）で拒否する（リプレイ対策．[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+  `accountProvisioning` が未設定なら `InvalidJobSpec`（"this runner has no
+  account provisioning key"）．鍵は設定されているが payload を開けなければ
+  `InvalidJobSpec`（"account provisioning payload could not be opened"）．
+  開けたら，証明書がすでに要件を満たしていてもステップ 8 の noop 早期
+  リターンを **飛ばして** 必ず `lego run` を起動する（`lego` が
+  `newAccount` を行うのは `run` の内側だけであり，登録を取り逃さないため）．
+  復号した `kid`／`hmac` はその起動限りで `LEGO_EAB_KID`／`LEGO_EAB_HMAC`
+  として渡される（[`lego` の起動](#lego-の起動)の環境変数を参照）．
+- **アカウント状態の公開規則（ステップ 13 の例外）．** プロビジョニング run
+  以外では，ステップ 13 は `lego` の成否にかかわらず常に行われる（これまでと
+  同じ）．プロビジョニング run では，`lego` の実行後にその世代が実際に登録
+  済みになっているときにだけ公開する．登録に至らなかった試み（`lego` の
+  失敗，タイムアウト，キャンセル）は，その世代について何も公開しない ――
+  ディレクトリは未登録のまま残り，Result の `accountProvisioning.status` は
+  `"failed"` になる．登録できても，その状態の公開（`persistAccounts`）に
+  失敗した場合，または公開後に読み直した世代の状態に登録済みのアカウントが
+  見つからない場合も `"failed"` である ―― Conductor は `"registered"` を
+  受けて世代を切り替えるので，作業ディレクトリにしか存在しないアカウントを
+  登録済みと報告してはならない（その EAB は消費済みなので，新しい EAB での
+  再プロビジョニングが必要になる）．登録と公開の両方が成功した場合にだけ
+  `"registered"` になり，同じ run が続けて
+  対象の証明書を発行・更新する（もしくは，証明書がすでに最新であっても
+  `noop` を経ずに `lego` を実行したことになるだけで，発行結果自体は変わら
+  ない）．どちらの場合も，Result の `action`（`issued`/`renewed`/`noop`/`failed`）
+  は証明書の発行結果を独立に報告し，`accountProvisioning` の有無・値とは
+  別の軸である．
+
 ### `lego` の起動
 
 引数ベクトルは，正確にこの順序で構築される（`internal/runner/lego`）:
@@ -453,12 +541,20 @@ TMPDIR=<workDir>
 PATH=/usr/local/bin:/usr/bin:/bin
 <dns.env，キー順にソート>
 <dns.passthroughEnv の名前ごとに 1 エントリ，値は Runner 自身の環境から引く>
-LEGO_EAB_KID=<acme.eab.kidEnv の値>        (eab が設定されている場合のみ)
-LEGO_EAB_HMAC=<acme.eab.hmacEnv の値>      (eab が設定されている場合のみ)
+LEGO_EAB_KID=<acme.eab.kidEnv の値，または復号済みの kid>
+LEGO_EAB_HMAC=<acme.eab.hmacEnv の値，または復号済みの hmac>
+  (次のいずれかの場合のみ現れる: (a) acme.account が無く acme.eab が設定
+  されている「レガシー」経路，または (b) acme.account.provisioning がある
+  「プロビジョニング run」の経路．世代を再利用する run（acme.account が
+  あるが provisioning が無い）では，どちらの経路も適用されず EAB は
+  一切現れない — 前節「ACME アカウントの世代とプロビジョニング」を参照)
 ```
 
 EAB の素材は `lego` 自身の環境変数（`LEGO_EAB_KID`/`LEGO_EAB_HMAC`）を通じて
 運ばれ，**決して** `argv` を通らないため，プロセス一覧には見えない．
+プロビジョニング run では，この値は Conductor から届いた
+`SealedProvisioning` payload を Runner の `accountProvisioning` 鍵で復号した
+ものであり，`acmeBindings.<name>.eab` の環境変数名は無視される．
 
 ## Certificate Store (ファイルシステム)
 
@@ -663,7 +759,7 @@ Runner が認識する（`Cancelled`/`Timeout`）．
 | `/usr/local/bin/lego` | バージョン固定しチェックサム検証済みの `lego` v4.35.2 バイナリ（[ADR 0010](adr/0010-pinned-lego-binary.md) を参照）． |
 | `/etc/acme-runner/config.json` | Runner の設定．**読み取り専用** でマウントする． |
 | `/work` | `lego.workDir`．書き込み可能な `tmpfs`/`emptyDir` でなければならない．証明書の秘密鍵はここに 1 回の run の間だけ一時的に存在する． |
-| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録，および（`jobSigning` を使うなら）リプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
+| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録（レガシーな世代なしアカウントに加え，世代スコープのアカウントは `acme-accounts/<binding>/<generation>` に），および（`jobSigning` を使うなら）リプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
 | `/store` | `filesystem` store のルートの例（開発・テスト専用）． |
 
 イメージは `--read-only` / Kubernetes の `readOnlyRootFilesystem: true` に
@@ -695,6 +791,17 @@ docker run --rm \
 フィールドの全一覧は
 [コントラクト](architecture.md#certificatereconcileresult-result) を参照．
 
+`accountProvisioning`（`{ binding, generation, status: "registered"|"failed" }`）は，
+ジョブが `acme.account.provisioning` を運び，かつ Runner が認可とバインディング
+解決を終えてプロビジョニングの手順に到達した場合にだけ現れる．それより前の
+失敗（検証エラー，ポリシー違反，未知のバインディング）はこのフィールドを一切
+持たない．`status: "registered"` は，そのアカウント世代が登録され，かつ Runner の
+`stateDir` に永続的に公開されたこと（公開後に読み直して確認済み）を意味し，同じ run の中で証明書の発行・更新自体が
+（別の理由で）失敗しても変わらない ―― `accountProvisioning.status` と
+`Result.status`／`action` は独立である．
+[ACME アカウントの世代とプロビジョニング](#acme-アカウントの世代とプロビジョニング)
+を参照．
+
 `error.summary` は `lego` の生の出力，コマンドライン，環境変数のダンプでは
 **決して** なく，Runner が所有する少数のテンプレートからのみ生成される．
 テンプレート化された要約自体が `Result` のコントラクトに違反する場合
@@ -709,6 +816,10 @@ docker run --rm \
 | `BindingNotFound` | 認可されたバインディング名が Runner の設定に定義されていない． | `<kind> binding "<name>" is not defined in runner configuration` |
 | `DnsFailure` | DNS バインディングの `passthroughEnv` 変数が Runner 自身の環境に設定されていない． | `dns binding "<name>" requires an environment variable that is not set` |
 | `AcmeFailure` | ACME バインディングの EAB の `kidEnv`/`hmacEnv` 変数が設定されていない． | `acme binding "<name>" requires EAB credentials that are not set` |
+| `AcmeFailure` | アカウント世代を再利用する run（`provisioning` なし）で，その世代がこの Runner 上でまだ登録されていない． | `acme account generation <g> of binding "<b>" is not provisioned on this runner` |
+| `InvalidJobSpec` | プロビジョニング run（`account.provisioning` あり）で，その世代がすでに登録済み（リプレイ）． | `acme account generation <g> of binding "<b>" is already provisioned` |
+| `InvalidJobSpec` | プロビジョニング payload が来たが，この Runner に `accountProvisioning` が設定されていない． | `this runner has no account provisioning key` |
+| `InvalidJobSpec` | プロビジョニング payload が Runner の鍵で開けなかった（未知の `keyId`，AAD 不一致，AEAD 認証失敗，不正な平文）． | `account provisioning payload could not be opened` |
 | `AcmeFailure` | `lego` が非ゼロのステータスで終了した． | `lego exited with status <n>` |
 | `AcmeFailure` | `lego` が `0` で終了したが，読める証明書／鍵ファイルを書かなかった． | `lego exited successfully but produced no usable certificate` |
 | `AcmeFailure` | `lego` が書いた証明書をパースできなかった． | `lego produced an unreadable certificate` |
@@ -718,7 +829,7 @@ docker run --rm \
 | `StoreFailure` | Certificate Store を開けなかった，読めなかった（`Current`），または書けなかった（`Put`）． | `certificate store could not be opened` / `... read failed` / `... write failed` |
 | `Timeout` | `lego` が `lego.timeoutSeconds` 以内に終わらなかった． | `lego did not finish within <n> seconds` |
 | `Cancelled` | `lego` の起動前または実行中，あるいは store／状態のロック待ちの間に，run がシグナルでキャンセルされた． | `run was cancelled before lego started` / `... while lego was running` / `run was cancelled by signal while waiting for …` |
-| `Internal` | 設定を読み込めなかった，作業ディレクトリを準備できなかった，ACME アカウントの状態を読めなかった，環境変数の欠落以外の理由で `lego` の起動を組み立てられなかった，または `lego` を開始すらできなかった． | 例: `runner configuration could not be loaded` |
+| `Internal` | 設定を読み込めなかった，アカウント世代の状態ディレクトリを準備できなかった，作業ディレクトリを準備できなかった，ACME アカウントの状態を読めなかった，account-provisioning 鍵を読み込めなかった，環境変数の欠落以外の理由で `lego` の起動を組み立てられなかった，または `lego` を開始すらできなかった． | 例: `runner configuration could not be loaded` / `acme account state directory could not be prepared` / `account provisioning keys could not be loaded` |
 
 ## ログと秘匿
 
@@ -840,6 +951,18 @@ docker run --rm \
   名前が一致する実ディレクトリだけを対象とする．壊れた状態が初回実行のように
   見えることは決してない．そうなれば新しい ACME アカウントを黙って登録して
   しまうからである．
+- **世代スコープのアカウント状態も `stateDir` の下に閉じている．**
+  `JobSpec.acme.account` が世代を指定する run は，上記のレイアウトを
+  `stateDir/acme-accounts/<binding>/<generation>` の下で使う
+  （`stateDir` 自身ではない．そちらはレガシーな，世代のないアカウント用
+  である）．3 つのパス構成要素（`acme-accounts`，`<binding>`，
+  `<generation>`）はそれぞれ作成前に `Lstat` で検査され，実ディレクトリで
+  あることだけが受理される（シンボリックリンクや他の種別は拒否）．
+  `<binding>` はコントラクトがすでに検証済みのバインディング名，
+  `<generation>` は範囲の決まった 10 進整数の文字列化であり，どちらも
+  追加のパス構成要素や `..` を注入できない．
+  [ACME アカウントの世代とプロビジョニング](#acme-アカウントの世代とプロビジョニング)
+  を参照．
 - **レイアウト検査が扱わないこと．** これは `stateDir` を所有するのと同じ
   ユーザーによる，ある時点での検査である．同じ UID を持つプロセスがこれと
   競合する（検査と書き込みの間に `accounts.d` をリンクに置き換える）ことは
@@ -911,6 +1034,15 @@ docker run --rm \
 - 署名は生成者の *判断* を検証しない．署名鍵を持つ Conductor はどんな名前の
   ジョブにも署名できる．それを限定するのは信頼された認可ポリシーである
   （`docs/threat-model.md`，T1）．
+- **アカウント世代を燃やすことについて．** プロビジョニング run が失敗すると
+  その世代番号は二度と使われない（次の要求は次の番号を取る）．これは
+  Conductor 側のリプレイ対策の一部であり，番号そのものに意味はないので
+  実害はないが，`GET /acme-bindings/{binding}` の一覧に `failed` の世代が
+  積み重なることは想定内である．
+- Runner は，Conductor が `GET /account-provisioning/key` で提示する公開鍵が
+  本当に自分の秘密鍵と対をなすものかを検証する手段を持たない（それを検証
+  するのは操作者が帯外で `keyId` を比較する運用手順である．
+  [ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
 - Runner には，渡された DNS の資格情報／ワークロード ID が実際に必要な
   チャレンジゾーンに限定されているかを検証する手段がない．その限定は各
   `DnsBinding` をどうプロビジョニングするかという運用上の要件であり，

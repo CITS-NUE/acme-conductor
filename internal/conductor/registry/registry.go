@@ -147,6 +147,14 @@ const (
 	AuditRunSucceeded      AuditAction = "run.succeeded"
 	AuditRunFailed         AuditAction = "run.failed"
 	AuditRunCancelled      AuditAction = "run.cancelled"
+	// ACME account provisioning (issue #42): a generation-scoped ACME
+	// account for an ACME binding, sealed to a Runner's provisioning key.
+	AuditACMEAccountProvisioningRequested AuditAction = "acme_account.provisioning_requested"
+	AuditACMEAccountProvisioningAttached  AuditAction = "acme_account.provisioning_attached"
+	AuditACMEAccountActivated             AuditAction = "acme_account.activated"
+	AuditACMEAccountProvisioningFailed    AuditAction = "acme_account.provisioning_failed"
+	AuditACMEAccountProvisioningCancelled AuditAction = "acme_account.provisioning_cancelled"
+	AuditACMEAccountRetired               AuditAction = "acme_account.retired"
 )
 
 // MaxAuditDetailLength bounds the free-text detail of an audit event.
@@ -170,6 +178,60 @@ type AuditEvent struct {
 	RunID          string
 	PolicyID       string
 	Detail         string
+}
+
+// ACMEAccountStatus is the lifecycle state of one ACME account generation
+// (issue #42, encrypted EAB provisioning).
+type ACMEAccountStatus string
+
+// ACME account generation statuses.
+const (
+	// ACMEAccountProvisioning: a sealed payload is stored, waiting to be
+	// claimed by a run (or already attached to one, RunID set).
+	ACMEAccountProvisioning ACMEAccountStatus = "provisioning"
+	// ACMEAccountActive: the account was registered on the Runner and is
+	// the binding's current generation. At most one per binding.
+	ACMEAccountActive ACMEAccountStatus = "active"
+	// ACMEAccountRetired: was active, superseded by a newer generation.
+	ACMEAccountRetired ACMEAccountStatus = "retired"
+	// ACMEAccountFailed: provisioning was attempted (or its outcome is
+	// unknown) and did not result in a registered account. The generation
+	// number is burnt: it is never reused.
+	ACMEAccountFailed ACMEAccountStatus = "failed"
+	// ACMEAccountCancelled: an operator cancelled the pending request
+	// before it was attached to any run.
+	ACMEAccountCancelled ACMEAccountStatus = "cancelled"
+)
+
+// Valid reports whether s is a known ACME account status.
+func (s ACMEAccountStatus) Valid() bool {
+	switch s {
+	case ACMEAccountProvisioning, ACMEAccountActive, ACMEAccountRetired, ACMEAccountFailed, ACMEAccountCancelled:
+		return true
+	}
+	return false
+}
+
+// ACMEAccount is one generation of an ACME account for a binding. The
+// sealed provisioning payload is deliberately not a field of this model:
+// it is returned only by ClaimACMEAccountProvisioning, to the scheduler,
+// and never by a List or Get.
+type ACMEAccount struct {
+	Binding    string
+	Generation int64
+	Status     ACMEAccountStatus
+	// KeyID is the Runner provisioning key the (now possibly cleared)
+	// sealed payload was sealed to.
+	KeyID string
+	// RunID is the run currently carrying the sealed payload, while
+	// Status is provisioning; empty otherwise.
+	RunID                string
+	RequestedBy          string
+	RequestedByAuthority string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	// ActivatedAt is set when Status becomes active.
+	ActivatedAt *time.Time
 }
 
 // TargetRunSummary is what the scheduler needs to decide whether a target
@@ -256,6 +318,44 @@ type Registry interface {
 
 	AppendAudit(ctx context.Context, ev *AuditEvent) error
 	ListAudit(ctx context.Context, opts ListAuditOptions) ([]*AuditEvent, error)
+
+	// ListACMEAccounts returns every generation recorded for binding,
+	// newest generation first. The sealed payload is never included.
+	ListACMEAccounts(ctx context.Context, binding string) ([]*ACMEAccount, error)
+	// RequestACMEAccountProvisioning records a new pending generation:
+	// acct.Generation must equal (the binding's highest recorded
+	// generation)+1, or ErrConflict; a binding may have at most one
+	// pending (provisioning, unattached or attached) generation at a
+	// time, or ErrConflict. sealedJSON is the JSON encoding of the
+	// v1alpha1.SealedProvisioning the caller validated; the Conductor
+	// never inspects it beyond storing it.
+	RequestACMEAccountProvisioning(ctx context.Context, acct *ACMEAccount, sealedJSON string, ev *AuditEvent) error
+	// ClaimACMEAccountProvisioning atomically attaches binding's pending,
+	// unattached generation (if any) to runID and returns it with its
+	// sealed payload; (nil, "", nil) when there is none to claim (no
+	// pending generation, or it is already attached to another run). It
+	// records an acme_account.provisioning_attached audit event itself.
+	ClaimACMEAccountProvisioning(ctx context.Context, binding string, runID string) (*ACMEAccount, string, error)
+	// ReleaseACMEAccountProvisioning detaches generation from runID
+	// (RunID cleared, status left provisioning) without recording an
+	// audit event: the run ended without the Runner ever attempting the
+	// payload, so the generation stays available to a later run.
+	ReleaseACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string) error
+	// CompleteACMEAccountProvisioning resolves an attached generation.
+	// registered true moves it to active (activated_at set, sealed
+	// payload cleared, RunID cleared) and retires whatever generation of
+	// the same binding was previously active; false moves it to failed
+	// (sealed payload cleared, RunID cleared; the generation number is
+	// burnt, never reused). ErrConflict if generation is not attached to
+	// runID under status provisioning.
+	CompleteACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string, registered bool, ev *AuditEvent) error
+	// CancelACMEAccountProvisioning moves generation to cancelled
+	// (sealed payload cleared); ErrConflict unless it is currently
+	// provisioning and unattached.
+	CancelACMEAccountProvisioning(ctx context.Context, binding string, generation int64, ev *AuditEvent) error
+	// ActiveACMEAccountGeneration returns binding's active generation, or
+	// 0 when none.
+	ActiveACMEAccountGeneration(ctx context.Context, binding string) (int64, error)
 
 	Ping(ctx context.Context) error
 	Close() error

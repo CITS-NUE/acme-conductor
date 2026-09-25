@@ -724,3 +724,56 @@ func TestJobSigning(t *testing.T) {
 		mustReject(t, marshalDoc(t, m), "at most")
 	})
 }
+
+func TestAccountProvisioning(t *testing.T) {
+	t.Run("absent means no provisioning key", func(t *testing.T) {
+		c := mustAccept(t, marshalDoc(t, validDoc()))
+		if c.AccountProvisioning != nil {
+			t.Fatal("accountProvisioning should be nil")
+		}
+	})
+	t.Run("one file accepted", func(t *testing.T) {
+		m := validDoc()
+		m["accountProvisioning"] = map[string]any{"privateKeyFiles": []any{"/etc/acme-runner/provisioning.pem"}}
+		c := mustAccept(t, marshalDoc(t, m))
+		if len(c.AccountProvisioning.PrivateKeyFiles) != 1 || c.AccountProvisioning.PrivateKeyFiles[0] != "/etc/acme-runner/provisioning.pem" {
+			t.Fatalf("PrivateKeyFiles = %v", c.AccountProvisioning.PrivateKeyFiles)
+		}
+	})
+	t.Run("rotation with two files", func(t *testing.T) {
+		m := validDoc()
+		m["accountProvisioning"] = map[string]any{"privateKeyFiles": []any{"/etc/acme-runner/provisioning-1.pem", "/etc/acme-runner/provisioning-2.pem"}}
+		c := mustAccept(t, marshalDoc(t, m))
+		if len(c.AccountProvisioning.PrivateKeyFiles) != 2 {
+			t.Fatalf("PrivateKeyFiles = %v", c.AccountProvisioning.PrivateKeyFiles)
+		}
+	})
+	rejections := []struct {
+		name string
+		ap   map[string]any
+		want string
+	}{
+		{"empty list", map[string]any{"privateKeyFiles": []any{}}, "at least one file"},
+		{"relative path", map[string]any{"privateKeyFiles": []any{"provisioning.pem"}}, "clean absolute path"},
+		{"non-clean path", map[string]any{"privateKeyFiles": []any{"/etc//acme-runner/provisioning.pem"}}, "clean absolute path"},
+		{"dot-dot path", map[string]any{"privateKeyFiles": []any{"/etc/acme-runner/../provisioning.pem"}}, "clean absolute path"},
+		{"duplicate path", map[string]any{"privateKeyFiles": []any{"/etc/acme-runner/provisioning.pem", "/etc/acme-runner/provisioning.pem"}}, "listed twice"},
+		{"unknown field", map[string]any{"privateKeyFiles": []any{"/etc/acme-runner/provisioning.pem"}, "publicKey": "x"}, "publicKey"},
+	}
+	for _, r := range rejections {
+		t.Run(r.name, func(t *testing.T) {
+			m := validDoc()
+			m["accountProvisioning"] = r.ap
+			mustReject(t, marshalDoc(t, m), r.want)
+		})
+	}
+	t.Run("too many files", func(t *testing.T) {
+		var files []any
+		for i := 0; i <= MaxProvisioningKeys; i++ {
+			files = append(files, fmt.Sprintf("/etc/acme-runner/provisioning-%d.pem", i))
+		}
+		m := validDoc()
+		m["accountProvisioning"] = map[string]any{"privateKeyFiles": files}
+		mustReject(t, marshalDoc(t, m), "at most")
+	})
+}

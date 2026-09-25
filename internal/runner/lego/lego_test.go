@@ -183,6 +183,89 @@ func TestBuild_MissingEABEnv(t *testing.T) {
 	}
 }
 
+// TestBuild_EABOverride: an explicit EAB override wins outright, even when
+// the ACME binding also configures its own env-named EAB (a provisioning
+// run must never fall back to the binding's env-named EAB).
+func TestBuild_EABOverride(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case "AZURE_CLIENT_SECRET":
+			return "s3cr3t-value", true
+		case "BINDING_KID_ENV":
+			return "binding-kid", true
+		case "BINDING_HMAC_ENV":
+			return "binding-hmac", true
+		}
+		return "", false
+	}
+	p := baseParams(lookup)
+	p.ACME.EAB = &config.EAB{KIDEnv: "BINDING_KID_ENV", HMACEnv: "BINDING_HMAC_ENV"}
+	p.EAB = &EABValues{KID: "decrypted-kid", HMAC: "decrypted-hmac"}
+
+	inv, err := Build(p)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if n := len(inv.Argv); n < 2 || inv.Argv[n-2] != "--eab" || inv.Argv[n-1] != "run" {
+		t.Fatalf("Argv tail = %v, want [... --eab run]", inv.Argv)
+	}
+	gotEnvTail := inv.Env[len(inv.Env)-2:]
+	wantEnvTail := []string{"LEGO_EAB_KID=decrypted-kid", "LEGO_EAB_HMAC=decrypted-hmac"}
+	if !reflect.DeepEqual(gotEnvTail, wantEnvTail) {
+		t.Errorf("Env tail = %v, want %v (the binding's own EAB must be ignored)", gotEnvTail, wantEnvTail)
+	}
+	secrets := inv.Secrets()
+	var haveKid, haveHmac, haveBindingKid bool
+	for _, s := range secrets {
+		switch s {
+		case "decrypted-kid":
+			haveKid = true
+		case "decrypted-hmac":
+			haveHmac = true
+		case "binding-kid":
+			haveBindingKid = true
+		}
+	}
+	if !haveKid || !haveHmac {
+		t.Errorf("Secrets() = %v, want it to include the overriding EAB kid and hmac", secrets)
+	}
+	if haveBindingKid {
+		t.Errorf("Secrets() = %v, the binding's own (unused) EAB must not be looked up at all", secrets)
+	}
+}
+
+// TestBuild_DisableEAB: DisableEAB suppresses the binding's own EAB
+// entirely, even when it is configured, and it is never looked up.
+func TestBuild_DisableEAB(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case "AZURE_CLIENT_SECRET":
+			return "s3cr3t-value", true
+		case "BINDING_KID_ENV", "BINDING_HMAC_ENV":
+			t.Fatalf("DisableEAB must never look up the binding's own EAB env (%s)", name)
+		}
+		return "", false
+	}
+	p := baseParams(lookup)
+	p.ACME.EAB = &config.EAB{KIDEnv: "BINDING_KID_ENV", HMACEnv: "BINDING_HMAC_ENV"}
+	p.DisableEAB = true
+
+	inv, err := Build(p)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, a := range inv.Argv {
+		if a == "--eab" {
+			t.Fatalf("argv = %v, must not contain --eab when DisableEAB is set", inv.Argv)
+		}
+	}
+	for _, kv := range inv.Env {
+		if strings.HasPrefix(kv, "LEGO_EAB_") {
+			t.Fatalf("env = %v, must not contain LEGO_EAB_* when DisableEAB is set", inv.Env)
+		}
+	}
+}
+
 func TestBuild_RelativeBinary(t *testing.T) {
 	p := baseParams(nil)
 	p.Binary = "lego"

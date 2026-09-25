@@ -12,6 +12,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -171,6 +172,53 @@ type Config struct {
 	// list, and the profile imported targets get. Absent means
 	// targetSource registry with no list to compare or import from.
 	Migration *Migration `json:"migration,omitempty"`
+	// AccountProvisioning, when present, enables the encrypted EAB
+	// provisioning API and GUI (issue #42): the operator seals an ACME
+	// External Account Binding to the Runner's provisioning key in the
+	// browser, and the Conductor stores and hands out only ciphertext.
+	// Absent disables it: the account-provisioning endpoints answer
+	// not_configured and the scheduler never claims a pending request
+	// (the API is the only way to create one).
+	AccountProvisioning *AccountProvisioning `json:"accountProvisioning,omitempty"`
+}
+
+// AccountProvisioning locates the Runner provisioning public key this
+// Conductor seals ACME account credentials to (docs/adr/0022). It never
+// holds a private key or an EAB value: the Conductor is not a party that
+// can ever read the credential it forwards (docs/adr/0005).
+type AccountProvisioning struct {
+	// PublicKey is the Runner's X25519 provisioning public key: a PEM
+	// "PUBLIC KEY" block, the standard base64 of its DER
+	// SubjectPublicKeyInfo, or the base64url (no padding) of the raw
+	// 32-byte key (see v1alpha1.ParseProvisioningPublicKey).
+	PublicKey string `json:"publicKey"`
+
+	pub *ecdh.PublicKey
+}
+
+// Key returns the parsed provisioning public key.
+func (a *AccountProvisioning) Key() *ecdh.PublicKey {
+	if a == nil {
+		return nil
+	}
+	return a.pub
+}
+
+// KeyID returns the parsed key's ProvisioningKeyID, or "" if a is nil.
+func (a *AccountProvisioning) KeyID() string {
+	if a == nil || a.pub == nil {
+		return ""
+	}
+	return v1alpha1.ProvisioningKeyID(a.pub)
+}
+
+func (a *AccountProvisioning) validate() error {
+	pub, err := v1alpha1.ParseProvisioningPublicKey(a.PublicKey)
+	if err != nil {
+		return invalid("accountProvisioning.publicKey: %v", err)
+	}
+	a.pub = pub
+	return nil
 }
 
 // Migration configures the migration tooling (docs/migration.md).
@@ -464,6 +512,11 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Migration.validate(c); err != nil {
 		return err
+	}
+	if c.AccountProvisioning != nil {
+		if err := c.AccountProvisioning.validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

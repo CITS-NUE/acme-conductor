@@ -166,6 +166,31 @@ CREATE TRIGGER policies_no_delete BEFORE DELETE ON policies
 ALTER TABLE audit_events ADD COLUMN actor_authority TEXT NOT NULL DEFAULT '';
 ALTER TABLE runs ADD COLUMN requested_by_authority TEXT NOT NULL DEFAULT '';
 `,
+	// 3: encrypted EAB provisioning and ACME account generations (issue
+	// #42, docs/adr/0022). sealed_payload and run_id are cleared once a
+	// generation reaches a terminal or attached-outcome state; at most
+	// one pending (provisioning) and one active generation per binding.
+	`
+CREATE TABLE acme_accounts (
+  binding                 TEXT    NOT NULL,
+  generation              INTEGER NOT NULL CHECK (generation >= 1),
+  status                  TEXT    NOT NULL CHECK (status IN ('provisioning','active','retired','failed','cancelled')),
+  key_id                  TEXT    NOT NULL,
+  sealed_payload          TEXT,
+  run_id                  TEXT,
+  requested_by            TEXT    NOT NULL,
+  requested_by_authority  TEXT    NOT NULL,
+  created_at              TEXT    NOT NULL,
+  updated_at              TEXT    NOT NULL,
+  activated_at            TEXT,
+  PRIMARY KEY (binding, generation)
+);
+CREATE UNIQUE INDEX acme_accounts_one_pending ON acme_accounts(binding) WHERE status = 'provisioning';
+CREATE UNIQUE INDEX acme_accounts_one_active  ON acme_accounts(binding) WHERE status = 'active';
+CREATE INDEX acme_accounts_run ON acme_accounts(run_id) WHERE run_id IS NOT NULL;
+CREATE TRIGGER acme_accounts_no_delete BEFORE DELETE ON acme_accounts
+  BEGIN SELECT RAISE(ABORT, 'acme_accounts cannot be deleted'); END;
+`,
 }
 
 // SchemaVersion is the schema version this binary expects.
@@ -788,4 +813,254 @@ func (d *DB) RunSummary(ctx context.Context, targetID string) (*registry.TargetR
 		return nil, fmt.Errorf("count failures: %w", err)
 	}
 	return &s, nil
+}
+
+// ---- acme accounts (issue #42) ----------------------------------------
+
+// schedulerActor and schedulerAuthority are used for the audit event this
+// package writes itself, when the scheduler-driven operation's signature
+// carries no *registry.AuditEvent (Claim). They mirror the values the
+// scheduler package uses for its own run audit events (package scheduler
+// cannot be imported here: it imports registry, which sqlite implements).
+const (
+	schedulerActor     = "scheduler"
+	schedulerAuthority = "scheduler"
+)
+
+const acmeAccountCols = `binding, generation, status, key_id, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at`
+
+func scanACMEAccount(sc interface{ Scan(...any) error }) (*registry.ACMEAccount, error) {
+	var a registry.ACMEAccount
+	var status string
+	var runID, activated sql.NullString
+	var created, updated string
+	if err := sc.Scan(&a.Binding, &a.Generation, &status, &a.KeyID, &runID, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated); err != nil {
+		return nil, err
+	}
+	a.Status = registry.ACMEAccountStatus(status)
+	a.RunID = runID.String
+	var err error
+	if a.CreatedAt, err = parseTime(created); err != nil {
+		return nil, err
+	}
+	if a.UpdatedAt, err = parseTime(updated); err != nil {
+		return nil, err
+	}
+	if a.ActivatedAt, err = parseOptTime(activated); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// ListACMEAccounts implements registry.Registry.
+func (d *DB) ListACMEAccounts(ctx context.Context, binding string) ([]*registry.ACMEAccount, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT `+acmeAccountCols+` FROM acme_accounts WHERE binding = ? ORDER BY generation DESC`, binding)
+	if err != nil {
+		return nil, fmt.Errorf("list acme accounts: %w", err)
+	}
+	defer rows.Close()
+	var out []*registry.ACMEAccount
+	for rows.Next() {
+		a, err := scanACMEAccount(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan acme account: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// RequestACMEAccountProvisioning implements registry.Registry.
+func (d *DB) RequestACMEAccountProvisioning(ctx context.Context, a *registry.ACMEAccount, sealedJSON string, ev *registry.AuditEvent) error {
+	now := time.Now().UTC()
+	a.Status = registry.ACMEAccountProvisioning
+	a.RunID = ""
+	a.CreatedAt = now
+	a.UpdatedAt = now
+	a.ActivatedAt = nil
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		var maxGen sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(generation) FROM acme_accounts WHERE binding = ?`, a.Binding).Scan(&maxGen); err != nil {
+			return fmt.Errorf("read max generation: %w", err)
+		}
+		want := int64(1)
+		if maxGen.Valid {
+			want = maxGen.Int64 + 1
+		}
+		if a.Generation != want {
+			return fmt.Errorf("%w: binding %q next generation is %d, not %d", registry.ErrConflict, a.Binding, want, a.Generation)
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO acme_accounts (binding, generation, status, key_id, sealed_payload, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at)
+			VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)`,
+			a.Binding, a.Generation, string(a.Status), a.KeyID, sealedJSON, a.RequestedBy, a.RequestedByAuthority, fmtTime(a.CreatedAt), fmtTime(a.UpdatedAt))
+		if err != nil {
+			if isUnique(err) {
+				return fmt.Errorf("%w: binding %q already has a pending provisioning request", registry.ErrConflict, a.Binding)
+			}
+			return fmt.Errorf("insert acme account: %w", err)
+		}
+		return insertAudit(ctx, tx, ev)
+	})
+}
+
+// ClaimACMEAccountProvisioning implements registry.Registry.
+func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding string, runID string) (*registry.ACMEAccount, string, error) {
+	var claimed *registry.ACMEAccount
+	var sealedJSON string
+	err := d.tx(ctx, func(tx *sql.Tx) error {
+		row := tx.QueryRowContext(ctx, `SELECT `+acmeAccountCols+`, sealed_payload FROM acme_accounts
+			WHERE binding = ? AND status = ? AND run_id IS NULL ORDER BY generation LIMIT 1`,
+			binding, string(registry.ACMEAccountProvisioning))
+		var status string
+		var runIDCol, activated, sealed sql.NullString
+		var created, updated string
+		var a registry.ACMEAccount
+		err := row.Scan(&a.Binding, &a.Generation, &status, &a.KeyID, &runIDCol, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated, &sealed)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("claim acme account: %w", err)
+		}
+		a.Status = registry.ACMEAccountStatus(status)
+		if a.CreatedAt, err = parseTime(created); err != nil {
+			return err
+		}
+		if a.UpdatedAt, err = parseTime(updated); err != nil {
+			return err
+		}
+		if a.ActivatedAt, err = parseOptTime(activated); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = ?, updated_at = ? WHERE binding = ? AND generation = ? AND status = ? AND run_id IS NULL`,
+			runID, fmtTime(time.Now().UTC()), a.Binding, a.Generation, string(registry.ACMEAccountProvisioning))
+		if err != nil {
+			return fmt.Errorf("attach acme account: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Lost the race to another claim (cannot happen with this
+			// package's single connection, but stay correct anyway).
+			return nil
+		}
+		a.RunID = runID
+		claimed = &a
+		sealedJSON = sealed.String
+		ev := &registry.AuditEvent{
+			Actor: schedulerActor, ActorAuthority: schedulerAuthority, Action: registry.AuditACMEAccountProvisioningAttached, RunID: runID,
+			Detail: fmt.Sprintf("acme account provisioning attached: binding=%s generation=%d keyId=%s runId=%s", a.Binding, a.Generation, a.KeyID, runID),
+		}
+		return insertAudit(ctx, tx, ev)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if claimed == nil {
+		return nil, "", nil
+	}
+	return claimed, sealedJSON, nil
+}
+
+// ReleaseACMEAccountProvisioning implements registry.Registry.
+func (d *DB) ReleaseACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string) error {
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`,
+			fmtTime(time.Now().UTC()), binding, generation, runID, string(registry.ACMEAccountProvisioning))
+		if err != nil {
+			return fmt.Errorf("release acme account: %w", err)
+		}
+		return nil
+	})
+}
+
+// CompleteACMEAccountProvisioning implements registry.Registry.
+func (d *DB) CompleteACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string, registered bool, ev *registry.AuditEvent) error {
+	now := time.Now().UTC()
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		if registered {
+			// Retire whatever generation of this binding is currently
+			// active before activating the new one: the partial unique
+			// index allows at most one active row at a time, so the old
+			// one must be gone before the new one can be set.
+			retireRows, err := tx.QueryContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND status = ? AND generation != ?`, binding, string(registry.ACMEAccountActive), generation)
+			if err != nil {
+				return fmt.Errorf("find previous active acme account: %w", err)
+			}
+			var previous []int64
+			for retireRows.Next() {
+				var g int64
+				if err := retireRows.Scan(&g); err != nil {
+					retireRows.Close()
+					return err
+				}
+				previous = append(previous, g)
+			}
+			if err := retireRows.Err(); err != nil {
+				return err
+			}
+			retireRows.Close()
+			for _, g := range previous {
+				if _, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, updated_at = ? WHERE binding = ? AND generation = ?`, string(registry.ACMEAccountRetired), fmtTime(now), binding, g); err != nil {
+					return fmt.Errorf("retire previous acme account: %w", err)
+				}
+				rev := &registry.AuditEvent{
+					Actor: ev.Actor, ActorAuthority: ev.ActorAuthority, Action: registry.AuditACMEAccountRetired, RunID: ev.RunID,
+					Detail: fmt.Sprintf("acme account retired: binding=%s generation=%d (superseded by generation=%d)", binding, g, generation),
+				}
+				if err := insertAudit(ctx, tx, rev); err != nil {
+					return err
+				}
+			}
+		}
+		var q string
+		var args []any
+		if registered {
+			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ?, activated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`
+			args = []any{string(registry.ACMEAccountActive), fmtTime(now), fmtTime(now), binding, generation, runID, string(registry.ACMEAccountProvisioning)}
+		} else {
+			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`
+			args = []any{string(registry.ACMEAccountFailed), fmtTime(now), binding, generation, runID, string(registry.ACMEAccountProvisioning)}
+		}
+		res, err := tx.ExecContext(ctx, q, args...)
+		if err != nil {
+			return fmt.Errorf("complete acme account: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("%w: acme account %s/%d is not attached to run %s under status provisioning", registry.ErrConflict, binding, generation, runID)
+		}
+		return insertAudit(ctx, tx, ev)
+	})
+}
+
+// CancelACMEAccountProvisioning implements registry.Registry.
+func (d *DB) CancelACMEAccountProvisioning(ctx context.Context, binding string, generation int64, ev *registry.AuditEvent) error {
+	now := time.Now().UTC()
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND status = ? AND run_id IS NULL`,
+			string(registry.ACMEAccountCancelled), fmtTime(now), binding, generation, string(registry.ACMEAccountProvisioning))
+		if err != nil {
+			return fmt.Errorf("cancel acme account: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists int
+			_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM acme_accounts WHERE binding = ? AND generation = ?`, binding, generation).Scan(&exists)
+			if exists == 0 {
+				return fmt.Errorf("%w: acme account %s/%d", registry.ErrNotFound, binding, generation)
+			}
+			return fmt.Errorf("%w: acme account %s/%d is not an unattached pending request", registry.ErrConflict, binding, generation)
+		}
+		return insertAudit(ctx, tx, ev)
+	})
+}
+
+// ActiveACMEAccountGeneration implements registry.Registry.
+func (d *DB) ActiveACMEAccountGeneration(ctx context.Context, binding string) (int64, error) {
+	var g int64
+	err := d.db.QueryRowContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND status = ?`, binding, string(registry.ACMEAccountActive)).Scan(&g)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("active acme account generation: %w", err)
+	}
+	return g, nil
 }

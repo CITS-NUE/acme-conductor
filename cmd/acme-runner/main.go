@@ -6,6 +6,7 @@
 //	acme-runner reconcile --job /input/job.json --result /output/result.json [--config /etc/acme-runner/config.json]
 //	acme-runner reconcile --exchange /exchange [--execution-name NAME] [--config /etc/acme-runner/config.json]
 //	acme-runner keygen --private FILE --public FILE
+//	acme-runner provisioning-keygen --private FILE --public FILE
 //
 // reconcile handles exactly one JobSpec: it validates the document,
 // authorizes it against the trusted runner configuration, runs the bundled
@@ -48,7 +49,7 @@ func main() {
 }
 
 func usage(stderr io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n  %s reconcile --exchange DIR [--execution-name NAME] [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n\n", component, component, component, component)
+	fmt.Fprintf(stderr, "Usage:\n  %s [--version] [--help]\n  %s reconcile --job FILE --result FILE [--config FILE] [--log-level LEVEL]\n  %s reconcile --exchange DIR [--execution-name NAME] [--config FILE] [--log-level LEVEL]\n  %s keygen --private FILE --public FILE\n  %s provisioning-keygen --private FILE --public FILE\n\n", component, component, component, component, component)
 	fmt.Fprintln(stderr, "ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate).")
 	fmt.Fprintln(stderr, "\nFlags:")
 	fs.PrintDefaults()
@@ -79,6 +80,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, getenv fu
 		return runReconcile(ctx, fs.Args()[1:], stdout, stderr, getenv)
 	case "keygen":
 		return keygen.Run(component, "result-signing", fs.Args()[1:], stdout, stderr)
+	case "provisioning-keygen":
+		return keygen.RunProvisioning(component, fs.Args()[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "%s: unknown command %q\n\n", component, fs.Arg(0))
 		fs.Usage()

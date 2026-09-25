@@ -15,6 +15,7 @@ package api
 
 import (
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,6 +80,10 @@ type Options struct {
 	// Migration, when set, exposes the migration endpoints and the
 	// target source flag; nil means target source registry and no list.
 	Migration *MigrationOptions
+	// ProvisioningKey, when set, is the Runner X25519 provisioning public
+	// key (issue #42): it enables the account-provisioning endpoints and
+	// GUI page. Nil disables them (not_configured).
+	ProvisioningKey *ecdh.PublicKey
 }
 
 // Server is the API handler.
@@ -93,7 +98,8 @@ type Server struct {
 	ui    *UIOptions
 	mux   *http.ServeMux
 
-	migration *MigrationOptions
+	migration    *MigrationOptions
+	provisioning *ecdh.PublicKey
 }
 
 // New builds the handler.
@@ -110,7 +116,7 @@ func New(o Options) *Server {
 	if o.Scheduler == nil {
 		o.Scheduler = noScheduler{}
 	}
-	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), migration: o.Migration}
+	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), migration: o.Migration, provisioning: o.ProvisioningKey}
 	s.routes()
 	return s
 }
@@ -148,6 +154,11 @@ func (s *Server) routes() {
 	api("GET "+Prefix+"/migration/diff", s.handleMigrationDiff)
 	api("POST "+Prefix+"/migration/diff", s.handleMigrationDiff)
 	api("POST "+Prefix+"/migration/import", s.handleMigrationImport)
+	api("GET "+Prefix+"/account-provisioning/key", s.handleProvisioningKey)
+	api("GET "+Prefix+"/acme-bindings", s.handleListACMEBindings)
+	api("GET "+Prefix+"/acme-bindings/{binding}", s.handleGetACMEBinding)
+	api("POST "+Prefix+"/acme-bindings/{binding}/provisioning", s.handleRequestACMEProvisioning)
+	api("DELETE "+Prefix+"/acme-bindings/{binding}/provisioning/{generation}", s.handleCancelACMEProvisioning)
 	if s.ui != nil {
 		s.uiRoutes()
 	}

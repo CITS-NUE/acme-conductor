@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	runnerconfig "github.com/CITS-NUE/acme-conductor/internal/runner/config"
+	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
 const minimal = `{
@@ -487,5 +488,53 @@ func TestMigrationRejects(t *testing.T) {
 		if err := mutate(t, withMigration(section)); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%s: err = %v, want ErrInvalid", name, err)
 		}
+	}
+}
+
+func TestAccountProvisioningConfiguration(t *testing.T) {
+	priv, err := v1alpha1.GenerateProvisioningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemKey, err := v1alpha1.MarshalProvisioningPublicKey(priv.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted, _ := json.Marshal(string(pemKey))
+	with := func(section string) string {
+		return strings.Replace(minimal, `"database"`, `"accountProvisioning": `+section+`, "database"`, 1)
+	}
+	c, err := Read(strings.NewReader(with(`{"publicKey": ` + string(quoted) + `}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccountProvisioning.KeyID() != v1alpha1.ProvisioningKeyID(priv.PublicKey()) || !c.AccountProvisioning.Key().Equal(priv.PublicKey()) {
+		t.Fatalf("accountProvisioning = %+v", c.AccountProvisioning)
+	}
+	if c, err := Read(strings.NewReader(minimal)); err != nil || c.AccountProvisioning != nil {
+		t.Fatalf("absent section: %+v %v", c, err)
+	}
+
+	signingPub, _, err := v1alpha1.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingPEM, err := v1alpha1.MarshalSigningPublicKey(signingPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingQuoted, _ := json.Marshal(string(signingPEM))
+	rejects := map[string]string{
+		"empty":         `{}`,
+		"not a key":     `{"publicKey": "bm90LWEta2V5"}`,
+		"signing key":   `{"publicKey": ` + string(signingQuoted) + `}`,
+		"unknown field": `{"publicKey": ` + string(quoted) + `, "privateKey": "x"}`,
+	}
+	for name, section := range rejects {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Read(strings.NewReader(with(section))); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v, want ErrInvalid", err)
+			}
+		})
 	}
 }

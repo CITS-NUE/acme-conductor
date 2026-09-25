@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -62,6 +63,12 @@ type harness struct {
 	resultKeys map[string]ed25519.PublicKey
 	// stores, when set, replaces testStores() for the runs.
 	stores *stores.Registry
+	// provisioningKeyFiles accumulates the paths provisioningKey() has
+	// written, so a second call rotates rather than replaces the first.
+	provisioningKeyFiles []string
+	// extraSecrets are additional markers assertNoSecrets checks for,
+	// beyond the fixed lego-leak markers (a decrypted EAB kid/hmac, say).
+	extraSecrets []string
 }
 
 func newHarness(t *testing.T, mode string, extraEnv map[string]string) *harness {
@@ -224,14 +231,80 @@ func (h *harness) resultSigning() ed25519.PublicKey {
 
 func (h *harness) assertNoSecrets() {
 	h.t.Helper()
-	for _, forbidden := range []string{"PRIVATE KEY", "-----BEGIN", "-----END", "ZmFrZS1sZWFrZWQta2V5", fakelego.LeakedSecret} {
+	for _, forbidden := range append([]string{"PRIVATE KEY", "-----BEGIN", "-----END", "ZmFrZS1sZWFrZWQta2V5", fakelego.LeakedSecret}, h.extraSecrets...) {
 		if strings.Contains(h.stdout.String(), forbidden) {
 			h.t.Fatalf("result contains %q", forbidden)
 		}
 		if strings.Contains(h.logs.String(), forbidden) {
 			h.t.Fatalf("log contains %q:\n%s", forbidden, h.logs.String())
 		}
+		if _, err := os.Stat(h.resPath); err == nil {
+			if data, err := os.ReadFile(h.resPath); err == nil && strings.Contains(string(data), forbidden) {
+				h.t.Fatalf("result file contains %q", forbidden)
+			}
+		}
 	}
+}
+
+// provisioningKey generates a fresh X25519 account-provisioning key pair,
+// writes the private key to a new file under the harness directory and
+// adds it to accountProvisioning.privateKeyFiles (appending, so a second
+// call exercises rotation rather than replacing the first key).
+func (h *harness) provisioningKey() *ecdh.PublicKey {
+	h.t.Helper()
+	priv, err := v1alpha1.GenerateProvisioningKey()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	pemBytes, err := v1alpha1.MarshalProvisioningPrivateKey(priv)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	path := filepath.Join(h.dir, fmt.Sprintf("provisioning-%d.pem", len(h.provisioningKeyFiles)+1))
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	h.provisioningKeyFiles = append(h.provisioningKeyFiles, path)
+	h.mutateConfig(func(m map[string]any) {
+		m["accountProvisioning"] = map[string]any{"privateKeyFiles": append([]string(nil), h.provisioningKeyFiles...)}
+	})
+	return priv.PublicKey()
+}
+
+// accountJob writes the default job with acme.account set to generation,
+// and, when pub is not nil, a provisioning payload sealing {kid, hmac} to
+// pub scoped to binding/generation (SealProvisioning, WP1). mut applies
+// after, as with job().
+func (h *harness) accountJob(pub *ecdh.PublicKey, binding string, generation int64, kid, hmac string, mut func(m map[string]any)) *v1alpha1.SealedProvisioning {
+	h.t.Helper()
+	var sealed *v1alpha1.SealedProvisioning
+	var sealedMap map[string]any
+	if pub != nil {
+		s, err := v1alpha1.SealProvisioning(pub, binding, generation, v1alpha1.ProvisioningEAB{KID: kid, HMAC: hmac})
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		sealed = s
+		data, err := json.Marshal(s)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &sealedMap); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+	h.job(func(m map[string]any) {
+		account := map[string]any{"generation": generation}
+		if sealedMap != nil {
+			account["provisioning"] = sealedMap
+		}
+		m["acme"].(map[string]any)["binding"] = binding
+		m["acme"].(map[string]any)["account"] = account
+		if mut != nil {
+			mut(m)
+		}
+	})
+	return sealed
 }
 
 func (h *harness) workEntries() []os.DirEntry {
@@ -1494,5 +1567,324 @@ func TestReconcileClaimMode(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(exchange.ClaimedDir(root, "01JABCDEFGHJKMNPQRSTVWXYZ8"), exchange.ResultFile)); err == nil {
 		t.Fatal("a result was written without an execution name")
+	}
+}
+
+// --- account generations and provisioning (issue #42) --------------------
+
+// mutateJob reads the job file back, applies mut and rewrites it: used to
+// build a job whose fields do not fit the job()/accountJob() shape (an
+// account ref that deliberately disagrees with what a sealed payload was
+// scoped to).
+func (h *harness) mutateJob(mut func(m map[string]any)) {
+	h.t.Helper()
+	data, err := os.ReadFile(h.jobPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		h.t.Fatal(err)
+	}
+	mut(m)
+	h.writeJSON(h.jobPath, m)
+}
+
+// generationRoot is the account state directory a generation-scoped job
+// publishes to.
+func (h *harness) generationRoot(binding string, generation int64) string {
+	return filepath.Join(h.stateDir, "acme-accounts", binding, strconv.FormatInt(generation, 10))
+}
+
+// TestReconcileAccountGenerationRequiresProvisionedAccount is case a): a
+// generation with no provisioning payload must already be registered on
+// this Runner, and the check runs without ever invoking lego.
+func TestReconcileAccountGenerationRequiresProvisionedAccount(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.accountJob(nil, "fake-ca", 1, "", "", nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if res.Error.Code != v1alpha1.ErrorCodeACMEFailure || !strings.Contains(res.Error.Summary, "is not provisioned") {
+		t.Fatalf("error = %+v", res.Error)
+	}
+	if res.AccountProvisioning != nil {
+		t.Fatalf("a non-provisioning run must never carry accountProvisioning: %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run for an unprovisioned generation")
+	}
+}
+
+// TestReconcileAccountProvisioningRegistersAndPublishes covers the whole
+// happy path of case b): registration, publication to the generation
+// root, the sealed EAB reaching lego, and reuse by a later
+// non-provisioning run against the same generation.
+func TestReconcileAccountProvisioningRegistersAndPublishes(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0001", "prov-hmac-aaaa", nil)
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionIssued {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Binding != "fake-ca" ||
+		res.AccountProvisioning.Generation != 1 || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningRegistered {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	root := h.generationRoot("fake-ca", 1)
+	if _, err := os.Stat(filepath.Join(root, "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json")); err != nil {
+		t.Fatalf("account state not published to the generation root: %v", err)
+	}
+	// The legacy stateDir/accounts must never be touched by a
+	// generation-scoped run.
+	if _, err := os.Stat(filepath.Join(h.stateDir, "accounts")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy account state touched by a generation-scoped run: %v", err)
+	}
+	var rec fakelego.Record
+	data, err := os.ReadFile(h.record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
+	}
+	var haveFlag bool
+	for _, a := range rec.Argv {
+		if a == "--eab" {
+			haveFlag = true
+		}
+	}
+	if !haveFlag {
+		t.Fatalf("argv missing --eab: %v", rec.Argv)
+	}
+	envSet := map[string]string{}
+	for _, kv := range rec.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			envSet[k] = v
+		}
+	}
+	if envSet["LEGO_EAB_KID"] != "prov-kid-0001" || envSet["LEGO_EAB_HMAC"] != "prov-hmac-aaaa" {
+		t.Fatalf("lego env = %v, want the decrypted EAB values", envSet)
+	}
+
+	// A later non-provisioning run against the same generation reuses the
+	// registered account; the certificate is already current, so lego is
+	// not invoked again (the noop shortcut is not skipped in case a).
+	os.Remove(h.record)
+	h.accountJob(nil, "fake-ca", 1, "", "", nil)
+	code, res = h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionNoop {
+		t.Fatalf("reuse run: code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if res.AccountProvisioning != nil {
+		t.Fatalf("a non-provisioning run must never carry accountProvisioning: %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego ran for a noop reuse of an already-registered generation")
+	}
+}
+
+// TestReconcileAccountProvisioningReplayIsRefused is the replay guard: a
+// provisioning payload presented again for a generation this Runner has
+// already registered is refused, and the existing state is left alone.
+func TestReconcileAccountProvisioningReplayIsRefused(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0002", "prov-hmac-bbbb", nil)
+	if code, res := h.run(context.Background()); code != ExitSucceeded || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningRegistered {
+		t.Fatalf("initial registration: code=%d result=%+v", code, res)
+	}
+	before, err := os.ReadFile(filepath.Join(h.generationRoot("fake-ca", 1), "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(h.record)
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-replay", "prov-hmac-replay", nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	if res.Error.Code != v1alpha1.ErrorCodeInvalidJobSpec || !strings.Contains(res.Error.Summary, "already provisioned") {
+		t.Fatalf("error = %+v", res.Error)
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed || res.AccountProvisioning.Generation != 1 {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run on a replayed provisioning payload")
+	}
+	after, err := os.ReadFile(filepath.Join(h.generationRoot("fake-ca", 1), "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("existing account state changed by a replayed provisioning payload: %q vs %q, %v", before, after, err)
+	}
+}
+
+// TestReconcileAccountProvisioningWrongScopeFails: a payload sealed for
+// one generation, replayed against another, fails to open (the AAD binds
+// the generation), and is reported the same as any other open failure.
+func TestReconcileAccountProvisioningWrongScopeFails(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0003", "prov-hmac-cccc", nil)
+	h.mutateJob(func(m map[string]any) {
+		m["acme"].(map[string]any)["account"].(map[string]any)["generation"] = float64(2)
+	})
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	if res.Error.Code != v1alpha1.ErrorCodeInvalidJobSpec || !strings.Contains(res.Error.Summary, "could not be opened") {
+		t.Fatalf("error = %+v", res.Error)
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed || res.AccountProvisioning.Generation != 2 {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run when the provisioning payload does not open")
+	}
+}
+
+// TestReconcileAccountProvisioningNoKeyConfigured: a Runner without an
+// accountProvisioning section refuses a provisioning payload outright.
+func TestReconcileAccountProvisioningNoKeyConfigured(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	priv, err := v1alpha1.GenerateProvisioningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.accountJob(priv.PublicKey(), "fake-ca", 1, "prov-kid-0004", "prov-hmac-dddd", nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeInvalidJobSpec || !strings.Contains(res.Error.Summary, "no account provisioning key") {
+		t.Fatalf("code=%d result=%+v", code, res)
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(h.record); err == nil {
+		t.Fatal("lego must not run without a provisioning key")
+	}
+}
+
+// TestReconcileAccountProvisioningRegisterFailPublishesNothing: lego's
+// "registerfail" mode never writes account.json (only the account private
+// key), so the generation root must stay without a registered account:
+// nothing is published for the generation on failure.
+func TestReconcileAccountProvisioningRegisterFailPublishesNothing(t *testing.T) {
+	h := newHarness(t, "registerfail", nil)
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0005", "prov-hmac-eeee", nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeACMEFailure || !strings.Contains(res.Error.Summary, "exited with status") {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Lstat(filepath.Join(h.generationRoot("fake-ca", 1), "accounts")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generation root published state despite a failed registration: %v", err)
+	}
+}
+
+// TestReconcileAccountProvisioningLegoFailsAfterRegistration: lego's "fail"
+// mode registers the account and then fails to obtain the certificate. The
+// overall run fails, but the account it registered is still published and
+// AccountProvisioning is reported as registered (Result.Status and
+// AccountProvisioning.Status are independent).
+func TestReconcileAccountProvisioningLegoFailsAfterRegistration(t *testing.T) {
+	h := newHarness(t, "fail", nil)
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0006", "prov-hmac-ffff", nil)
+	code, res := h.run(context.Background())
+	if code != ExitFailed || res.Status != v1alpha1.StatusFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeACMEFailure {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningRegistered {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+	if _, err := os.Stat(filepath.Join(h.generationRoot("fake-ca", 1), "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json")); err != nil {
+		t.Fatalf("registered account not published despite the later cert failure: %v", err)
+	}
+}
+
+// TestReconcileAccountProvisioningKIDReachesLego proves, via fakelego's
+// FAKE_LEGO_EXPECT_EAB_KID check, that the exact kid this Runner decrypted
+// from the sealed payload is what reaches lego (and only that value: a
+// mismatch is refused by the fake before it would register anything).
+func TestReconcileAccountProvisioningKIDReachesLego(t *testing.T) {
+	h := newHarness(t, "ok", map[string]string{fakelego.EnvExpectEABKID: "expected-kid-999"})
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "expected-kid-999", "hmac-for-999", nil)
+	if code, res := h.run(context.Background()); code != ExitSucceeded || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningRegistered {
+		t.Fatalf("matching kid: code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+
+	h2 := newHarness(t, "ok", map[string]string{fakelego.EnvExpectEABKID: "expected-kid-999"})
+	pub2 := h2.provisioningKey()
+	h2.accountJob(pub2, "fake-ca", 1, "some-other-kid", "hmac-for-other", nil)
+	code, res := h2.run(context.Background())
+	if code != ExitFailed || res.Error == nil || res.Error.Code != v1alpha1.ErrorCodeACMEFailure {
+		t.Fatalf("mismatching kid: code=%d result=%+v\n%s", code, res, h2.logs.String())
+	}
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed {
+		t.Fatalf("accountProvisioning = %+v", res.AccountProvisioning)
+	}
+}
+
+// TestReconcileAccountProvisioningPlaintextNeverLeaks is the explicit
+// design requirement: the decrypted EAB kid and hmac must never appear in
+// the Runner's captured stdout, log output or result file, under
+// distinctive markers that would be easy to spot if they did.
+func TestReconcileAccountProvisioningPlaintextNeverLeaks(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	const kid = "distinctive-marker-kid-0xCAFEBABE"
+	const hmac = "distinctive-marker-hmac-0xDEADBEEF"
+	h.extraSecrets = []string{kid, hmac}
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, kid, hmac, nil)
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningRegistered {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	// h.run() already asserts h.extraSecrets are absent from stdout, logs
+	// and the result file; the registered generation root's account.json
+	// (lego's own file, not the Result) is allowed to hold ACME account
+	// metadata but never these markers either.
+	acct, err := os.ReadFile(filepath.Join(h.generationRoot("fake-ca", 1), "accounts", "acme.test.invalid", "certs@example.ac.jp", "account.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(acct), kid) || strings.Contains(string(acct), hmac) {
+		t.Fatalf("published account state contains the decrypted EAB: %s", acct)
+	}
+}
+
+// TestReconcileAccountProvisioningPersistFailureIsNotRegistered: lego
+// registers the account (newAccount succeeded, the EAB is consumed) but the
+// account state cannot be published for the generation. The generation must
+// then be reported as failed, never registered: the Conductor activates a
+// generation on "registered", and the next run could not reuse an account
+// that only ever existed in this run's work directory.
+func TestReconcileAccountProvisioningPersistFailureIsNotRegistered(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	root := h.generationRoot("fake-ca", 1)
+	// fakelego plants a regular file at accounts.d just before it exits, so
+	// persistAccounts refuses the layout (ErrAccountsCorrupt).
+	h.mutateConfig(func(m map[string]any) {
+		dns := m["dnsBindings"].(map[string]any)["fake-dns"].(map[string]any)
+		dns["env"].(map[string]any)[fakelego.EnvPlantFile] = filepath.Join(root, "accounts.d")
+	})
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0010", "prov-hmac-pppp", nil)
+	_, res := h.run(context.Background())
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed {
+		t.Fatalf("accountProvisioning = %+v\n%s", res.AccountProvisioning, h.logs.String())
+	}
+	if _, err := os.Lstat(filepath.Join(root, "accounts")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generation root has published state: %v", err)
+	}
+	if !strings.Contains(h.logs.String(), "could not be persisted") {
+		t.Fatalf("persist failure not logged:\n%s", h.logs.String())
 	}
 }
