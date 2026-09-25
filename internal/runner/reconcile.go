@@ -574,16 +574,32 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	// provisioning run is the one exception: until lego has actually
 	// registered the account, nothing is published for this generation, so
 	// a failed or partial attempt never makes the generation look claimed.
+	//
+	// A provisioning run reports the generation as registered only once
+	// the registered account is durably published: the Conductor activates
+	// the generation (and retires the previous one) on that report, so a
+	// registration that exists only in this run's work directory must be
+	// reported as failed, keeping the previous generation in use.
 	registered := accountRegistered(work)
 	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
 	if !provisioning || registered {
 		if perr := persistAccounts(persistCtx, work, accountRoot); perr != nil {
 			log.Warn("ACME account state could not be persisted", "error", perr.Error())
+		} else if provisioning {
+			published, verr := publishedAccountRegistered(persistCtx, accountRoot)
+			switch {
+			case verr != nil:
+				log.Warn("published ACME account state could not be verified", "error", verr.Error())
+			case !published:
+				log.Warn("published ACME account state holds no registered account")
+			default:
+				ap.Status = v1alpha1.AccountProvisioningRegistered
+			}
 		}
 	}
 	cancelPersist()
-	if provisioning && registered {
-		ap.Status = v1alpha1.AccountProvisioningRegistered
+	if provisioning && registered && ap.Status != v1alpha1.AccountProvisioningRegistered {
+		log.Warn("the account was registered but its state was not published; the generation is reported as failed and needs a new EAB")
 	}
 	if err != nil {
 		return nil, failAP(v1alpha1.ErrorCodeInternal, "lego could not be executed", err)

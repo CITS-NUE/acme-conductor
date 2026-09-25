@@ -169,7 +169,8 @@ func TestACMEProvisioningOnlyOneRunCarriesPayload(t *testing.T) {
 			carriers++
 			mu.Unlock()
 		}
-		res := okResult(f.clock(), spec, v1alpha1.ActionIssued, 90)
+		// One day left, so the target is due again for the second cycle.
+		res := okResult(f.clock(), spec, v1alpha1.ActionIssued, 1)
 		if spec.ACME.Account != nil && spec.ACME.Account.Provisioning != nil {
 			res.AccountProvisioning = &v1alpha1.AccountProvisioningResult{Binding: f.policy.ACMEBinding, Generation: spec.ACME.Account.Generation, Status: v1alpha1.AccountProvisioningRegistered}
 		}
@@ -201,5 +202,46 @@ func TestACMEProvisioningMismatchedResultNeverActivates(t *testing.T) {
 	active, _ := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
 	if active != 0 {
 		t.Fatalf("active generation = %d", active)
+	}
+}
+
+// TestACMEProvisioningFailedResultKeepsPreviousActive: a Runner that could
+// not durably publish a freshly registered account reports the generation
+// as failed; the previously active generation must stay active and be the
+// one the next run uses.
+func TestACMEProvisioningFailedResultKeepsPreviousActive(t *testing.T) {
+	f := setup(t, 1)
+	requestProvisioning(t, f, 1)
+	f.fake.respond = func(_ context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+		// One day left, so the target is due again for the second cycle.
+		res := okResult(f.clock(), spec, v1alpha1.ActionIssued, 1)
+		if spec.ACME.Account != nil && spec.ACME.Account.Provisioning != nil {
+			status := v1alpha1.AccountProvisioningRegistered
+			if spec.ACME.Account.Generation == 2 {
+				status = v1alpha1.AccountProvisioningFailed
+			}
+			res.AccountProvisioning = &v1alpha1.AccountProvisioningResult{Binding: f.policy.ACMEBinding, Generation: spec.ACME.Account.Generation, Status: status}
+		}
+		return res, nil
+	}
+	f.cycle(t)
+	requestProvisioning(t, f, 2)
+	f.target.Owner = "other"
+	if err := f.reg.UpdateTarget(context.Background(), f.target, f.target.Revision, nil); err != nil {
+		t.Fatal(err)
+	}
+	if planned, started := f.cycle(t); planned != 1 || started != 1 {
+		t.Fatalf("planned %d started %d", planned, started)
+	}
+	if spec := f.fake.specs[len(f.fake.specs)-1]; spec.ACME.Account == nil || spec.ACME.Account.Generation != 2 || spec.ACME.Account.Provisioning == nil {
+		t.Fatalf("second run did not carry generation 2: %+v", spec.ACME.Account)
+	}
+	active, err := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
+	if err != nil || active != 1 {
+		t.Fatalf("active generation = %d %v", active, err)
+	}
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	if err != nil || len(list) != 2 || list[0].Generation != 2 || list[0].Status != registry.ACMEAccountFailed || list[1].Status != registry.ACMEAccountActive {
+		t.Fatalf("list = %+v %v", list, err)
 	}
 }

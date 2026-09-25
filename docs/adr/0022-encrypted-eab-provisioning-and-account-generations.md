@@ -123,7 +123,10 @@ run のたびに使われる継続的な資格情報とは性質が異なる．
 - **世代の活性化は，一致する `registered` の Result を得たときだけ行われる．
   失敗や不明な結果はその世代番号を燃やし，旧世代を活性のままにする．**
   Runner は，`lego` の実行後にその世代のディレクトリが登録済みになっている
-  ときにだけ状態を公開する（登録に至らなかった試みは何も公開しない）．
+  ときにだけ状態を公開し（登録に至らなかった試みは何も公開しない），その
+  公開が成功して読み直した状態に登録済みのアカウントがあるときにだけ
+  `registered` と報告する．公開に失敗すれば，登録自体は成功していても
+  `failed` である．
   Conductor 側では `CompleteACMEAccountProvisioning` が，`Result` の
   `accountProvisioning` が要求した binding／generation と一致し，かつ
   `status: registered` であるときにだけ，その世代を `active` にし

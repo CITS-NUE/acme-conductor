@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/ecdh"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/CITS-NUE/acme-conductor/internal/fslock"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/config"
 	"github.com/CITS-NUE/acme-conductor/internal/runner/lego"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
@@ -84,7 +86,32 @@ func mkdirRealComponent(path string) error {
 // (that a directory holds a proper account is exactly what this function
 // exists to confirm).
 func accountRegistered(dir string) bool {
-	root := filepath.Join(dir, lego.AccountsDir)
+	return accountsTreeRegistered(filepath.Join(dir, lego.AccountsDir))
+}
+
+// publishedAccountRegistered reports whether the account state durably
+// published under stateRoot (the version its "accounts" link points at,
+// read under the shared state lock like loadAccounts) holds a registered
+// account. A provisioning run consults it after persistAccounts: lego
+// having registered the account in the work directory is not enough to
+// report the generation as registered, because the next run can only
+// reuse what was actually published.
+func publishedAccountRegistered(ctx context.Context, stateRoot string) (bool, error) {
+	lock, err := fslock.Shared(ctx, filepath.Join(stateRoot, stateLockFile))
+	if err != nil {
+		return false, err
+	}
+	defer lock.Unlock()
+	current, err := validateAccountsLayout(stateRoot)
+	if err != nil || current == "" {
+		return false, err
+	}
+	return accountsTreeRegistered(current), nil
+}
+
+// accountsTreeRegistered is accountRegistered for a tree laid out like
+// lego's "accounts" directory itself (<host>/<email>/account.json).
+func accountsTreeRegistered(root string) bool {
 	found := false
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if found {

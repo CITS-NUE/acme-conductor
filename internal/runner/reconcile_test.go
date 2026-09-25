@@ -1859,3 +1859,32 @@ func TestReconcileAccountProvisioningPlaintextNeverLeaks(t *testing.T) {
 		t.Fatalf("published account state contains the decrypted EAB: %s", acct)
 	}
 }
+
+// TestReconcileAccountProvisioningPersistFailureIsNotRegistered: lego
+// registers the account (newAccount succeeded, the EAB is consumed) but the
+// account state cannot be published for the generation. The generation must
+// then be reported as failed, never registered: the Conductor activates a
+// generation on "registered", and the next run could not reuse an account
+// that only ever existed in this run's work directory.
+func TestReconcileAccountProvisioningPersistFailureIsNotRegistered(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	root := h.generationRoot("fake-ca", 1)
+	// fakelego plants a regular file at accounts.d just before it exits, so
+	// persistAccounts refuses the layout (ErrAccountsCorrupt).
+	h.mutateConfig(func(m map[string]any) {
+		dns := m["dnsBindings"].(map[string]any)["fake-dns"].(map[string]any)
+		dns["env"].(map[string]any)[fakelego.EnvPlantFile] = filepath.Join(root, "accounts.d")
+	})
+	pub := h.provisioningKey()
+	h.accountJob(pub, "fake-ca", 1, "prov-kid-0010", "prov-hmac-pppp", nil)
+	_, res := h.run(context.Background())
+	if res.AccountProvisioning == nil || res.AccountProvisioning.Status != v1alpha1.AccountProvisioningFailed {
+		t.Fatalf("accountProvisioning = %+v\n%s", res.AccountProvisioning, h.logs.String())
+	}
+	if _, err := os.Lstat(filepath.Join(root, "accounts")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generation root has published state: %v", err)
+	}
+	if !strings.Contains(h.logs.String(), "could not be persisted") {
+		t.Fatalf("persist failure not logged:\n%s", h.logs.String())
+	}
+}

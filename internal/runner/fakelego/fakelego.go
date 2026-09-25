@@ -56,6 +56,11 @@ const (
 	// opened provisioning payload actually reached lego, without the fake
 	// ever logging or returning the value itself.
 	EnvExpectEABKID = "FAKE_LEGO_EXPECT_EAB_KID"
+	// EnvPlantFile, when set, makes the fake create an empty regular file
+	// at this path just before it exits. Tests point it at a Runner state
+	// path (for example a generation's accounts.d) to make the Runner's
+	// account-state publication fail after lego registered an account.
+	EnvPlantFile = "FAKE_LEGO_PLANT_FILE"
 )
 
 // LeakedSecret is a value the "fail" mode prints on stderr, so tests can
@@ -80,6 +85,9 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 			fmt.Fprintln(stderr, "fake lego: record:", err)
 			return 3
 		}
+	}
+	if plant := getenv(EnvPlantFile); plant != "" {
+		defer os.WriteFile(plant, nil, 0o600)
 	}
 	mode := getenv(EnvMode)
 	if mode == "" {
