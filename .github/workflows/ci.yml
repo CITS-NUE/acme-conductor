@@ -132,7 +132,7 @@ jobs:
       # Build only — this workflow never pushes images. The release
       # workflow (release.yml) pushes to ghcr.io on a version tag.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.${{ matrix.component }}
