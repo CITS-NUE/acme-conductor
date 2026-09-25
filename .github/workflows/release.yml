@@ -128,7 +128,7 @@ jobs:
       # registry under the image digest and verifiable with `gh
       # attestation verify`.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
