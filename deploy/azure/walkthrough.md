@@ -36,7 +36,7 @@ Container Apps 環境の作成（5〜10 分）が占める．
 
 | 作業 | 必要な権限 | 備考 |
 |---|---|---|
-| Azure リソースの作成（手順 4, 8） | デプロイ先 RG の `Contributor` | |
+| Azure リソースの作成（手順 4，8） | デプロイ先 RG の `Contributor` | |
 | サブスクリプションスコープのネストしたデプロイ（手順 8） | サブスクリプションの `Microsoft.Resources/deployments/*`（サブスクリプションの `Contributor` や `Owner` に含まれる） | `main.bicep` はカスタムロールを `scope: subscription()` の module（`modules/roles.bicep`）で作るため，**RG の `Contributor` だけでは足りない**．`User Access Administrator` にも含まれない |
 | カスタムロール定義の作成（手順 8） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`） | `Contributor` と `Role Based Access Control Administrator` には **含まれない** |
 | ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任でもよい（#37 以降）．[手順 8](#8-デプロイ) を参照 |
