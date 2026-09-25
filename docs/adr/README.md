@@ -27,6 +27,7 @@
 | [0019](0019-provider-boundary.md) | プロバイダ境界: 公開コントラクト，合成層のレジストリ，単一モジュール，`deploy/azure` は残す |
 | [0020](0020-migration-from-cert-infra.md) | cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ |
 | [0021](0021-keyvault-pkcs12-content-type.md) | Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする |
+| [0022](0022-encrypted-eab-provisioning-and-account-generations.md) | 暗号化された EAB プロビジョニングと ACME アカウントの世代 |
 
 [`docs/architecture.md`](../architecture.md) と
 [`docs/threat-model.md`](../threat-model.md) も参照．
