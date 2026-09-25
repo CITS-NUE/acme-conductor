@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACME Conductor</title>
+<meta name="description" content="ACME Conductor は，学内の多数のホスト名の TLS 証明書を ACME で自動発行・更新するための，クラウドに依存しないコントロールプレーンです．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html" aria-current="page">概要</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="migration.html">既存環境からの移行</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>学内のたくさんの証明書を，<br>秘密鍵を集めずに自動で更新する</h1>
+    <p class="lead">
+      ACME Conductor は，大学などの組織が管理する多数のホスト名について，TLS 証明書の発行と更新を
+      ACME（Let's Encrypt など）で自動化するためのコントロールプレーンです．
+      「どのホスト名に，どのポリシーで，いつ証明書を出すか」を一か所で管理しつつ，
+      秘密鍵や DNS・Key Vault の資格情報は管理サーバに一切持たせない設計になっています．
+    </p>
+  </section>
+
+  <div class="cards">
+    <div class="card cp">
+      <h3>一覧とポリシーを一か所で</h3>
+      <p>ホスト名（FQDN）の一覧，許可するドメイン，更新時期，鍵の種類を REST API と GUI で管理し，すべての操作を追記専用の監査ログに残します．</p>
+    </div>
+    <div class="card dp">
+      <h3>ACME の実装は lego に任せる</h3>
+      <p>新しい ACME クライアントではありません．広く使われている <a href="https://github.com/go-acme/lego">go-acme/lego</a> をバージョン固定で同梱し，1 回の実行ごとに 1 度だけ呼び出します．</p>
+    </div>
+    <div class="card secret">
+      <h3>秘密鍵は管理側を通らない</h3>
+      <p>秘密鍵は使い捨ての Runner の中で生成され，Key Vault などの証明書ストアへ直接書き込まれた後，破棄されます．</p>
+    </div>
+  </div>
+
+  <h2 id="overview">全体像</h2>
+  <p>
+    システムは 2 つのプログラムに分かれています．常駐して「何をすべきか」を決める
+    <strong>Conductor</strong>（コントロールプレーン）と，1 件の仕事ごとに起動されて実際に証明書を取りに行く
+    <strong>Runner</strong>（データプレーン）です．両者の間を行き来するのは，
+    署名付きの「作業指示書（JobSpec）」と「結果報告（Result）」の 2 種類の文書だけです．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 470" role="img" aria-labelledby="ov-t ov-d">
+      <title id="ov-t">ACME Conductor の全体構成</title>
+      <desc id="ov-d">管理者は GUI または REST API で Conductor を操作する．Conductor は署名付き JobSpec を Runner に渡し，Runner は lego を使って ACME 認証局と DNS プロバイダとやり取りし，証明書と秘密鍵を Certificate Store に直接格納し，署名付き Result を Conductor に返す．</desc>
+      <defs>
+        <marker id="ov-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="ov-acp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-cp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="ov-adp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="ov-as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-secret" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <!-- 操作者 -->
+      <rect class="d-ext" x="16" y="52" width="150" height="70" rx="8"/>
+      <text class="d-text" x="91" y="80" text-anchor="middle">管理者・閲覧者</text>
+      <text class="d-small" x="91" y="102" text-anchor="middle">GUI / REST API</text>
+      <line class="d-line" x1="166" y1="87" x2="208" y2="87" marker-end="url(#ov-a)"/>
+      <text class="d-small" x="91" y="146" text-anchor="middle">OIDC で認証</text>
+      <text class="d-small" x="91" y="164" text-anchor="middle">admin / viewer</text>
+
+      <!-- コントロールプレーンの領域 -->
+      <rect class="d-zone" x="196" y="14" width="262" height="442" rx="12"/>
+      <text class="d-cp-text" x="327" y="34" text-anchor="middle">コントロールプレーン</text>
+
+      <rect class="d-cp" x="210" y="46" width="234" height="240" rx="10"/>
+      <text class="d-title" x="327" y="70" text-anchor="middle">acme-conductor</text>
+      <g>
+        <rect class="d-box" x="222" y="82" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="101" text-anchor="middle">Target（FQDN）レジストリ</text>
+        <rect class="d-box" x="222" y="114" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="133" text-anchor="middle">証明書ポリシー</text>
+        <rect class="d-box" x="222" y="146" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="165" text-anchor="middle">スケジューラ</text>
+        <rect class="d-box" x="222" y="178" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="197" text-anchor="middle">Run（実行）の記録</text>
+        <rect class="d-box" x="222" y="210" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="229" text-anchor="middle">追記専用の監査ログ</text>
+        <rect class="d-box" x="222" y="242" width="210" height="28" rx="5"/>
+        <text class="d-text" x="327" y="261" text-anchor="middle">Job Launcher</text>
+      </g>
+
+      <line class="d-line" x1="327" y1="286" x2="327" y2="322" marker-end="url(#ov-a)"/>
+      <rect class="d-ext" x="226" y="324" width="202" height="58" rx="8"/>
+      <text class="d-text" x="327" y="348" text-anchor="middle">SQLite（1 ファイル）</text>
+      <text class="d-small" x="327" y="368" text-anchor="middle">鍵・資格情報は入らない</text>
+
+      <text class="d-danger-text" x="327" y="414" text-anchor="middle">✕ 秘密鍵を持たない</text>
+      <text class="d-danger-text" x="327" y="436" text-anchor="middle">✕ DNS / Key Vault の権限なし</text>
+
+      <!-- JobSpec / Result -->
+      <line class="d-line-cp" x1="444" y1="96" x2="520" y2="96" marker-end="url(#ov-acp)"/>
+      <text class="d-cp-text" x="482" y="84" text-anchor="middle">JobSpec</text>
+      <line class="d-line-dp d-dash" x1="520" y1="150" x2="444" y2="150" marker-end="url(#ov-adp)"/>
+      <text class="d-dp-text" x="482" y="172" text-anchor="middle">Result</text>
+
+      <!-- データプレーンの領域 -->
+      <rect class="d-zone" x="508" y="14" width="380" height="442" rx="12"/>
+      <text class="d-dp-text" x="698" y="34" text-anchor="middle">データプレーン（1 回ごとの使い捨て）</text>
+
+      <rect class="d-dp" x="522" y="46" width="190" height="160" rx="10"/>
+      <text class="d-title" x="617" y="70" text-anchor="middle">acme-runner</text>
+      <text class="d-text" x="536" y="98">① 検証と認可</text>
+      <text class="d-text" x="536" y="124">② 更新が必要か確認</text>
+      <text class="d-text" x="536" y="150">③ lego を 1 度だけ起動</text>
+      <text class="d-text" x="536" y="176">④ 検証して格納</text>
+      <text class="d-small" x="536" y="197">⑤ Result を返して終了</text>
+
+      <!-- 外部 -->
+      <rect class="d-ext" x="744" y="50" width="132" height="52" rx="8"/>
+      <text class="d-text" x="810" y="72" text-anchor="middle">ACME 認証局</text>
+      <text class="d-small" x="810" y="91" text-anchor="middle">Let's Encrypt など</text>
+      <rect class="d-ext" x="744" y="128" width="132" height="52" rx="8"/>
+      <text class="d-text" x="810" y="150" text-anchor="middle">DNS プロバイダ</text>
+      <text class="d-small" x="810" y="169" text-anchor="middle">DNS-01 の TXT</text>
+      <line class="d-line" x1="712" y1="84" x2="742" y2="76" marker-end="url(#ov-a)"/>
+      <line class="d-line" x1="712" y1="146" x2="742" y2="154" marker-end="url(#ov-a)"/>
+
+      <line class="d-line-secret" x1="617" y1="206" x2="617" y2="296" marker-end="url(#ov-as)"/>
+      <text class="d-secret-text" x="627" y="250">証明書 + 秘密鍵</text>
+      <text class="d-small" x="627" y="270">直接書き込み</text>
+
+      <rect class="d-secret" x="522" y="298" width="354" height="84" rx="10"/>
+      <text class="d-title" x="699" y="326" text-anchor="middle">Certificate Store</text>
+      <text class="d-text" x="699" y="348" text-anchor="middle">Azure Key Vault（本番）/ ファイル（開発）</text>
+      <text class="d-small" x="699" y="368" text-anchor="middle">Web サーバや Application Gateway はここを参照</text>
+
+      <text class="d-dp-text" x="698" y="414" text-anchor="middle">クラウドの認証はワークロード ID（マネージド ID）</text>
+      <text class="d-small" x="698" y="436" text-anchor="middle">設定ファイルに静的なシークレットを置かない</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>コントロールプレーン</span>
+      <span><i class="dp"></i>データプレーン</span>
+      <span><i class="secret"></i>秘密鍵が置かれる場所</span>
+      <span><i class="ext"></i>外部サービス</span>
+    </div>
+    <figcaption>Conductor は「いつ・何を」を決めるだけで，ACME 認証局・DNS・証明書ストアとは一切通信しません．それらと話すのは Runner だけです．JobSpec と Result はどちらも Ed25519 で署名されます．</figcaption>
+  </figure>
+
+  <h3>役割分担</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Conductor（<code>acme-conductor</code>）</th><th>Runner（<code>acme-runner</code>）</th></tr></thead>
+      <tbody>
+        <tr><th>動き方</th><td>常駐サービス（API・GUI・スケジューラ）</td><td>1 件ごとに起動し，終わったら終了するジョブ</td></tr>
+        <tr><th>秘密鍵</th><td>決して持たない</td><td>1 回の実行中だけ一時領域に置き，格納後に破棄</td></tr>
+        <tr><th>DNS / Key Vault の資格情報</th><td>持たない</td><td>自分のワークロード ID で認証</td></tr>
+        <tr><th>ACME・DNS・Store との通信</th><td>しない</td><td>する（Runner だけ）</td></tr>
+        <tr><th>ネットワークへの公開</th><td>管理者向けの API と GUI</td><td>なし（待ち受けるポートを持たない）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="fit">どんな組織に向いているか</h2>
+  <div class="cards">
+    <div class="card dp">
+      <h3>向いている</h3>
+      <ul>
+        <li>学部・研究室・サービスごとに多数のホスト名があり，証明書の期限切れを仕組みで防ぎたい</li>
+        <li>DNS-01 チャレンジで発行したい（Web サーバを外部公開していないホストも含めて）</li>
+        <li>Azure を使っており，証明書を Key Vault に置いて Application Gateway などから参照している</li>
+        <li>「誰がいつどのホスト名を追加したか」を監査ログとして残したい</li>
+      </ul>
+    </div>
+    <div class="card danger">
+      <h3>今のところ向いていない</h3>
+      <ul>
+        <li>秘密鍵を各サーバへ配布する機能が欲しい（配布 API は意図的に持ちません）</li>
+        <li>HTTP-01 チャレンジで発行したい（DNS-01 のみ）</li>
+        <li>AWS / GCP 上で動かしたい（設計上は見越していますが未実装）</li>
+        <li>1 枚の証明書に複数の SAN を入れたい（FQDN 1 つにつき 1 枚）</li>
+        <li>国際化ドメイン名（IDN）を扱いたい</li>
+      </ul>
+    </div>
+  </div>
+  <p class="muted">詳しくは<a href="status.html">現状と制限</a>を参照してください．</p>
+
+  <h2 id="path">導入までの道のり</h2>
+  <p>いきなり本番の証明書を切り替える必要はありません．次の順に，小さく確かめながら進められます．</p>
+  <ol class="steps">
+    <li><strong>手元で試す</strong> — 開発用の認証（<code>localhost-dev</code>）とローカルプロセスのランチャー，ファイルの証明書ストアで，1 台のマシン上に全体を動かします．ACME は Let's Encrypt の <em>ステージング</em> を使います．<br><a href="deploy.html#local">導入ガイド: 手元で試す</a></li>
+    <li><strong>Azure にデプロイする</strong> — 同梱の Bicep テンプレートで，Container Apps 上に Conductor と Runner，権限の重ならない 2 つのマネージド ID を作ります．まずはステージング CA と 1 つのホスト名から．<br><a href="deploy.html#azure">導入ガイド: Azure にデプロイする</a></li>
+    <li><strong>既存の一覧を取り込んで見比べる</strong> — いま別の仕組み（IaC など）で証明書を更新しているなら，ホスト名の一覧を取り込み，Conductor には発行させずに差分だけを監視する <code>shadow</code> モードで様子を見ます．<br><a href="migration.html">既存環境からの移行</a></li>
+    <li><strong>切り替える</strong> — 設定のフラグを <code>registry</code> にして再起動すると Conductor が発行を始めます．戻すときもフラグを戻すだけです．</li>
+  </ol>
+
+  <h2 id="principles">守っている約束</h2>
+  <p>設計全体を通して，次の原則が成り立つようにしています．それぞれがどの脅威に対応するかは<a href="security.html">安全設計</a>で図解しています．</p>
+  <ul>
+    <li>Conductor は証明書の秘密鍵を保存・取得・配布しない．</li>
+    <li>Conductor は DNS，Key Vault，長期有効なクラウド資格情報を持たない．</li>
+    <li>Runner はワークロード ID（Azure Managed Identity など）で認証し，静的なシークレットを使わない．</li>
+    <li>秘密鍵は Runner の一時領域で生成され，証明書ストアに直接書き込まれた後に破棄される．</li>
+    <li>API で指定できるのは，管理者が登録した「バインディング」の名前だけ．コマンド，イメージ，リソース ID，資格情報は指定できない．</li>
+    <li>Runner は受け取った指示書を，自分の信頼できる設定に照らして改めて認可する．</li>
+    <li>自動テストが本物の ACME 認証局を呼ぶことはない．</li>
+  </ul>
+
+  <div class="next">
+    <span></span>
+    <a class="fwd" href="how-it-works.html"><small>次へ</small>仕組み: 1 枚の証明書が更新されるまで</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>

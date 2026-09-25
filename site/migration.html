@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>既存環境からの移行 — ACME Conductor</title>
+<meta name="description" content="既存の IaC 管理のホスト一覧から ACME Conductor へ，切替日を設けずに移行する方法．target source フラグ（iac / shadow / registry）と比較・取り込みの手順を説明します．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="migration.html" aria-current="page">既存環境からの移行</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>既存環境からの移行</h1>
+    <p class="lead">
+      すでに IaC（Infrastructure as Code）でホスト一覧を管理し，別の仕組みで
+      証明書を更新している場合，切替日を設けずに ACME Conductor へ移せます．
+      一覧を取り込み，しばらくの間は発行させずに既存の仕組みと突き合わせて見比べ，
+      準備ができてから切り替え，必要ならフラグ 1 つで元に戻せます．
+    </p>
+  </section>
+
+  <div class="callout">
+    <p>
+      このページは，学内の IaC（Bicep など）でホスト一覧を管理し，別の仕組みで
+      証明書を更新している組織を想定しています．著者らの環境では，この既存の
+      仕組みを「<code>cert-infra</code>」（固定ホスト一覧を <code>lego</code>
+      で更新し Key Vault に取り込む，Bicep 定義の Container Apps Job）と
+      呼んでいます．ACME Conductor は <code>cert-infra</code> リポジトリ自体を
+      変更しません．読むだけで，止めるのも操作者です．詳しくは
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/migration.md">docs/migration.md</a>
+      と <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0020-migration-from-cert-infra.md">ADR 0020</a>
+      を参照してください．
+    </p>
+  </div>
+
+  <h2 id="what">移行するものとしないもの</h2>
+  <p>
+    移行するのは<strong>管理対象の名前の集合（FQDN）だけ</strong>です．一覧が
+    寄与するのは FQDN のみであり，それ以外は何も寄与しません．
+  </p>
+  <div class="cards">
+    <div class="card dp">
+      <h3>移行するもの</h3>
+      <ul>
+        <li>ホスト名（FQDN）の一覧のみ．Conductor の target レジストリに，
+          FQDN ごとに 1 つの <code>Target</code> として作成されます．</li>
+      </ul>
+    </div>
+    <div class="card danger">
+      <h3>移行しないもの</h3>
+      <ul>
+        <li><strong>ACME アカウント</strong> — Runner の <code>lego</code> は
+          自身の状態ディレクトリの下に新しいアカウントを登録します．両方の
+          アカウントは CA 側で共存できます．</li>
+        <li><strong>証明書</strong> — 切替後の初回実行で，取り込んだ各 target に
+          新しい証明書が発行され，Conductor 自身のオブジェクト名の下に格納
+          されます．既存の仕組みが使っていた名前ではありません．</li>
+        <li><strong>ポリシー</strong> — 許可するサフィックス，使う ACME
+          バインディング，更新のタイミングは，一覧からは導出されません．
+          管理者が「取り込みプロファイル」の中で一度だけ決めます．</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2 id="target-source">target source フラグ</h2>
+  <p>
+    設定 <code>migration.targetSource</code> が，どちらのシステムが証明書を
+    発行するかを決めます．3 つのモードがあり，起動時に設定として読まれます
+    （API からは変更できません）．変更は設定変更と再起動だけで完結し，データの
+    移動や再計算は起きません．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 860 300" role="img" aria-labelledby="mig1-t mig1-d">
+      <title id="mig1-t">targetSource の 3 つのモードと遷移</title>
+      <desc id="mig1-d">iac から shadow へ，shadow から registry へと順に進む．registry から iac または shadow へはロールバックの矢印が戻る．iac と shadow では既存の仕組みが発行を続け，Conductor は発行しない．shadow では加えて一覧とレジストリを定期的に比較する．registry ではレジストリが正であり，Conductor のスケジューラが発行する．</desc>
+      <defs>
+        <marker id="mig1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="mig1-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="mig1-adan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-danger" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="d-ext" x="20" y="30" width="220" height="150" rx="10"/>
+      <text class="d-title" x="130" y="56" text-anchor="middle">iac</text>
+      <text class="d-text" x="130" y="80" text-anchor="middle">既存の仕組みが発行する</text>
+      <text class="d-small" x="130" y="100" text-anchor="middle">Conductor は発行しない</text>
+      <text class="d-small" x="130" y="118" text-anchor="middle">比較もしない</text>
+      <text class="d-small" x="130" y="140" text-anchor="middle">レジストリは編集のみ可能</text>
+      <text class="d-small" x="130" y="160" text-anchor="middle">移行前・ロールバック先</text>
+
+      <rect class="d-cp" x="320" y="30" width="220" height="150" rx="10"/>
+      <text class="d-title" x="430" y="56" text-anchor="middle">shadow</text>
+      <text class="d-text" x="430" y="80" text-anchor="middle">既存の仕組みが発行する</text>
+      <text class="d-small" x="430" y="100" text-anchor="middle">Conductor は発行しない</text>
+      <text class="d-text" x="430" y="122" text-anchor="middle">一覧とレジストリを</text>
+      <text class="d-text" x="430" y="140" text-anchor="middle">定期的に比較する</text>
+      <text class="d-small" x="430" y="160" text-anchor="middle">結果は監査イベントに記録</text>
+
+      <rect class="d-dp" x="620" y="30" width="220" height="150" rx="10"/>
+      <text class="d-title" x="730" y="56" text-anchor="middle">registry</text>
+      <text class="d-text" x="730" y="80" text-anchor="middle">Conductor が発行する</text>
+      <text class="d-small" x="730" y="100" text-anchor="middle">スケジューラが run を</text>
+      <text class="d-small" x="730" y="118" text-anchor="middle">計画・開始する</text>
+      <text class="d-small" x="730" y="140" text-anchor="middle">既定であり移行後の状態</text>
+      <text class="d-small" x="730" y="160" text-anchor="middle">レジストリが正</text>
+
+      <line class="d-line" x1="240" y1="105" x2="318" y2="105" marker-end="url(#mig1-a)"/>
+      <line class="d-line-dp" x1="540" y1="105" x2="618" y2="105" marker-end="url(#mig1-ad)"/>
+
+      <line class="d-line-danger" x1="620" y1="220" x2="242" y2="220" marker-end="url(#mig1-adan)"/>
+      <text class="d-danger-text" x="430" y="212" text-anchor="middle">ロールバック（iac または shadow を再設定して再起動）</text>
+      <text class="d-small" x="430" y="238" text-anchor="middle">レジストリの内容は保持される．削除されるものはない．</text>
+    </svg>
+    <div class="legend">
+      <span><i class="ext"></i>iac — 発行せず比較もしない</span>
+      <span><i class="cp"></i>shadow — 発行せず比較する</span>
+      <span><i class="dp"></i>registry — Conductor が発行する</span>
+    </div>
+    <figcaption>
+      <code>iac</code> と <code>shadow</code> の下では <code>POST /targets/{id}/runs</code> は
+      <code>409 issuance_disabled</code> を返し，証明書の発行，DNS レコードの変更，
+      クラウドリソースへのアクセスは一切起きません．<code>iac</code> と
+      <code>shadow</code> は，移行完了を宣言したリリースの後も少なくとも
+      1 マイナーリリースの間サポートされ続けるので，ロールバックにはフラグの
+      変更以外に何も要りません．
+    </figcaption>
+  </figure>
+
+  <h2 id="compare">比較のカテゴリ</h2>
+  <p>
+    比較は一覧を読み，API と同じ方法ですべての名前を正規化し（小文字化，末尾の
+    ドット 1 つの除去，構文検査），各名前を 1 つのカテゴリに振り分けます．
+    不正な項目が 1 つでもあれば，一覧全体の読み込みが失敗します．
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>カテゴリ</th><th>意味</th><th>取り込みが行うこと</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge dp">added</span></td><td>一覧にあり，レジストリにない．</td><td>プロファイルから target を作成する．</td></tr>
+        <tr><td><span class="badge">changed</span></td><td>両方にあるが，レジストリの target が無効化されているか，プロファイルと異なるポリシーまたはバインディングを名指している．</td><td>何もしない．操作者が判断する．レポートはどのフィールドが異なるかを示す．</td></tr>
+        <tr><td><span class="badge">missing</span></td><td>レジストリにあり，一覧にない．</td><td>何もしない．移行は何も削除しない（<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0008-no-purge-in-mvp.md">ADR 0008</a>）．不要なら target を無効化すること．</td></tr>
+        <tr><td><span class="badge">unchanged</span></td><td>両方にあり，同じ．</td><td>何もしない．</td></tr>
+        <tr><td><span class="badge secret">rejected</span></td><td>一覧にあるが，プロファイルのポリシーがその名前を許可しない（サフィックスまたはワイルドカードの規則）．</td><td>何もせず，他の何も行わない．一覧全体が，修正されるまで一切取り込まれない．</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">
+    所有者は比較の対象ではありません．一覧は所有者を知らず，取り込み後に操作者が
+    target ごとにプロファイルの所有者を精緻化することは十分にありえます．
+    取り込みは冪等で，既定では dry-run です．何かを作成するには API では
+    <code>dryRun: false</code> を，CLI では <code>--apply</code> を渡します．
+  </p>
+
+  <h2 id="sources">一覧のソース</h2>
+  <p>一覧は次のいずれか 1 つから読みます．</p>
+  <div class="cards">
+    <div class="card cp">
+      <h3>Bicep パラメータファイル</h3>
+      <p>
+        <code>bicepParamFile</code>（<code>parameter</code> 併用可，既定は
+        <code>targetDomains</code>）．既存の IaC 管理のホスト一覧（例えば
+        <code>infra/main.bicepparam</code>）をそのまま読みます．専用のリーダが
+        <code>param &lt;name&gt; = [ … ]</code> 文，コメント，単純な文字列リテラルを
+        理解し，評価が必要になるもの（補間文字列，変数，関数呼び出し）はすべて
+        拒否します．評価が必要な一覧は，先に TargetList へ書き出してください．
+      </p>
+    </div>
+    <div class="card dp">
+      <h3>TargetList 文書</h3>
+      <p>
+        <code>jsonFile</code>．厳密にデコードされる汎用の JSON 文書
+        （<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/targets.example.json">deploy/examples/targets.example.json</a>）で，
+        特定の IaC 形式に依存しません．<code>acme-conductor migrate list
+        --bicepparam FILE --output json</code> で書き出せるほか，他組織では
+        独自のスクリプトで直接生成しても構いません．
+      </p>
+      <pre><code>{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "TargetList",
+  "fqdns": [
+    "leaf.cerdad.example.ac.jp",
+    "www.example.ac.jp"
+  ]
+}</code></pre>
+    </div>
+    <div class="card">
+      <h3>インライン一覧</h3>
+      <p>
+        <code>fqdns</code>．設定そのものに書いた名前の配列（最大 10000 個）．
+        Container Apps デプロイはこの方法で一覧を得ます．
+      </p>
+    </div>
+  </div>
+  <p class="muted">
+    ソースはサーバ側の設定 <code>migration.source</code> です．CLI はファイルを
+    ローカルで読んで名前を送ることもできるので，操作者の手元に既存の IaC の
+    チェックアウトがあれば足ります．どのソースであっても，寄与するのは FQDN
+    だけで，取り込まれた target のポリシーやバインディングは常に
+    <code>migration.profile</code> から来ます．一覧がバインディングを選ぶことは
+    決してできません．
+  </p>
+
+  <h2 id="config">設定例</h2>
+  <p>
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/conductor-config.migration.example.json">deploy/examples/conductor-config.migration.example.json</a>
+    の <code>migration</code> セクション抜粋です．
+  </p>
+  <pre><code>"migration": {
+  "targetSource": "shadow",
+  "source": {
+    "bicepParamFile": "/srv/cert-infra/infra/main.bicepparam",
+    "parameter": "targetDomains"
+  },
+  "profile": {
+    "policyRef": "cert-infra",
+    "executionBinding": "local",
+    "dnsBinding": "azure-dns-staging",
+    "storeBinding": "filesystem-dev",
+    "owner": "cert-infra migration"
+  },
+  "compareIntervalSeconds": 300
+}</code></pre>
+
+  <h2 id="steps">手順</h2>
+  <p>
+    以下は，既存の仕組みで管理されたデプロイ（または，1 台のホストでのリハーサル）
+    から ACME Conductor へ移す手順です．前提として，Runner が既存の仕組みと
+    同じ DNS ゾーンでチャレンジを完了でき，証明書ストアに書き込めることが必要です．
+  </p>
+  <ol class="steps">
+    <li>
+      <strong>暗転状態で始める．</strong>
+      <code>targetSource: shadow</code>（または <code>iac</code>），既存の
+      IaC の一覧を指す <code>migration.source</code>，そして移行対象ホストのために
+      作った <code>migration.profile</code>（<code>allowedDnsSuffixes</code> が
+      ホストを覆い，<code>acmeBinding</code> はリハーサルが終わるまでステージング
+      CA を指す）で Conductor をデプロイします．既存の仕組みのジョブは更新を
+      続けます．この時点で Conductor は，証明書を発行せず，DNS レコードを変更せず，
+      クラウドリソースに一切触れません．
+    </li>
+    <li>
+      <strong>差分を見る．</strong>
+      <pre><code>acme-conductor migrate diff --bicepparam ~/src/cert-infra/infra/main.bicepparam \
+  --server https://acme-conductor.example.ac.jp --token-file token</code></pre>
+      すべての名前が <code>added</code> に入り，<code>rejected</code> には
+      何もないことを期待します．<code>rejected</code> の名前があれば，取り込む前に
+      ポリシー（または一覧）を修正します．
+    </li>
+    <li>
+      <strong>取り込み，そして適用する．</strong>
+      同じコマンドを <code>import</code> で実行すると，<code>--apply</code> が
+      何を作成するかを示す dry-run になります．<code>--apply</code> を付けると
+      実際に作成し，監査ログに各 target を <code>target.imported</code> として
+      記録します．もう一度実行しても何も作成されません（冪等）．
+    </li>
+    <li>
+      <strong>shadow で様子を見る．</strong>
+      既存の一覧がまだ変わりうる間は <code>targetSource: shadow</code> のままに
+      しておきます．GUI の Migration ページ（と <code>GET /migration</code>）が
+      最新の比較を示し，結果が変わるたびに <code>migration.compared</code>
+      監査イベントが記録されます．この間もレジストリは完全に編集可能で，何も
+      発行せずにポリシー・所有者・バインディングを準備できます．
+    </li>
+    <li>
+      <strong>切り替える．</strong>
+      <code>targetSource: registry</code> を設定して再起動します．スケジューラは
+      取り込んだ target（一度も reconcile されていない）に run を計画し，Runner が
+      発行・格納し，各 target に証明書の概要が現れます．
+    </li>
+    <li>
+      <strong>利用側を向け直す．</strong>
+      証明書ストアのオブジェクトを名前で参照している利用側（例えば Application
+      Gateway のリスナー）を，新しくできたオブジェクトへ操作者が向け直します．
+      これが移行の中で利用側から見える唯一の手順であり，このリポジトリの外に
+      あります．古いオブジェクトは手で削除されるまで残ります．
+    </li>
+    <li>
+      <strong>既存の仕組みを止める．</strong>
+      操作者が選んだタイミングで既存のジョブを止めます（スケジュールの一時停止，
+      またはデプロイの削除）．両者は別々の ACME アカウントと別々のオブジェクト名を
+      使うため，一時的に重なっていても構いませんが，その代償として CA の
+      レート制限に対してホストごとに 1 回余分な発行が生じます．
+    </li>
+  </ol>
+
+  <div class="callout warn">
+    <p>
+      <strong>ロールバック</strong>は <code>targetSource: iac</code>
+      （または <code>shadow</code>）を設定して再起動するだけです．Conductor は
+      直ちに計画を止め，進行中の run は通常どおり完了するかシャットダウン時に
+      キャンセルされ，レジストリは shadow フェーズと切替が記録したすべてを
+      保持します．既存の仕組みのジョブを止めていたなら再開します．復元すべき
+      データはなく，何も削除されていません．
+    </p>
+  </div>
+
+  <h2 id="timeline">切替のタイムライン</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 200" role="img" aria-labelledby="mig2-t mig2-d">
+      <title id="mig2-t">切替の時間軸</title>
+      <desc id="mig2-d">shadow フェーズで既存の仕組みが発行を続けながら比較を行い，registry への切替直後に一時的に両方の仕組みが並行して動き，利用側の向け直しと既存ジョブの停止をもって既存の仕組みは完全に止まる．</desc>
+      <defs>
+        <marker id="mig2-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+      <line class="d-line" x1="40" y1="150" x2="820" y2="150" marker-end="url(#mig2-a)"/>
+
+      <rect class="d-ext" x="60" y="40" width="230" height="70" rx="8"/>
+      <text class="d-text" x="175" y="65" text-anchor="middle">shadow フェーズ</text>
+      <text class="d-small" x="175" y="86" text-anchor="middle">既存の仕組みが発行を継続</text>
+      <text class="d-small" x="175" y="102" text-anchor="middle">Conductor は比較のみ</text>
+      <line class="d-line" x1="175" y1="110" x2="175" y2="150"/>
+
+      <rect class="d-dp" x="330" y="40" width="220" height="70" rx="8"/>
+      <text class="d-text" x="440" y="65" text-anchor="middle">registry へ切替</text>
+      <text class="d-small" x="440" y="86" text-anchor="middle">Conductor が発行を開始</text>
+      <text class="d-small" x="440" y="102" text-anchor="middle">両者が一時的に並行</text>
+      <line class="d-line" x1="440" y1="110" x2="440" y2="150"/>
+
+      <rect class="d-secret" x="590" y="40" width="220" height="70" rx="8"/>
+      <text class="d-text" x="700" y="65" text-anchor="middle">利用側の向け直し</text>
+      <text class="d-small" x="700" y="86" text-anchor="middle">新オブジェクトを参照</text>
+      <text class="d-small" x="700" y="102" text-anchor="middle">既存の仕組みを停止</text>
+      <line class="d-line" x1="700" y1="110" x2="700" y2="150"/>
+
+      <text class="d-small" x="60" y="172">時間 →</text>
+    </svg>
+    <div class="legend">
+      <span><i class="ext"></i>shadow：既存の仕組みのみ発行</span>
+      <span><i class="dp"></i>registry 切替：Conductor が発行開始</span>
+      <span><i class="secret"></i>利用側の向け直しと既存仕組みの停止</span>
+    </div>
+    <figcaption>切替日を 1 日に固定する必要はありません．shadow の期間の長さも，並行稼働の期間も，操作者が選べます．</figcaption>
+  </figure>
+
+  <h2 id="cli-api">CLI と API</h2>
+  <p>
+    CLI（<code>acme-conductor migrate</code>）は<strong>既定で dry-run</strong>で，
+    <code>--apply</code> を渡さない限り target を作成しません．<code>changed</code>
+    の target を更新することも，<code>missing</code> の target を削除することも
+    決してありません．
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>コマンド</th><th>目的</th></tr></thead>
+      <tbody>
+        <tr><td><code>acme-conductor migrate list (--bicepparam FILE [--parameter NAME] | --json FILE) [--output text|json]</code></td><td>ソースを読み，正規化済みの名前を印字する．サーバ不要．</td></tr>
+        <tr><td><code>acme-conductor migrate diff [SOURCE] [--server URL] [--token-file FILE] [--output text|json]</code></td><td>レジストリと比較してレポートを表示する．</td></tr>
+        <tr><td><code>acme-conductor migrate import [SOURCE] [--server URL] [--token-file FILE] [--apply] [--output text|json]</code></td><td>取り込む．<code>--apply</code> なしは dry-run．</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>メソッドとパス</th><th>目的</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/v1alpha1/migration</code></td><td>フラグ，発行が有効かどうか，設定されたソースとプロファイル，<code>shadow</code> では最新の比較．</td></tr>
+        <tr><td><code>GET /api/v1alpha1/migration/diff</code></td><td>設定された一覧を比較する → レポート．viewer が読める．</td></tr>
+        <tr><td><code>POST /api/v1alpha1/migration/diff</code></td><td><code>{"fqdns": […]}</code> を比較する → レポート．</td></tr>
+        <tr><td><code>POST /api/v1alpha1/migration/import</code></td><td><code>{"fqdns": […], "dryRun": true}</code> を取り込む．<code>dryRun</code> の既定は <code>true</code>．何かを作成したときはスケジューラを起こす．</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">
+    テストは本物の ACME 認証局やクラウド API を決して呼びません．比較と取り込みは
+    本物の SQLite レジストリに対して実行され，<code>acme-conductor migrate</code>
+    自体も動作中の Conductor に対してエンドツーエンドで検証されています．詳しくは
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/migration.md">docs/migration.md</a>
+    を参照してください．
+  </p>
+
+  <div class="next">
+    <a href="deploy.html"><small>前へ</small>導入ガイド</a>
+    <a class="fwd" href="status.html"><small>次へ</small>現状と制限</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>現状と制限 — ACME Conductor</title>
+<meta name="description" content="ACME Conductor の実装済みの機能，実デプロイで確認したことと未確認のこと，主な制限，非目標，設計判断の記録（ADR），参加・問い合わせ方法をまとめます．プロジェクトは v0.x の早期段階です．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="migration.html">既存環境からの移行</a>
+      <a href="status.html" aria-current="page">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>現状と制限</h1>
+    <p class="lead">
+      ACME Conductor はまだ <code>v0.x</code> の早期段階のプロジェクトです．
+      このページは，何が実装済みで，実デプロイで何を確認し何をまだ確認して
+      いないか，主な制限と非目標，設計判断の記録，参加・問い合わせの方法を
+      できるだけ率直にまとめたものです．導入を検討する際は，このページと
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/threat-model.md">脅威モデル</a>
+      を合わせて確認してください．
+    </p>
+  </section>
+
+  <h2 id="implemented">実装済みの機能</h2>
+  <div class="cards">
+    <div class="card dp">
+      <h3>Runner と Certificate Store</h3>
+      <p>固定バージョンの <code>lego</code> CLI を同梱したワンショットの Runner と，開発・テスト用のファイルシステム Store．</p>
+    </div>
+    <div class="card cp">
+      <h3>Conductor（レジストリ，REST API，スケジューラ）</h3>
+      <p>SQLite のレジストリ，REST API，スケジューラ，ローカルプロセスランチャー，ローカルホスト限定の開発用認証．</p>
+    </div>
+    <div class="card secret">
+      <h3>Azure Key Vault store（PEM / PKCS #12）</h3>
+      <p>マネージド ID（開発では <code>DefaultAzureCredential</code>）で認証する Key Vault store アダプタ．バインディングごとにパスワードなし PKCS #12 での取り込みも選べます．</p>
+    </div>
+    <div class="card cp">
+      <h3>Azure Container Apps Job ランチャーと署名付きエンベロープ</h3>
+      <p>Runner が自身のマネージド ID で動くスケジュール実行の Job として，Conductor が共有ボリュームに差し出すジョブを受け取ります．Conductor は実行を開始できません．分離された ID と最小権限のカスタムロール．署名付き・期限付きのジョブエンベロープと Runner 側のリプレイ台帳，署名付き Result．</p>
+    </div>
+    <div class="card">
+      <h3>認証（OIDC，localhost-dev）と GUI</h3>
+      <p>名前付きプリンシパルと admin/viewer ロールによる OIDC ベアラートークン認証，PKCE サインインを備えた最小限の静的 GUI．Container Apps デプロイでは API と GUI が HTTPS ingress で応答します．</p>
+    </div>
+    <div class="card">
+      <h3>リリースパイプライン</h3>
+      <p>両イメージをダイジェスト固定のベースから SBOM と provenance 付きで GHCR に公開するリリースワークフロー．</p>
+    </div>
+    <div class="card dp">
+      <h3>cert-infra からの移行ツール</h3>
+      <p>既存の IaC 管理ホスト一覧を読み，レジストリと比較し（<code>added</code> <code>changed</code> <code>missing</code> <code>unchanged</code> <code>rejected</code> の 5 分類），冪等に取り込みます（既定は dry-run．更新も削除も決して行いません）．詳しくは<a href="migration.html">既存環境からの移行</a>を参照してください．</p>
+    </div>
+  </div>
+  <p class="muted">出典: <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md#実装済みの機能">docs/architecture.md「実装済みの機能」</a>．</p>
+
+  <h2 id="verified">実デプロイで確認済み / 未確認</h2>
+  <p>
+    2026-09-25 に <code>v0.6.0</code> のイメージで staging デプロイを行い，staging CA で
+    1 つの target の発行が端から端まで通ることを確認しました．CI はサブスクリプション
+    へのデプロイを行わないため，実インフラでの検証はこの 1 回の手作業のデプロイに
+    基づいています．
+  </p>
+  <div class="cards">
+    <div class="card dp">
+      <h3>確認済み</h3>
+      <ul>
+        <li>毎分の実行開始と実行名の照会（<code>CONTAINER_APP_JOB<wbr>_EXECUTION_NAME</code>）</li>
+        <li>共有上のディレクトリのリネームによるジョブの受け渡し（1 実行が取る場合）</li>
+        <li>ロールのアクション名（Conductor は実行状態を読み，Runner は DNS TXT 書き込みと Key Vault 取り込みができる）</li>
+        <li><code>lego</code> の <code>azuredns</code> プロバイダが Container Apps の ID エンドポイントでマネージド ID 認証できること</li>
+        <li>Azure Files（SMB，<code>nobrl</code>）上での SQLite の動作と，既定の <code>resultGraceSeconds</code>（30 秒）内での Result 到達</li>
+        <li>API と GUI が HTTPS ingress で応答すること</li>
+        <li>1 target 分の Runner 設定がシークレットのサイズ上限に収まること</li>
+      </ul>
+    </div>
+    <div class="card danger">
+      <h3>未確認（想定に基づく）</h3>
+      <ul>
+        <li>2 つの実行が同じジョブを同時に取り合ったときの SMB 上のリネームの原子性</li>
+        <li><code>Microsoft.App/jobs/<wbr>stop/execution/action</code> による実行の停止</li>
+        <li>SMB 上の <code>flock</code>（所有権ロック）の信頼性．リビジョン更新時に一時的に 2 レプリカが重なりうる</li>
+        <li>Result 伝播遅延の幅（SMB キャッシュにより <code>resultGraceSeconds</code> の調整が必要な場合がある）</li>
+        <li>ピア暗号化（<code>peerTrafficConfiguration<wbr>.encryption.enabled</code>）が ingress からレプリカへのホップを実際に暗号化していること</li>
+        <li>多数のバインディングを持つ大きな Runner 設定がプラットフォームのシークレット値上限を超えないこと</li>
+      </ul>
+    </div>
+  </div>
+  <p class="muted">出典: <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/azure/README.md#実デプロイで確認したこととまだ確認していないこと">deploy/azure/README.md「実デプロイで確認したことと，まだ確認していないこと」</a>．新しい環境へのデプロイは，ステージング CA と 1 target から始め，最初から最後まで見守ることが推奨されています．</p>
+
+  <h2 id="limits">主な制限</h2>
+
+  <h3>Conductor 側</h3>
+  <ul>
+    <li><strong>認証・認可</strong> — プロバイダが発行した admin ロールのトークンは audience の範囲内で信頼され，失効確認やイントロスペクションは行いません．ロールは admin/viewer の 2 つだけで，target ごと・ポリシーごとの権限はありません．<code>localhost-dev</code> は開発ホスト 1 台向けで，人ではなくホストを認証します．</li>
+    <li><strong>GUI は最小限</strong> — API の上の一覧とフォームのみで，ダッシュボードも一括操作も独自の状態もありません．</li>
+    <li><strong>ローカルランチャーは 1 ホスト限定</strong> — 同じホストに <code>acme-runner</code> が必要で，資格情報は <code>passthroughEnv</code> 経由で Conductor の環境に置かれます．Container Apps ランチャーにはこの制約はありません．</li>
+    <li><strong>強制終了は Runner を取り残し得る</strong> — 復旧は該当 run を「結果不明」として扱いますが，Runner はなお完了するかもしれず，次の期限到来 run と競合しえます．</li>
+    <li><strong>単一プロセス・単一コネクション</strong> — レジストリはすべてのステートメントを直列化します．数百の target と 1 人の操作者には十分ですが，多忙なマルチテナント API には向きません．マルチレプリカは非目標です．</li>
+    <li><strong>ポリシー変更はバージョン管理も push もされない</strong> — 更新は各 target の次の run で適用され，run にポリシーのリビジョンはなく，各 JobSpec 内のスナップショットがあるだけです．</li>
+    <li><strong>ローカルランチャーでは署名は任意</strong> — <code>jobSigning</code> なしでは生の JobSpec を渡し，end-to-end で認証するものがありません．1 ホスト上でのみ許容されます．</li>
+    <li><strong>メトリクスエンドポイントはまだない</strong> — <code>/healthz</code>・<code>/readyz</code> はありますが，Prometheus の <code>/metrics</code> はありません．</li>
+    <li><strong>移行は名前だけを移す</strong> — 証明書やアカウントは移行されず，利用側の参照先の付け替えは操作者が行います．shadow 比較が比べるのは一覧であって Store 内の証明書ではありません．</li>
+  </ul>
+
+  <h3>Runner 側</h3>
+  <ul>
+    <li><strong>ファイルシステム Store は開発・テスト専用</strong> — 独自のアクセス制御を持たず，本物のシークレットストアの代替にはなりません．</li>
+    <li><strong>Key Vault store は本物の vault に対しては未検証</strong> — vault API のプロセス内の偽物に対して試験されており，実際の取り込み動作は文書化されていますが CI では検証されていません．</li>
+    <li><strong><code>credential: default</code> は開発上の利便性</strong> — <code>DefaultAzureCredential</code> チェーンが環境変数や <code>PATH</code> 上の開発者ツールを使うことがあります．本番では <code>managed-identity</code> を指定します．</li>
+    <li><strong>Runner 自体には run レベルの並行制御がない</strong> — 手動や別のランチャーで開始された Runner については，同じ target への二重発行を防げません（Conductor 自身が起動する run は target ごとに最大 1 つに制限）．</li>
+    <li><strong>リプレイ台帳は <code>stateDir</code> ごと</strong> — 状態ディレクトリが別々の Runner は互いの受理済み run を見ません．<code>jobSigning</code> のない Runner には期限やリプレイの検査がありません．</li>
+    <li><strong>署名は生成者を認証するのであって判断を認証しない</strong> — 署名鍵を持つ Conductor はどんな名前のジョブにも署名できます．それを限定するのは Runner の信頼された認可ポリシーです．</li>
+    <li><strong>DNS スコープの検証はできない</strong> — 渡された DNS 資格情報／ワークロード ID が実際に必要なチャレンジゾーンに限定されているかを Runner は検証できません．</li>
+    <li><strong>ログ秘匿はヒューリスティック</strong> — 値ベースの既知シークレット・既知 PEM マーカーのマスクであり，汎用のシークレット検出器ではありません．</li>
+  </ul>
+
+  <div class="callout warn">
+    <p>
+      Runner の <code>renewBeforeDays</code>／<code>keyType</code> というコストの
+      レバーは，Runner 側ではまだ制限されていません（脅威モデルの残存リスク）．
+      JobSpec で名前について認可された生成者は，再発行を強制したり高価な鍵種別を
+      強制したりできますが，これはすでに認可されたスコープ内でのコスト・
+      レート制限のレバーであって権限昇格ではありません．
+    </p>
+  </div>
+
+  <h2 id="non-goals">非目標</h2>
+  <p>
+    次の項目は，今後 ADR が別途定めるまで明示的に対象外です．理由の多くは
+    「MVP のスコープを絞る」「境界の外側（すでにある実装）に任せる」ことに
+    あります．
+  </p>
+  <ul>
+    <li><strong>ACME プロトコルや DNS プロバイダ連携の再実装</strong> — <code>lego</code> がすでに行っています．</li>
+    <li><strong>独自の暗号</strong></li>
+    <li><strong>秘密鍵配布 API</strong> — Conductor の中核の安全設計原則（秘密鍵を持たない）と相容れません．</li>
+    <li><strong>Kubernetes オペレータや CRD</strong></li>
+    <li><strong>複数レプリカ／高可用な Conductor</strong> — SQLite の単一プロセス・単一コネクション設計に対応します．</li>
+    <li><strong>PostgreSQL</strong> — 当面は SQLite がストアです．</li>
+    <li><strong>AWS または GCP のプロバイダ</strong> — バインディングモデルはこれらを見越していますが，まだ何も実装されていません．</li>
+    <li><strong>Arc 管理下のホストへの証明書配布</strong></li>
+    <li><strong>あらゆる種類の自動 purge</strong> — <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0008-no-purge-in-mvp.md">ADR 0008</a> を参照．</li>
+    <li><strong>任意のスクリプトや発行後フック</strong></li>
+    <li><strong>利用者が指定するコンテナイメージ</strong></li>
+    <li><strong>動的なプラグインダウンロード</strong></li>
+  </ul>
+  <p class="muted">出典: <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md#非目標">docs/architecture.md「非目標」</a>．</p>
+
+  <h2 id="adr">設計判断の記録</h2>
+  <p>
+    アーキテクチャ上重要な決定は，MADR 風の軽量な形式で ADR
+    （Architecture Decision Record）として記録されています．
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ADR</th><th>題名</th></tr></thead>
+      <tbody>
+        <tr><td>0001</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0001-record-architecture-decisions.md">アーキテクチャ決定を記録する</a></td></tr>
+        <tr><td>0002</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0002-go-monorepo-with-two-binaries.md">2 つのバイナリを持つ Go モノレポ</a></td></tr>
+        <tr><td>0003</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0003-use-lego-cli-as-subprocess-in-runner.md">Runner で lego CLI をサブプロセスとして使う</a></td></tr>
+        <tr><td>0004</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0004-versioned-jobspec-result-contract.md">バージョン付きの JobSpec/Result コントラクト</a></td></tr>
+        <tr><td>0005</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0005-conductor-never-touches-secrets.md">Conductor は決してシークレットに触れない</a></td></tr>
+        <tr><td>0006</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0006-ascii-only-fqdn-in-v1alpha1.md">v1alpha1 では ASCII のみの FQDN</a></td></tr>
+        <tr><td>0007</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0007-container-baseline.md">コンテナの基本方針</a></td></tr>
+        <tr><td>0008</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0008-no-purge-in-mvp.md">MVP では purge しない</a></td></tr>
+        <tr><td>0009</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0009-runner-execution-model.md">Runner の実行モデル</a></td></tr>
+        <tr><td>0010</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0010-pinned-lego-binary.md">lego バイナリのバージョン固定</a></td></tr>
+        <tr><td>0011</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0011-conductor-storage-and-run-model.md">Conductor のストレージと run モデル</a></td></tr>
+        <tr><td>0012</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0012-localhost-only-dev-auth.md">ローカルホスト限定の開発用認証</a></td></tr>
+        <tr><td>0013</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0013-azure-key-vault-store-adapter.md">Azure Key Vault の store アダプタ</a></td></tr>
+        <tr><td>0014</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0014-azure-container-apps-job-launcher.md">Azure Container Apps Job ランチャー</a></td></tr>
+        <tr><td>0015</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0015-signed-job-envelope.md">署名付きジョブエンベロープと Result エンベロープとリプレイ台帳</a></td></tr>
+        <tr><td>0016</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0016-oidc-bearer-auth-and-gui.md">OIDC ベアラートークン認証と 2 つのロールと静的 GUI</a></td></tr>
+        <tr><td>0017</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0017-release-pipeline.md">リリースパイプライン: SBOM と provenance 付きの GHCR イメージとダイジェスト固定のベース</a></td></tr>
+        <tr><td>0018</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0018-authority-qualified-principals.md">監査プリンシパルは権威（issuer，localhost-dev，scheduler）で修飾する</a></td></tr>
+        <tr><td>0019</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0019-provider-boundary.md">プロバイダ境界: 公開コントラクト，合成層のレジストリ，単一モジュール，deploy/azure は残す</a></td></tr>
+        <tr><td>0020</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0020-migration-from-cert-infra.md">cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ</a></td></tr>
+        <tr><td>0021</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0021-keyvault-pkcs12-content-type.md">Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">一覧の出典: <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/README.md">docs/adr/README.md</a>．背景と併せて <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md">docs/architecture.md</a> と <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/threat-model.md">docs/threat-model.md</a> も参照してください．</p>
+
+  <h2 id="risks">残存リスク（要約）</h2>
+  <p>
+    脅威モデルは，未解決のまま残るリスクを明示しています．おもなものだけを
+    挙げます（詳細は<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/threat-model.md#残存リスクと未対策事項">脅威モデル「残存リスクと未対策事項」</a>を参照）:
+  </p>
+  <ul>
+    <li>移行の shadow モードは一覧を比較するのであって証明書を比較するのではなく，古いジョブが更新をやめたホストには気づきません（T16）．</li>
+    <li>ベアラートークンは期限切れまで有効で，失効確認は行いません（T14）．</li>
+    <li><code>localhost-dev</code> はすべてのループバックのピアを信頼する開発モードです（T13）．</li>
+    <li>GitHub Actions はダイジェストではなくタグで固定されており，リリースワークフローはまだ実行されていません（T8）．</li>
+    <li>Container Apps のピア間暗号化は文書化されていますが実デプロイでは観測されていません（T14）．</li>
+    <li>コードベース全体を対象とするログスクラブの専用テストスイートはまだありません．</li>
+  </ul>
+
+  <h2 id="contribute">参加・問い合わせ</h2>
+  <div class="cards">
+    <div class="card cp">
+      <h3>コントリビューション</h3>
+      <p>
+        1 PR = 1 目的．PR を開く前に <code>make verify</code>（gofmt と句読点の検査，
+        go vet，go test，go test -race），<code>make vulncheck</code>，
+        <code>make images</code> を実行します．日本語の句読点は「，」「．」に統一し，
+        GUI にインラインスクリプトやサードパーティ資産を置かず，Conductor のコアに
+        クラウド SDK を入れないといった規則があります．詳しくは
+        <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
+        を参照してください．
+      </p>
+    </div>
+    <div class="card secret">
+      <h3>セキュリティ報告</h3>
+      <p>
+        脆弱性が疑われる場合は，公開の issue や議論チャンネルではなく，
+        リポジトリの GitHub プライベート脆弱性報告（Security タブ →
+        Report a vulnerability）を使います．専任のセキュリティチームや
+        正式な SLA は持たない早期段階のプロジェクトのため，対応はベストエフォートです．
+        <code>v1</code> リリースが存在するまでは <code>main</code> ブランチのみが
+        セキュリティ修正の対象です．詳しくは
+        <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/SECURITY.md">SECURITY.md</a>
+        を参照してください．
+      </p>
+    </div>
+    <div class="card">
+      <h3>ライセンス</h3>
+      <p>
+        <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/LICENSE">Apache License 2.0</a>
+        で公開されています．
+      </p>
+    </div>
+  </div>
+
+  <div class="next">
+    <a href="migration.html"><small>前へ</small>既存環境からの移行</a>
+    <a class="fwd" href="index.html"><small>次へ</small>概要に戻る</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>

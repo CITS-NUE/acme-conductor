@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>仕組み — ACME Conductor</title>
+<meta name="description" content="ACME Conductor で 1 枚の証明書が登録から更新まで，Conductor と Runner の間をどう流れるかを図解します．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="how-it-works.html" aria-current="page">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="migration.html">既存環境からの移行</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>仕組み: 1 枚の証明書が<br>更新されるまで</h1>
+    <p class="lead">
+      このページでは，1 つのホスト名を登録してから証明書が実際に更新されるまでに，
+      Conductor と Runner の間で何がやり取りされるかを順を追って説明します．
+      まず登場する概念を整理し，次に全体の流れ，Run の状態遷移，更新要否の判断，
+      Runner の 1 回の実行，JobSpec/Result の実例，障害時の振る舞いの順に見ていきます．
+    </p>
+  </section>
+
+  <h2 id="concepts">登場する概念</h2>
+  <p>
+    管理者が API・GUI で操作するのは「名前」だけです．コマンドや資格情報そのものを
+    直接指定することはできません．次の概念を押さえておくと，以降の図が読みやすくなります．
+  </p>
+  <div class="cards">
+    <div class="card cp">
+      <h3>Target</h3>
+      <p>管理対象の FQDN（ホスト名）1 つを表すレコードです．どの CertificatePolicy に従うか，
+      どのバインディング名を使うかを持ちます．1 つの Target は 1 つの FQDN です（SAN は増やせません）．</p>
+    </div>
+    <div class="card cp">
+      <h3>CertificatePolicy</h3>
+      <p>許可する DNS サフィックス，ワイルドカードの可否，鍵の種類（<code>keyType</code>），
+      更新を始める日数（<code>renewBeforeDays</code>）などの規則です．複数の Target が 1 つの
+      ポリシーを共有できます．</p>
+    </div>
+    <div class="card dp">
+      <h3>4 種類のバインディング</h3>
+      <p>ExecutionBinding・DnsBinding・StoreBinding・AcmeBinding はいずれも管理者が登録した
+      <strong>論理名</strong>です．Target やポリシーはこの名前だけを運びます．
+      ExecutionBinding は Conductor 自身の設定で launcher に解決されますが，
+      DnsBinding・StoreBinding・AcmeBinding の名前が実際に何を指すか
+      （ディレクトリ URL，DNS プロバイダの資格情報，Key Vault の URL など）は
+      <strong>Runner 自身の設定ファイル</strong>だけで解決されます．Conductor はその実体を知りません．</p>
+    </div>
+    <div class="card">
+      <h3>Run と AuditEvent</h3>
+      <p><strong>Run</strong> は 1 回の reconcile 試行の記録で，
+      <code>queued</code>/<wbr><code>starting</code>/<wbr><code>running</code>/<wbr><code>succeeded</code>/<wbr><code>failed</code>/<wbr><code>cancelled</code> のいずれかの状態を持ちます．
+      <strong>AuditEvent</strong> は target の作成・更新，run の開始・失敗，ポリシー拒否などを記録する
+      追記専用のログです．</p>
+    </div>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 430" role="img" aria-labelledby="c1-t c1-d">
+      <title id="c1-t">名前とその解決の分離</title>
+      <desc id="c1-d">Conductor 側の Target は CertificatePolicy を参照し，4 種類のバインディングは論理名だけを持つ．executionBinding は Conductor 自身の設定で launcher に解決されるが，acme／dns／store の 3 つの名前は，Conductor には見えない Runner 側の設定ファイルの中だけで実体に解決される．</desc>
+      <defs>
+        <marker id="c1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="c1-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="d-zone" x="14" y="14" width="852" height="248" rx="12"/>
+      <text class="d-cp-text" x="440" y="32" text-anchor="middle">Conductor 側（名前だけを保持する）</text>
+      <text class="d-small" x="440" y="48" text-anchor="middle">executionBinding だけは Conductor 自身の設定で launcher に解決される</text>
+
+      <rect class="d-cp" x="30" y="62" width="260" height="164" rx="10"/>
+      <text class="d-title" x="160" y="84" text-anchor="middle">Target</text>
+      <text class="d-mono" x="44" y="108">fqdn: wiki.example.ac.jp</text>
+      <text class="d-mono" x="44" y="128">policyRef: 01JPOLICY…</text>
+      <text class="d-mono" x="44" y="152">executionBinding: "local"</text>
+      <text class="d-mono" x="44" y="172">dnsBinding: "azure-dns-…"</text>
+      <text class="d-mono" x="44" y="192">storeBinding: "filesystem-dev"</text>
+      <text class="d-small" x="44" y="214">— どれも文字列の名前 —</text>
+
+      <rect class="d-cp" x="310" y="62" width="230" height="164" rx="10"/>
+      <text class="d-title" x="425" y="84" text-anchor="middle">CertificatePolicy</text>
+      <text class="d-mono" x="324" y="108">allowedDnsSuffixes</text>
+      <text class="d-mono" x="324" y="128">allowWildcard</text>
+      <text class="d-mono" x="324" y="148">renewBeforeDays</text>
+      <text class="d-mono" x="324" y="168">keyType</text>
+      <text class="d-mono" x="324" y="192">acmeBinding: "letsencrypt-…"</text>
+
+      <rect class="d-cp" x="560" y="62" width="300" height="164" rx="10"/>
+      <text class="d-title" x="710" y="84" text-anchor="middle">Run / AuditEvent</text>
+      <text class="d-text" x="574" y="110">Run: queued / starting / running /</text>
+      <text class="d-text" x="574" y="128">succeeded / failed / cancelled</text>
+      <text class="d-text" x="574" y="152">AuditEvent: target・run・policy の</text>
+      <text class="d-text" x="574" y="170">イベントを記録（追記専用）</text>
+      <text class="d-small" x="574" y="200">証明書の実体はここに含まれない</text>
+
+      <line class="d-line-dp d-dash" x1="425" y1="226" x2="380" y2="290" marker-end="url(#c1-ad)"/>
+      <text class="d-dp-text" x="500" y="270" text-anchor="middle">acme／dns／store の名前だけを渡す</text>
+
+      <rect class="d-zone" x="14" y="304" width="852" height="112" rx="12"/>
+      <text class="d-dp-text" x="440" y="324" text-anchor="middle">Runner 側（acme／dns／store の名前を実体に解決する唯一の場所）</text>
+
+      <rect class="d-dp" x="60" y="338" width="230" height="62" rx="8"/>
+      <text class="d-text" x="175" y="360" text-anchor="middle">acmeBindings</text>
+      <text class="d-small" x="175" y="378" text-anchor="middle">letsencrypt-… → directoryURL・EAB</text>
+
+      <rect class="d-dp" x="325" y="338" width="230" height="62" rx="8"/>
+      <text class="d-text" x="440" y="360" text-anchor="middle">dnsBindings</text>
+      <text class="d-small" x="440" y="378" text-anchor="middle">azure-dns-… → provider・env</text>
+
+      <rect class="d-dp" x="590" y="338" width="230" height="62" rx="8"/>
+      <text class="d-text" x="705" y="360" text-anchor="middle">storeBindings</text>
+      <text class="d-small" x="705" y="378" text-anchor="middle">filesystem-dev → vaultURL 等</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>Conductor が持つ情報（名前のみ）</span>
+      <span><i class="dp"></i>Runner 側だけが持つ実体</span>
+    </div>
+    <figcaption>
+      Conductor が API で受け付けるのはあらかじめ登録済みのバインディング名だけであり，コマンドや
+      資格情報を直接指定することはできません．名前が何に解決されるかは Runner の設定であり，
+      Conductor がそれを見ることは決してありません．詳しくは
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md#バインディングモデル">architecture.md: バインディングモデル</a>
+      を参照してください．
+    </figcaption>
+  </figure>
+
+  <h2 id="flow">全体の流れ</h2>
+  <p>
+    以下は，証明書の期限が近づいてから新しい証明書が Certificate Store に格納されるまでの
+    典型的な流れです．横方向が登場人物，縦方向が時間の経過を表します．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 900" role="img" aria-labelledby="c2-t c2-d">
+      <title id="c2-t">証明書が更新されるまでのシーケンス</title>
+      <desc id="c2-d">管理者が target を登録すると，Conductor のスケジューラが期限到来を判断して run を待機状態にし，署名付き JobSpec を Runner に渡す．Runner は検証と認可を行い，Certificate Store に現在の証明書を問い合わせ，更新が不要なら noop で終了し，必要なら lego を起動して ACME CA・DNS とやり取りし，証明書を Store に格納してから Result を Conductor に返す．</desc>
+      <defs>
+        <marker id="c2-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="c2-acp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-cp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="c2-adp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <!-- lanes -->
+      <text class="d-title" x="70" y="26" text-anchor="middle">管理者</text>
+      <text class="d-title" x="260" y="26" text-anchor="middle">Conductor</text>
+      <text class="d-title" x="450" y="26" text-anchor="middle">Runner</text>
+      <text class="d-title" x="630" y="26" text-anchor="middle">Certificate</text>
+      <text class="d-title" x="630" y="42" text-anchor="middle">Store</text>
+      <text class="d-title" x="800" y="26" text-anchor="middle">ACME CA ／</text>
+      <text class="d-title" x="800" y="42" text-anchor="middle">DNS</text>
+
+      <line class="d-line" x1="70" y1="56" x2="70" y2="860"/>
+      <line class="d-line" x1="260" y1="56" x2="260" y2="860"/>
+      <line class="d-line" x1="450" y1="56" x2="450" y2="860"/>
+      <line class="d-line" x1="630" y1="56" x2="630" y2="860"/>
+      <line class="d-line" x1="800" y1="56" x2="800" y2="860"/>
+
+      <!-- 1: target 登録 -->
+      <line class="d-line-cp" x1="70" y1="80" x2="260" y2="80" marker-end="url(#c2-acp)"/>
+      <text class="d-cp-text" x="165" y="72" text-anchor="middle">① target 登録</text>
+      <text class="d-small" x="165" y="96" text-anchor="middle">POST /targets（fqdn・policyRef・binding 名）</text>
+
+      <!-- 2: scheduler -->
+      <rect class="d-box" x="200" y="118" width="120" height="46" rx="6"/>
+      <text class="d-text" x="260" y="138" text-anchor="middle">②スケジューラが</text>
+      <text class="d-text" x="260" y="154" text-anchor="middle">期限到来を判断</text>
+      <text class="d-small" x="260" y="182" text-anchor="middle">run が queued になる</text>
+
+      <!-- 3: JobSpec -->
+      <line class="d-line-cp" x1="260" y1="204" x2="450" y2="204" marker-end="url(#c2-acp)"/>
+      <text class="d-cp-text" x="355" y="196" text-anchor="middle">③ JobSpec（署名付き）</text>
+      <text class="d-small" x="355" y="220" text-anchor="middle">ポリシーの値はスナップショットとして同梱</text>
+
+      <!-- 4: validate/authorize -->
+      <rect class="d-box" x="390" y="242" width="120" height="46" rx="6"/>
+      <text class="d-text" x="450" y="262" text-anchor="middle">④検証・認可</text>
+      <text class="d-small" x="450" y="278" text-anchor="middle">（自身の設定で）</text>
+
+      <!-- 5: query store -->
+      <line class="d-line" x1="450" y1="312" x2="630" y2="312" marker-end="url(#c2-a)"/>
+      <text class="d-small" x="540" y="304" text-anchor="middle">⑤現在の証明書を問い合わせ</text>
+      <line class="d-line d-dash" x1="630" y1="332" x2="450" y2="332" marker-end="url(#c2-a)"/>
+      <text class="d-small" x="540" y="350" text-anchor="middle">格納済みの証明書（公開部分）</text>
+
+      <!-- 6: noop branch -->
+      <rect class="d-box" x="370" y="368" width="440" height="40" rx="6"/>
+      <text class="d-text" x="590" y="392" text-anchor="middle">⑥まだ有効なら noop で終了（lego は起動しない）</text>
+
+      <text class="d-small" x="450" y="426" text-anchor="middle">更新が必要な場合はここから続く ↓</text>
+
+      <!-- 7: lego起動 / DNS-01 -->
+      <rect class="d-dp" x="390" y="448" width="120" height="40" rx="6"/>
+      <text class="d-text" x="450" y="472" text-anchor="middle">⑦ lego を起動</text>
+
+      <line class="d-line-dp" x1="450" y1="508" x2="800" y2="508" marker-end="url(#c2-adp)"/>
+      <text class="d-dp-text" x="625" y="500" text-anchor="middle">⑧ DNS-01 チャレンジの TXT を書き込み</text>
+      <line class="d-line-dp d-dash" x1="800" y1="528" x2="450" y2="528" marker-end="url(#c2-adp)"/>
+      <text class="d-small" x="625" y="546" text-anchor="middle">伝播確認</text>
+
+      <line class="d-line-dp" x1="450" y1="576" x2="800" y2="576" marker-end="url(#c2-adp)"/>
+      <text class="d-dp-text" x="625" y="568" text-anchor="middle">⑨証明書の発行を要求</text>
+      <line class="d-line-dp d-dash" x1="800" y1="596" x2="450" y2="596" marker-end="url(#c2-adp)"/>
+      <text class="d-small" x="625" y="614" text-anchor="middle">証明書とチェーン</text>
+
+      <!-- 10: verify -->
+      <rect class="d-box" x="390" y="632" width="120" height="46" rx="6"/>
+      <text class="d-text" x="450" y="652" text-anchor="middle">⑩発行結果を</text>
+      <text class="d-text" x="450" y="668" text-anchor="middle">検証</text>
+
+      <!-- 11: put store -->
+      <line class="d-line-secret" x1="450" y1="702" x2="630" y2="702" marker-end="url(#c2-a)"/>
+      <text class="d-secret-text" x="540" y="694" text-anchor="middle">⑪証明書+秘密鍵を格納</text>
+
+      <!-- 12: result -->
+      <line class="d-line-dp" x1="450" y1="746" x2="260" y2="746" marker-end="url(#c2-adp)"/>
+      <text class="d-dp-text" x="355" y="738" text-anchor="middle">⑫ Result（署名付き）</text>
+      <text class="d-small" x="355" y="762" text-anchor="middle">action・fingerprint・expiresAt／error</text>
+
+      <rect class="d-box" x="200" y="784" width="120" height="46" rx="6"/>
+      <text class="d-text" x="260" y="804" text-anchor="middle">⑬ Run を</text>
+      <text class="d-text" x="260" y="820" text-anchor="middle">succeeded/failed に記録</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>Conductor が関わるやり取り</span>
+      <span><i class="dp"></i>Runner が関わるやり取り</span>
+      <span><i class="secret"></i>秘密鍵が動く経路</span>
+    </div>
+    <figcaption>
+      Conductor が直接話すのは管理者（API/GUI）だけです．ACME CA・DNS・Certificate Store と話すのは
+      すべて Runner です．詳しくは
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#実行フロー">runner.md: 実行フロー</a>
+      と
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/conductor.md#run-のライフサイクルとスケジューリング">conductor.md: Run のライフサイクルとスケジューリング</a>
+      を参照してください．
+    </figcaption>
+  </figure>
+
+  <h2 id="lifecycle">Run の状態遷移</h2>
+  <p>
+    1 回の reconcile 試行は <code>Run</code> というレコードで表され，次のいずれかの状態を持ちます．
+    ある target について，同時に <code>queued</code>／<wbr><code>starting</code>／<wbr><code>running</code>
+    の run が存在できるのは 1 つだけです．2 つ目を要求すると，アクティブな run を示す
+    <span class="badge">409 run_active</span> が返ります．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 430" role="img" aria-labelledby="c3-t c3-d">
+      <title id="c3-t">Run の状態遷移</title>
+      <desc id="c3-d">中央の列が進行中の状態で，queued からスケジューラのクレームで starting，Runner の起動で running になり，Result が成功なら succeeded になる．左の cancelled へは，queued と running からは API のキャンセルで，starting からは target やポリシーの無効化または revision の変更で遷移する．右の failed へは，starting からは JobSpec の拒否または起動の失敗で，running からは Result の失敗やタイムアウトなどで遷移する．</desc>
+      <defs>
+        <marker id="c3-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="c3-ad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="c3-adg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-danger" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <text class="d-small" x="105" y="24" text-anchor="middle">終端</text>
+      <text class="d-small" x="440" y="24" text-anchor="middle">進行中（target ごとに最大 1 つ）</text>
+      <text class="d-small" x="775" y="24" text-anchor="middle">終端</text>
+
+      <!-- 進行中の状態 -->
+      <rect class="d-box" x="365" y="40" width="150" height="44" rx="8"/>
+      <text class="d-text" x="440" y="67" text-anchor="middle">queued</text>
+      <line class="d-line" x1="440" y1="84" x2="440" y2="148" marker-end="url(#c3-a)"/>
+      <text class="d-small" x="452" y="121">スケジューラがクレーム</text>
+      <rect class="d-box" x="365" y="150" width="150" height="44" rx="8"/>
+      <text class="d-text" x="440" y="177" text-anchor="middle">starting</text>
+      <line class="d-line" x1="440" y1="194" x2="440" y2="258" marker-end="url(#c3-a)"/>
+      <text class="d-small" x="452" y="231">Runner を起動</text>
+      <rect class="d-box" x="365" y="260" width="150" height="44" rx="8"/>
+      <text class="d-text" x="440" y="287" text-anchor="middle">running</text>
+      <line class="d-line-dp" x1="440" y1="304" x2="440" y2="368" marker-end="url(#c3-ad)"/>
+      <text class="d-dp-text" x="452" y="341">Result が成功</text>
+      <rect class="d-dp" x="365" y="370" width="150" height="44" rx="8"/>
+      <text class="d-text" x="440" y="397" text-anchor="middle">succeeded</text>
+
+      <!-- cancelled -->
+      <rect class="d-danger" x="30" y="40" width="150" height="264" rx="10"/>
+      <text class="d-text" x="105" y="177" text-anchor="middle">cancelled</text>
+      <line class="d-line-danger" x1="365" y1="62" x2="182" y2="62" marker-end="url(#c3-adg)"/>
+      <text class="d-danger-text" x="273" y="53" text-anchor="middle">API でキャンセル</text>
+      <line class="d-line-danger" x1="365" y1="172" x2="182" y2="172" marker-end="url(#c3-adg)"/>
+      <text class="d-danger-text" x="273" y="163" text-anchor="middle">target／ポリシー無効化</text>
+      <text class="d-danger-text" x="273" y="193" text-anchor="middle">revision の変更</text>
+      <line class="d-line-danger" x1="365" y1="282" x2="182" y2="282" marker-end="url(#c3-adg)"/>
+      <text class="d-danger-text" x="273" y="273" text-anchor="middle">API でキャンセル</text>
+
+      <!-- failed -->
+      <rect class="d-danger" x="700" y="150" width="150" height="154" rx="10"/>
+      <text class="d-text" x="775" y="232" text-anchor="middle">failed</text>
+      <line class="d-line-danger" x1="515" y1="172" x2="698" y2="172" marker-end="url(#c3-adg)"/>
+      <text class="d-danger-text" x="607" y="163" text-anchor="middle">JobSpec の拒否</text>
+      <text class="d-danger-text" x="607" y="193" text-anchor="middle">起動の失敗</text>
+      <line class="d-line-danger" x1="515" y1="282" x2="698" y2="282" marker-end="url(#c3-adg)"/>
+      <text class="d-danger-text" x="607" y="273" text-anchor="middle">Result が失敗</text>
+      <text class="d-danger-text" x="607" y="303" text-anchor="middle">タイムアウトなど</text>
+    </svg>
+    <div class="legend">
+      <span><i class="dp"></i>成功で終わる遷移</span>
+      <span><i class="danger"></i>失敗・キャンセルにつながる遷移</span>
+    </div>
+    <figcaption>
+      失敗またはキャンセルされた run の後は，<code>retryBackoffSeconds</code>（既定 300 秒）待ってから
+      同じ target を再試行します．連続して失敗するたびに待ち時間は 2 倍になり，
+      <code>maxRetryBackoffSeconds</code>（既定 21600 秒）で頭打ちになります．詳しくは
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/conductor.md#run-のライフサイクルとスケジューリング">conductor.md: Run のライフサイクルとスケジューリング</a>
+      を参照してください．
+    </figcaption>
+  </figure>
+
+  <h2 id="noop">更新が必要かの判断</h2>
+  <p>
+    「そろそろ確認する時期か」を決めるのは Conductor のスケジューラですが，
+    「実際に発行・更新が必要か」を最終的に決めるのは常に <strong>Runner</strong> です．
+    この 2 つの判断は分かれています．
+  </p>
+  <div class="cards">
+    <div class="card cp">
+      <h3>Conductor 側: run を queued にするかどうか</h3>
+      <p>有効なポリシーを持つ有効な target について，一度も成功していない，target のリビジョンが
+      最後に成功した run と異なる，最後の成功が有効期限を記録していない，または
+      <code>expiresAt − renewBeforeDays</code> を過ぎていれば run を待機状態にします．
+      これは「確認しに行くべきか」という判断であり，「発行すべきか」ではありません．</p>
+    </div>
+    <div class="card dp">
+      <h3>Runner 側: 実際に lego を起動するかどうか</h3>
+      <p>Runner は Certificate Store に現在の証明書を問い合わせ，格納済みの証明書が
+      target の FQDN を SAN に含み，すでに有効で，鍵の種別がポリシー通りで，
+      <code>renewBeforeDays</code> より先まで有効なら，その場で
+      <span class="badge dp">noop</span> として終了します．lego は一度も起動されません．
+      そうでなければ発行・更新に進みます．</p>
+    </div>
+  </div>
+  <p>
+    Result の <code>action</code> は 3 種類です．<span class="badge dp">issued</span>
+    はそのオブジェクトについて store に証明書が存在しなかった場合，
+    <span class="badge dp">renewed</span> は証明書が存在し新しいフィンガープリントが以前と異なる場合，
+    <span class="badge dp">noop</span> は上記の早期終了の場合です．Conductor が「期限到来」と判断した
+    run でも，Runner が証明書はまだ最新だと確認すれば ACME CA には一切接触せず noop で終わります．
+  </p>
+
+  <h2 id="runner-run">Runner の 1 回の実行</h2>
+  <p>
+    Runner は起動されるたびに，ちょうど 1 つの JobSpec を処理してから終了する使い捨てのプロセスです．
+    次の手順は <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#実行フロー">runner.md: 実行フロー</a>
+    を要約したものです．
+  </p>
+  <ol class="steps dp">
+    <li><strong>ジョブを読む</strong> — 署名付きエンベロープなら署名を検証し，リプレイ台帳と照合する．</li>
+    <li><strong>厳密に検証する</strong> — 未知のフィールドや重複キーを拒否し，文書が自己整合していることを確かめる（これは認可ではない）．</li>
+    <li><strong>自身の設定で認可する</strong> — <code>RunnerAuthorizationPolicy</code> に照らし，DNS サフィックスとバインディング名を既定拒否で検査する．</li>
+    <li><strong>バインディング名を解決する</strong> — acme／dns／store の 3 つの名前を自身の設定の実体（URL・資格情報の変数名など）に変換する．</li>
+    <li><strong>Certificate Store に現在の証明書を問い合わせる</strong> — 更新が不要なら noop でここまでにする．</li>
+    <li><strong>作業ディレクトリを作る</strong> — <code>&lt;workDir&gt;/run-&lt;runId&gt;-&lt;rand&gt;</code>（モード 0700）．ACME アカウントの状態だけを状態ディレクトリからコピーする．</li>
+    <li><strong>lego の argv と環境をゼロから組み立てる</strong> — Runner プロセス自身の環境は継承しない．JobSpec の値がシェル文字列に補間されることはない．</li>
+    <li><strong>lego をちょうど 1 回起動する</strong> — 専用のプロセスグループで，タイムアウト付きで実行する．</li>
+    <li><strong>生成された証明書を検証する</strong> — SAN が target の FQDN と一致すること，鍵が一致すること，まだ失効していないことなどを確認する．</li>
+    <li><strong>Certificate Store に格納する</strong> — ここでのみ証明書と秘密鍵が永続化される．</li>
+    <li><strong>作業ディレクトリを破棄する</strong> — <code>defer</code> により，成功・失敗を問わずすべての経路で実行される．これが秘密鍵のローカルコピーを消す唯一の処理である．</li>
+    <li><strong>Result を出力して終了する</strong> — stdout に 1 行の JSON，指定があればファイルにも．</li>
+  </ol>
+  <p class="muted">
+    引数ベクトルは常に固定の順序で組み立てられ（<code>--accept-tos --email … --server … --dns … --domains … --key-type … --path …</code> の後に
+    <code>run</code>），シェルは一度も起動されません．EAB のキー ID と HMAC は <code>argv</code> ではなく
+    <code>LEGO_EAB_KID</code>／<code>LEGO_EAB_HMAC</code> という環境変数で渡されるため，プロセス一覧には現れません．
+    詳しくは<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#lego-の起動">runner.md: lego の起動</a>を参照してください．
+  </p>
+
+  <h2 id="contract">JobSpec と Result の例</h2>
+  <p>
+    Conductor と Runner の間を行き来する文書はこの 2 種類だけです．どちらも厳密にデコードされ
+    （未知のフィールドと重複キーは拒否），現れるのは不透明な識別子・正規化された FQDN・
+    ポリシーの値・論理バインディング名だけです．
+  </p>
+  <p><strong>JobSpec</strong>（<code>CertificateReconcileJob</code>．<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/job.example.json">実例</a>）:</p>
+  <pre><code>{
+  "apiVersion": "acme-conductor.cits-nue.github.io/v1alpha1",
+  "kind": "CertificateReconcileJob",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "target": { "id": "01JABCDEFGHJKMNPQRSTVWXYZ1", "fqdn": "wiki.example.ac.jp", "revision": 3 },
+  "policy": {
+    "allowedDnsSuffixes": ["example.ac.jp"],
+    "allowWildcard": false,
+    "renewBeforeDays": 30,
+    "keyType": "ec256"
+  },
+  "acme": { "binding": "letsencrypt-staging" },
+  "dns": { "binding": "azure-dns-staging" },
+  "store": { "binding": "filesystem-dev" }
+}</code></pre>
+
+  <p><strong>Result</strong>（<code>CertificateReconcileResult</code>）成功時:</p>
+  <pre><code>{
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "status": "succeeded",
+  "action": "issued",
+  "expiresAt": "2026-12-19T00:00:00Z",
+  "fingerprintSha256": "a1b2c3d4…",
+  "storeObjectRef": "www-example-ac-jp",
+  "error": null
+}</code></pre>
+
+  <p>失敗時:</p>
+  <pre><code>{
+  "kind": "CertificateReconcileResult",
+  "runId": "01JABCDEFGHJKMNPQRSTVWXYZ0",
+  "status": "failed",
+  "action": "failed",
+  "error": { "code": "DnsFailure", "summary": "TXT record propagation timed out" }
+}</code></pre>
+
+  <p>
+    どちらの文書にも <strong>決して現れないもの</strong> があります: シェルコマンド，実行ファイルの
+    パス，任意の環境変数，コンテナイメージの参照，クライアントシークレットやアクセスキーや秘密鍵，
+    任意のクラウドリソース ID，任意の出力パスです．そのためのフィールドがそもそも存在しません．
+    <code>error.summary</code> も lego の生の出力や環境変数のダンプではなく，Runner が持つ安全な
+    テンプレートからのみ生成されます．詳しくは
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md#jobspecresult-コントラクト">architecture.md: JobSpec/Result コントラクト</a>
+    と
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#result-とエラーコード">runner.md: Result とエラーコード</a>
+    を参照してください．
+  </p>
+
+  <h2 id="failure">障害時の振る舞い</h2>
+  <div class="cards">
+    <div class="card danger">
+      <h3>Conductor が停止・再起動すると</h3>
+      <p>
+        <code>SIGTERM</code>／<code>SIGINT</code> を受けると，実行中の run は最大
+        <code>server.shutdownGraceSeconds</code> まで継続してからキャンセルされます．
+        再起動時，レジストリにまだ <code>starting</code> または <code>running</code> として残っている
+        run は，Runner が実際に何をしたか分からないまま「outcome unknown（結果不明）」として
+        <code>failed</code> と記録されます．Conductor が run を再開することは決してありません．
+      </p>
+    </div>
+    <div class="card dp">
+      <h3>取り残された Runner はどうなるか</h3>
+      <p>
+        強制終了で取り残された Runner が Store への書き込みを完了させているかもしれません．
+        その場合，Conductor は何も推測せず，単に「結果不明」として記録するだけです．
+        次に期限到来の検査が新しい run をスケジュールしたとき，Runner が Certificate Store に
+        問い合わせて証明書がすでに最新であることを見つければ，CA には接触せず
+        <span class="badge dp">noop</span> で終わります．そうでなければ改めて更新します．
+      </p>
+    </div>
+  </div>
+  <p>
+    この設計により，Conductor 側の「結果不明」という保守的な記録と，Runner 側の
+    「Store に問い合わせてから判断する」という冪等な振る舞いの組み合わせだけで，
+    二重発行や証明書の取りこぼしを防いでいます．詳しくは
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/conductor.md#シャットダウンと復旧">conductor.md: シャットダウンと復旧</a>
+    を参照してください．
+  </p>
+
+  <div class="next">
+    <a href="index.html"><small>前へ</small>概要</a>
+    <a class="fwd" href="security.html"><small>次へ</small>安全設計</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>
