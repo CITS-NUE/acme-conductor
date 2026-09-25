@@ -29,7 +29,7 @@ PR を開く前に以下を実行すること（CI でも実行される —
 `.github/workflows/ci.yml`）:
 
 ```sh
-make verify    # gofmt の検査，go vet，go test，go test -race
+make verify    # gofmt と句読点の検査，go vet，go test，go test -race
 make vulncheck # モジュールに対する govulncheck
 make images    # 両方のコンテナイメージをビルドし，問題なくビルドできることを確認
 ```
@@ -62,6 +62,10 @@ v0.5.0`）．リリースワークフロー（`.github/workflows/release.yml`）
 
 ## コーディング規則
 
+- **日本語の句読点は「，」「．」に統一する．** 和文の読点・句点
+  （U+3001，U+3002）は使わない．文書，コメント，UI の文言のすべてに適用する．
+  `make punct`（`make verify` と CI も実行する）が，追跡しているファイルに
+  それらがあれば失敗する．
 - **GUI にインラインスクリプトやサードパーティの資産を置かない．** ページは
   `default-src 'none'` の下で配信される．描画するものはすべて DOM のメソッド
   （`textContent`，`createElement`）を通し，API のデータや URL から組み立てた

@@ -43,6 +43,9 @@ jobs:
             exit 1
           fi
 
+      - name: Japanese punctuation check
+        run: make punct
+
       - name: go vet
         run: go vet ./...
 

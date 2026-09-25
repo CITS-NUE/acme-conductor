@@ -65,7 +65,7 @@ DNS プロバイダを決して呼ばない．`lego` / `acme-runner` の偽物�
 ## クイックスタート
 
 ```sh
-make verify   # gofmt, go vet, go test, go test -race
+make verify   # gofmt，句読点，go vet，go test，go test -race
 make build    # ./bin/acme-conductor と ./bin/acme-runner をビルド
 ./bin/acme-conductor --version
 ./bin/acme-runner --version

@@ -23,7 +23,7 @@ LDFLAGS := -s -w \
 IMAGE_REGISTRY := ghcr.io/cits-nue
 IMAGE_TAG      := dev
 
-.PHONY: build fmt fmt-fix vet test test-race vulncheck image-conductor image-runner images verify
+.PHONY: build fmt fmt-fix vet test test-race vulncheck image-conductor image-runner images verify punct
 
 ## build: compile both binaries into bin/ with version metadata baked in.
 build:
@@ -80,5 +80,17 @@ image-runner:
 ## images: build both container images.
 images: image-conductor image-runner
 
-## verify: run the full local verification suite (fmt, vet, test, test-race).
-verify: fmt vet test test-race
+# The ideographic comma and full stop (U+3001, U+3002), spelled as UTF-8
+# bytes so that this file does not trip its own check.
+JA_COMMA    := $(shell printf '\343\200\201')
+JA_PERIOD   := $(shell printf '\343\200\202')
+
+## punct: fail if any tracked file uses U+3001 or U+3002; Japanese text uses ， and ．.
+punct:
+	@if git grep -nF -e '$(JA_COMMA)' -e '$(JA_PERIOD)'; then \
+		echo "Use ， and ． instead of U+3001 and U+3002 (see CONTRIBUTING.md)."; \
+		exit 1; \
+	fi
+
+## verify: run the full local verification suite (fmt, punct, vet, test, test-race).
+verify: fmt punct vet test test-race
