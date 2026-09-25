@@ -35,7 +35,7 @@ const (
 )
 
 // LocalProcess runs acme-runner as a child process of the Conductor. It is
-// the Phase 2 execution shape, meant for development and tests: the
+// the local execution shape, meant for development and tests: the
 // Runner inherits nothing from the Conductor except what PassthroughEnv
 // names, but whatever it names must then be present in the Conductor's
 // own environment, which is why this launcher is not for production

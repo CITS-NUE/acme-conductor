@@ -36,7 +36,7 @@ Container Apps 環境の作成（5〜10 分）が占める．
 
 | 作業 | 必要な権限 | 備考 |
 |---|---|---|
-| Azure リソースの作成（手順 4, 8） | デプロイ先 RG の `Contributor` | |
+| Azure リソースの作成（手順 4，8） | デプロイ先 RG の `Contributor` | |
 | サブスクリプションスコープのネストしたデプロイ（手順 8） | サブスクリプションの `Microsoft.Resources/deployments/*`（サブスクリプションの `Contributor` や `Owner` に含まれる） | `main.bicep` はカスタムロールを `scope: subscription()` の module（`modules/roles.bicep`）で作るため，**RG の `Contributor` だけでは足りない**．`User Access Administrator` にも含まれない |
 | カスタムロール定義の作成（手順 8） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`） | `Contributor` と `Role Based Access Control Administrator` には **含まれない** |
 | ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任でもよい（#37 以降）．[手順 8](#8-デプロイ) を参照 |
@@ -378,6 +378,23 @@ API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) �
   `storeObjectRef` で代える．
 - チャレンジ用ゾーンに `_acme-challenge` の TXT が残っていない
   （`az network dns record-set txt list -g <zone rg> -z <challenge zone>`）．
+
+Conductor と Runner の間でジョブが受け渡されたことは，両方のログから確かめられる．
+1 つの `runId` について，`job offered to the runner job`（conductor），
+`signed job envelope verified`（runner），`job taken by an execution`（conductor．
+`execution` に実行名が付く），`reconcile succeeded`（runner），`job execution ended`
+（conductor．`status` が `Succeeded`）が並べばよい．Conductor のトークンは要らない:
+
+```sh
+WS=$(az containerapp env show -g $RG -n $P-cae \
+  --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+az monitor log-analytics query -w "$WS" -t P1D -o table --analytics-query '
+ContainerAppConsoleLogs_CL
+| where Log_s has_any ("job offered to the runner job", "job taken by an execution",
+                       "signed job envelope verified", "reconcile succeeded", "job execution ended")
+| project TimeGenerated, ContainerName_s, Log_s
+| order by TimeGenerated asc'
+```
 
 run が `AcmeFailure lego exited with status 1` で失敗した場合，lego 自身のメッセージは
 今のところ debug ログにしか出ず，Azure のテンプレートでは debug を有効にできない

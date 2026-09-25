@@ -3,8 +3,7 @@
 既存の `cert-infra` デプロイ（固定されたホスト一覧を `lego` で更新し Key Vault に
 取り込む，Bicep で定義された Container Apps Job）を，切替日を設けずに
 ACME Conductor へ移す方法と，shadow フェーズの結果から必要だと分かった場合に
-元へ戻す方法を述べる．ここにあるものはすべて
-[ロードマップ](architecture.md#ロードマップ)の Phase 6 であり，決定は
+元へ戻す方法を述べる．決定は
 [ADR 0020](adr/0020-migration-from-cert-infra.md) に記録されている．
 
 `cert-infra` リポジトリ自体はこのプロジェクトによって **変更されない**．その

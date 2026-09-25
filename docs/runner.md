@@ -8,19 +8,20 @@
 エラーコードのコントラクト，そして Runner が現時点で保証すること・しないことを
 扱う．
 
-Phase 1 では，公式の `lego` CLI とファイルシステムの Certificate Store を同梱した
-ワンショットの Runner を提供する．Phase 2 以降は Conductor が target を
-スケジュールし，Runner をローカルの子プロセスとして起動する
-（[`docs/conductor.md`](conductor.md) を参照）．Runner 自体はそれによって
-変わらず，ここで説明する通りに手動で起動することもできる．Phase 3 では
-実行基盤のマネージド ID で認証する Azure Key Vault の Certificate Store が
-加わる．[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault)
-を参照．Phase 4 では署名付きジョブエンベロープが加わる．[`jobSigning`](#jobsigning)
+`acme-runner` は，公式の `lego` CLI とファイルシステムの Certificate Store を
+同梱したワンショットの Runner である．ここで説明する通りに手動で起動することも
+できるが，通常は Conductor が target をスケジュールし，Runner をローカルの
+子プロセスまたは Container Apps Job の実行として動かす
+（[`docs/conductor.md`](conductor.md) を参照）．
+Runner 自体はそれによって変わらない．Certificate Store には，実行基盤の
+マネージド ID で認証する Azure Key Vault も使える．
+[Certificate Store (Azure Key Vault)](#certificate-store-azure-key-vault)
+を参照．署名付きジョブエンベロープにも対応する．[`jobSigning`](#jobsigning)
 を設定すると，Runner は Conductor が署名したジョブだけを，その有効期間内に，
 1 度だけ受け付ける．さらに Runner は自身のマネージド ID の下で
 Azure Container Apps Job として動く
 （[Container Apps Job として動かす](#container-apps-job-として動かす) と
-[ロードマップ](architecture.md#ロードマップ) を参照）．
+[実装済みの機能](architecture.md#実装済みの機能) を参照）．
 
 ## 概要
 
@@ -117,6 +118,7 @@ acme-runner --help
 | `dnsBindings` | map | 1 件以上必要．キーの規則は同じ． |
 | `storeBindings` | map | 1 件以上必要．キーの規則は同じ． |
 | `jobSigning` | object | 任意．存在する場合，署名付きジョブエンベロープだけを受け付ける．後述． |
+| `resultSigning` | object | 任意．存在する場合，Runner はすべての Result に署名する．後述． |
 
 ### `authorization`
 
@@ -265,13 +267,13 @@ Result ファイルにも同じものが出る．対応する公開鍵を設定�
 受け付けず，これによって共有の交換用ボリュームへの別の書き手が Result を
 すり替えたり改変したりできなくなる．Runner は閉じた側に倒れる．鍵を読めない
 場合，素の成功を報告するのではなく run が失敗し（`Internal`，"result signing
-key could not be loaded"），`lego` は実行されない．Phase 4 のデプロイでは
+key could not be loaded"），`lego` は実行されない．Container Apps のデプロイでは
 必須である．プライベートなディレクトリを介するローカルランチャーは
 これなしで動かしてもよい．
 
 ### Container Apps Job として動かす
 
-Phase 4 のデプロイ（[`deploy/azure`](../deploy/azure/README.md)）では，
+Container Apps のデプロイ（[`deploy/azure`](../deploy/azure/README.md)）では，
 Runner はユーザー割り当てマネージド ID を持つ Container Apps Job であり，
 DNS と Key Vault の両方がこの ID で認証する．store バインディングは
 `credential: managed-identity` を **その ID のクライアント ID を
@@ -322,7 +324,7 @@ Result に署名する．
 完全で検証済みの例は
 [`deploy/examples/runner-config.example.json`](../deploy/examples/runner-config.example.json)
 を参照（Let's Encrypt の **ステージング**，シークレットでない `env` だけを
-持つ `azuredns` の DNS バインディング — Phase 3 以降はマネージド ID を
+持つ `azuredns` の DNS バインディング — マネージド ID を
 前提とするため `passthroughEnv` はない．代わりにサービスプリンシパルに対して
 ローカル開発する場合は，`passthroughEnv` に `AZURE_CLIENT_SECRET` を加え，
 Runner 自身の環境でそれを export する — さらに `/store` をルートとする
@@ -344,7 +346,7 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
 2. Runner の設定を読み込む（厳密な JSON: 未知のフィールド，重複キー，末尾の
    余分なデータ，深すぎるネストは拒否．上限 256 KiB．JobSpec と同じデコーダ
    `internal/strictjson`）．
-3. **署名付きエンベロープ**（Phase 4，[`jobSigning`](#jobsigning)）:
+3. **署名付きエンベロープ**（[`jobSigning`](#jobsigning)）:
    `protected.payload` のバイト列そのものに対する Ed25519 署名を信頼された
    公開鍵（`kid` で鍵を選ぶ）で検証し，`expiresAt` が過ぎていないこと，
    `issuedAt` が `clockSkewSeconds` 以上先でないことを確認してから，
@@ -661,7 +663,7 @@ Runner が認識する（`Cancelled`/`Timeout`）．
 | `/usr/local/bin/lego` | バージョン固定しチェックサム検証済みの `lego` v4.35.2 バイナリ（[ADR 0010](adr/0010-pinned-lego-binary.md) を参照）． |
 | `/etc/acme-runner/config.json` | Runner の設定．**読み取り専用** でマウントする． |
 | `/work` | `lego.workDir`．書き込み可能な `tmpfs`/`emptyDir` でなければならない．証明書の秘密鍵はここに 1 回の run の間だけ一時的に存在する． |
-| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録，および Phase 4 以降はリプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
+| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録，および（`jobSigning` を使うなら）リプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
 | `/store` | `filesystem` store のルートの例（開発・テスト専用）． |
 
 イメージは `--read-only` / Kubernetes の `readOnlyRootFilesystem: true` に
@@ -748,8 +750,8 @@ docker run --rm \
 この秘匿は **値ベースかつヒューリスティック** である．Runner 自身が解決した
 特定のシークレット値と既知の PEM マーカーをマスクするのであって，任意の，
 あるいは未知の形式のシークレットをマスクするのではない．コードベースの
-残りのログ文にわたる専用の秘匿テストスイートは依然として Phase 3 以降の
-作業である（[`docs/threat-model.md`](threat-model.md) を参照）．
+残りのログ文にわたる専用の秘匿テストスイートは，まだない．今後の課題である
+（[`docs/threat-model.md`](threat-model.md) を参照）．
 
 ## セキュリティ境界
 
@@ -785,9 +787,8 @@ docker run --rm \
 - 自動テストは本物の ACME CA や本物の DNS プロバイダを決して呼ばない．
   テストは `internal/runner/fakelego` に対して実行される．これは `lego` の
   観測可能なファイル／終了コードの振る舞いをネットワークアクセスなしで
-  模倣するテストダブルである（Phase 1 は
-  [`docs/architecture.md`](architecture.md#セキュリティ原則) の原則 8 を
-  強制する）．
+  模倣するテストダブルである（[`docs/architecture.md`](architecture.md#セキュリティ原則)
+  の原則 8 を強制する）．
 - **並行性について正確に．** ディスク上の 2 つの store は 1 台のホスト上で
   並行安全である．アカウント状態の公開と run 開始時のコピーインは
   `stateDir/.lock` のアドバイザリ `flock` で直列化され（公開側は排他，
@@ -796,8 +797,8 @@ docker run --rm \
   同じ target に対する 2 つの Runner プロセスは依然として両方とも `lego` を
   実行し，2 つの ACME オーダーを出し，DNS チャレンジで競合しうる．
   Conductor の run レジストリとスケジューラは，自身が起動する run について
-  その排他を提供する（Phase 2．
-  [`docs/conductor.md`](conductor.md#run-のライフサイクルとスケジューリング)
+  その排他を提供する
+  （[`docs/conductor.md`](conductor.md#run-のライフサイクルとスケジューリング)
   を参照）．それはこれらの store の性質ではなく，他の手段で開始された
   Runner はその対象外である．
 - **ロックとキャンセル．** ロックの取得はカーネル内で決してブロックしない．
@@ -842,7 +843,7 @@ docker run --rm \
 - **レイアウト検査が扱わないこと．** これは `stateDir` を所有するのと同じ
   ユーザーによる，ある時点での検査である．同じ UID を持つプロセスがこれと
   競合する（検査と書き込みの間に `accounts.d` をリンクに置き換える）ことは
-  Phase 1 の脅威モデルの範囲外であり，脅威モデルは Runner のユーザーが
+  脅威モデルの範囲外であり，脅威モデルは Runner のユーザーが
   所有するローカルファイルシステムを前提とする．
 
 ## クラッシュ安全性
@@ -887,22 +888,19 @@ docker run --rm \
   文書化されているが，CI で検証されてはいない．取り込みを妨げる論理削除
   済みの証明書を復旧も purge も決して行わず，自身の ID のロール割り当てが
   文書通りに狭いことを検証することもできない．
-- Key Vault store は PEM のみを書く．App Service と Azure Front Door の
-  組み込みの Key Vault 連携は PKCS #12 を必要とし，この store では役立たない．
-  PKCS #12 での取り込みは Phase 3 の範囲外である
-  （[利用者とコンテンツタイプ](#certificate-store-azure-key-vault) を参照）．
 - `credential: default` では，SDK の `DefaultAzureCredential` チェーンが
   Runner の環境からサービスプリンシパルの変数を読み，`PATH` から開発者
   ツールを実行することがある．これは開発上の利便性であって本番の姿勢では
   ない．`managed-identity` を指定すること．
 - claim モードでジョブを取る操作のアトミック性は，交換用ボリューム上で
-  ディレクトリの rename がアトミックであることに依存する．SMB 共有では
-  そうであると期待されるが，最初の実際のデプロイでしか検証されない
-  （[`deploy/azure/README.md`](../deploy/azure/README.md)）．
+  ディレクトリの rename がアトミックであることに依存する．Azure Files（SMB）上で
+  1 つの実行がジョブを取れることは実デプロイで確認したが，2 つの実行が同時に
+  取り合う場合は観測していない
+  （[`deploy/azure/README.md`](../deploy/azure/README.md#実デプロイで確認したこととまだ確認していないこと)）．
 - Runner 自体には run レベルの並行制御がない．同じ target に対する 2 つの
   Runner プロセスは両方とも発行しうる（二重発行，ACME レート制限の消費）．
   ファイルシステム store とアカウント状態はそれに耐える（最後の書き手が
-  勝つ）．Conductor（Phase 2）は自身が起動する run についてはこれを防ぐ
+  勝つ）．Conductor は自身が起動する run についてはこれを防ぐ
   （target ごとにアクティブな run は最大 1 つ）が，手動や別のランチャーで
   開始された Runner については防がない．
 - リプレイ台帳は `stateDir` ごとである．別々の状態ディレクトリを持つ
@@ -920,10 +918,10 @@ docker run --rm \
 - `lego` 出力のログ秘匿は値ベースかつヒューリスティック（既知のシークレット
   値，既知の PEM マーカー）であり，汎用のシークレット検出器ではなく，この
   パッケージの外にはまだ専用のテストスイートがない．
-- Container Apps のデプロイ（Phase 4）は偽物とコンパイル済み Bicep に対して
-  試験されており，本物のサブスクリプションに対してではない．Container Apps
-  の ID エンドポイントを通じた `lego` の `azuredns` プロバイダのマネージド
-  ID 認証と，プラットフォームの実行テンプレート上書きは，最初のデプロイが
-  確認するまでは文書上の期待である（`deploy/azure/README.md`）．上記の
+- Container Apps のデプロイは，CI では偽物とコンパイル済み Bicep に対して
+  試験されている．Container Apps の ID エンドポイントを通じた `lego` の
+  `azuredns` プロバイダのマネージド ID 認証を含め，1 つの target の発行が
+  実デプロイで通ることは確認したが，確認していない項目が残る
+  （[`deploy/azure/README.md`](../deploy/azure/README.md#実デプロイで確認したこととまだ確認していないこと)）．上記の
   コマンドラインが示すように，`JobSpec` を手動で生成し `Result` を手動で
   消費することは依然として可能である．

@@ -6,24 +6,24 @@ REST API と GUI，`Target` がどのように `Run` になり `Run` がどの�
 駆動されるか，2 つの認証モード，ディスク上の状態とそのバックアップ方法，そして
 現時点で Conductor が保証すること・しないことを扱う．
 
-Phase 2 では Conductor の MVP を出荷した．target・ポリシー・run・監査イベントを
-SQLite に保持するレジストリ，REST API，スケジューラ，そして `acme-runner`
+Conductor は，target・ポリシー・run・監査イベントを SQLite に保持するレジストリ，
+REST API，スケジューラを備える．ランチャーは 2 種類ある．1 つは `acme-runner`
 （[`docs/runner.md`](runner.md) を参照）を子プロセスとして動かすローカルプロセスの
-ランチャーであり，**単一ホスト・単一ユーザーの開発およびテスト用デプロイ** である．
-Phase 4 では第 2 のランチャー `azure-container-apps-job` が加わる．これは run ごとに，
-別途プロビジョニングされた Azure Container Apps Job の実行を 1 つ開始する
-（Runner は自身のマネージド ID を持ち，資格情報が Conductor を経由することは
-決してない）．さらに **ジョブ署名** が加わる．どのランチャーも Runner に生の
-`JobSpec` ではなく署名付き・期限付きのエンベロープを渡すことができ，Container Apps
-ランチャーは常にそうする．Phase 5 では本番の認証モード `oidc` が加わる．OpenID
-Connect プロバイダのベアラートークン，名前付きプリンシパル，admin と viewer の
-ロール，TLS リスナーまたはその前段のプラットフォーム ingress である．さらに
-Conductor 自身が配信する最小限の **GUI** が加わる（[認証](#認証)と [GUI](#gui) を
-参照）．`localhost-dev` モードは開発ホスト 1 台向けに残る．Phase 6 では
-**移行ツール** が加わる．既存のインフラ定義のホスト一覧を読み，レジストリと比較して
-足りないものを取り込む `migrate` コマンドと API，および操作者が切り替えるまで
-Conductor に何も発行させない `migration.targetSource` フラグである
-（[`docs/migration.md`](migration.md) と [`migration`](#migration) を参照）．
+ランチャーであり，**単一ホスト・単一ユーザーの開発およびテスト用デプロイ** 向けで
+ある．もう 1 つは `azure-container-apps-job` であり，run ごとに，別途
+プロビジョニングされた Azure Container Apps Job の実行を 1 つ開始する（Runner は
+自身のマネージド ID を持ち，資格情報が Conductor を経由することは決してない）．
+さらに **ジョブ署名** を備える．どのランチャーも Runner に生の `JobSpec` ではなく
+署名付き・期限付きのエンベロープを渡すことができ，Container Apps ランチャーは
+常にそうする．本番の認証モード `oidc` も備える．OpenID Connect プロバイダの
+ベアラートークン，名前付きプリンシパル，admin と viewer のロール，TLS リスナー
+またはその前段のプラットフォーム ingress である．さらに Conductor 自身が配信する
+最小限の **GUI** を持つ（[認証](#認証)と [GUI](#gui) を参照）．`localhost-dev`
+モードは開発ホスト 1 台向けに残る．**移行ツール** も備える．既存のインフラ定義の
+ホスト一覧を読み，レジストリと比較して足りないものを取り込む `migrate` コマンドと
+API，および操作者が切り替えるまで Conductor に何も発行させない
+`migration.targetSource` フラグである（[`docs/migration.md`](migration.md) と
+[`migration`](#migration) を参照）．
 
 ## 概要
 
@@ -140,7 +140,7 @@ Runner の `jobSigning.publicKeys` に貼り付けるために出力される．
 | `principalClaim` | string | `sub` | その値が監査のアクターおよび `requestedBy` として記録されるクレーム．表示名ではなくサブジェクトの **安定した識別子** であること（`preferred_username`，`email`，`name` はユーザーの改名で変わる）．Entra ID: `oid` を設定する（Entra ID の `sub` はクライアントごとに異なるペアワイズ値）．印字可能文字の文字列で 256 バイト以下でなければならない． |
 | `rolesClaim` | string | `roles` | その値（文字列または文字列の配列）が `roles` と照合されるクレーム． |
 | `roles.admin` | []string | —（必須，空でない） | **admin** ロールを与える値: すべてのエンドポイント． |
-| `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin． |
+| `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin．どちらの一覧も最大 32 個． |
 | `clockSkewSeconds` | int | `60` | `exp`，`nbf`，`iat` に適用する許容差．`1`–`300`． |
 | `keyCacheSeconds` | int | `3600` | ディスカバリ文書と署名鍵を再取得するまで再利用する時間．未知の鍵 ID は早期の再取得を引き起こす（最大で 1 分に 1 回）．`60`–`86400`． |
 
@@ -181,7 +181,7 @@ Conductor は **クライアントシークレットを持たない**．プロ�
 | `runnerConfig` | string | —（必須） | **Runner の** 設定のクリーンな絶対パス．`--config` として渡される．Conductor がこれを読むことは決してない． |
 | `workDir` | string | —（必須） | クリーンな絶対パス．run の実行中に `job.json` と `result.json` を保持する run ごとのディレクトリ（`run-<runId>/`，モード `0700`）の親．証明書の素材を保持することは決してない — Runner は自身の `workDir`/`stateDir` を持つ．なければ作成される． |
 | `timeoutSeconds` | int | `1200` | Conductor から見た Runner 実行 1 回の上限．Runner の `lego.timeoutSeconds` より大きく設定し，Runner 自身のより正確な `Timeout` 結果が勝つようにする．`1`–`86400`． |
-| `passthroughEnv` | []string | `[]` | **Conductor プロセス** の環境変数のうち，Runner の子プロセスへそのまま転送する変数名（`^[A-Z][A-Z0-9_]{0,63}$`．`PATH`，`HOME`，`TMPDIR`，`LD_*` は予約済み）．それ以外はすべて渡されない．子プロセスが受け取るのは `HOME`/`TMPDIR`（その run のディレクトリ），固定の `PATH`，およびここに列挙した変数だけである．列挙されているが設定されていない変数は警告としてログに記録され省略される．その場合 Runner 自身が run をフェイルクローズで失敗させる（バインディング名を示す `DnsFailure`/`AcmeFailure`）．下記のセキュリティ注記を参照． |
+| `passthroughEnv` | []string | `[]` | **Conductor プロセス** の環境変数のうち，Runner の子プロセスへそのまま転送する変数名（`^[A-Z][A-Z0-9_]{0,63}$`，最大 64 個．`PATH`，`HOME`，`TMPDIR`，`LD_*` は予約済み）．それ以外はすべて渡されない．子プロセスが受け取るのは `HOME`/`TMPDIR`（その run のディレクトリ），固定の `PATH`，およびここに列挙した変数だけである．列挙されているが設定されていない変数は警告としてログに記録され省略される．その場合 Runner 自身が run をフェイルクローズで失敗させる（バインディング名を示す `DnsFailure`/`AcmeFailure`）．下記のセキュリティ注記を参照． |
 
 **`passthroughEnv` に関するセキュリティ注記．** これは，ローカルランチャーで
 起動された Runner に DNS の資格情報や EAB シークレットが届く唯一の手段であり，
@@ -246,7 +246,7 @@ name>` である．Conductor の ID に必要なのは，Job リソースに対�
 |---|---|---|---|
 | `subscriptionId` | string | —（必須） | Job を保持するサブスクリプションの GUID． |
 | `resourceGroup` | string | —（必須） | Job のリソースグループ． |
-| `jobName` | string | —（必須） | Container Apps Job の名前（小文字・数字・ハイフンで 2–32 文字，`--` は不可）． |
+| `jobName` | string | —（必須） | Container Apps Job の名前（小文字で始まり小文字か数字で終わる，小文字・数字・ハイフンの 2–32 文字．`--` は不可）． |
 | `cloud` | string | `public` | `public`，`china`，`government` のいずれか: Resource Manager のエンドポイントと ID の authority を選ぶ． |
 | `credential` | string | `default` | Conductor が Resource Manager に認証する方法: `managed-identity`（プラットフォームの ID — 本番ではこれを使う）または `default`（SDK の `DefaultAzureCredential` チェーン．交換用共有をマウントした開発者ホストで Conductor を動かす場合向け）． |
 | `managedIdentityClientId` | string | — | `managed-identity` のみ: ユーザー割り当て ID のクライアント ID．省略時はシステム割り当て． |
@@ -292,7 +292,7 @@ name>` である．Conductor の ID に必要なのは，Job リソースに対�
 `expiresAt`・ランダムなノンスを持つ厳密なヘッダのもとに置き，Ed25519 で署名した
 ものである．Runner は対応する公開鍵を自身の `jobSigning.publicKeys`
 （[`docs/runner.md`](runner.md#jobsigning)）に列挙しなければならず，生の JobSpec を
-拒否する．`jobSigning` がなければ，ローカルランチャーは Phase 2 と同様に生の
+拒否する．`jobSigning` がなければ，ローカルランチャーは引き続き生の
 `JobSpec` を渡す．この秘密鍵は Conductor が読む唯一のシークレットである．これは
 Runner に対する Conductor の ID であって，DNS・Store・クラウドの資格情報ではない．
 ローテーションするには，まず新しい公開鍵を Runner に追加し，次に `privateKeyFile`
@@ -435,7 +435,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
   次のティックで target が期限到来になり得る．
 - `acmeBinding` — 次の ACME オーダーの CA を選ぶだけである．以前の CA による最新の
   証明書がこの変更だけを理由に再発行されることはないので，target は次の更新時に
-  （または再発行すべき別の理由を見つけた手動 run で）新しい CA に移る．Phase 2 は
+  （または再発行すべき別の理由を見つけた手動 run で）新しい CA に移る．Conductor は
   バインディング変更による強制再発行を行わない
   （[ADR 0011](adr/0011-conductor-storage-and-run-model.md)）．
 - `allowedDnsSuffixes`，`allowWildcard` — 更新そのものにおいて既存の target に
@@ -717,7 +717,7 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 
 ### `localhost-dev`（開発ホスト 1 台）
 
-Phase 2 のモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
+開発ホスト 1 台向けのモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
 `/api/` 配下へのリクエストは次の **すべて** が成り立つ場合にのみ受理される．
 
 - リスナーがループバックアドレスにバインドされていること（設定で強制し，
@@ -740,7 +740,9 @@ Phase 2 のモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
 
 `/ui/` は同じ API の上に載る最小限のインターフェースである．target（一覧，作成，
 編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
-絞り込める一覧，詳細，キャンセル），監査ログを扱う．バイナリに埋め込まれた 3 つの
+絞り込める一覧，詳細，キャンセル），監査ログ，移行の状態（target source，設定された
+ソース，shadow モードでの直近の比較．読み取り専用で，取り込みは
+`acme-conductor migrate` で行う）を扱う．バイナリに埋め込まれた 3 つの
 静的ファイル（ページ 1 つ，スクリプト 1 つ，スタイルシート 1 つ）で，フレームワークも
 ビルド手順もない．表示するものはすべて DOM のメソッドで描画し，データからマークアップを
 組み立てることは決してなく，API の呼び出しは自身のオリジンに対してのみ行う．
@@ -873,12 +875,12 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
 - **ローカルランチャーは 1 ホストである．** 同じホストに `acme-runner`（とその
   `lego`）が必要で，Runner が必要とする資格情報は Conductor の環境に置かなければ
   ならない（`passthroughEnv`）．Container Apps ランチャーにはどちらの制約もない．
-- **Container Apps ランチャーは偽のプラットフォームに対して検証されている．**
-  そのテストは Jobs API のプロセス内の偽物に対して exchange 全体を動かし，Bicep は
-  コンパイルと lint を通る．実行テンプレートの上書きがボリュームマウントを継承する
-  こと，カスタムロールのアクション名，SMB 共有上の SQLite と `flock`，Result の
-  伝播遅延は，最初の実機デプロイで確認されるまでは文書化された期待にとどまる
-  （[`deploy/azure/README.md`](../deploy/azure/README.md)）．
+- **Container Apps ランチャーの一部は実デプロイで観測していない．** CI の
+  テストは Jobs API のプロセス内の偽物に対して exchange 全体を動かし，Bicep は
+  コンパイルと lint を通る．staging の実デプロイで 1 つの target の発行が端から
+  端まで通ることは確認したが，同時に取り合うときの SMB 上のリネームの原子性，
+  実行の停止，SMB 上の `flock` はまだ観測していない
+  （[`deploy/azure/README.md`](../deploy/azure/README.md#実デプロイで確認したこととまだ確認していないこと)）．
 - **強制終了は Runner を取り残し得る．** 復旧はそのような run を `failed`／
   「結果不明」とする．Runner はなお完了するかもしれず，次の期限到来の run がそれと
   競合する（Store とアカウントの状態はそれに耐えるが，ACME の注文が重複することは

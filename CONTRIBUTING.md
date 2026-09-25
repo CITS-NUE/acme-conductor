@@ -1,7 +1,7 @@
 # ACME Conductor へのコントリビューション
 
 ACME Conductor に関心を持ってくれてありがとう．このプロジェクトはまだ初期段階
-（Phase 6 — [`docs/architecture.md`](docs/architecture.md#ロードマップ) を参照）
+（`v0.x` — [`docs/architecture.md`](docs/architecture.md#実装済みの機能) を参照）
 であり，そのセキュリティ特性は境界を尊重する厳格な設計に依存している．PR を
 開く前にこの文書を読んでほしい．
 
@@ -9,19 +9,10 @@ ACME Conductor に関心を持ってくれてありがとう．このプロジ�
 
 - **1 つの PR = 1 つの目的．** PR は一貫した 1 つのことだけを行う．機能追加，
   修正，リファクタリング，ドキュメント更新のいずれかである．無関係な変更を
-  まとめてはならない．
-- **Phase は別々の PR にする．** [ロードマップ](docs/architecture.md#ロードマップ)
-  は厳密な Phase の順序（Phase 0 ブートストラップ → Phase 1 Runner →
-  Phase 2 Conductor MVP → ...）を定めている．たとえ便利に思えても，前の Phase に
-  限定された PR の中で後の Phase の機能を実装してはならない — 例えば，Phase 0/1
-  が進行中のあいだに本物の DNS プロバイダの資格情報や REST API を追加しては
-  ならない．PR の範囲が後の Phase の一部を必要とすることが判明した場合は，PR の
-  説明にそう書き，黙って範囲を広げるのではなく作業を分割すること．
-- **要求された Phase を超えて実装しない．** Phase 1 の実装を求められたなら，
-  Phase 1 を実装する — Phase 2 や 3 のプレビューは，たとえ小さくても実装しない．
-  これにより各 PR を固定された既知の範囲に対してレビューでき，
-  [`docs/architecture.md`](docs/architecture.md#ロードマップ) の Phase の境界が
-  意味を持ち続ける．
+  まとめてはならない．要求された範囲を超えて実装しないこと — たとえ便利に
+  思えても，ある目的のための PR の中で別の目的の機能を実装してはならない．
+  PR の範囲が別の関心事の一部を必要とすることが判明した場合は，PR の説明に
+  そう書き，黙って範囲を広げるのではなく作業を分割すること．
 
 ## ローカルでの検査
 
@@ -29,7 +20,7 @@ PR を開く前に以下を実行すること（CI でも実行される —
 `.github/workflows/ci.yml`）:
 
 ```sh
-make verify    # gofmt の検査，go vet，go test，go test -race
+make verify    # gofmt と句読点の検査，go vet，go test，go test -race
 make vulncheck # モジュールに対する govulncheck
 make images    # 両方のコンテナイメージをビルドし，問題なくビルドできることを確認
 ```
@@ -62,6 +53,10 @@ v0.5.0`）．リリースワークフロー（`.github/workflows/release.yml`）
 
 ## コーディング規則
 
+- **日本語の句読点は「，」「．」に統一する．** 和文の読点・句点
+  （U+3001，U+3002）は使わない．文書，コメント，UI の文言のすべてに適用する．
+  `make punct`（`make verify` と CI も実行する）が，追跡しているファイルに
+  それらがあれば失敗する．
 - **GUI にインラインスクリプトやサードパーティの資産を置かない．** ページは
   `default-src 'none'` の下で配信される．描画するものはすべて DOM のメソッド
   （`textContent`，`createElement`）を通し，API のデータや URL から組み立てた

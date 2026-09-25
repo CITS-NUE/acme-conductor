@@ -1,4 +1,4 @@
-// Package acajob is the Azure Container Apps Job launcher (Phase 4). The
+// Package acajob is the Azure Container Apps Job launcher. The
 // Runner runs as a *scheduled* Container Apps Job whose executions start on
 // the platform's own cadence; the Conductor never starts one. For each run
 // the Conductor offers a signed JobSpec in an exchange directory both

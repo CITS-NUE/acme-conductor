@@ -6,7 +6,7 @@
 // T10). Role definitions are subscription-level resources, so this module
 // is deployed at subscription scope by main.bicep; their assignable scope
 // is that subscription, which is why the DNS zone and the Key Vault must
-// live in the same subscription as the deployment (Phase 4).
+// live in the same subscription as the deployment.
 targetScope = 'subscription'
 
 import { roleDefinitionName, roleKeys } from 'role-ids.bicep'

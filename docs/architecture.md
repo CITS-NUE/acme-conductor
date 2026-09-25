@@ -17,9 +17,9 @@ ACME Conductor は，クラウドに依存しない証明書管理のコント�
   決してない．
 - **`acme-runner`** はデータプレーンである．ワンショットの OCI ジョブとして，受け取った
   `JobSpec` を厳格に検証し，自身の信頼された Runner 側ポリシー
-  （`policy.RunnerAuthorizationPolicy`，Phase 1）に照らして要求を認可し，`lego` を
+  （`policy.RunnerAuthorizationPolicy`）に照らして要求を認可し，`lego` を
   ちょうど 1 回起動し，結果を正規化し，証明書を外部の **Certificate Store**
-  （ローカル開発ではファイルシステム，Phase 3 以降は Azure Key Vault）に直接書き込み，
+  （ローカル開発ではファイルシステム，デプロイでは Azure Key Vault）に直接書き込み，
   終了する．自身のサーバもスケジューラも動かさない．
 
 この分割は，2 つの半分をそれぞれ異なる最小限の ID でデプロイできるようにするために
@@ -73,12 +73,12 @@ Conductor が DNS プロバイダや Certificate Store と直接やり取りす�
 - **Scheduler** — `Target` の発行または更新の期限が到来したかを判断し，その
   `JobSpec` を生成する．
 - **Job Launcher interface** — 「どこかで Runner の実行を開始する」ことの抽象化
-  （コントラクトは `pkg/launcher`．実装は Phase 2 以降のローカルプロセスである
-  `internal/conductor/launcher/localprocess` と，Phase 4 以降の Azure Container Apps
+  （コントラクトは `pkg/launcher`．実装はローカルプロセスである
+  `internal/conductor/launcher/localprocess` と，Azure Container Apps
   Job である `internal/conductor/launcher/acajob`）．クラウド固有のランチャーコードは
   このインタフェースの背後に置き，決して Conductor のコアには置かない．
 - **API と GUI** — REST API（`internal/conductor/api`）は自由形式の入力を受け付ける
-  唯一の境界である．Phase 5 以降は OIDC ベアラートークンで呼び出し元を認証し，
+  唯一の境界である．OIDC ベアラートークンで呼び出し元を認証し，
   admin または viewer のロールを持つ名前付きプリンシパルとして扱い
   （`internal/conductor/oidc`，[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)），
   同じ API の上で最小限の静的 GUI（`internal/conductor/ui`）を提供する．開発モード
@@ -89,15 +89,15 @@ Conductor が DNS プロバイダや Certificate Store と直接やり取りす�
 - **JobSpec の検証と認可** — 厳格なデコード（[コントラクト](#jobspecresult-コントラクト)
   を参照）に加えて完全な意味的検証（`JobSpec.Validate`．文書そのものの自己整合性の
   検査）を行い，続いて Runner 自身の信頼された `policy.RunnerAuthorizationPolicy`
-  （Phase 1）に照らして認可する．後述の[検証と認可](#検証と認可)を参照．
+  に照らして認可する．後述の[検証と認可](#検証と認可)を参照．
 - **lego の起動** — 検証済みの `JobSpec` から組み立てた明示的な引数ベクトルで，固定
   バージョンの `lego` バイナリをサブプロセスとして 1 回だけ呼び出す．このコマンドの
   組み立てにも実行にもシェルは決して使わない．
 - **Result の正規化** — `lego` が生成したものを `Result` 文書に変換する: 安定した
   エラー分類，証明書のフィンガープリント，有効期限のタイムスタンプ，論理的な store
   参照．証明書本体，鍵の実体，資格情報が `Result` に現れることは決してない．
-- **Certificate Store アダプタ** — 秘密鍵と証明書を設定された store（Phase 1 以降は
-  ファイルシステム，Phase 3 以降は Azure Key Vault）に直接書き込み，その後ローカルの
+- **Certificate Store アダプタ** — 秘密鍵と証明書を設定された store（ローカル開発では
+  ファイルシステム，デプロイでは Azure Key Vault）に直接書き込み，その後ローカルの
   コピーを破棄する．システム全体で秘密鍵を保持する唯一の場所であり，しかも 1 回の
   実行の間だけである．
 
@@ -113,7 +113,10 @@ Conductor が DNS プロバイダや Certificate Store と直接やり取りす�
 デプロイでは Azure Key Vault．[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)
 を参照）で，`StoreBinding` を通じて指し示す．Conductor がここから読み出すことは
 決してない．store アダプタはバンドルを書き込み，更新判断のために証明書の公開部分を
-読み戻す．store から秘密鍵を読み戻すアダプタは存在しない．
+読み戻す．store から秘密鍵を読み戻すアダプタは存在しない．Key Vault では，
+バインディングごとに PEM かパスワードなし PKCS #12（PFX）での取り込みを選べ，
+格納形式がバインディングと異なる証明書は（秘密鍵を読み戻して書き直すのではなく）
+再発行される（[ADR 0021](adr/0021-keyvault-pkcs12-content-type.md)）．
 
 ## コントロールプレーンとデータプレーン
 
@@ -128,7 +131,7 @@ Conductor が DNS プロバイダや Certificate Store と直接やり取りす�
 
 Conductor の停止が，すでに起動された Runner ジョブの完了を妨げることは決してあっては
 ならない．Runner は処理のために Conductor を呼び戻すことはなく，完了時に `Result` を
-報告するだけである．Phase 2 のローカルプロセスランチャーでは Runner は Conductor の
+報告するだけである．ローカルプロセスランチャーでは Runner は Conductor の
 子プロセスなので，正常停止はそれを（`server.shutdownGraceSeconds` まで）待ってから
 キャンセルする．Conductor が結果を取りこぼした実行は，次回起動時に「結果不明」として
 失敗と記録され，決して推測されない
@@ -136,10 +139,10 @@ Conductor の停止が，すでに起動された Runner ジョブの完了を�
 
 ## ドメインモデル
 
-Phase 2 で実装済み（`internal/conductor/registry` がモデルと `Registry` インタフェースを
+`internal/conductor/registry` がモデルと `Registry` インタフェースを
 定義し，`internal/conductor/sqlite` が永続化する．
 [ADR 0011](adr/0011-conductor-storage-and-run-model.md) と
-[`docs/conductor.md`](conductor.md) を参照）．Phase 0 のコントラクトとストレージ設計が
+[`docs/conductor.md`](conductor.md) を参照．コントラクトとストレージ設計が
 一致するよう，ここに記述する．
 
 - **`Target`** — `{id, fqdn (normalized ASCII, unique), enabled, owner,
@@ -157,8 +160,9 @@ Phase 2 で実装済み（`internal/conductor/registry` がモデルと `Registr
   [バインディングモデル](#バインディングモデル)を参照．
 - **`Run`** — `{id, targetId, targetRevision, status
   (queued|starting|running|succeeded|failed|cancelled), requestedBy,
-  requestedAt, startedAt, finishedAt, action, expiresAt, fingerprint,
-  errorCode, errorSummary, externalExecutionId}`．1 つの `Run` は完了すると
+  requestedByAuthority, requestedAt, startedAt, finishedAt, action, expiresAt,
+  fingerprintSha256, storeObjectRef, errorCode, errorSummary,
+  externalExecutionId}`．1 つの `Run` は完了すると
   1 組の `JobSpec`/`Result` に対応する．
 - **`AuditEvent`** — 追記専用．target の作成/更新/無効化，ジョブ開始，ジョブ失敗，
   ポリシー拒否について記録される．MVP には purge 操作がない
@@ -274,13 +278,12 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
     捕捉される．
 
   `Authorize` は正規化済みの FQDN を要求し（呼び出し元に代わって正規化はしない），
-  検証と同じラベル境界の規則でサフィックスを照合する．Phase 0 ではポリシー型と判断
-  関数をテスト付きで定義した．Phase 1 以降，Runner は信頼された設定
+  検証と同じラベル境界の規則でサフィックスを照合する．Runner は信頼された設定
   （`internal/runner/config`）を読み込み，そこから `RunnerAuthorizationPolicy` を
   組み立てて（`Config.Policy()`）から `JobSpec` に基づいて行動する．正確な手順は
   [`docs/runner.md`](runner.md#実行フロー) を，これが何を閉じ何を閉じないかは
   `docs/threat-model.md`（T1/T2/T5 および「保証レベル」）を参照．
-- **署名の範囲．** Phase 4 以降，`JobSpec` は `SignedCertificateReconcileJob`
+- **署名の範囲．** `JobSpec` は `SignedCertificateReconcileJob`
   エンベロープ（`pkg/api/v1alpha1/signedjob.go`，
   [ADR 0015](adr/0015-signed-job-envelope.md)）に包んで運ぶことができる: JobSpec の
   バイト列そのものに対する Ed25519 の JWS 構成であり，`kid`，`issuedAt`，`expiresAt`，
@@ -345,8 +348,8 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
 （`bearer `，`basic `，`authorization:`，`password=`，`secret=`，`token=`，`sig=`，
 `key=` など）は大文字小文字を区別せずに照合される．この検査は多層防御であって
 シークレット検出器ではない: 任意のシークレットや未知の形式を認識することはできない．
-`Result` に生の外部出力が入らないことを実際に保証する規則は Runner の責務である
-（Phase 1）: Runner は生の外部コマンド/SDK のエラー，stdout，stderr を `Result` に
+`Result` に生の外部出力が入らないことを実際に保証する規則は Runner の責務である:
+Runner は生の外部コマンド/SDK のエラー，stdout，stderr を `Result` に
 決してコピーしない．`error.summary` は Runner が持つ安全なテンプレートだけから生成され，
 外部の詳細はすべて秘匿処理済みの内部ログにのみ出力される．`error.code` は固定された
 追記専用の集合（`InvalidJobSpec`，`PolicyViolation`，`BindingNotFound`，
@@ -404,36 +407,39 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
 
 ```
 cmd/
-  acme-conductor/   コントロールプレーンのバイナリ (serve，Phase 2)．providers.go が同梱するランチャー型を登録する
-  acme-runner/      データプレーンのバイナリ (reconcile，Phase 1)．providers.go が同梱する store 型を登録する
+  acme-conductor/   コントロールプレーンのバイナリ (serve)．providers.go が同梱するランチャー型を登録する
+  acme-runner/      データプレーンのバイナリ (reconcile)．providers.go が同梱する store 型を登録する
 internal/
-  conductor/            Conductor の配線: 設定，レジストリ，スケジューラ，ランチャー，API (Phase 2)
+  conductor/            Conductor の配線: 設定，レジストリ，スケジューラ，ランチャー，API
   conductor/api/        REST API ハンドラ，localhost-dev 認証器，ロールの強制，GUI のルート
-  conductor/oidc/       OIDC ベアラートークン認証器: ディスカバリ，鍵セットのキャッシュ，JWS 検証 (Phase 5)
+  conductor/oidc/       OIDC ベアラートークン認証器: ディスカバリ，鍵セットのキャッシュ，JWS 検証
   conductor/oidc/oidctest/ テスト用のインプロセス OpenID プロバイダ．出荷するバイナリにはコンパイルされない
-  conductor/ui/         埋め込みの GUI: index.html，app.js，app.css (Phase 5)
+  conductor/ui/         埋め込みの GUI: index.html，app.js，app.css
   conductor/config/     Conductor の設定の読み込みと検証．ランチャー型を知らない
   conductor/launchers/  合成層: Conductor のコアがランチャーを構築する際に通るランチャープロバイダのレジストリ
   conductor/launcher/localprocess/ ローカルプロセスのランチャー (開発とテスト)
-  conductor/launcher/acajob/ Azure Container Apps Job ランチャー (Phase 4)．Conductor 唯一の Azure SDK import
+  conductor/launcher/acajob/ Azure Container Apps Job ランチャー．Conductor 唯一の Azure SDK import
   conductor/registry/   ドメインモデル (Target，CertificatePolicy，Run，AuditEvent) と Registry インタフェース
   conductor/scheduler/  期限到来の判断，target ごとの排他，run の実行
   conductor/sqlite/     Registry の SQLite 実装．マイグレーション付き
   conductor/fakerunner/ Conductor のテストで使う acme-runner のテストダブル．出荷するバイナリにはコンパイルされない
-  conductor/migration/  インフラ定義のホスト一覧からの移行: Bicep パラメータ/TargetList の読み取り，差分，冪等な取り込み，shadow 比較 (Phase 6)
+  conductor/migration/  インフラ定義のホスト一覧からの移行: Bicep パラメータ/TargetList の読み取り，差分，冪等な取り込み，shadow 比較
+  exchange/         自ら起動する Runner にジョブを差し出し，1 つの Runner だけが取るためのディスク上の受け渡しプロトコル (ADR 0014)
   fslock/           Runner のディスク上の store が共有するアドバイザリファイルロック
+  keygen/           両バイナリ共通の keygen サブコマンド: ジョブ署名鍵と Result 署名鍵 (Ed25519) の生成 (ADR 0015)
   policy/           FQDN の正規化とサフィックス照合 (internal/policy/fqdn.go)
-  runner/           Runner の reconcile ループ，作業ディレクトリ/状態ディレクトリの扱い，Result の書き出し (Phase 1)
-  runner/config/    Runner の設定の読み込みと検証 (Phase 1)．store 型を知らない
+  runner/           Runner の reconcile ループ，作業ディレクトリ/状態ディレクトリの扱い，Result の書き出し
+  runner/config/    Runner の設定の読み込みと検証．store 型を知らない
   runner/transport/ ジョブが Runner に届き Result が出ていく経路: Source コントラクトと 2 ファイル方式のトランスポート
   runner/transport/claim/ 共有ディレクトリ (交換用) のトランスポート．実行 ID はコマンドから与えられる
   runner/platform/azurecontainerapps/ Container Apps Job 実行の実行 ID．Runner がその基盤に言及する唯一の場所
   runner/stores/    合成層: Runner のコアが store を開く際に通る store プロバイダのレジストリ
-  runner/lego/      lego の argv/env の構築，サブプロセス実行，出力の秘匿 (Phase 1)
+  runner/lego/      lego の argv/env の構築，サブプロセス実行，出力の秘匿
   runner/fakelego/  Runner のテストで使う lego のテストダブル．出荷するバイナリにはコンパイルされない
   store/            Certificate Store の実装．コントラクト自体は pkg/store
-  store/filesystem/ ファイルシステムを用いる Certificate Store (開発/テスト専用，Phase 1)
-  store/keyvault/   Azure Key Vault の Certificate Store (Phase 3)．Runner 唯一の Azure SDK import
+  store/filesystem/ ファイルシステムを用いる Certificate Store (開発/テスト専用)
+  store/keyvault/   Azure Key Vault の Certificate Store．Runner 唯一の Azure SDK import
+  strictjson/       セキュリティ上重要な設定とコントラクトの厳格な JSON デコード: 未知フィールド，重複キー，末尾データを拒否する
   version/          -ldflags で注入するビルド情報
 pkg/api/v1alpha1/   バージョン付きの JobSpec/Result コントラクトと署名付きジョブエンベロープ (型，検証，厳格なデコード)
 pkg/store/          Certificate Store コントラクト (Store，Bundle，Info) とすべての store が共有する証明書ヘルパー
@@ -441,12 +447,12 @@ pkg/launcher/       Job Launcher コントラクト (Launcher，Execution，Erro
                     — pkg/ は別モジュールのプロバイダアダプタが import するもの (pkg/contracts_test.go がそれを保つ)
 schemas/v1alpha1/   Go コントラクトを写した JSON Schema．テストで同期を保つ
 deploy/examples/    Conductor と Runner の設定例と JobSpec 文書の例
-deploy/azure/       Container Apps デプロイ用の Bicep: 環境，ID，カスタムロール，Runner Job，Conductor アプリ (Phase 4)
+deploy/azure/       Container Apps デプロイ用の Bicep: 環境，ID，カスタムロール，Runner Job，Conductor アプリ
 docs/               この文書，脅威モデル，Conductor と Runner のガイド，ADR
 Dockerfile.conductor  acme-conductor 用の distroless・非 root イメージ
 Dockerfile.runner     acme-runner 用の distroless・非 root イメージ
 Makefile            build / verify / image のターゲット
-.github/workflows/   CI (フォーマット，vet，ビルド，テスト，race，govulncheck，コンテナのスモークテスト) とリリースワークフロー (SBOM と provenance 付きの GHCR イメージ，Phase 5)
+.github/workflows/   CI (フォーマット，vet，ビルド，テスト，race，govulncheck，コンテナのスモークテスト) とリリースワークフロー (SBOM と provenance 付きの GHCR イメージ)
 ```
 
 `pkg/` には両バイナリから，そしてゆくゆくは JobSpec/Result コントラクトを話す外部
@@ -456,20 +462,20 @@ Makefile            build / verify / image のターゲット
 ## 技術選定
 
 - **Go**．REST API には標準の `net/http`（メソッドとパターンによる `ServeMux`）を使い，
-  Web フレームワークは使わない（Phase 2）．
+  Web フレームワークは使わない．
 - **SQLite**（`modernc.org/sqlite`．純 Go なので `CGO_ENABLED=0` を保てる）を
   `Registry` インタフェースの背後に置き，Conductor の状態（Target，CertificatePolicy，
   Run，AuditEvent）にバージョン付きの明示的なマイグレーションを用いる．
   [ADR 0011](adr/0011-conductor-storage-and-run-model.md) を参照．PostgreSQL と
   複数レプリカの Conductor は当面明示的に対象外である（[非目標](#非目標)を参照）．
-- GUI には **SPA フレームワークもビルド工程も使わない**（Phase 5）: バイナリに
+- GUI には **SPA フレームワークもビルド工程も使わない**: バイナリに
   埋め込んだ 3 つの静的ファイル，DOM による描画，厳格な Content-Security-Policy，
   ブラウザ内でパブリッククライアントとして行う OIDC 認可コード + PKCE．API のトークン
   検証は JWT ライブラリから取らず，標準ライブラリの `crypto/rsa` と `crypto/ecdsa` の
   上にリポジトリ内で書かれている．受け入れるものが脅威モデルの列挙とちょうど一致する
   ようにするためである（[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)）．
 - **Runner イメージ**: マルチステージビルド，取得しチェックサム検証した固定バージョンの
-  公式 `lego` バイナリ（Phase 1），distroless の静的ベースイメージ．
+  公式 `lego` バイナリ，distroless の静的ベースイメージ．
 - **GHCR**（`ghcr.io/cits-nue/acme-conductor`，`ghcr.io/cits-nue/acme-runner`）が
   正式なコンテナレジストリである．バージョンタグを打つと，ダイジェスト固定のベース
   イメージから `linux/amd64` と `linux/arm64` 向けの両イメージが SBOM と SLSA provenance
@@ -488,7 +494,7 @@ Makefile            build / verify / image のターゲット
 
 ## セキュリティ原則
 
-これらはすべての Phase を通じて成り立ち，[`docs/threat-model.md`](threat-model.md) で
+これらはシステム全体を通じて成り立ち，[`docs/threat-model.md`](threat-model.md) で
 具体的な対策に紐付けられている:
 
 1. Conductor は証明書の秘密鍵を保存・取得・配布することが決してない．
@@ -517,28 +523,58 @@ Makefile            build / verify / image のターゲット
 - 実行に関するすべてのログ行は `runId` と `targetId` を持つ．
 - ログには資格情報，秘密鍵，ACME External Account Binding（EAB）の HMAC を決して
   含めない．脅威モデルのシークレット漏えいの項を参照．
-- `/healthz` と `/readyz` は Phase 2 以降存在する（`readyz` はレジストリに ping する）．
-  Prometheus の `/metrics` エンドポイントは後の Phase で続く．
+- `/healthz` と `/readyz` が存在する（`readyz` はレジストリに ping する）．
+  Prometheus の `/metrics` エンドポイントは未対応である．
 
-## ロードマップ
+## 実装済みの機能
 
-**Phase 0 から 6** が現在実装済みである．Phase は厳密に順次進める．1 つの PR は
-1 つの Phase の範囲を実装し，それ以上は実装しない
-（[`CONTRIBUTING.md`](../CONTRIBUTING.md) を参照）．
+以下が現在実装済みの機能である．
 
-| Phase | 範囲 |
-|---|---|
-| 0 | ブートストラップ: モジュール構成，JobSpec/Result コントラクト，CI． |
-| 1 | **実装済み．** Runner + ファイルシステムの Certificate Store，固定バージョンの `lego` CLI 付き．[`docs/runner.md`](runner.md)，[ADR 0009](adr/0009-runner-execution-model.md)，[ADR 0010](adr/0010-pinned-lego-binary.md) を参照． |
-| 2 | **実装済み．** Conductor MVP: SQLite レジストリ，REST API，ローカルプロセスランチャー，ローカルホスト限定の開発用認証．[`docs/conductor.md`](conductor.md)，[ADR 0011](adr/0011-conductor-storage-and-run-model.md)，[ADR 0012](adr/0012-localhost-only-dev-auth.md) を参照． |
-| 3 | **実装済み．** Azure Key Vault の store アダプタ．基盤のマネージド ID（開発では SDK の `DefaultAzureCredential` チェーン）で認証する．[`docs/runner.md`](runner.md#certificate-store-azure-key-vault) と [ADR 0013](adr/0013-azure-key-vault-store-adapter.md) を参照． |
-| 4 | **実装済み．** Azure Container Apps Job ランチャー（Runner は自身のマネージド ID で動くスケジュール実行の Job として，Conductor が共有ボリュームに差し出すジョブを受け取る．Conductor は実行を開始できない）．分離された ID と最小権限のカスタムロールで Bicep によりプロビジョニングする．署名付き・期限付きのジョブエンベロープと Runner 側のリプレイ台帳，Runner が署名した Result．[`docs/conductor.md`](conductor.md#実行バインディング-azure-container-apps-job)，[`deploy/azure/README.md`](../deploy/azure/README.md)，[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)，[ADR 0015](adr/0015-signed-job-envelope.md) を参照． |
-| 5 | **実装済み．** 名前付きプリンシパルと admin/viewer ロールによる OIDC ベアラートークン認証，TLS リスナーまたは ingress 背後にあることの明示的な宣言，PKCE サインインを備えた最小限の静的 GUI，そして両イメージをダイジェスト固定のベースから SBOM と provenance 付きで GHCR に公開するリリースワークフロー．Container Apps のデプロイは HTTPS ingress を得て，管理用サイドカーを失う．[`docs/conductor.md`](conductor.md#認証)，[ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md)，[ADR 0017](adr/0017-release-pipeline.md) を参照． |
-| 6 | **実装済み．** 既存の cert-infra リポジトリからの移行ツール: ホスト一覧をその Bicep パラメータファイル（または TargetList 文書）から読み，レジストリと比較し（`added`/`changed`/`missing`/`unchanged`/`rejected`），冪等に取り込む（既定は dry-run．更新も削除も決して行わない）．`migration.targetSource` フラグ（`iac`/`shadow`/`registry`）により切り替えまで Conductor は発行を行わず，shadow モードでは比較を記録する．ロールバックはこのフラグである．[`docs/migration.md`](migration.md) と [ADR 0020](adr/0020-migration-from-cert-infra.md) を参照． |
+- **Runner と Certificate Store** — 固定バージョンの `lego` CLI を同梱した
+  ワンショットの Runner と，開発・テスト用のファイルシステムの Certificate Store．[`docs/runner.md`](runner.md)，
+  [ADR 0009](adr/0009-runner-execution-model.md)，
+  [ADR 0010](adr/0010-pinned-lego-binary.md) を参照．
+- **Conductor（レジストリ，REST API，スケジューラ）** — SQLite のレジストリ，
+  REST API，スケジューラ，ローカルプロセスランチャー，ローカルホスト限定の開発用認証．
+  [`docs/conductor.md`](conductor.md)，
+  [ADR 0011](adr/0011-conductor-storage-and-run-model.md)，
+  [ADR 0012](adr/0012-localhost-only-dev-auth.md) を参照．
+- **Azure Key Vault store（PEM / PKCS #12）** — Azure Key Vault の store アダプタ．
+  基盤のマネージド ID（開発では SDK の `DefaultAzureCredential` チェーン）で認証する．
+  [`docs/runner.md`](runner.md#certificate-store-azure-key-vault) と
+  [ADR 0013](adr/0013-azure-key-vault-store-adapter.md) を参照．バインディングごとに
+  パスワードなし PKCS #12 での取り込みも選べる（[ADR 0021](adr/0021-keyvault-pkcs12-content-type.md)）．
+- **Azure Container Apps Job ランチャーと署名付きエンベロープ** — Azure Container
+  Apps Job ランチャー（Runner は自身のマネージド ID で動くスケジュール実行の Job
+  として，Conductor が共有ボリュームに差し出すジョブを受け取る．Conductor は実行を
+  開始できない）．分離された ID と最小権限のカスタムロールで Bicep により
+  プロビジョニングする．署名付き・期限付きのジョブエンベロープと Runner 側の
+  リプレイ台帳，Runner が署名した Result．
+  [`docs/conductor.md`](conductor.md#実行バインディング-azure-container-apps-job)，
+  [`deploy/azure/README.md`](../deploy/azure/README.md)，
+  [ADR 0014](adr/0014-azure-container-apps-job-launcher.md)，
+  [ADR 0015](adr/0015-signed-job-envelope.md) を参照．
+- **認証（OIDC，localhost-dev）と GUI** — 名前付きプリンシパルと admin/viewer
+  ロールによる OIDC ベアラートークン認証，TLS リスナーまたは ingress 背後にあることの
+  明示的な宣言，PKCE サインインを備えた最小限の静的 GUI．Container Apps の
+  デプロイでは，API と GUI は HTTPS ingress で応答する．
+  [`docs/conductor.md`](conductor.md#認証)，
+  [ADR 0016](adr/0016-oidc-bearer-auth-and-gui.md) を参照．
+- **リリースパイプライン** — 両イメージをダイジェスト固定のベースから SBOM と
+  provenance 付きで GHCR に公開するリリースワークフロー．
+  [ADR 0017](adr/0017-release-pipeline.md) を参照．
+- **cert-infra からの移行** — 既存の cert-infra リポジトリからの移行ツール:
+  ホスト一覧をその Bicep パラメータファイル（または TargetList 文書）から読み，
+  レジストリと比較し（`added`/`changed`/`missing`/`unchanged`/`rejected`），冪等に
+  取り込む（既定は dry-run．更新も削除も決して行わない）．`migration.targetSource`
+  フラグ（`iac`/`shadow`/`registry`）により切り替えまで Conductor は発行を行わず，
+  shadow モードでは比較を記録する．ロールバックはこのフラグである．
+  [`docs/migration.md`](migration.md) と
+  [ADR 0020](adr/0020-migration-from-cert-infra.md) を参照．
 
 ## 非目標
 
-将来の Phase または ADR が別途定めるまで，明示的に対象外とする:
+今後 ADR が別途定めるまで，明示的に対象外とする:
 
 - ACME プロトコルや DNS プロバイダ連携の再実装（`lego` がすでに行っている）．
 - 独自の暗号．

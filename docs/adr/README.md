@@ -20,7 +20,7 @@
 | [0012](0012-localhost-only-dev-auth.md) | ローカルホスト限定の開発用認証 |
 | [0013](0013-azure-key-vault-store-adapter.md) | Azure Key Vault の store アダプタ |
 | [0014](0014-azure-container-apps-job-launcher.md) | Azure Container Apps Job ランチャー |
-| [0015](0015-signed-job-envelope.md) | 署名付きジョブエンベロープとリプレイ台帳 |
+| [0015](0015-signed-job-envelope.md) | 署名付きジョブエンベロープと Result エンベロープとリプレイ台帳 |
 | [0016](0016-oidc-bearer-auth-and-gui.md) | OIDC ベアラートークン認証と 2 つのロールと静的 GUI |
 | [0017](0017-release-pipeline.md) | リリースパイプライン: SBOM と provenance 付きの GHCR イメージとダイジェスト固定のベース |
 | [0018](0018-authority-qualified-principals.md) | 監査プリンシパルは権威 (issuer，`localhost-dev`，`scheduler`) で修飾する |

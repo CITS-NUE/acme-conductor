@@ -11,7 +11,7 @@
 
 # --- builder -----------------------------------------------------------
 #
-# Base images are pinned by digest (Phase 5): the tag says what the
+# Base images are pinned by digest: the tag says what the
 # digest is expected to be, the digest is what is built from. Dependabot
 # (.github/dependabot.yml) proposes updates to both together.
 FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS builder
@@ -106,12 +106,12 @@ COPY --from=lego /out/lego /usr/local/bin/lego
 # image change that alters the default user.
 USER nonroot:nonroot
 
-# The runner will need a writable tmpfs/emptyDir mounted at /work (scratch
-# space for the ACME/lego exchange) and /state (certificate output) once
-# Phase 1+ adds the actual job logic. Those are supplied by the caller at
-# run time (docker run --tmpfs / Kubernetes emptyDir volumes), not baked
-# into the image — so no VOLUME is declared here; a VOLUME instruction
-# would create anonymous volumes on every `docker run` and is not wanted.
-# The root filesystem otherwise stays read-only friendly (no writes at
-# startup in Phase 0).
+# The runner needs a writable tmpfs/emptyDir mounted at /work (scratch
+# space for the ACME/lego exchange; certificate keys live there only for
+# one run) and a persistent volume at /state (ACME account state and the
+# replay ledger). Those are supplied by the caller at run time (docker run
+# --tmpfs / -v, Kubernetes volumes), not baked into the image — so no
+# VOLUME is declared here; a VOLUME instruction would create anonymous
+# volumes on every `docker run` and is not wanted. The root filesystem
+# otherwise stays read-only friendly (no writes at startup).
 ENTRYPOINT ["/usr/local/bin/acme-runner"]
