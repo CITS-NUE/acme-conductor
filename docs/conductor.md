@@ -140,7 +140,7 @@ Runner の `jobSigning.publicKeys` に貼り付けるために出力される．
 | `principalClaim` | string | `sub` | その値が監査のアクターおよび `requestedBy` として記録されるクレーム．表示名ではなくサブジェクトの **安定した識別子** であること（`preferred_username`，`email`，`name` はユーザーの改名で変わる）．Entra ID: `oid` を設定する（Entra ID の `sub` はクライアントごとに異なるペアワイズ値）．印字可能文字の文字列で 256 バイト以下でなければならない． |
 | `rolesClaim` | string | `roles` | その値（文字列または文字列の配列）が `roles` と照合されるクレーム． |
 | `roles.admin` | []string | —（必須，空でない） | **admin** ロールを与える値: すべてのエンドポイント． |
-| `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin． |
+| `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin．どちらの一覧も最大 32 個． |
 | `clockSkewSeconds` | int | `60` | `exp`，`nbf`，`iat` に適用する許容差．`1`–`300`． |
 | `keyCacheSeconds` | int | `3600` | ディスカバリ文書と署名鍵を再取得するまで再利用する時間．未知の鍵 ID は早期の再取得を引き起こす（最大で 1 分に 1 回）．`60`–`86400`． |
 
@@ -181,7 +181,7 @@ Conductor は **クライアントシークレットを持たない**．プロ�
 | `runnerConfig` | string | —（必須） | **Runner の** 設定のクリーンな絶対パス．`--config` として渡される．Conductor がこれを読むことは決してない． |
 | `workDir` | string | —（必須） | クリーンな絶対パス．run の実行中に `job.json` と `result.json` を保持する run ごとのディレクトリ（`run-<runId>/`，モード `0700`）の親．証明書の素材を保持することは決してない — Runner は自身の `workDir`/`stateDir` を持つ．なければ作成される． |
 | `timeoutSeconds` | int | `1200` | Conductor から見た Runner 実行 1 回の上限．Runner の `lego.timeoutSeconds` より大きく設定し，Runner 自身のより正確な `Timeout` 結果が勝つようにする．`1`–`86400`． |
-| `passthroughEnv` | []string | `[]` | **Conductor プロセス** の環境変数のうち，Runner の子プロセスへそのまま転送する変数名（`^[A-Z][A-Z0-9_]{0,63}$`．`PATH`，`HOME`，`TMPDIR`，`LD_*` は予約済み）．それ以外はすべて渡されない．子プロセスが受け取るのは `HOME`/`TMPDIR`（その run のディレクトリ），固定の `PATH`，およびここに列挙した変数だけである．列挙されているが設定されていない変数は警告としてログに記録され省略される．その場合 Runner 自身が run をフェイルクローズで失敗させる（バインディング名を示す `DnsFailure`/`AcmeFailure`）．下記のセキュリティ注記を参照． |
+| `passthroughEnv` | []string | `[]` | **Conductor プロセス** の環境変数のうち，Runner の子プロセスへそのまま転送する変数名（`^[A-Z][A-Z0-9_]{0,63}$`，最大 64 個．`PATH`，`HOME`，`TMPDIR`，`LD_*` は予約済み）．それ以外はすべて渡されない．子プロセスが受け取るのは `HOME`/`TMPDIR`（その run のディレクトリ），固定の `PATH`，およびここに列挙した変数だけである．列挙されているが設定されていない変数は警告としてログに記録され省略される．その場合 Runner 自身が run をフェイルクローズで失敗させる（バインディング名を示す `DnsFailure`/`AcmeFailure`）．下記のセキュリティ注記を参照． |
 
 **`passthroughEnv` に関するセキュリティ注記．** これは，ローカルランチャーで
 起動された Runner に DNS の資格情報や EAB シークレットが届く唯一の手段であり，
@@ -246,7 +246,7 @@ name>` である．Conductor の ID に必要なのは，Job リソースに対�
 |---|---|---|---|
 | `subscriptionId` | string | —（必須） | Job を保持するサブスクリプションの GUID． |
 | `resourceGroup` | string | —（必須） | Job のリソースグループ． |
-| `jobName` | string | —（必須） | Container Apps Job の名前（小文字・数字・ハイフンで 2–32 文字，`--` は不可）． |
+| `jobName` | string | —（必須） | Container Apps Job の名前（小文字で始まり小文字か数字で終わる，小文字・数字・ハイフンの 2–32 文字．`--` は不可）． |
 | `cloud` | string | `public` | `public`，`china`，`government` のいずれか: Resource Manager のエンドポイントと ID の authority を選ぶ． |
 | `credential` | string | `default` | Conductor が Resource Manager に認証する方法: `managed-identity`（プラットフォームの ID — 本番ではこれを使う）または `default`（SDK の `DefaultAzureCredential` チェーン．交換用共有をマウントした開発者ホストで Conductor を動かす場合向け）． |
 | `managedIdentityClientId` | string | — | `managed-identity` のみ: ユーザー割り当て ID のクライアント ID．省略時はシステム割り当て． |
@@ -740,7 +740,9 @@ Phase 2 のモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
 
 `/ui/` は同じ API の上に載る最小限のインターフェースである．target（一覧，作成，
 編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
-絞り込める一覧，詳細，キャンセル），監査ログを扱う．バイナリに埋め込まれた 3 つの
+絞り込める一覧，詳細，キャンセル），監査ログ，移行の状態（target source，設定された
+ソース，shadow モードでの直近の比較．読み取り専用で，取り込みは
+`acme-conductor migrate` で行う）を扱う．バイナリに埋め込まれた 3 つの
 静的ファイル（ページ 1 つ，スクリプト 1 つ，スタイルシート 1 つ）で，フレームワークも
 ビルド手順もない．表示するものはすべて DOM のメソッドで描画し，データからマークアップを
 組み立てることは決してなく，API の呼び出しは自身のオリジンに対してのみ行う．
