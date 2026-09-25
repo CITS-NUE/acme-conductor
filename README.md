@@ -101,6 +101,7 @@ docs/                 アーキテクチャ，脅威モデル，ADR
 
 ## ドキュメント
 
+- [図解入りの解説サイト](https://cits-nue.github.io/acme-conductor/)（導入を検討する方向け．ソースは [`site/`](site/)）
 - [アーキテクチャ](docs/architecture.md)
 - [Conductor 運用ガイド](docs/conductor.md)
 - [Runner 運用ガイド](docs/runner.md)
