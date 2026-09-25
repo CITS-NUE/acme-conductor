@@ -46,7 +46,7 @@ jobs:
       # The full history is needed for the ancestry check; a shallow
       # clone would make every commit look unrelated to main.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -72,7 +72,7 @@ jobs:
       IMAGE: ghcr.io/cits-nue/acme-${{ matrix.component }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
