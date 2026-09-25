@@ -1,17 +1,21 @@
 // Package keyvault implements a Certificate Store on Azure Key Vault.
 //
 // One store object is one Key Vault *certificate*: Put imports the leaf
-// certificate, its chain and its private key as a single PEM document
-// (Key Vault's certificate import, content type application/x-pem-file),
-// which makes Key Vault keep the key (exportable through the certificate's
-// secret, so that a consumer with secrets/get can read the certificate and
-// key as PEM) and creates a new version of the certificate; consumers that
-// reference the versionless certificate see the new version on their next
-// refresh. The store writes PEM only: consumers that read the secret and
-// accept PEM content are served, while the built-in Key Vault integrations
-// of Azure services that require PKCS #12 (application/x-pkcs12) — App
-// Service and Azure Front Door among them — are not served by this store
-// (docs/runner.md, "Consumers and content type"). Current reads the
+// certificate, its chain and its private key (Key Vault's certificate
+// import), which makes Key Vault keep the key (exportable through the
+// certificate's secret, so that a consumer with secrets/get can read the
+// certificate and key) and creates a new version of the certificate;
+// consumers that reference the versionless certificate see the new version
+// on their next refresh. The binding's content type decides the form of
+// the secret (ADR 0021; docs/runner.md, "Consumers and content type"):
+// "pem" imports a single PEM document (application/x-pem-file), and
+// "pkcs12" imports a passwordless PKCS #12 file (application/x-pkcs12),
+// which Key Vault re-encodes into the empty-password form that the
+// built-in Key Vault integrations of Azure services — Application Gateway,
+// App Service, Front Door — require. No PFX password exists anywhere in
+// the system either way. Current reports a certificate whose stored
+// content type is not the binding's as stale, so that switching a binding
+// takes effect at the target's next run. Current reads the
 // certificate's public part only (the certificates/get permission): the
 // Runner never reads a private key back out of the vault, so it never
 // needs the secrets/get permission, and its identity should not be
@@ -38,6 +42,7 @@ package keyvault
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -51,6 +56,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
+	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
@@ -80,7 +86,25 @@ const (
 	TagManagedByValue = "acme-conductor"
 )
 
-const contentTypePEM = "application/x-pem-file"
+// Content types a binding may select, and the secret content type each
+// one makes Key Vault store.
+const (
+	// ContentTypePEM stores the certificate, its chain and an unencrypted
+	// PKCS #8 key as one PEM document. The default.
+	ContentTypePEM = "pem"
+	// ContentTypePKCS12 stores a PKCS #12 (PFX) file with an empty
+	// password, which Azure services' built-in Key Vault integrations
+	// require.
+	ContentTypePKCS12 = "pkcs12"
+)
+
+const (
+	mimePEM    = "application/x-pem-file"
+	mimePKCS12 = "application/x-pkcs12"
+)
+
+// contentTypeMIME maps a binding content type to the secret content type.
+var contentTypeMIME = map[string]string{ContentTypePEM: mimePEM, ContentTypePKCS12: mimePKCS12}
 
 var (
 	// certificateNameRe is Key Vault's rule for certificate names.
@@ -219,6 +243,9 @@ type Config struct {
 	// client ID (credential "managed-identity" only); empty means the
 	// system-assigned identity.
 	ManagedIdentityClientID string `json:"managedIdentityClientId,omitempty"`
+	// ContentType selects the form of the certificate's secret:
+	// ContentTypePEM (the default) or ContentTypePKCS12.
+	ContentType string `json:"contentType,omitempty"`
 }
 
 // ParseConfig strictly decodes and validates a binding's configuration
@@ -238,6 +265,12 @@ func ParseConfig(raw json.RawMessage) (Config, error) {
 	if err := ValidateCredential(c.Credential, c.ManagedIdentityClientID); err != nil {
 		return Config{}, err
 	}
+	if c.ContentType == "" {
+		c.ContentType = ContentTypePEM
+	}
+	if _, ok := contentTypeMIME[c.ContentType]; !ok {
+		return Config{}, fmt.Errorf("contentType must be %q or %q", ContentTypePEM, ContentTypePKCS12)
+	}
 	return c, nil
 }
 
@@ -255,11 +288,14 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(v.URL, cred, nil)
+	return New(v.URL, cred, &Options{ContentType: cfg.ContentType})
 }
 
-// Options tunes New. The zero value is right for production.
+// Options tunes New. The zero value is a production PEM store.
 type Options struct {
+	// ContentType is the binding's content type (ContentTypePEM when
+	// empty).
+	ContentType string
 	// ClientOptions, when set, configures the SDK client (transport,
 	// retries, challenge verification). Tests use it to reach a fake vault.
 	ClientOptions *azcertificates.ClientOptions
@@ -272,6 +308,9 @@ type Options struct {
 type Store struct {
 	vaultURL string
 	client   *azcertificates.Client
+	// contentType is the binding content type; mime is its secret
+	// content type.
+	contentType, mime string
 }
 
 // New returns a store for vaultURL that authenticates with cred.
@@ -281,6 +320,14 @@ func New(vaultURL string, cred azcore.TokenCredential, opts *Options) (*Store, e
 	}
 	if cred == nil {
 		return nil, errors.New("credential is required")
+	}
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = ContentTypePEM
+	}
+	mime, ok := contentTypeMIME[contentType]
+	if !ok {
+		return nil, fmt.Errorf("contentType must be %q or %q", ContentTypePEM, ContentTypePKCS12)
 	}
 	if opts.InsecureSkipVaultHostCheck {
 		u, err := url.Parse(vaultURL)
@@ -298,7 +345,7 @@ func New(vaultURL string, cred azcore.TokenCredential, opts *Options) (*Store, e
 	if err != nil {
 		return nil, fmt.Errorf("key vault client: %w", err)
 	}
-	return &Store{vaultURL: vaultURL, client: client}, nil
+	return &Store{vaultURL: vaultURL, client: client, contentType: contentType, mime: mime}, nil
 }
 
 // Type implements store.Store.
@@ -450,6 +497,9 @@ func certificateName(object string) (string, error) {
 // as absent for reading; importing over it is refused by the vault until
 // it is recovered or purged). A certificate that exists but is disabled,
 // has no body, or is not the one asked for is an error, not an absence.
+// The certificate is reported stale when the vault reports a secret
+// content type other than the binding's; the Runner then issues it anew,
+// since it never reads the private key back to re-encode it.
 func (s *Store) Current(ctx context.Context, object string) (*store.Info, error) {
 	name, err := certificateName(object)
 	if err != nil {
@@ -467,7 +517,11 @@ func (s *Store) Current(ctx context.Context, object string) (*store.Info, error)
 	if err != nil {
 		return nil, err
 	}
-	return store.InfoOf(leaf), nil
+	info := store.InfoOf(leaf)
+	if ct := secretContentType(resp.Certificate); ct != "" && !strings.EqualFold(ct, s.mime) {
+		info.Stale = true
+	}
+	return info, nil
 }
 
 // Put implements store.Store: it imports b as a new version of the
@@ -491,21 +545,23 @@ func (s *Store) Put(ctx context.Context, object string, b store.Bundle) error {
 	if err := onlyCertificates(b.Chain); err != nil {
 		return fmt.Errorf("bundle chain: %w", err)
 	}
-	// Key Vault's PEM import wants an unencrypted PKCS #8 key; lego writes
-	// SEC 1 for EC keys, so re-encode rather than depend on the vault's
-	// tolerance.
-	key, err := store.PrivateKeyToPKCS8(b.PrivateKey)
-	if err != nil {
-		return fmt.Errorf("bundle private key: %w", err)
+	var value string
+	switch s.contentType {
+	case ContentTypePKCS12:
+		value, err = pkcs12Value(leaf, b)
+	default:
+		value, err = pemValue(b)
 	}
-	doc := strings.Join([]string{string(b.Certificate), string(b.Chain), string(key)}, "")
+	if err != nil {
+		return err
+	}
 	enabled := true
-	contentType := contentTypePEM
+	mime := s.mime
 	managedBy := TagManagedByValue
 	params := azcertificates.ImportCertificateParameters{
-		Base64EncodedCertificate: &doc, // the wire field is "value"; PEM goes as is
+		Base64EncodedCertificate: &value, // the wire field is "value"
 		CertificateAttributes:    &azcertificates.CertificateAttributes{Enabled: &enabled},
-		CertificatePolicy:        &azcertificates.CertificatePolicy{SecretProperties: &azcertificates.SecretProperties{ContentType: &contentType}},
+		CertificatePolicy:        &azcertificates.CertificatePolicy{SecretProperties: &azcertificates.SecretProperties{ContentType: &mime}},
 		Tags:                     map[string]*string{TagManagedBy: &managedBy},
 	}
 	resp, err := s.client.ImportCertificate(ctx, name, params, nil)
@@ -519,7 +575,66 @@ func (s *Store) Put(ctx context.Context, object string, b store.Bundle) error {
 	if store.Fingerprint(stored) != store.Fingerprint(leaf) {
 		return fmt.Errorf("key vault import: vault reports a different certificate than the one imported for %q", name)
 	}
+	// A content type the vault did not take would make every later run
+	// see the certificate as stale and issue it again.
+	if ct := secretContentType(resp.Certificate); ct != "" && !strings.EqualFold(ct, s.mime) {
+		return fmt.Errorf("key vault import: vault reports content type %q for %q, not %q", ct, name, s.mime)
+	}
 	return nil
+}
+
+// pemValue is the import value for ContentTypePEM: the leaf, the chain and
+// the key as one PEM document, sent as is. Key Vault's PEM import wants an
+// unencrypted PKCS #8 key; lego writes SEC 1 for EC keys, so the key is
+// re-encoded rather than depending on the vault's tolerance.
+func pemValue(b store.Bundle) (string, error) {
+	key, err := store.PrivateKeyToPKCS8(b.PrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("bundle private key: %w", err)
+	}
+	return strings.Join([]string{string(b.Certificate), string(b.Chain), string(key)}, ""), nil
+}
+
+// pkcs12Value is the import value for ContentTypePKCS12: a base64-encoded
+// PKCS #12 file with no password, no encryption and no MAC. Key Vault
+// re-encodes it into the form it hands to consumers (an empty password,
+// 3DES and a SHA-1 MAC), so the encoding chosen here does not affect
+// compatibility, and no password has to exist for it.
+func pkcs12Value(leaf *x509.Certificate, b store.Bundle) (string, error) {
+	key, err := store.ParsePrivateKey(b.PrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("bundle private key: %w", err)
+	}
+	var chain []*x509.Certificate
+	rest := b.Chain
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return "", fmt.Errorf("bundle chain: %w", err)
+		}
+		chain = append(chain, c)
+	}
+	pfx, err := pkcs12.Passwordless.Encode(key, leaf, chain, "")
+	if err != nil {
+		return "", fmt.Errorf("bundle: pkcs12 encoding: %w", err)
+	}
+	value := base64.StdEncoding.EncodeToString(pfx)
+	clear(pfx)
+	return value, nil
+}
+
+// secretContentType is the secret content type in the certificate's
+// policy, or "" when the vault did not report one.
+func secretContentType(c azcertificates.Certificate) string {
+	if c.Policy == nil || c.Policy.SecretProperties == nil || c.Policy.SecretProperties.ContentType == nil {
+		return ""
+	}
+	return *c.Policy.SecretProperties.ContentType
 }
 
 // checkBundle verifies that a certificate bundle the vault returned is the

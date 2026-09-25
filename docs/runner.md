@@ -215,12 +215,17 @@ Runner はジョブを 1 つも取らずに失敗で終了し，
 | `vaultURL` | string | vault のベース URL．`https://<vault-name>.vault.azure.net`（または `.vault.azure.cn` / `.vault.usgovcloudapi.net` 配下の同等のもの．これはそのクラウドの ID エンドポイントの選択も兼ねる）．それ以外は不可: ポート・パス・クエリ・フラグメント・資格情報を含まず，ホストはこれら 3 つのサフィックスのいずれかの下にあり，整形式の vault 名でなければならない．必須． |
 | `credential` | string | Runner が Azure に認証する方法: `managed-identity`（プラットフォームのマネージド ID のみ．本番ではこれを使う）または `default`（SDK の `DefaultAzureCredential`．環境変数，ワークロード ID，マネージド ID，その後に開発者ツール `az`/`azd`/Azure PowerShell をこの順に試す．開発用）．省略時の既定値は `default`．資格情報の値がこのファイルに置かれることは決してない． |
 | `managedIdentityClientId` | string | `credential: managed-identity` のときのみ．ユーザー割り当てマネージド ID のクライアント ID（GUID）．省略時はシステム割り当て ID を意味する． |
+| `contentType` | string | 証明書のシークレットの形式: `pem`（`application/x-pem-file`）または `pkcs12`（パスワードなしの PFX，`application/x-pkcs12`）．省略時の既定値は `pem`．Application Gateway，App Service，Front Door など，組み込みの Key Vault 連携で証明書を使う利用者には `pkcs12` が必要（[利用者とコンテンツタイプ](#certificate-store-azure-key-vault)，[ADR 0021](adr/0021-keyvault-pkcs12-content-type.md)）． |
 
 ```json
 "storeBindings": {
   "keyvault-prod": {
     "type": "azure-keyvault",
     "config": { "vaultURL": "https://kv-acme.vault.azure.net", "credential": "managed-identity" }
+  },
+  "keyvault-prod-pfx": {
+    "type": "azure-keyvault",
+    "config": { "vaultURL": "https://kv-acme.vault.azure.net", "credential": "managed-identity", "contentType": "pkcs12" }
   }
 }
 ```
@@ -508,12 +513,13 @@ target が 1 つの store オブジェクトを共有することである（可
 
 Azure Key Vault の Certificate Store（`internal/store/keyvault`，
 バインディング種別 `azure-keyvault`，
-[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)）は，target ごとに
+[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)，
+[ADR 0021](adr/0021-keyvault-pkcs12-content-type.md)）は，target ごとに
 1 つの Key Vault **証明書** を保持する．実際のデプロイ向けの store である．
 vault は利用者が（証明書のシークレットを通じて）証明書を読み出す場所であり，
 独自のアクセス制御と監査を持ち，Runner 自身の vault へのアクセスは狭く
-短命である．この store が書くのは **PEM** の証明書であり，どの利用者がそれを
-使えるかは後述の [利用者とコンテンツタイプ](#certificate-store-azure-key-vault) に
+短命である．この store が書く証明書の形式は，バインディングの `contentType` で
+**PEM** か **PKCS #12** かを選ぶ．どの利用者がどちらを使えるかは後述の [利用者とコンテンツタイプ](#certificate-store-azure-key-vault) に
 まとめる．
 
 **オブジェクト名．** Result の `storeObjectRef` は Key Vault の証明書名である．
@@ -526,39 +532,55 @@ SHA-256 の接頭部分であるため，可読部分だけが異なる 2 つの
 証明書に対応する．
 
 **`Put` が行うこと．** バンドルをローカルで検証した後（証明書がパースでき，
-秘密鍵がそれと一致し，チェーンが証明書のみを含む），Runner は秘密鍵を
-暗号化なしの PKCS #8 に再エンコードし（`lego` は EC 鍵を SEC 1 で書く），
-リーフ + チェーン + 鍵を 1 つの PEM 文書に連結して，vault の
+秘密鍵がそれと一致し，チェーンが証明書のみを含む），Runner は取り込む値を
+作る．`contentType: pem` では，秘密鍵を暗号化なしの PKCS #8 に再エンコードし
+（`lego` は EC 鍵を SEC 1 で書く），リーフ + チェーン + 鍵を 1 つの PEM 文書に
+連結する．`contentType: pkcs12` では，リーフ，チェーン，鍵をパスワードなし
+（暗号化なし・MAC なし）の PKCS #12 にまとめ，base64 にする．そのうえで vault の
 *import certificate* 操作を呼ぶ（`POST /certificates/<name>/import`，
-コンテンツタイプ `application/x-pem-file`，タグ `managed-by=acme-conductor`，
-有効化済み）．Key Vault は鍵を自身の鍵ストアに保持し，証明書の新しい
+コンテンツタイプ `application/x-pem-file` または `application/x-pkcs12`，
+タグ `managed-by=acme-conductor`，有効化済み）．Key Vault は鍵を自身の鍵ストアに保持し，証明書の新しい
 *バージョン* を作成し（その名前の既存の証明書は決して上書きされず，以前の
 バージョンは読み取り可能なまま残る），証明書のシークレットを通じて利用者に
 証明書を公開する．続いて Runner は vault が報告する証明書が取り込んだもの
 （同じ SHA-256 フィンガープリント，同じ名前）であることを確認し，そうで
-なければ run を失敗させる．PFX も PFX パスワードもどの時点でも関与しない．
+なければ run を失敗させる．vault が報告するコンテンツタイプがバインディングと
+異なる場合も失敗させる（そのままにすると，以後の run のたびに再発行が起きる
+ため）．PFX パスワードはどの時点でも存在しない．
 
-**利用者とコンテンツタイプ．** この store はコンテンツタイプ
-`application/x-pem-file` でのみ取り込むため，証明書のシークレットは証明書
-チェーンと秘密鍵を PEM として保持する．これは `secrets/get` でシークレットを
-読み，PEM の内容を受け付ける利用者に役立つ．自らシークレットを取得する
-アプリケーションやサイドカー，Key Vault 参照を通じてシークレットを受け取る
-仮想マシンやコンテナ，そして Key Vault 連携が PEM を受け付けるあらゆる
-サービスである．PKCS #12（`application/x-pkcs12`）を必要とする組み込みの
-Key Vault 連携には役立た **ない**．
-[App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
-は vault から PKCS #12 の証明書だけを取り込み，
-[Azure Front Door](https://learn.microsoft.com/en-us/azure/frontdoor/domain#certificate-requirements)
-は PFX を必要とする（そして EC 証明書をまったく受け付けない）．証明書を
-これらのサービスに届けなければならない target には PKCS #12 での取り込みが
-必要だが，Phase 3 では実装していない（システム内に PFX も PFX パスワードも
-存在しない．[ADR 0013](adr/0013-azure-key-vault-store-adapter.md)）．
-この store が管理する証明書を利用者に向ける前に，その利用者自身の文書で
-コンテンツタイプと鍵種別の要件を確認すること．Application Gateway は
-どちらとも検証していない．
+**利用者とコンテンツタイプ．** 証明書のシークレットの形式は，バインディングの
+`contentType` で決まる．
+
+- `pem`（既定．`application/x-pem-file`）: シークレットは証明書チェーンと秘密鍵を
+  PEM として保持する．`secrets/get` でシークレットを読み，PEM の内容を受け付ける
+  利用者に役立つ．自らシークレットを取得するアプリケーションやサイドカー，
+  Key Vault 参照を通じてシークレットを受け取る仮想マシンやコンテナである．
+- `pkcs12`（`application/x-pkcs12`）: Runner はパスワードなしの PFX を取り込み，
+  Key Vault はそれを空パスワード・3DES・SHA-1 の MAC の形式に組み直して
+  シークレットとして公開する．組み込みの Key Vault 連携は PFX を要求するので，
+  こちらを使う．
+  [Application Gateway](https://learn.microsoft.com/azure/application-gateway/key-vault-certs#certificate-settings-in-key-vault)
+  は PEM を `ApplicationGatewaySslCertificateInvalidData` で拒否する（本番で確認
+  済み．PEM も有効とするトラブルシュート記事の記述とは異なる）．
+  [App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-ssl-certificate#import-a-certificate-from-key-vault)
+  は vault から PKCS #12 の証明書だけを取り込む．
+  [Azure Front Door](https://learn.microsoft.com/en-us/azure/frontdoor/domain#certificate-requirements)
+  と API Management は PFX かつ RSA を必要とするので，ポリシーの `keyType` で
+  RSA（`rsa2048` 以上）も選ぶ．
+
+同じ vault を指す `pem` と `pkcs12` のバインディングを並べて置き，target の
+`storeBinding` で選ぶ．オブジェクト名は FQDN から導くので，バインディングを
+切り替えても証明書名は変わらず，新しい版が重なる．切り替えた target は，
+証明書がまだ有効でも次の run で再発行される（`Current` を参照）．この store が
+管理する証明書を利用者に向ける前に，その利用者自身の文書でコンテンツタイプと
+鍵種別の要件を確認すること．
 
 **`Current` が行うこと．** `GET /certificates/<name>/` — 証明書の現在の
-バージョンで，*公開部分のみ*（`cer`，属性）．Key Vault はこの呼び出しに
+バージョンで，*公開部分のみ*（`cer`，属性，ポリシー）．ポリシーのシークレットの
+コンテンツタイプがバインディングの `contentType` と異なる証明書は，古い形式
+（stale）として報告する．Runner は秘密鍵を読み戻して詰め替えることができない
+ので，その証明書を再発行する（鍵種別がポリシーと異なる場合と同じ扱い）．vault が
+コンテンツタイプを報告しない場合は stale としない．Key Vault はこの呼び出しに
 `certificates/get` 権限で応答する．秘密鍵は `secrets/get` の背後にあり，
 Runner はこれを決して呼ばず，付与してはならない．証明書がない場合
 （HTTP 404．論理削除された証明書も同じ応答を返す）は「何も格納されていない」

@@ -418,14 +418,22 @@ run の画面の **Store object** が Key Vault の証明書名である．た�
 https://<vault>.vault.azure.net/secrets/<Store object>
 ```
 
-Conductor は証明書を **PEM**（`application/x-pem-file`）で，鍵は既定で **EC（P-256）** で
-格納する．利用側がこの形式を受け付けるかを先に確認する:
+Conductor が証明書を格納する形式は，store バインディングの `contentType` で決まる．
+既定は **PEM**（`application/x-pem-file`）で，`pkcs12` を指定すると **パスワードなしの PFX**
+（`application/x-pkcs12`）になる．鍵は既定で **EC（P-256）** である．利用側がどの形式を
+要求するかを先に確認し，target の `storeBinding` をそれに合うバインディングにする:
 
-| 利用側 | 可否 | 根拠 |
+| 利用側 | 必要な形式 | 根拠 |
 |---|---|---|
-| Application Gateway v2 | 使える見込み | Microsoft の文書は Key Vault のシークレットとして PEM も有効としている．EC 鍵の証明書は，既存の本番 Application Gateway で提示の実績がある（PFX 形式での格納）．PEM と Conductor の組み合わせは **未検証** なので，最初の 1 件で確かめる |
-| App Service，Azure Front Door | **使えない** | PKCS #12（PFX）しか取り込まない．Front Door は EC 鍵も受け付けない（[`docs/runner.md`](../../docs/runner.md#certificate-store-azure-key-vault)） |
-| シークレットを自分で読むアプリ，VM，コンテナ | 使える | PEM を読めればよい |
+| Application Gateway v2 | **PFX（`pkcs12`）．PEM 不可** | PEM を参照すると更新が `ApplicationGatewaySslCertificateInvalidData` で失敗し，ゲートウェイが `Failed` のまま残る（leaf-infra の本番で確認．issue #41）．製品の文書も PFX のみとしている．PEM も有効とするトラブルシュート記事の記述は，実際の挙動と異なる．EC 鍵は PFX で提示の実績がある |
+| App Service | PFX（`pkcs12`） | vault から PKCS #12 しか取り込まない |
+| Azure Front Door，API Management | PFX（`pkcs12`）かつ RSA | ポリシーの `keyType` を `rsa2048` 以上にする（[`docs/runner.md`](../../docs/runner.md#certificate-store-azure-key-vault)） |
+| シークレットを自分で読むアプリ，VM，コンテナ | PEM（既定） | PEM を読めればよい |
+
+`pkcs12` のバインディングは，Runner の設定と Conductor の設定の両方に加える．既存の
+target のバインディングを切り替えると，証明書がまだ有効でも次の run で再発行され，
+同じ Store object に PFX の新しい版ができる．利用側を付け替える（11-4）のは，その版が
+できた **後** にする．
 
 ### 11-3. 利用側の ID に読み取り権限を付ける
 

@@ -60,6 +60,8 @@ type harness struct {
 	env        map[string]string
 	now        time.Time
 	resultKeys map[string]ed25519.PublicKey
+	// stores, when set, replaces testStores() for the runs.
+	stores *stores.Registry
 }
 
 func newHarness(t *testing.T, mode string, extraEnv map[string]string) *harness {
@@ -152,7 +154,7 @@ func (h *harness) run(ctx context.Context) (int, *v1alpha1.Result) {
 		ConfigPath:  h.cfgPath,
 		JobPath:     h.jobPath,
 		ResultPath:  h.resPath,
-		Stores:      testStores(),
+		Stores:      h.storeRegistry(),
 		Stdout:      &h.stdout,
 		Logger:      logger,
 		Now:         func() time.Time { return h.now },
@@ -805,6 +807,54 @@ func TestReconcileReissuesWhenStoredKeyTypeDiffers(t *testing.T) {
 	}
 }
 
+// staleStore is a filesystem store that reports the certificate with the
+// fingerprint stale as held in another form, the way the Key Vault store
+// reports a content type other than its binding's.
+type staleStore struct {
+	store.Store
+	stale string
+}
+
+func (s staleStore) Current(ctx context.Context, object string) (*store.Info, error) {
+	info, err := s.Store.Current(ctx, object)
+	if err == nil && info.FingerprintSHA256 == s.stale {
+		info.Stale = true
+	}
+	return info, err
+}
+
+// A store binding whose form changed applies at the next run: a current
+// certificate the store reports as stale is reissued, and the reissued one
+// is a noop afterwards.
+func TestReconcileReissuesWhenStoredFormIsStale(t *testing.T) {
+	h := newHarness(t, "ok", nil)
+	h.job(nil)
+	object := h.putCert("wiki.example.ac.jp", h.now.Add(-24*time.Hour), h.now.Add(90*24*time.Hour))
+	fs, err := filesystem.New(h.storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := fs.Current(context.Background(), object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stores = stores.New()
+	h.stores.Register(stores.Adapt(filesystem.Type, filesystem.ParseConfig, func(c filesystem.Config) (store.Store, error) {
+		st, err := filesystem.Open(c)
+		return staleStore{Store: st, stale: before.FingerprintSHA256}, err
+	}))
+	code, res := h.run(context.Background())
+	if code != ExitSucceeded || res.Action != v1alpha1.ActionRenewed {
+		t.Fatalf("code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+	if !strings.Contains(h.logs.String(), "another form") {
+		t.Fatalf("expected a stale form message:\n%s", h.logs.String())
+	}
+	if code, res := h.run(context.Background()); code != ExitSucceeded || res.Action != v1alpha1.ActionNoop {
+		t.Fatalf("second run: code=%d result=%+v\n%s", code, res, h.logs.String())
+	}
+}
+
 func TestReconcileRejectsWrongKeyType(t *testing.T) {
 	h := newHarness(t, "ok", map[string]string{fakelego.EnvKeyTypeOverride: "rsa2048"})
 	h.job(nil)
@@ -1055,6 +1105,13 @@ func TestReconcileRefusesEscapingAccountsLink(t *testing.T) {
 
 // testStores is the registry every test Runner gets: the filesystem
 // store only, which is what the fixture configures.
+func (h *harness) storeRegistry() *stores.Registry {
+	if h.stores != nil {
+		return h.stores
+	}
+	return testStores()
+}
+
 func testStores() *stores.Registry {
 	r := stores.New()
 	r.Register(stores.Adapt(filesystem.Type, filesystem.ParseConfig, filesystem.Open))
