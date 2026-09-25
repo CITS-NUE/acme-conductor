@@ -28,6 +28,8 @@
 // not verify and how to operate the result.
 targetScope = 'resourceGroup'
 
+import { roleDefinitionName, roleKeys } from 'modules/role-ids.bicep'
+
 // --- parameters --------------------------------------------------------------
 
 @description('Azure region for every resource.')
@@ -162,6 +164,14 @@ var shareRunnerState = 'runner-state'
 var shareExchange = 'exchange'
 
 // --- roles (subscription scope) ----------------------------------------------
+
+// The role definition IDs are built here from the same names the roles
+// module uses, not taken from its outputs, so that they are known at
+// preflight (see modules/role-ids.bicep). The grants below depend on the
+// module explicitly instead.
+var conductorJobObserverRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.conductorJobObserver))
+var runnerDnsTxtWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerDnsTxtWriter))
+var runnerKeyVaultCertificateWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerKeyVaultCertificateWriter))
 
 module roles 'modules/roles.bicep' = {
   name: '${deployment().name}-roles'
@@ -698,8 +708,11 @@ resource conductorObservesRunner 'Microsoft.Authorization/roleAssignments@2022-0
   properties: {
     principalId: conductorIdentity.properties.principalId
     principalType: 'ServicePrincipal'
-    roleDefinitionId: roles.outputs.conductorJobObserverRoleId
+    roleDefinitionId: conductorJobObserverRoleId
   }
+  dependsOn: [
+    roles
+  ]
 }
 
 // Runner identity -> TXT records in the challenge zone.
@@ -709,8 +722,11 @@ module runnerDns 'modules/dns-role-assignment.bicep' = {
   params: {
     dnsZoneName: dnsZoneName
     runnerPrincipalId: runnerIdentity.properties.principalId
-    roleDefinitionId: roles.outputs.runnerDnsTxtWriterRoleId
+    roleDefinitionId: runnerDnsTxtWriterRoleId
   }
+  dependsOn: [
+    roles
+  ]
 }
 
 // Runner identity -> import certificates into the vault.
@@ -720,8 +736,11 @@ module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {
   params: {
     keyVaultName: keyVaultName
     runnerPrincipalId: runnerIdentity.properties.principalId
-    roleDefinitionId: roles.outputs.runnerKeyVaultCertificateWriterRoleId
+    roleDefinitionId: runnerKeyVaultCertificateWriterRoleId
   }
+  dependsOn: [
+    roles
+  ]
 }
 
 // --- outputs -----------------------------------------------------------------

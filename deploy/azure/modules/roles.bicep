@@ -9,6 +9,8 @@
 // live in the same subscription as the deployment (Phase 4).
 targetScope = 'subscription'
 
+import { roleDefinitionName, roleKeys } from 'role-ids.bicep'
+
 @description('Prefix for the role names, so several deployments in one tenant do not collide (role names are tenant-unique).')
 @minLength(1)
 @maxLength(40)
@@ -23,7 +25,7 @@ param roleNamePrefix string
 // Job's own schedule instead. It may not change the Job either, and it
 // holds no DNS, Key Vault or storage data permission at all.
 resource conductorJobObserver 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(subscription().id, roleNamePrefix, 'acme-conductor-job-observer')
+  name: roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.conductorJobObserver)
   properties: {
     roleName: '${roleNamePrefix} Conductor Job Execution Observer'
     description: 'Read, list and stop executions of the ACME Runner Container Apps Job. No start (its execution template could replace the image) and no write access to the Job.'
@@ -50,7 +52,7 @@ resource conductorJobObserver 'Microsoft.Authorization/roleDefinitions@2022-04-0
 // in it (what lego's azuredns provider does for a DNS-01 challenge) and
 // nothing else in DNS.
 resource runnerDnsTxtWriter 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(subscription().id, roleNamePrefix, 'acme-runner-dns-txt-writer')
+  name: roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerDnsTxtWriter)
   properties: {
     roleName: '${roleNamePrefix} Runner DNS TXT Writer'
     description: 'Read a DNS zone and create, read and delete TXT record sets in it (ACME DNS-01 challenges).'
@@ -78,7 +80,7 @@ resource runnerDnsTxtWriter 'Microsoft.Authorization/roleDefinitions@2022-04-01'
 // certificate into the vault (docs/adr/0013). It may never read a secret
 // (the private key of any certificate), delete, purge or recover.
 resource runnerKeyVaultCertificateWriter 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(subscription().id, roleNamePrefix, 'acme-runner-keyvault-certificate-writer')
+  name: roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerKeyVaultCertificateWriter)
   properties: {
     roleName: '${roleNamePrefix} Runner Key Vault Certificate Writer'
     description: 'Read certificates (public part) and import certificates into a Key Vault. No secrets/get, no delete or purge.'
