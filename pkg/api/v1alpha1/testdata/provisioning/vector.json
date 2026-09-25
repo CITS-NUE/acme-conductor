@@ -1,0 +1,18 @@
+{
+  "description": "Deterministic test vector for the x25519-hkdf-sha256-a256gcm/v1 EAB provisioning scheme (issue #42, WP1). Fixed ephemeral private key and nonce make the ciphertext reproducible; this file lets a browser WebCrypto implementation (internal/conductor/ui) be checked against the exact Go output. See pkg/api/v1alpha1/provisioning.go for the scheme and provisioning_test.go for the test that reads this file.",
+  "runnerPrivateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VuBCIEIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB\n-----END PRIVATE KEY-----\n",
+  "ephemeralPrivateKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
+  "nonceHex": "030303030303030303030303",
+  "binding": "letsencrypt-staging",
+  "generation": 1,
+  "kid": "test-kid-0001",
+  "hmac": "dGVzdC1obWFjLWtleS0wMDAx",
+  "expectedPlaintextJson": "{\"kid\":\"test-kid-0001\",\"hmac\":\"dGVzdC1obWFjLWtleS0wMDAx\"}",
+  "expectedSealedProvisioning": {
+    "version": "x25519-hkdf-sha256-a256gcm/v1",
+    "keyId": "1a92f23852dc908d",
+    "ephemeralPublicKey": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+    "nonce": "AwMDAwMDAwMDAwMD",
+    "ciphertext": "19JXJr3se_7zmhhjCyaLm2k01b7-Uy7srjEt4Simh9IcCgXD8vTjBAkHYYGvYlKs0yB7RcT3OPeRsDE3CEFXbogqQCajAAtYvg"
+  }
+}

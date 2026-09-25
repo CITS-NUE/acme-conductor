@@ -8,6 +8,19 @@ base64url エンコードされた `JobSpec` 文書）と，Runner が返す署�
 エンベロープ（`signedresult.schema.json`．その `payload` は base64url
 エンコードされた `Result` 文書）である．
 
+`jobspec.schema.json` の `acme`（`$defs/acmeRef`）は，任意の `account`
+（`$defs/acmeAccountRef`：世代を表す `generation` と，その世代を登録する実行に
+限って現れる `provisioning`）を持つ．`provisioning`
+（`$defs/sealedProvisioning`）は，Runner の provisioning 鍵（X25519）に封じた
+ACME の External Account Binding（kid + hmac）であり，暗号文以外の平文は
+決してワイヤに現れない（`pkg/api/v1alpha1/provisioning.go` を参照）．
+`result.schema.json` の `accountProvisioning`
+（`$defs/accountProvisioningResult`）は，そのプロビジョニング実行の結果
+（`registered` | `failed`）を報告する．`sealedProvisioning.ciphertext` の
+`minLength`/`maxLength` は文字数だけの近似であり，Go の
+`SealedProvisioning.Validate` が検査する厳密な復号後バイト長
+（`MinProvisioningCiphertext`..`MaxProvisioningCiphertext`）の方が正である．
+
 ## バージョンポリシー
 
 - `v1alpha1` はプレリリースのコントラクトバージョンだが，すでにリリース済みの

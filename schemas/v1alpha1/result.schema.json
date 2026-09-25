@@ -71,6 +71,10 @@
         { "type": "null" },
         { "$ref": "#/$defs/resultError" }
       ]
+    },
+    "accountProvisioning": {
+      "$ref": "#/$defs/accountProvisioningResult",
+      "description": "Present iff the job carried acme.account.provisioning and the Runner attempted to open it. Independent of status/action: a run can register the account and still fail the certificate issuance that followed."
     }
   },
   "allOf": [
@@ -130,6 +134,27 @@
           "minLength": 1,
           "maxLength": 1024,
           "description": "Short human-readable summary. MUST NOT contain command lines, environment dumps, credentials, key material or certificate bodies: summaries MUST come from Runner-owned templates, never copied from raw external output. Go validation additionally rejects control characters, blank-after-trim text and known secret markers (e.g. PEM headers, bearer tokens; header and key=value markers are matched case-insensitively). That marker check is a best-effort defense-in-depth heuristic, not a secret detector, and is not expressible in JSON Schema."
+        }
+      }
+    },
+    "accountProvisioningResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "generation", "status"],
+      "properties": {
+        "binding": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["registered", "failed"]
         }
       }
     }

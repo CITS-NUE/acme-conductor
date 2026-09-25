@@ -65,6 +65,47 @@ var KeyTypes = []KeyType{KeyTypeEC256, KeyTypeEC384, KeyTypeRSA2048, KeyTypeRSA3
 // account and optional EAB reference live in Runner configuration).
 type ACMERef struct {
 	Binding string `json:"binding"`
+	// Account selects a generation-scoped ACME account on the Runner. Absent
+	// means the legacy, unversioned account state (and the binding's
+	// env-named EAB, if any).
+	Account *ACMEAccountRef `json:"account,omitempty"`
+}
+
+// MaxAccountGeneration bounds ACMEAccountRef.Generation.
+const MaxAccountGeneration = 1_000_000
+
+// ACMEAccountRef selects one generation of an ACME account for a binding.
+type ACMEAccountRef struct {
+	// Generation is 1..MaxAccountGeneration. Generations are never reused:
+	// a burnt generation number stays burnt even if provisioning fails.
+	Generation int64 `json:"generation"`
+	// Provisioning is present only on the run that registers this
+	// generation (a newAccount request with this EAB). Absent means the
+	// Runner must find the generation already registered in its own state.
+	Provisioning *SealedProvisioning `json:"provisioning,omitempty"`
+}
+
+// SealedProvisioning is an EAB (kid + hmac) sealed to a Runner provisioning
+// key. It is opaque to everything but the Runner holding the matching
+// private key: the Conductor, the transport and this package's own
+// validation see only ciphertext, never the plaintext kid or hmac. See
+// provisioning.go for the sealing/opening scheme.
+type SealedProvisioning struct {
+	// Version must equal ProvisioningVersion.
+	Version string `json:"version"`
+	// KeyID is 16 lower-case hex characters: ProvisioningKeyID of the
+	// Runner public key this was sealed to.
+	KeyID string `json:"keyId"`
+	// EphemeralPublicKey is the base64url (no padding) encoding of the
+	// 32-byte X25519 public key generated for this seal.
+	EphemeralPublicKey string `json:"ephemeralPublicKey"`
+	// Nonce is the base64url (no padding) encoding of the 12-byte AES-GCM
+	// nonce.
+	Nonce string `json:"nonce"`
+	// Ciphertext is the base64url (no padding) encoding of the AES-256-GCM
+	// ciphertext (authentication tag appended), decoded length bounded by
+	// MinProvisioningCiphertext..MaxProvisioningCiphertext.
+	Ciphertext string `json:"ciphertext"`
 }
 
 // DNSRef names an administrator-registered DNS provider binding.
@@ -99,6 +140,46 @@ type Result struct {
 	FinishedAt     time.Time `json:"finishedAt"`
 	// Error is null on success and required on failure.
 	Error *ResultError `json:"error"`
+	// AccountProvisioning reports the outcome of a provisioning run:
+	// present iff the job carried acme.account.provisioning and the Runner
+	// attempted to open it. Result.Status/Action are independent of
+	// AccountProvisioning.Status: a run can register the account and still
+	// fail the certificate issuance that followed in the same run.
+	AccountProvisioning *AccountProvisioningResult `json:"accountProvisioning,omitempty"`
+}
+
+// AccountProvisioningResult reports what happened to one ACME account
+// generation's provisioning attempt.
+type AccountProvisioningResult struct {
+	Binding    string                    `json:"binding"`
+	Generation int64                     `json:"generation"`
+	Status     AccountProvisioningStatus `json:"status"`
+}
+
+// AccountProvisioningStatus is the outcome of an account provisioning
+// attempt.
+type AccountProvisioningStatus string
+
+// Account provisioning statuses. "registered" means the ACME account for
+// that generation was registered (newAccount succeeded) and its state was
+// published on the Runner, even if certificate issuance later in the same
+// run failed.
+const (
+	AccountProvisioningRegistered AccountProvisioningStatus = "registered"
+	AccountProvisioningFailed     AccountProvisioningStatus = "failed"
+)
+
+// AccountProvisioningStatuses lists all statuses in schema order.
+var AccountProvisioningStatuses = []AccountProvisioningStatus{AccountProvisioningRegistered, AccountProvisioningFailed}
+
+// Valid reports whether s is a known account provisioning status.
+func (s AccountProvisioningStatus) Valid() bool {
+	for _, v := range AccountProvisioningStatuses {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // ResultStatus is the terminal status of a run as reported by the Runner.

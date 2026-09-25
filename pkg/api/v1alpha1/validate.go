@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -27,6 +28,19 @@ const (
 	// Azure Key Vault certificate names (1..127 characters) and leaves room
 	// for filesystem-store base names without ever admitting a path.
 	MaxStoreObjectRefLength = 128
+	// ephemeralPublicKeyLen and provisioningNonceLen are the exact decoded
+	// byte lengths of SealedProvisioning.EphemeralPublicKey (a 32-byte
+	// X25519 public key) and .Nonce (a 12-byte AES-GCM nonce); encoded as
+	// unpadded base64url that is 43 and 16 characters respectively.
+	ephemeralPublicKeyLen = 32
+	provisioningNonceLen  = 12
+	// MinProvisioningCiphertext and MaxProvisioningCiphertext bound the
+	// decoded length (bytes) of SealedProvisioning.Ciphertext: the
+	// AES-256-GCM tag (16 bytes) plus 1..4096 bytes of plaintext (the
+	// plaintext is always a short `{"kid":..,"hmac":..}` JSON document,
+	// well under that bound).
+	MinProvisioningCiphertext = 17
+	MaxProvisioningCiphertext = 4096 + 16
 )
 
 var (
@@ -43,6 +57,11 @@ var (
 	// '?', '#', '@', '%', '&', '=' or whitespace, and it must start and end
 	// with an alphanumeric character. ".." is rejected separately.
 	storeObjectRefRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$`)
+	// provisioningKeyIDRe: 16 lower-case hex characters (see ProvisioningKeyID).
+	provisioningKeyIDRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	// base64URLRe: unpadded base64url, used for SealedProvisioning's binary
+	// fields.
+	base64URLRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 )
 
 // ErrValidation is wrapped by every validation failure.
@@ -125,6 +144,11 @@ func (s *JobSpec) Validate() error {
 	if err := validateBindingName("acme.binding", s.ACME.Binding); err != nil {
 		return err
 	}
+	if s.ACME.Account != nil {
+		if err := s.ACME.Account.validate("acme.account"); err != nil {
+			return err
+		}
+	}
 	if err := validateBindingName("dns.binding", s.DNS.Binding); err != nil {
 		return err
 	}
@@ -170,6 +194,79 @@ func (p *PolicySpec) validate() error {
 	}
 	if !p.KeyType.Valid() {
 		return invalid("policy.keyType", fmt.Sprintf("must be one of %v", KeyTypes))
+	}
+	return nil
+}
+
+// validate checks an ACMEAccountRef embedded at field.
+func (a *ACMEAccountRef) validate(field string) error {
+	if a.Generation < 1 || a.Generation > MaxAccountGeneration {
+		return invalid(field+".generation", fmt.Sprintf("must be between 1 and %d", MaxAccountGeneration))
+	}
+	if a.Provisioning != nil {
+		if err := a.Provisioning.validate(field + ".provisioning"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Validate checks a SealedProvisioning document for shape only: it never
+// decrypts or inspects the plaintext it carries. See provisioning.go for
+// the sealing/opening scheme.
+func (p *SealedProvisioning) Validate() error {
+	if p == nil {
+		return invalid("$", "nil SealedProvisioning")
+	}
+	return p.validate("$")
+}
+
+func (p *SealedProvisioning) validate(field string) error {
+	if p.Version != ProvisioningVersion {
+		return invalid(field+".version", fmt.Sprintf("must be %q", ProvisioningVersion))
+	}
+	if !provisioningKeyIDRe.MatchString(p.KeyID) {
+		return invalid(field+".keyId", "must be 16 lower-case hex characters")
+	}
+	if err := validateExactB64(field+".ephemeralPublicKey", p.EphemeralPublicKey, ephemeralPublicKeyLen); err != nil {
+		return err
+	}
+	if err := validateExactB64(field+".nonce", p.Nonce, provisioningNonceLen); err != nil {
+		return err
+	}
+	if err := validateBoundedB64(field+".ciphertext", p.Ciphertext, MinProvisioningCiphertext, MaxProvisioningCiphertext); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateExactB64 requires v to be unpadded base64url decoding to exactly
+// n bytes.
+func validateExactB64(field, v string, n int) error {
+	if len(v) != base64.RawURLEncoding.EncodedLen(n) || !base64URLRe.MatchString(v) {
+		return invalid(field, fmt.Sprintf("must be unpadded base64url of exactly %d bytes", n))
+	}
+	if _, err := base64.RawURLEncoding.Strict().DecodeString(v); err != nil {
+		return invalidErr(field, "must be unpadded base64url", err)
+	}
+	return nil
+}
+
+// validateBoundedB64 requires v to be unpadded base64url decoding to
+// between min and max bytes, inclusive.
+func validateBoundedB64(field, v string, min, max int) error {
+	if v == "" || !base64URLRe.MatchString(v) {
+		return invalid(field, "must be unpadded base64url")
+	}
+	if len(v) > base64.RawURLEncoding.EncodedLen(max) {
+		return invalid(field, fmt.Sprintf("must encode at most %d bytes", max))
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(v)
+	if err != nil {
+		return invalidErr(field, "must be unpadded base64url", err)
+	}
+	if len(decoded) < min || len(decoded) > max {
+		return invalid(field, fmt.Sprintf("decoded length must be between %d and %d bytes", min, max))
 	}
 	return nil
 }
@@ -271,6 +368,17 @@ func (r *Result) Validate() error {
 		}
 		if err := validateOpaqueText("error.summary", r.Error.Summary, MaxErrorSummaryLength); err != nil {
 			return err
+		}
+	}
+	if r.AccountProvisioning != nil {
+		if err := validateBindingName("accountProvisioning.binding", r.AccountProvisioning.Binding); err != nil {
+			return err
+		}
+		if r.AccountProvisioning.Generation < 1 || r.AccountProvisioning.Generation > MaxAccountGeneration {
+			return invalid("accountProvisioning.generation", fmt.Sprintf("must be between 1 and %d", MaxAccountGeneration))
+		}
+		if !r.AccountProvisioning.Status.Valid() {
+			return invalid("accountProvisioning.status", fmt.Sprintf("must be one of %v", AccountProvisioningStatuses))
 		}
 	}
 	return nil
