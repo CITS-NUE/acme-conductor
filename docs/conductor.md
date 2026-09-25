@@ -6,24 +6,24 @@ REST API と GUI，`Target` がどのように `Run` になり `Run` がどの�
 駆動されるか，2 つの認証モード，ディスク上の状態とそのバックアップ方法，そして
 現時点で Conductor が保証すること・しないことを扱う．
 
-Phase 2 では Conductor の MVP を出荷した．target・ポリシー・run・監査イベントを
-SQLite に保持するレジストリ，REST API，スケジューラ，そして `acme-runner`
+Conductor は，target・ポリシー・run・監査イベントを SQLite に保持するレジストリ，
+REST API，スケジューラを備える．ランチャーは 2 種類ある．1 つは `acme-runner`
 （[`docs/runner.md`](runner.md) を参照）を子プロセスとして動かすローカルプロセスの
-ランチャーであり，**単一ホスト・単一ユーザーの開発およびテスト用デプロイ** である．
-Phase 4 では第 2 のランチャー `azure-container-apps-job` が加わる．これは run ごとに，
-別途プロビジョニングされた Azure Container Apps Job の実行を 1 つ開始する
-（Runner は自身のマネージド ID を持ち，資格情報が Conductor を経由することは
-決してない）．さらに **ジョブ署名** が加わる．どのランチャーも Runner に生の
-`JobSpec` ではなく署名付き・期限付きのエンベロープを渡すことができ，Container Apps
-ランチャーは常にそうする．Phase 5 では本番の認証モード `oidc` が加わる．OpenID
-Connect プロバイダのベアラートークン，名前付きプリンシパル，admin と viewer の
-ロール，TLS リスナーまたはその前段のプラットフォーム ingress である．さらに
-Conductor 自身が配信する最小限の **GUI** が加わる（[認証](#認証)と [GUI](#gui) を
-参照）．`localhost-dev` モードは開発ホスト 1 台向けに残る．Phase 6 では
-**移行ツール** が加わる．既存のインフラ定義のホスト一覧を読み，レジストリと比較して
-足りないものを取り込む `migrate` コマンドと API，および操作者が切り替えるまで
-Conductor に何も発行させない `migration.targetSource` フラグである
-（[`docs/migration.md`](migration.md) と [`migration`](#migration) を参照）．
+ランチャーであり，**単一ホスト・単一ユーザーの開発およびテスト用デプロイ** 向けで
+ある．もう 1 つは `azure-container-apps-job` であり，run ごとに，別途
+プロビジョニングされた Azure Container Apps Job の実行を 1 つ開始する（Runner は
+自身のマネージド ID を持ち，資格情報が Conductor を経由することは決してない）．
+さらに **ジョブ署名** を備える．どのランチャーも Runner に生の `JobSpec` ではなく
+署名付き・期限付きのエンベロープを渡すことができ，Container Apps ランチャーは
+常にそうする．本番の認証モード `oidc` も備える．OpenID Connect プロバイダの
+ベアラートークン，名前付きプリンシパル，admin と viewer のロール，TLS リスナー
+またはその前段のプラットフォーム ingress である．さらに Conductor 自身が配信する
+最小限の **GUI** を持つ（[認証](#認証)と [GUI](#gui) を参照）．`localhost-dev`
+モードは開発ホスト 1 台向けに残る．**移行ツール** も備える．既存のインフラ定義の
+ホスト一覧を読み，レジストリと比較して足りないものを取り込む `migrate` コマンドと
+API，および操作者が切り替えるまで Conductor に何も発行させない
+`migration.targetSource` フラグである（[`docs/migration.md`](migration.md) と
+[`migration`](#migration) を参照）．
 
 ## 概要
 
@@ -292,7 +292,7 @@ name>` である．Conductor の ID に必要なのは，Job リソースに対�
 `expiresAt`・ランダムなノンスを持つ厳密なヘッダのもとに置き，Ed25519 で署名した
 ものである．Runner は対応する公開鍵を自身の `jobSigning.publicKeys`
 （[`docs/runner.md`](runner.md#jobsigning)）に列挙しなければならず，生の JobSpec を
-拒否する．`jobSigning` がなければ，ローカルランチャーは Phase 2 と同様に生の
+拒否する．`jobSigning` がなければ，ローカルランチャーは引き続き生の
 `JobSpec` を渡す．この秘密鍵は Conductor が読む唯一のシークレットである．これは
 Runner に対する Conductor の ID であって，DNS・Store・クラウドの資格情報ではない．
 ローテーションするには，まず新しい公開鍵を Runner に追加し，次に `privateKeyFile`
@@ -435,7 +435,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
   次のティックで target が期限到来になり得る．
 - `acmeBinding` — 次の ACME オーダーの CA を選ぶだけである．以前の CA による最新の
   証明書がこの変更だけを理由に再発行されることはないので，target は次の更新時に
-  （または再発行すべき別の理由を見つけた手動 run で）新しい CA に移る．Phase 2 は
+  （または再発行すべき別の理由を見つけた手動 run で）新しい CA に移る．Conductor は
   バインディング変更による強制再発行を行わない
   （[ADR 0011](adr/0011-conductor-storage-and-run-model.md)）．
 - `allowedDnsSuffixes`，`allowWildcard` — 更新そのものにおいて既存の target に
@@ -717,7 +717,7 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 
 ### `localhost-dev`（開発ホスト 1 台）
 
-Phase 2 のモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
+開発ホスト 1 台向けのモード（[ADR 0012](adr/0012-localhost-only-dev-auth.md)）．
 `/api/` 配下へのリクエストは次の **すべて** が成り立つ場合にのみ受理される．
 
 - リスナーがループバックアドレスにバインドされていること（設定で強制し，
