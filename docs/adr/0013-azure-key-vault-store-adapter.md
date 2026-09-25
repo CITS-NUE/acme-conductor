@@ -1,6 +1,6 @@
 # 0013: Azure Key Vault の store アダプタ
 
-- ステータス: 採択
+- ステータス: 採択（「コンテンツタイプは PEM のみ」は [ADR 0021](0021-keyvault-pkcs12-content-type.md) で置き換えられた）
 - 日付: 2026-09-22
 
 ## 背景

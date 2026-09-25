@@ -9,6 +9,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates v1.4.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	modernc.org/sqlite v1.46.0
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (

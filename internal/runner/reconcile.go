@@ -398,7 +398,10 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		// A policy whose keyType changed takes effect at the target's next
 		// run: a stored certificate with another key type is reissued.
 		keyOK := current.KeyType == spec.Policy.KeyType
-		if covers && valid && keyOK && current.NotAfter.After(now.Add(renewBefore)) {
+		// Likewise a store binding whose form changed (a Key Vault content
+		// type): the stored private key is never read back to re-encode.
+		formOK := !current.Stale
+		if covers && valid && keyOK && formOK && current.NotAfter.After(now.Add(renewBefore)) {
 			log.Info("certificate is current; nothing to do", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 			return &outcome{action: v1alpha1.ActionNoop, info: current, objectRef: object, storeType: st.Type()}, nil
 		}
@@ -409,6 +412,8 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 			log.Warn("stored certificate is not yet valid; reissuing", "fingerprintSha256", current.FingerprintSHA256, "notBefore", current.NotBefore.Format(time.RFC3339))
 		case !keyOK:
 			log.Info("stored certificate key type differs from the policy; reissuing", "fingerprintSha256", current.FingerprintSHA256, "storedKeyType", string(current.KeyType), "keyType", string(spec.Policy.KeyType))
+		case !formOK:
+			log.Info("stored certificate is in another form than the store binding writes; reissuing", "fingerprintSha256", current.FingerprintSHA256)
 		default:
 			log.Info("certificate is due for renewal", "fingerprintSha256", current.FingerprintSHA256, "expiresAt", current.NotAfter.Format(time.RFC3339))
 		}

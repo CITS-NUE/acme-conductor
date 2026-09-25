@@ -53,6 +53,13 @@ type Info struct {
 	// certificate's public key corresponds to, or empty when the key is of
 	// no supported type or size.
 	KeyType v1alpha1.KeyType
+	// Stale reports that the store holds the certificate in another form
+	// than the one it is configured to write (for example a Key Vault
+	// binding switched from PEM to PKCS #12), so the certificate has to be
+	// written anew even when it is otherwise current. The Runner issues it
+	// again, since it never reads a stored private key back. A store with
+	// a single form leaves it false.
+	Stale bool
 }
 
 // Store is the adapter interface implemented per binding type.

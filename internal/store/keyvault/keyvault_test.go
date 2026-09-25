@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azcertificates"
+	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/store"
@@ -194,17 +195,44 @@ func (f *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			f.fail(w, 400, "BadParameter", "body")
 			return
 		}
-		if req.Policy.SecretProps.ContentType != "application/x-pem-file" {
-			f.fail(w, 400, "BadParameter", "only PEM import is imitated")
-			return
-		}
 		if req.Pwd != nil {
-			f.fail(w, 400, "BadParameter", "PEM import takes no password")
+			f.fail(w, 400, "BadParameter", "the store never sends a password")
 			return
 		}
 		var certs [][]byte
 		var keyPEM []byte
 		var keyBlock string
+		switch req.Policy.SecretProps.ContentType {
+		case "application/x-pem-file":
+		case "application/x-pkcs12":
+			// Key Vault does not convert PEM to PKCS #12: the value must be
+			// a base64-encoded PFX readable without a password.
+			pfx, err := base64.StdEncoding.DecodeString(req.Value)
+			if err != nil {
+				f.fail(w, 400, "BadParameter", "Base64-encoded PKCS#12 can not be read")
+				return
+			}
+			key, leaf, chain, err := pkcs12.DecodeChain(pfx, "")
+			if err != nil {
+				f.fail(w, 400, "BadParameter", "PKCS#12 can not be read")
+				return
+			}
+			der, err := x509.MarshalPKCS8PrivateKey(key)
+			if err != nil {
+				f.fail(w, 400, "BadParameter", "PKCS#12 key")
+				return
+			}
+			keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+			keyBlock = "PKCS12"
+			certs = append(certs, leaf.Raw)
+			for _, c := range chain {
+				certs = append(certs, c.Raw)
+			}
+			req.Value = ""
+		default:
+			f.fail(w, 400, "BadParameter", "content type")
+			return
+		}
 		rest := []byte(req.Value)
 		for {
 			var block *pem.Block
@@ -307,8 +335,15 @@ func (f *fakeVault) requestCount() int {
 
 func newTestStore(t *testing.T, f *fakeVault) (*Store, *fakeCredential) {
 	t.Helper()
+	return newTestStoreAs(t, f, "")
+}
+
+// newTestStoreAs is newTestStore for a binding content type.
+func newTestStoreAs(t *testing.T, f *fakeVault, contentType string) (*Store, *fakeCredential) {
+	t.Helper()
 	cred := &fakeCredential{}
 	st, err := New(f.srv.URL, cred, &Options{
+		ContentType:                contentType,
 		InsecureSkipVaultHostCheck: true,
 		ClientOptions: &azcertificates.ClientOptions{
 			ClientOptions:                        azcore.ClientOptions{Transport: f.srv.Client(), Retry: policy.RetryOptions{MaxRetries: -1}},
@@ -443,6 +478,101 @@ func TestPutDetectsVaultStoringADifferentCertificate(t *testing.T) {
 	err := st.Put(context.Background(), st.ObjectName("wiki.example.ac.jp"), store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
 	if err == nil || !strings.Contains(err.Error(), "different certificate") {
 		t.Fatalf("Put: %v", err)
+	}
+}
+
+// A pkcs12 binding imports a passwordless PFX holding the leaf, the chain
+// and the key, with the PKCS #12 content type.
+func TestPutPKCS12(t *testing.T) {
+	for _, gen := range []func(*testing.T, ...string) ([]byte, []byte, *x509.Certificate){genECCert, genRSACert} {
+		f := newFakeVault(t)
+		st, _ := newTestStoreAs(t, f, ContentTypePKCS12)
+		certPEM, keyPEM, cert := gen(t, "leaf.example.ac.jp")
+		chainPEM, _, _ := genECCert(t, "Fake Intermediate")
+		object := st.ObjectName("leaf.example.ac.jp")
+		if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, Chain: chainPEM, PrivateKey: keyPEM}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		e := f.entry(object)
+		if e == nil || e.contentType != "application/x-pkcs12" || e.keyBlock != "PKCS12" || e.certBlocks != 2 || !e.enabled {
+			t.Fatalf("imported entry = %+v", e)
+		}
+		if e.tags[TagManagedBy] != TagManagedByValue {
+			t.Errorf("tags = %v", e.tags)
+		}
+		info, err := st.Current(context.Background(), object)
+		if err != nil || info.FingerprintSHA256 != store.Fingerprint(cert) || info.Stale {
+			t.Fatalf("Current = %+v, %v", info, err)
+		}
+	}
+}
+
+// Switching a binding's content type makes the certificate stored in the
+// other form stale for it, and the next Put stores a new version in the
+// binding's form (Key Vault accepts a different content type per version).
+func TestContentTypeSwitchMarksStale(t *testing.T) {
+	f := newFakeVault(t)
+	pemStore, _ := newTestStore(t, f)
+	pfxStore, _ := newTestStoreAs(t, f, ContentTypePKCS12)
+	certPEM, keyPEM, _ := genECCert(t, "leaf.example.ac.jp")
+	object := pemStore.ObjectName("leaf.example.ac.jp")
+	if err := pemStore.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatalf("Put PEM: %v", err)
+	}
+	if info, err := pemStore.Current(context.Background(), object); err != nil || info.Stale {
+		t.Fatalf("PEM binding on PEM certificate: %+v, %v", info, err)
+	}
+	if info, err := pfxStore.Current(context.Background(), object); err != nil || !info.Stale {
+		t.Fatalf("pkcs12 binding on PEM certificate: %+v, %v", info, err)
+	}
+	if err := pfxStore.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatalf("Put PKCS #12: %v", err)
+	}
+	if info, err := pfxStore.Current(context.Background(), object); err != nil || info.Stale {
+		t.Fatalf("pkcs12 binding on PKCS #12 certificate: %+v, %v", info, err)
+	}
+	if info, err := pemStore.Current(context.Background(), object); err != nil || !info.Stale {
+		t.Fatalf("PEM binding on PKCS #12 certificate: %+v, %v", info, err)
+	}
+}
+
+// A vault that reports no content type in the policy does not make the
+// certificate stale, which would otherwise reissue it on every run.
+func TestMissingContentTypeIsNotStale(t *testing.T) {
+	f := newFakeVault(t)
+	st, _ := newTestStoreAs(t, f, ContentTypePKCS12)
+	certPEM, keyPEM, _ := genECCert(t, "leaf.example.ac.jp")
+	object := st.ObjectName("leaf.example.ac.jp")
+	if err := st.Put(context.Background(), object, store.Bundle{Certificate: certPEM, PrivateKey: keyPEM}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	f.entry(object).contentType = ""
+	if info, err := st.Current(context.Background(), object); err != nil || info.Stale {
+		t.Fatalf("Current = %+v, %v", info, err)
+	}
+}
+
+// An import the vault reports back with another content type fails the
+// Put, instead of leaving a certificate that every later run finds stale.
+func TestPutDetectsVaultKeepingAnotherContentType(t *testing.T) {
+	f := newFakeVault(t)
+	st, _ := newTestStoreAs(t, f, ContentTypePKCS12)
+	certPEM, keyPEM, _ := genECCert(t, "leaf.example.ac.jp")
+	f.onImport = func(w http.ResponseWriter, name string, e *fakeEntry) bool {
+		kept := *e
+		kept.contentType = "application/x-pem-file"
+		f.writeBundle(w, name, &kept)
+		return true
+	}
+	err := st.Put(context.Background(), st.ObjectName("leaf.example.ac.jp"), store.Bundle{Certificate: certPEM, PrivateKey: keyPEM})
+	if err == nil || !strings.Contains(err.Error(), "content type") {
+		t.Fatalf("Put: %v", err)
+	}
+}
+
+func TestNewRejectsUnknownContentType(t *testing.T) {
+	if _, err := New("https://kv-acme-dev.vault.azure.net", &fakeCredential{}, &Options{ContentType: "der"}); err == nil || !strings.Contains(err.Error(), "contentType") {
+		t.Fatalf("New: %v", err)
 	}
 }
 
