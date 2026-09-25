@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>導入ガイド — ACME Conductor</title>
+<meta name="description" content="ACME Conductor を手元で試し，Azure Container Apps に本番デプロイするまでの手順を，実際のコマンドと設定例で説明します．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html" aria-current="page">導入ガイド</a>
+      <a href="migration.html">既存環境からの移行</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>手元で試してから，<br>Azure へ小さく導入する</h1>
+    <p class="lead">
+      このページでは，ACME Conductor をまず 1 台のマシン上で動かして仕組みを確かめ，
+      次に Azure Container Apps へステージング環境としてデプロイするまでを，実際の
+      コマンドと設定例に沿って説明します．どちらもステージング CA と 1 つのホスト名
+      から始めることを前提にしています．
+    </p>
+  </section>
+
+  <h2 id="requirements">必要なもの</h2>
+  <div class="cards">
+    <div class="card cp">
+      <h3>手元で試す場合</h3>
+      <ul>
+        <li>Go のビルド環境（<code>make build</code> でソースからビルドする場合），または GHCR の公開イメージを取得できるネットワーク</li>
+        <li><code>bin/acme-conductor</code> と <code>bin/acme-runner</code> を同じホストに置けること（Conductor のコンテナイメージには Runner が含まれません）</li>
+        <li>Let's Encrypt <em>ステージング</em> の ACME ディレクトリへの通信と，テスト用の DNS ゾーン（本ガイドの例は Azure DNS）</li>
+        <li><code>curl</code> と <code>jq</code>（REST API を試すため）</li>
+      </ul>
+    </div>
+    <div class="card dp">
+      <h3>Azure にデプロイする場合</h3>
+      <ul>
+        <li>デプロイ用の Azure サブスクリプションと，リソースグループを作成する権限</li>
+        <li>DNS ゾーン（Azure DNS）と RBAC 権限モデルの Key Vault — <strong>デプロイと同じサブスクリプション</strong>に置くこと（カスタムロールの割り当て可能スコープの制約）</li>
+        <li>そのサブスクリプションにロール定義とロール割り当てを作成する権利（Owner または User Access Administrator 相当）</li>
+        <li>OIDC プロバイダ（例: Microsoft Entra ID）に，API 用と GUI 用の 2 つのアプリ登録を作成できること</li>
+        <li><code>acme-conductor keygen</code> と <code>acme-runner keygen</code> で作る，交換用共有の往復それぞれに 1 組ずつの Ed25519 署名鍵ペア（合計 2 組）</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2 id="local">手元で試す</h2>
+  <p>
+    開発用の認証（<code>localhost-dev</code>）と，Runner を子プロセスとして起動する
+    <code>local-process</code> ランチャー，ファイルシステムの Certificate Store を使い，
+    1 台のマシンの上に Conductor と Runner の両方を動かします．ACME は Let's Encrypt の
+    <em>ステージング</em> を使うため，本物の証明書は発行されません．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 860 300" role="img" aria-labelledby="loc-t loc-d">
+      <title id="loc-t">手元で試すときの構成</title>
+      <desc id="loc-d">1 台のホストの上で，Conductor プロセスが子プロセスとして Runner を起動する．Runner は lego を呼び出し，ステージング CA と DNS プロバイダに問い合わせ，証明書と秘密鍵をファイルシステムの Certificate Store に書き込む．操作者は curl で Conductor の REST API を叩く．</desc>
+      <defs>
+        <marker id="loc-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="loc-acp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-cp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="loc-as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-secret" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="d-ext" x="16" y="110" width="130" height="60" rx="8"/>
+      <text class="d-text" x="81" y="136" text-anchor="middle">操作者</text>
+      <text class="d-small" x="81" y="154" text-anchor="middle">curl / jq</text>
+      <line class="d-line" x1="146" y1="140" x2="182" y2="140" marker-end="url(#loc-a)"/>
+
+      <rect class="d-zone" x="170" y="20" width="500" height="260" rx="12"/>
+      <text class="d-cp-text" x="420" y="40" text-anchor="middle">1 台のホスト</text>
+
+      <rect class="d-cp" x="186" y="60" width="190" height="120" rx="10"/>
+      <text class="d-title" x="281" y="84" text-anchor="middle">acme-conductor serve</text>
+      <text class="d-text" x="200" y="108">localhost-dev 認証</text>
+      <text class="d-text" x="200" y="130">local-process ランチャー</text>
+      <text class="d-small" x="200" y="152">127.0.0.1:8080</text>
+      <text class="d-small" x="200" y="170">SQLite（conductor.db）</text>
+
+      <line class="d-line-cp" x1="376" y1="120" x2="450" y2="120" marker-end="url(#loc-acp)"/>
+      <text class="d-cp-text" x="413" y="108" text-anchor="middle">子プロセス起動</text>
+
+      <rect class="d-dp" x="450" y="60" width="190" height="120" rx="10"/>
+      <text class="d-title" x="545" y="84" text-anchor="middle">acme-runner reconcile</text>
+      <text class="d-text" x="464" y="108">lego を 1 度だけ起動</text>
+      <text class="d-text" x="464" y="130">--job / --result</text>
+      <text class="d-small" x="464" y="152">Let's Encrypt staging</text>
+      <text class="d-small" x="464" y="170">azuredns バインディング</text>
+
+      <line class="d-line-secret" x1="545" y1="180" x2="545" y2="230" marker-end="url(#loc-as)"/>
+      <text class="d-secret-text" x="555" y="210">証明書 + 秘密鍵</text>
+
+      <rect class="d-secret" x="380" y="232" width="330" height="40" rx="8"/>
+      <text class="d-text" x="545" y="257" text-anchor="middle">filesystem Certificate Store（/store）</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>Conductor プロセス</span>
+      <span><i class="dp"></i>Runner の子プロセス</span>
+      <span><i class="secret"></i>秘密鍵が置かれる場所</span>
+      <span><i class="ext"></i>操作者</span>
+    </div>
+    <figcaption>この構成では Conductor の環境変数がパススルーで Runner に渡るため（<code>passthroughEnv</code>），単一ユーザーの開発ホスト以外では使わない構成です．</figcaption>
+  </figure>
+
+  <h3>1. ビルドする</h3>
+  <pre><code>make build    # ./bin/acme-conductor と ./bin/acme-runner
+./bin/acme-conductor --version
+./bin/acme-runner --version</code></pre>
+  <p class="muted">GHCR のイメージ（<a href="#images">イメージとリリース</a>）から始めても構いませんが，Conductor のイメージには Runner が含まれないため，<code>local-process</code> ランチャーを試すにはソースからビルドするか，両方のバイナリを含む独自イメージを用意します．</p>
+
+  <h3>2. 署名鍵を作る</h3>
+  <p>手元での試用では省略しても動きますが（<code>jobSigning</code> のないローカルランチャーは生の <code>JobSpec</code> を渡します），練習を兼ねて作っておくと Azure デプロイの手順に直結します．</p>
+  <pre><code>./bin/acme-conductor keygen --private job-signing.pem --public job-signing.pub</code></pre>
+
+  <h3>3. 設定を書く</h3>
+  <p>
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/conductor-config.example.json">deploy/examples/conductor-config.example.json</a>
+    と
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/runner-config.example.json">deploy/examples/runner-config.example.json</a>
+    をコピーして，パスを手元の環境に合わせます．バインディング名（<code>letsencrypt-staging</code>，<code>azure-dns-staging</code>，<code>filesystem-dev</code>）は両方の設定で一致していなければなりません．Conductor はバインディング名しか知らず，実体は Runner 側の設定が持ちます．次は Conductor 側の設定の抜粋です（<code>apiVersion</code>，<code>server</code>，<code>database</code>，<code>scheduler</code> などは例のファイルを参照）．
+  </p>
+  <pre><code>{
+  "executionBindings": {
+    "local": {
+      "type": "local-process",
+      "config": {
+        "runnerBinary": "/path/to/bin/acme-runner",
+        "runnerConfig": "/path/to/runner-config.json",
+        "workDir": "/path/to/conductor-runs"
+      }
+    }
+  },
+  "acmeBindings": ["letsencrypt-staging"],
+  "dnsBindings": ["azure-dns-staging"],
+  "storeBindings": ["filesystem-dev"]
+}</code></pre>
+  <p>Runner 側は <code>storeBindings.filesystem-dev</code> を <code>type: filesystem</code> でファイルシステムの <code>directory</code> に向け，DNS の資格情報が必要なら <code>dnsBindings.azure-dns-staging.passthroughEnv</code> に環境変数名を列挙し，Conductor を起動する側の環境でその変数を export します．</p>
+
+  <h3>4. Conductor を起動する</h3>
+  <pre><code>./bin/acme-conductor serve --config /path/to/conductor-config.json</code></pre>
+  <p>既定では <code>127.0.0.1:8080</code> で REST API と GUI（<code>/ui/</code>）が動きます．<code>localhost-dev</code> モードでは，ループバックに接続できるローカルユーザーは誰でも管理者として扱われます．</p>
+
+  <h3>5. ポリシーと target を登録する</h3>
+  <p>
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/conductor.md#%E3%82%BB%E3%83%83%E3%82%B7%E3%83%A7%E3%83%B3%E4%BE%8B">docs/conductor.md のセッション例</a>
+    に沿って，ポリシーを作成し，それを参照する target を作成します．
+  </p>
+  <pre><code>C=http://127.0.0.1:8080/api/v1alpha1
+P=$(curl -s -H 'Content-Type: application/json' \
+  -d '{"allowedDnsSuffixes":["example.ac.jp"],"acmeBinding":"letsencrypt-staging","renewBeforeDays":30,"keyType":"ec256"}' \
+  $C/policies | jq -r .id)
+T=$(curl -s -H 'Content-Type: application/json' \
+  -d "{\"fqdn\":\"wiki.example.ac.jp\",\"owner\":\"web-team\",\"policyRef\":\"$P\",\"executionBinding\":\"local\",\"dnsBinding\":\"azure-dns-staging\",\"storeBinding\":\"filesystem-dev\"}" \
+  $C/targets | jq -r .id)</code></pre>
+  <p>target の作成でスケジューラが即座に起こされ，証明書がまだない target は待機中の run になります．次で進み具合を見ます．</p>
+
+  <h3>6. run を見守る</h3>
+  <pre><code>curl -s $C/targets/$T | jq .lastRun
+curl -s "$C/audit?targetId=$T" | jq '.items[].action'</code></pre>
+  <p>
+    <code>lastRun.status</code> が <code>succeeded</code> になれば，<code>filesystem-dev</code> の
+    <code>directory</code> の下に証明書と秘密鍵が書き込まれています．手動で今すぐ run を要求したい
+    場合は <code>curl -s -X POST $C/targets/$T/runs</code> を使います（アクティブな run がある間は
+    <code>409</code>）．GUI（<code>http://127.0.0.1:8080/ui/</code>）でも同じ内容を確認できます．
+  </p>
+
+  <h2 id="azure">Azure にデプロイする</h2>
+  <p>
+    同梱の Bicep テンプレート（<a href="https://github.com/CITS-NUE/acme-conductor/tree/main/deploy/azure">deploy/azure</a>）は，
+    Container Apps 環境の上に HTTPS ingress を持つ Conductor の Container App と，毎分スケジュール実行される
+    Runner の Container Apps Job，権限の重ならない 2 つのユーザー割り当てマネージド ID，3 つの Azure Files 共有，
+    DNS ゾーンと Key Vault へのロール割り当て，Log Analytics を一括でプロビジョニングします．
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 1120 470" role="img" aria-labelledby="az-t az-d">
+      <title id="az-t">Azure にデプロイされるリソース</title>
+      <desc id="az-d">Container Apps 環境の中に，HTTPS ingress を持つ Conductor の Container App と，毎分スケジュール実行される Runner の Container Apps Job がある．Conductor 用と Runner 用の2つのユーザー割り当てマネージド IDがあり，それぞれ異なるカスタムロールを持つ．Conductor の ID は Runner の Job に対する Conductor Job Execution Observer ロールだけを持つ．Runner の ID は DNS ゾーンに対する Runner DNS TXT Writer ロールと，Key Vault に対する Runner Key Vault Certificate Writer ロールを持つ．ストレージアカウントは3つの Azure Files 共有を提供する．DNS ゾーンと Key Vault は別リソースグループにあってもよいが同じサブスクリプションになければならない．Log Analytics が両方のコンテナのログを受け取る．</desc>
+      <defs>
+        <marker id="az-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="az-acp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-cp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="az-adp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="d-ext" x="16" y="16" width="140" height="52" rx="8"/>
+      <text class="d-text" x="86" y="38" text-anchor="middle">管理者</text>
+      <text class="d-small" x="86" y="56" text-anchor="middle">GUI / API（OIDC）</text>
+      <line class="d-line" x1="156" y1="42" x2="198" y2="42" marker-end="url(#az-a)"/>
+      <line class="d-line" x1="86" y1="68" x2="86" y2="354" marker-end="url(#az-a)"/>
+
+      <rect class="d-zone" x="184" y="8" width="712" height="330" rx="12"/>
+      <text class="d-cp-text" x="540" y="28" text-anchor="middle">Container Apps 環境</text>
+
+      <rect class="d-cp" x="200" y="42" width="320" height="110" rx="10"/>
+      <text class="d-title" x="360" y="66" text-anchor="middle">Conductor Container App</text>
+      <text class="d-text" x="212" y="90">HTTPS ingress + OIDC</text>
+      <text class="d-text" x="212" y="112">署名付き JobSpec を差し出す</text>
+      <text class="d-small" x="212" y="134">id: id-conductor</text>
+
+      <rect class="d-dp" x="560" y="42" width="320" height="110" rx="10"/>
+      <text class="d-title" x="720" y="66" text-anchor="middle">Runner Container Apps Job</text>
+      <text class="d-text" x="572" y="90">毎分スケジュール実行</text>
+      <text class="d-text" x="572" y="112">reconcile --exchange /exchange</text>
+      <text class="d-small" x="572" y="134">id: id-runner</text>
+
+      <line class="d-line-cp" x1="360" y1="152" x2="360" y2="176" marker-end="url(#az-acp)"/>
+      <line class="d-line-dp" x1="720" y1="152" x2="720" y2="176" marker-end="url(#az-adp)"/>
+
+      <rect class="d-box" x="200" y="176" width="320" height="50" rx="8"/>
+      <text class="d-text" x="360" y="196" text-anchor="middle">Conductor Job Execution Observer</text>
+      <text class="d-small" x="360" y="214" text-anchor="middle">read / list / stop execution のみ</text>
+
+      <rect class="d-box" x="560" y="176" width="320" height="68" rx="8"/>
+      <text class="d-text" x="720" y="196" text-anchor="middle">Runner DNS TXT Writer</text>
+      <text class="d-text" x="720" y="216" text-anchor="middle">Runner Key Vault Certificate Writer</text>
+      <text class="d-small" x="720" y="236" text-anchor="middle">Job の開始や変更の権限はなし</text>
+
+
+      <rect class="d-secret" x="200" y="270" width="680" height="52" rx="10"/>
+      <text class="d-title" x="540" y="290" text-anchor="middle">ストレージアカウント（Azure Files）</text>
+      <text class="d-text" x="540" y="310" text-anchor="middle">conductor-state / runner-state / exchange</text>
+
+      <line class="d-line-dp" x1="880" y1="196" x2="918" y2="200" marker-end="url(#az-adp)"/>
+      <line class="d-line-dp" x1="880" y1="226" x2="918" y2="262" marker-end="url(#az-adp)"/>
+
+      <rect class="d-ext" x="920" y="176" width="184" height="50" rx="8"/>
+      <text class="d-text" x="1012" y="196" text-anchor="middle">DNS ゾーン（Azure DNS）</text>
+      <text class="d-small" x="1012" y="214" text-anchor="middle">同じサブスクリプション</text>
+
+      <rect class="d-ext" x="920" y="244" width="184" height="50" rx="8"/>
+      <text class="d-text" x="1012" y="264" text-anchor="middle">Key Vault</text>
+      <text class="d-small" x="1012" y="282" text-anchor="middle">RBAC 権限モデル</text>
+
+      <line class="d-line d-dash" x1="295" y1="338" x2="295" y2="352" marker-end="url(#az-a)"/>
+      <rect class="d-ext" x="16" y="354" width="170" height="52" rx="8"/>
+      <text class="d-text" x="101" y="376" text-anchor="middle">OIDC プロバイダ</text>
+      <text class="d-small" x="101" y="394" text-anchor="middle">Entra ID など</text>
+      <rect class="d-ext" x="210" y="354" width="170" height="52" rx="8"/>
+      <text class="d-text" x="295" y="376" text-anchor="middle">Log Analytics</text>
+      <text class="d-small" x="295" y="394" text-anchor="middle">両コンテナのログ</text>
+
+      <text class="d-small" x="560" y="430" text-anchor="middle">Conductor の ID は DNS・Key Vault・ストレージのデータ権限を持たない．Runner の ID は Job・ストレージアカウントの権限を持たない．</text>
+      <text class="d-small" x="560" y="452" text-anchor="middle">どちらの ID もストレージアカウントキーを読めない（共有は環境がマウントする）．</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>Conductor 側</span>
+      <span><i class="dp"></i>Runner 側</span>
+      <span><i class="secret"></i>2 つのコンテナが共有する状態</span>
+      <span><i class="ext"></i>デプロイの前提として用意するもの</span>
+    </div>
+    <figcaption>3 つのカスタムロールはいずれも最小権限で，サブスクリプションスコープで定義されます．そのため DNS ゾーンと Key Vault はデプロイと同じサブスクリプションになければなりません．</figcaption>
+  </figure>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 860 290" role="img" aria-labelledby="ex-t ex-d">
+      <title id="ex-t">exchange 共有での受け渡し</title>
+      <desc id="ex-d">Conductor は署名付きジョブを staging に書き，1回のリネームで pending に移す．Runner の毎分の実行がそれを claimed にリネームして取り，処理後に result.json を書く．Conductor は execution の状態をポーリングし，終了を確認してから run ディレクトリを削除する．Conductor はどの実行も開始しない．</desc>
+      <defs>
+        <marker id="ex-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="ex-acp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-cp" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="ex-adp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-arrowhead-dp" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="d-cp" x="16" y="30" width="150" height="60" rx="8"/>
+      <text class="d-text" x="91" y="56" text-anchor="middle">Conductor</text>
+      <text class="d-small" x="91" y="74" text-anchor="middle">署名付き JobSpec</text>
+
+      <rect class="d-zone" x="200" y="10" width="480" height="180" rx="12"/>
+      <text class="d-cp-text" x="440" y="30" text-anchor="middle">exchange 共有（両コンテナがマウント）</text>
+
+      <rect class="d-box" x="216" y="60" width="130" height="46" rx="8"/>
+      <text class="d-text" x="281" y="88" text-anchor="middle">staging/</text>
+      <line class="d-line-cp" x1="166" y1="60" x2="214" y2="83" marker-end="url(#ex-acp)"/>
+
+      <line class="d-line" x1="346" y1="83" x2="392" y2="83" marker-end="url(#ex-a)"/>
+      <text class="d-small" x="369" y="73" text-anchor="middle">rename</text>
+      <rect class="d-box" x="392" y="60" width="130" height="46" rx="8"/>
+      <text class="d-text" x="457" y="88" text-anchor="middle">pending/</text>
+
+      <line class="d-line-dp" x1="522" y1="83" x2="568" y2="83" marker-end="url(#ex-adp)"/>
+      <text class="d-small" x="545" y="73" text-anchor="middle">claim</text>
+      <rect class="d-box" x="568" y="60" width="98" height="46" rx="8"/>
+      <text class="d-text" x="617" y="88" text-anchor="middle">claimed/</text>
+
+      <rect class="d-dp" x="712" y="30" width="132" height="60" rx="8"/>
+      <text class="d-text" x="778" y="56" text-anchor="middle">Runner の</text>
+      <text class="d-text" x="778" y="74" text-anchor="middle">毎分の実行</text>
+      <line class="d-line-dp" x1="666" y1="83" x2="710" y2="60" marker-end="url(#ex-adp)"/>
+
+      <rect class="d-secret" x="392" y="130" width="176" height="46" rx="8"/>
+      <text class="d-text" x="480" y="158" text-anchor="middle">result.json（署名付き）</text>
+      <line class="d-line" x1="617" y1="106" x2="480" y2="128" marker-end="url(#ex-a)"/>
+
+      <line class="d-line" x1="420" y1="176" x2="120" y2="222" marker-end="url(#ex-a)"/>
+      <rect class="d-cp" x="16" y="224" width="150" height="50" rx="8"/>
+      <text class="d-text" x="91" y="246" text-anchor="middle">Conductor が</text>
+      <text class="d-text" x="91" y="264" text-anchor="middle">状態をポーリング</text>
+
+      <text class="d-danger-text" x="480" y="244" text-anchor="middle">Conductor は execution を決して開始しない — 開始できるのはプラットフォームのスケジュールだけ</text>
+      <text class="d-small" x="480" y="266" text-anchor="middle">claimTimeoutSeconds 以内に誰も取らなければ，Conductor は同じ rename で差し出しを取り下げる</text>
+    </svg>
+    <div class="legend">
+      <span><i class="cp"></i>Conductor が書く／読む</span>
+      <span><i class="dp"></i>Runner が書く／読む</span>
+      <span><i class="secret"></i>署名付き文書</span>
+    </div>
+    <figcaption>exchange 共有は Conductor が所有するトランスポートではないため，行き来する 2 種類の文書はどちらも Ed25519 で署名され，相手の公開鍵で検証されます．<code>staging/</code> から <code>pending/</code> への移動も，<code>pending/</code> から <code>claimed/</code> への移動も 1 回のディレクトリの rename です．Conductor は <code>pollIntervalSeconds</code>（既定 10 秒）ごとに実行の状態を読み，終端状態になるまで待ちます．</figcaption>
+  </figure>
+
+  <p class="callout warn">
+    <strong>まずはステージング CA と 1 つのホスト名から始めてください．</strong>
+    このテンプレートは 1 つの組織のサブスクリプションでの staging デプロイでは端から端まで
+    確認できていますが（<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/azure/README.md#%E5%AE%9F%E3%83%87%E3%83%97%E3%83%AD%E3%82%A4%E3%81%A7%E7%A2%BA%E8%AA%8D%E3%81%97%E3%81%9F%E3%81%93%E3%81%A8%E3%81%A8%E3%81%BE%E3%81%A0%E7%A2%BA%E8%AA%8D%E3%81%97%E3%81%A6%E3%81%84%E3%81%AA%E3%81%84%E3%81%93%E3%81%A8">同時実行時のリネームの原子性や SMB 上の <code>flock</code> など未確認の項目</a>が残っています．新しい環境へのデプロイは，最初から最後まで見守ってください．
+  </p>
+
+  <h3>手順</h3>
+  <ol class="steps">
+    <li><strong>署名鍵ペアを 2 組作る</strong> — 交換用共有の往復それぞれに 1 組．<br>
+      <pre><code>acme-conductor keygen --private job-signing.pem --public job-signing.pub
+acme-runner keygen --private result-signing.pem --public result-signing.pub</code></pre>
+      各コマンドが表示する <code>publicKey:</code> の 1 行を，次の手順の設定に貼り付けます．
+    </li>
+    <li><strong>Runner の設定を書く</strong> — <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/examples/runner-config.aca.example.json">deploy/examples/runner-config.aca.example.json</a> を出発点にします．<code>lego.stateDir</code> は <code>/state</code>，<code>lego.workDir</code> は <code>/work</code> のままにし，DNS バインディングはマネージド ID で認証するようにします（<code>AZURE_AUTH_METHOD</code> は設定しません．<code>passthroughEnv</code> に <code>AZURE_CLIENT_ID</code>，<code>IDENTITY_ENDPOINT</code>，<code>IDENTITY_HEADER</code> を列挙）．<code>jobSigning.publicKeys</code> は Bicep テンプレートが自動で追加するため，ここには書きません．</li>
+    <li><strong><code>main.bicepparam</code> をコピーして値を埋める</strong> — <code>deploy/azure</code> ディレクトリ内にコピーします（<code>runnerConfigJson</code> の <code>loadTextContent</code> が相対パスで解決するため）．イメージのダイジェスト，バインディング名，DNS ゾーン，Key Vault，公開鍵，OIDC の値を記入します．<br>
+      <pre><code>cd deploy/azure
+cp main.bicepparam my.bicepparam</code></pre>
+    </li>
+    <li><strong>秘密鍵を環境変数として export してデプロイする</strong> — 秘密鍵は <code>readEnvironmentVariable</code> で読まれ，パラメータファイルには書きません．<br>
+      <pre><code>export ACME_JOB_SIGNING_PRIVATE_KEY_PEM="$(cat job-signing.pem)"
+export ACME_RESULT_SIGNING_PRIVATE_KEY_PEM="$(cat result-signing.pem)"
+az deployment group create --resource-group rg-acme \
+  --template-file main.bicep --parameters my.bicepparam</code></pre>
+      イメージはダイジェストで固定して GHCR から直接 pull されるため，ローカルでのビルドや GHCR の資格情報は不要です．
+    </li>
+    <li><strong>最初の実行を確認する</strong> — Runner の設定はデプロイ時には検証されず，各実行の開始時に読み込まれます．待機中のジョブがなくても実行は毎分動き，<code>no pending job; nothing to do</code> で <code>Succeeded</code> になるのが正常です．<br>
+      <pre><code>az containerapp job execution list -g rg-acme -n &lt;prefix&gt;-runner \
+  --query "[0:3].{name:name,status:properties.status}" -o table
+az containerapp job logs show -g rg-acme -n &lt;prefix&gt;-runner \
+  --execution &lt;execution name&gt; --container runner --format text</code></pre>
+    </li>
+    <li><strong>GUI のリダイレクト URI を登録する</strong> — デプロイ後に出力される <code>conductorGuiRedirectUri</code>（<code>https://&lt;app fqdn&gt;/ui/</code>）を，OIDC プロバイダ側の GUI 用アプリ登録（シングルページアプリケーション）のリダイレクト URI に設定します．アプリの FQDN は初回デプロイ後にはじめて判明するため，これだけを後から登録すればよく，再デプロイは不要です．</li>
+  </ol>
+
+  <p>
+    実際に組織のサブスクリプションへ 1 つずつコマンドを実行した記録は
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/azure/walkthrough.md">deploy/azure/walkthrough.md</a>
+    にあります．命名や権限の確認，Entra ID のアプリ登録の作り方まで，順を追って書かれています．
+    生成 AI（Claude Code など）に作業を手伝わせたい場合は
+    <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/deploy/azure/ai-assisted-deploy.md">deploy/azure/ai-assisted-deploy.md</a>
+    に，何を AI に任せてよく何を人が判断すべきかがまとめられています．
+  </p>
+
+  <h2 id="ops">デプロイ後の運用</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>項目</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><th>到達方法</th><td>API と GUI には <code>conductorUrl</code>（デプロイの出力）で到達します．HTTPS のみで，<code>/api/</code> 配下のすべてのリクエストと GUI の操作には admin または viewer ロールを持つベアラートークンが必要です．<code>/healthz</code>，<code>/readyz</code>，GUI の静的ファイルだけが認証不要です．</td></tr>
+        <tr><th>バックアップ（Conductor）</th><td><code>conductor-state</code> 共有上の <code>conductor.db</code> です．共有のスナップショットを取るか，アプリをゼロにスケールした状態でファイルをコピーします．<code>runner-state</code> 共有（ACME アカウント鍵）もバックアップ対象です．<code>exchange</code> 共有には永続的なものはありません．</td></tr>
+        <tr><th>復元</th><td>プロセス（またはアプリ）を止めてファイルを戻します．新しいバイナリは起動時にスキーマを前方に移行しますが，古いバイナリは新しいスキーマのデータベースを拒否するため，ロールバックには対応するバックアップの復元が伴います．バックアップ時点で実行中だった run は次の起動時に「結果不明」として失敗扱いになります．</td></tr>
+        <tr><th>ロールバック</th><td>以前のテンプレートとパラメータで <code>az deployment group create</code> を実行するか，以前のイメージダイジェストを設定し，対応する <code>conductor.db</code> も復元します．</td></tr>
+        <tr><th>署名鍵のローテーション</th><td>まず検証側に新しい公開鍵を追加し（Runner の <code>jobSigning.publicKeys</code>，または Conductor の <code>resultSigningPublicKey</code>．どちらも複数保持できます），デプロイし，次に署名側を新しい秘密鍵に切り替え，最後に古い公開鍵を取り除きます．</td></tr>
+        <tr><th>残留した run ディレクトリ</th><td>実行の終了が確認できなかったとき，Conductor は <code>exchange</code> 共有上に <code>claimed/run-&lt;runId&gt;/</code> を残し「run directory kept」とログに記録します．<code>az containerapp job execution list</code> で実行の終了を確認したうえで，手で削除します．</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="images">イメージとリリース</h2>
+  <p>
+    バージョンタグを打つと，両方のイメージが SBOM と provenance を添えて
+    <code>ghcr.io/cits-nue/acme-conductor</code> と <code>ghcr.io/cits-nue/acme-runner</code>
+    に <code>linux/amd64</code> と <code>linux/arm64</code> 向けに公開されます．固定する前に
+    リリースを検証し，そのダイジェストで固定して使います．
+  </p>
+  <pre><code>gh attestation verify oci://ghcr.io/cits-nue/acme-conductor:&lt;version&gt; --owner CITS-NUE
+gh attestation verify oci://ghcr.io/cits-nue/acme-runner:&lt;version&gt; --owner CITS-NUE
+docker buildx imagetools inspect ghcr.io/cits-nue/acme-conductor:&lt;version&gt;</code></pre>
+  <p>
+    <code>latest</code> タグも便宜上付きますが，デプロイが固定する対象にはしません．GHCR の公開
+    イメージにレジストリの資格情報は不要ですが，新しいパッケージ（名前を変えたイメージ，新しい
+    バイナリ）を資格情報なしで pull できるようにするには，組織のオーナーが一度だけ公開設定にする
+    必要があります．
+  </p>
+
+  <div class="next">
+    <a class="back" href="security.html"><small>前へ</small>安全設計</a>
+    <a class="fwd" href="migration.html"><small>次へ</small>既存環境からの移行</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>
