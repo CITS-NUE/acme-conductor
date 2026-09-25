@@ -11,7 +11,7 @@ package ui
 
 import "embed"
 
-// Files holds index.html, app.js and app.css.
+// Files holds index.html, app.js, provision.js and app.css.
 //
-//go:embed index.html app.js app.css
+//go:embed index.html app.js provision.js app.css
 var Files embed.FS
