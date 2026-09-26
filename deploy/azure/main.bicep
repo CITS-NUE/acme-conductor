@@ -20,9 +20,10 @@
 //     TLS and the hop from ingress to replica is encrypted.
 //
 // Nothing here is a secret except the two signing private keys (the
-// Conductor's job-signing key, the Runner's result-signing key), each a
-// secure parameter stored as a secret and mounted as a file for its own
-// binary.
+// Conductor's job-signing key, the Runner's result-signing key) and, when
+// encrypted EAB provisioning is enabled, the Runner's account-provisioning
+// private key, each a secure parameter stored as a secret and mounted as a
+// file for its own binary.
 // No DNS or Key Vault credential exists anywhere: both are the Runner's
 // managed identity. See deploy/azure/README.md for what this template does
 // not verify and how to operate the result.
@@ -65,6 +66,13 @@ param resultSigningPrivateKeyPem string
 
 @description('The matching public key (PEM or one-line base64), placed into the Conductor configuration as resultSigning.publicKeys[0].')
 param resultSigningPublicKey string
+
+@description('The X25519 account-provisioning private key, PEM (PKCS #8), from `acme-runner provisioning-keygen`. Stored as a Container Apps Job secret and mounted as a file for the Runner only; the Runner opens sealed EAB provisioning payloads with it (docs/adr/0022). Empty (with accountProvisioningPublicKey empty) leaves encrypted EAB provisioning disabled.')
+@secure()
+param accountProvisioningPrivateKeyPem string = ''
+
+@description('The matching public key (the one-line publicKey of `acme-runner provisioning-keygen`, or PEM), placed into the Conductor configuration as accountProvisioning.publicKey. Give both provisioning parameters or neither.')
+param accountProvisioningPublicKey string = ''
 
 @description('Logical ACME binding names the Conductor registers (must match the Runner configuration).')
 param acmeBindings array
@@ -162,6 +170,19 @@ var conductorAppName = '${namePrefix}-conductor'
 var shareConductorState = 'conductor-state'
 var shareRunnerState = 'runner-state'
 var shareExchange = 'exchange'
+
+// --- encrypted EAB provisioning (optional) -----------------------------------
+
+// Both provisioning keys, or neither. One without the other fails the
+// deployment before anything is changed: an empty private key would
+// overwrite the Job secret and every provisioning run would fail on the
+// Runner, and a private key without the public one would leave the
+// Conductor unable to offer the key to the GUI.
+var accountProvisioningEnabled = empty(accountProvisioningPrivateKeyPem) && empty(accountProvisioningPublicKey)
+  ? false
+  : !empty(accountProvisioningPrivateKeyPem) && !empty(accountProvisioningPublicKey)
+      ? true
+      : fail('accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together (both empty disables encrypted EAB provisioning).')
 
 // --- roles (subscription scope) ----------------------------------------------
 
@@ -331,7 +352,8 @@ resource exchangeStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01'
 
 // The operator's Runner configuration plus the Conductor's public key (so
 // the Runner cannot be deployed without the key it needs to verify jobs),
-// the path of its own result-signing key, and the client ID of the
+// the path of its own result-signing key (and of its account-provisioning
+// key, when provisioning is enabled), and the client ID of the
 // Runner's user-assigned identity on every Key Vault store binding that
 // authenticates with a managed identity: the Job carries a user-assigned
 // identity only, and a managed-identity credential that names no client
@@ -366,7 +388,13 @@ var runnerConfig = union(runnerConfigInput, {
     privateKeyFile: '/etc/acme-runner/result-signing.pem'
   }
   storeBindings: runnerStoreBindings
-})
+}, accountProvisioningEnabled ? {
+  accountProvisioning: {
+    privateKeyFiles: [
+      '/etc/acme-runner/account-provisioning.pem'
+    ]
+  }
+} : {})
 
 resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
   name: runnerJobName
@@ -401,7 +429,7 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
         parallelism: 1
         replicaCompletionCount: 1
       }
-      secrets: [
+      secrets: concat([
         {
           name: 'runner-config'
           // Not a secret (it holds no credential, docs/runner.md); a
@@ -413,7 +441,12 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'result-signing-key'
           value: resultSigningPrivateKeyPem
         }
-      ]
+      ], accountProvisioningEnabled ? [
+        {
+          name: 'account-provisioning-key'
+          value: accountProvisioningPrivateKeyPem
+        }
+      ] : [])
     }
     template: {
       containers: [
@@ -468,7 +501,7 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'runner-config'
           storageType: 'Secret'
-          secrets: [
+          secrets: concat([
             {
               secretRef: 'runner-config'
               path: 'config.json'
@@ -477,7 +510,12 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'result-signing-key'
               path: 'result-signing.pem'
             }
-          ]
+          ], accountProvisioningEnabled ? [
+            {
+              secretRef: 'account-provisioning-key'
+              path: 'account-provisioning.pem'
+            }
+          ] : [])
         }
         {
           name: 'exchange'
@@ -502,7 +540,11 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
 
 // --- the Conductor: a single-replica app behind the HTTPS ingress ------------
 
-var conductorConfig = union(conductorConfigBase, empty(migration) ? {} : { migration: migration })
+var conductorConfig = union(
+  conductorConfigBase,
+  empty(migration) ? {} : { migration: migration },
+  accountProvisioningEnabled ? { accountProvisioning: { publicKey: accountProvisioningPublicKey } } : {}
+)
 
 var conductorConfigBase = {
   apiVersion: 'acme-conductor.cits-nue.github.io/v1alpha1'

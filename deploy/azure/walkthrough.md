@@ -153,6 +153,27 @@ done
 cat "$d"/*.pub.b64    # これが jobSigningPublicKey / resultSigningPublicKey
 ```
 
+### 3-1. 暗号化 EAB プロビジョニング用の鍵（EAB が必須の CA を使う場合のみ）
+
+UPKI など External Account Binding（EAB）が必須の CA を使う場合は，EAB を
+GUI からブラウザ内で暗号化して投入するための X25519 鍵ペアも用意する
+（[ADR 0022](../../docs/adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
+Let's Encrypt だけなら不要で，次の手順のパラメタも空のままでよい．
+この鍵は `acme-runner provisioning-keygen` で生成する:
+
+```sh
+acme-runner provisioning-keygen \
+  --private "$d/account-provisioning.pem" --public "$d/account-provisioning.pub"
+chmod 600 "$d/account-provisioning.pem"
+# 出力の publicKey: が accountProvisioningPublicKey．keyId: は手順 9 の確認用に控える
+```
+
+署名鍵と同じく，秘密鍵は Key Vault などに保管し，デプロイの直前に環境変数
+`ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM` へ読み込む．テンプレートは
+公開鍵と秘密鍵の **両方** が与えられたときだけこの機能を有効にし，片方だけの
+ときはデプロイを何も変更しないうちに失敗させる．環境変数を設定し忘れた
+再デプロイで，シークレットが空で上書きされることはない．
+
 ## 4. リソースグループと Key Vault の作成
 
 ```sh
@@ -263,6 +284,9 @@ param jobSigningPublicKey = '<job-signing.pub.b64>'
 param jobSigningPrivateKeyPem = readEnvironmentVariable('ACME_JOB_SIGNING_PRIVATE_KEY_PEM', '')
 param resultSigningPublicKey = '<result-signing.pub.b64>'
 param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_PRIVATE_KEY_PEM', '')
+// 手順 3-1 の鍵を作った場合のみ（両方とも書くか，両方とも書かない）
+param accountProvisioningPublicKey = '<account-provisioning の publicKey>'
+param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
 param runnerConfigJson = loadTextContent('staging.runner-config.json')
 param oidcIssuer = 'https://login.microsoftonline.com/<tenant-id>/v2.0'
 param oidcAudience = '<oidcAudience>'
@@ -281,6 +305,8 @@ param ingressAllowedCidrs = []
 az bicep build-params --file staging.bicepparam --stdout > /dev/null && echo OK
 export ACME_JOB_SIGNING_PRIVATE_KEY_PEM="$(cat ~/.acme-conductor/staging/job-signing.pem)"
 export ACME_RESULT_SIGNING_PRIVATE_KEY_PEM="$(cat ~/.acme-conductor/staging/result-signing.pem)"
+# 手順 3-1 の鍵を作った場合のみ
+export ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM="$(cat ~/.acme-conductor/staging/account-provisioning.pem)"
 az deployment group what-if -g rg-acme-staging -n acme-stg \
   --template-file main.bicep --parameters staging.bicepparam --result-format ResourceIdOnly
 ```
@@ -342,6 +368,15 @@ az containerapp job logs show -g $RG -n $P-runner --execution <execution name> -
 Runner の実行が毎分 `Failed` になる場合は，まずログを見る．ログに
 `runner configuration could not be loaded` と出ていれば Runner 設定の誤りである．
 直して手順 8 を再実行する．
+
+暗号化 EAB プロビジョニングを有効にした場合は，Conductor が公開鍵を持っている
+ことを確かめる．`GET /api/v1alpha1/account-provisioning/key` が `keyId` を返し，
+それが手順 3-1 で控えた `keyId` と一致すればよい（未設定なら `404`
+`not_configured`）．API にはトークンが要るので，GUI の EAB 投入画面
+（ACME バインディングの provisioning）に表示される `keyId` で見るのが簡単である．
+この比較は Conductor を経由しない控えと突き合わせて行う
+（[`docs/conductor.md`](../../docs/conductor.md) の既知の制約を参照）．
+出力の `conductorConfig` にも `accountProvisioning.publicKey` が出る．
 
 GUI のリダイレクト URI を登録する:
 
@@ -558,6 +593,8 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |
+| what-if／デプロイが `accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together` で失敗する | provisioning 用の公開鍵と秘密鍵の片方だけが渡された（多くは環境変数 `ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM` の設定忘れ） | 環境変数を設定する．機能を使わないなら `accountProvisioning*` の行を両方消す（手順 3-1） |
+| GUI で EAB を投入しようとすると公開鍵がないと言われる／API が `404 not_configured` | `accountProvisioningPublicKey` を渡していない | 手順 3-1 の鍵を渡して再デプロイする |
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
