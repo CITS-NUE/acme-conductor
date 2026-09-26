@@ -76,6 +76,21 @@ run のたびに使われる継続的な資格情報とは性質が異なる．
   （`ProvisioningKeyID`）は，署名鍵の `KeyID` と同じ導出（生の公開鍵の
   SHA-256 の先頭 16 桁の 16 進）を X25519 の生公開鍵に適用したものであり，
   どちらの鍵種別も同じ考え方で識別できる．
+- **EAB を受け付ける binding は操作者が明示する．** Conductor は ACME binding
+  を名前でしか知らず（binding が指す CA の directory は Runner の設定にしか
+  ない），その CA が EAB を要求するかどうかを自分では判断できない．そこで
+  Conductor の設定 `accountProvisioning.bindings`（1 個以上，いずれも
+  `acmeBindings` に列挙済み）に EAB を要求する CA の binding を挙げ，それ
+  以外の binding は GUI に投入フォームを出さず，API も
+  `409 eab_not_required` で要求を拒否する．EAB が要らない CA（Let's
+  Encrypt など）の binding に無意味な EAB を投入させたり，ダミー値の投入を
+  誘ったりしないためである．これは真偽の属性であってシークレットではない
+  ので，[ADR 0005](0005-conductor-never-touches-secrets.md) には反しない．
+  スケジューラもこのリストにある binding についてだけ未着手の要求を
+  claim する．リストから外すことは操作者の明示的な停止の意思であり，外す
+  前に投入されて残っていた暗号文を後から Runner へ送ってはならないからで
+  ある．残った要求は保留のまま run に添付されず，活性世代があれば通常通り
+  使われ，操作者がキャンセルできる．
 - **Conductor が保存し取り扱えるのは暗号文とメタデータだけである．**
   Conductor の `acme_accounts` テーブル（`internal/conductor/sqlite`）は
   `sealed_payload` に `SealedProvisioning` の JSON をそのまま持つが，これは

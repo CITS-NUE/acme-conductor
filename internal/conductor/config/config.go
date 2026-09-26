@@ -178,7 +178,7 @@ type Config struct {
 	// browser, and the Conductor stores and hands out only ciphertext.
 	// Absent disables it: the account-provisioning endpoints answer
 	// not_configured and the scheduler never claims a pending request
-	// (the API is the only way to create one).
+	// (not even one left in the database by an earlier configuration).
 	AccountProvisioning *AccountProvisioning `json:"accountProvisioning,omitempty"`
 }
 
@@ -192,8 +192,29 @@ type AccountProvisioning struct {
 	// SubjectPublicKeyInfo, or the base64url (no padding) of the raw
 	// 32-byte key (see v1alpha1.ParseProvisioningPublicKey).
 	PublicKey string `json:"publicKey"`
+	// Bindings are the ACME bindings whose CA requires an External
+	// Account Binding: only these get the provisioning form and accept a
+	// provisioning request. The Conductor knows an ACME binding by name
+	// only and cannot tell on its own whether the CA behind it wants an
+	// EAB (the Runner holds the directory URL), so the operator says so
+	// here. Each must be listed in acmeBindings.
+	Bindings []string `json:"bindings"`
 
 	pub *ecdh.PublicKey
+}
+
+// RequiresEAB reports whether binding is one of the ACME bindings listed
+// in Bindings. It is false for every binding if a is nil.
+func (a *AccountProvisioning) RequiresEAB(binding string) bool {
+	return a != nil && contains(a.Bindings, binding)
+}
+
+// EABBindings returns Bindings, or nil if a is nil.
+func (a *AccountProvisioning) EABBindings() []string {
+	if a == nil {
+		return nil
+	}
+	return a.Bindings
 }
 
 // Key returns the parsed provisioning public key.
@@ -212,10 +233,18 @@ func (a *AccountProvisioning) KeyID() string {
 	return v1alpha1.ProvisioningKeyID(a.pub)
 }
 
-func (a *AccountProvisioning) validate() error {
+func (a *AccountProvisioning) validate(c *Config) error {
 	pub, err := v1alpha1.ParseProvisioningPublicKey(a.PublicKey)
 	if err != nil {
 		return invalid("accountProvisioning.publicKey: %v", err)
+	}
+	if err := validateNames("accountProvisioning.bindings", a.Bindings); err != nil {
+		return err
+	}
+	for _, n := range a.Bindings {
+		if !c.HasACMEBinding(n) {
+			return invalid("accountProvisioning.bindings: %q is not listed in acmeBindings", n)
+		}
 	}
 	a.pub = pub
 	return nil
@@ -514,7 +543,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if c.AccountProvisioning != nil {
-		if err := c.AccountProvisioning.validate(); err != nil {
+		if err := c.AccountProvisioning.validate(c); err != nil {
 			return err
 		}
 	}

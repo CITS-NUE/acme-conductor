@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
+	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
 )
 
 // requestProvisioning records a pending generation for f.policy.ACMEBinding
@@ -243,5 +245,68 @@ func TestACMEProvisioningFailedResultKeepsPreviousActive(t *testing.T) {
 	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
 	if err != nil || len(list) != 2 || list[0].Generation != 2 || list[0].Status != registry.ACMEAccountFailed || list[1].Status != registry.ACMEAccountActive {
 		t.Fatalf("list = %+v %v", list, err)
+	}
+}
+
+// A pending generation on a binding the scheduler does not treat as an
+// EAB binding (it was dropped from accountProvisioning.bindings after the
+// request, or provisioning was disabled) is never claimed: its payload
+// stays out of the JobSpec, the active generation is used as usual, and
+// the pending row stays for an operator to cancel.
+func TestACMEProvisioningNotClaimedForBindingWithoutEAB(t *testing.T) {
+	for name, bindings := range map[string][]string{"other binding": {"another-ca"}, "provisioning disabled": nil} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t, 1)
+			ctx := context.Background()
+			f.fake.respond = func(_ context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+				// One day left, so the target is due again for the next cycle.
+				res := okResult(f.clock(), spec, v1alpha1.ActionIssued, 1)
+				if spec.ACME.Account != nil && spec.ACME.Account.Provisioning != nil {
+					res.AccountProvisioning = &v1alpha1.AccountProvisioningResult{Binding: f.policy.ACMEBinding, Generation: spec.ACME.Account.Generation, Status: v1alpha1.AccountProvisioningRegistered}
+				}
+				return res, nil
+			}
+			// Generation 1 becomes active while fake-ca is an EAB binding.
+			requestProvisioning(t, f, 1)
+			f.cycle(t)
+			if active, err := f.reg.ActiveACMEAccountGeneration(ctx, f.policy.ACMEBinding); err != nil || active != 1 {
+				t.Fatalf("active generation = %d %v", active, err)
+			}
+			requestProvisioning(t, f, 2)
+
+			// The Conductor restarts with fake-ca no longer an EAB binding.
+			f.s = New(Options{
+				Registry: f.reg, Launchers: map[string]launcher.Launcher{"local": f.fake},
+				Tick: 10 * time.Millisecond, MaxConcurrentRuns: 1,
+				RetryBackoff: 5 * time.Minute, MaxRetryBackoff: 6 * time.Hour, Now: f.clock,
+				ProvisioningBindings: bindings,
+			})
+			f.target.Owner = "other"
+			if err := f.reg.UpdateTarget(ctx, f.target, f.target.Revision, nil); err != nil {
+				t.Fatal(err)
+			}
+			if planned, started := f.cycle(t); planned != 1 || started != 1 {
+				t.Fatalf("planned %d started %d", planned, started)
+			}
+			spec := f.fake.specs[len(f.fake.specs)-1]
+			if spec.ACME.Account == nil || spec.ACME.Account.Generation != 1 || spec.ACME.Account.Provisioning != nil {
+				t.Fatalf("spec.ACME.Account = %+v, want the active generation 1 and no payload", spec.ACME.Account)
+			}
+			if run := f.lastRun(t); run.Status != registry.RunSucceeded {
+				t.Fatalf("run = %+v", run)
+			}
+			list, err := f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding)
+			if err != nil || len(list) != 2 || list[0].Generation != 2 || list[0].Status != registry.ACMEAccountProvisioning || list[0].RunID != "" || list[1].Status != registry.ACMEAccountActive {
+				t.Fatalf("list = %+v %v", list, err)
+			}
+			// The operator can still cancel the stranded request.
+			if err := f.reg.CancelACMEAccountProvisioning(ctx, f.policy.ACMEBinding, 2, nil); err != nil {
+				t.Fatalf("cancel: %v", err)
+			}
+			list, err = f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding)
+			if err != nil || list[0].Status != registry.ACMEAccountCancelled {
+				t.Fatalf("list after cancel = %+v %v", list, err)
+			}
+		})
 	}
 }

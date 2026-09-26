@@ -54,9 +54,12 @@ param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_
 // `acme-runner provisioning-keygen --private account-provisioning.pem --public account-provisioning.pub`
 // (the "publicKey:" line of its output). Give both or neither; both empty
 // (the default) leaves the feature disabled, and one without the other
-// fails the deployment before anything changes.
+// fails the deployment before anything changes. accountProvisioningBindings
+// names the ACME bindings (from acmeBindings) whose CA requires EAB: only
+// those get the provisioning form (a CA like Let's Encrypt does not).
 // param accountProvisioningPublicKey = '<publicKey from provisioning-keygen>'
 // param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
+// param accountProvisioningBindings = ['<acme binding whose CA requires EAB>']
 
 param runnerConfigJson = loadTextContent('../examples/runner-config.aca.example.json')
 

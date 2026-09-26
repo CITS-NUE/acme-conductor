@@ -114,6 +114,7 @@ func setup(t *testing.T, maxRuns int) *fixture {
 		Registry: reg, Launchers: map[string]launcher.Launcher{"local": f.fake},
 		Tick: 10 * time.Millisecond, MaxConcurrentRuns: maxRuns,
 		RetryBackoff: 5 * time.Minute, MaxRetryBackoff: 6 * time.Hour, Now: f.clock,
+		ProvisioningBindings: []string{"fake-ca"},
 	})
 	ctx := context.Background()
 	f.policy = &registry.Policy{AllowedDnsSuffixes: []string{"example.ac.jp"}, ACMEBinding: "fake-ca", RenewBeforeDays: 30, KeyType: v1alpha1.KeyTypeEC256, MaxSANs: 1, Enabled: true}

@@ -67,8 +67,13 @@ func acmeAccountResource(a *registry.ACMEAccount) ACMEAccountResource {
 // ACMEBindingResource is the response representation of one configured
 // ACME binding's account provisioning state.
 type ACMEBindingResource struct {
-	Name             string `json:"name"`
-	ActiveGeneration int64  `json:"activeGeneration"`
+	Name string `json:"name"`
+	// ExternalAccountBinding reports whether this binding's CA requires
+	// an EAB (it is listed in accountProvisioning.bindings), i.e. whether
+	// it accepts a provisioning request. A binding that does not still
+	// lists the generations it has, and a pending one can be cancelled.
+	ExternalAccountBinding bool  `json:"externalAccountBinding"`
+	ActiveGeneration       int64 `json:"activeGeneration"`
 	// Pending is the binding's unique provisioning-status generation, if
 	// any (whether or not it is yet attached to a run).
 	Pending     *ACMEAccountResource  `json:"pending"`
@@ -80,7 +85,7 @@ func (s *Server) acmeBindingResource(r *http.Request, name string) (*ACMEBinding
 	if err != nil {
 		return nil, err
 	}
-	res := &ACMEBindingResource{Name: name, Generations: make([]ACMEAccountResource, 0, len(list))}
+	res := &ACMEBindingResource{Name: name, ExternalAccountBinding: s.bind.has(s.eabBindings, name), Generations: make([]ACMEAccountResource, 0, len(list))}
 	for _, a := range list {
 		item := acmeAccountResource(a)
 		res.Generations = append(res.Generations, item)
@@ -150,6 +155,10 @@ func (s *Server) handleRequestACMEProvisioning(w http.ResponseWriter, r *http.Re
 	binding, err := s.pathBinding(r)
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	if !s.bind.has(s.eabBindings, binding) {
+		s.fail(w, r, &apiError{status: http.StatusConflict, code: "eab_not_required", message: fmt.Sprintf("acme binding %q is not listed in accountProvisioning.bindings: its CA does not take an External Account Binding", binding)})
 		return
 	}
 	var in ACMEProvisioningInput
