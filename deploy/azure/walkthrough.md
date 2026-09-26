@@ -284,9 +284,10 @@ param jobSigningPublicKey = '<job-signing.pub.b64>'
 param jobSigningPrivateKeyPem = readEnvironmentVariable('ACME_JOB_SIGNING_PRIVATE_KEY_PEM', '')
 param resultSigningPublicKey = '<result-signing.pub.b64>'
 param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_PRIVATE_KEY_PEM', '')
-// 手順 3-1 の鍵を作った場合のみ（両方とも書くか，両方とも書かない）
+// 手順 3-1 の鍵を作った場合のみ（3 行とも書くか，3 行とも書かない）
 param accountProvisioningPublicKey = '<account-provisioning の publicKey>'
 param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
+param accountProvisioningBindings = ['<EAB を要求する CA の ACME binding>']  // acmeBindings のいずれか
 param runnerConfigJson = loadTextContent('staging.runner-config.json')
 param oidcIssuer = 'https://login.microsoftonline.com/<tenant-id>/v2.0'
 param oidcAudience = '<oidcAudience>'
@@ -376,7 +377,8 @@ Runner の実行が毎分 `Failed` になる場合は，まずログを見る．
 （ACME バインディングの provisioning）に表示される `keyId` で見るのが簡単である．
 この比較は Conductor を経由しない控えと突き合わせて行う
 （[`docs/conductor.md`](../../docs/conductor.md) の既知の制約を参照）．
-出力の `conductorConfig` にも `accountProvisioning.publicKey` が出る．
+出力の `conductorConfig` にも `accountProvisioning.publicKey` と
+`accountProvisioning.bindings` が出る．
 
 GUI のリダイレクト URI を登録する:
 
@@ -593,8 +595,10 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |
-| what-if／デプロイが `accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together` で失敗する | provisioning 用の公開鍵と秘密鍵の片方だけが渡された（多くは環境変数 `ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM` の設定忘れ） | 環境変数を設定する．機能を使わないなら `accountProvisioning*` の行を両方消す（手順 3-1） |
+| what-if／デプロイが `accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together` で失敗する | provisioning 用の公開鍵と秘密鍵の片方だけが渡された（多くは環境変数 `ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM` の設定忘れ） | 環境変数を設定する．機能を使わないなら `accountProvisioning*` の行をすべて消す（手順 3-1） |
 | GUI で EAB を投入しようとすると公開鍵がないと言われる／API が `404 not_configured` | `accountProvisioningPublicKey` を渡していない | 手順 3-1 の鍵を渡して再デプロイする |
+| what-if／デプロイが `accountProvisioningBindings must …` または `accountProvisioningBindings may only …` で失敗する | 有効化したのに `accountProvisioningBindings` が空，無効なのに値がある，または `acmeBindings` にない名前がある | EAB を要求する CA の binding（`acmeBindings` のいずれか）を挙げる．機能を使わないなら `accountProvisioning*` の行をすべて消す |
+| GUI の ACME アカウントのページで，ある binding に投入フォームが出ない／API が `409 eab_not_required` | その binding が `accountProvisioningBindings` に挙がっていない | CA が EAB を要求するなら `accountProvisioningBindings` に加えて再デプロイする．要求しない CA（Let's Encrypt など）なら投入は不要 |
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |

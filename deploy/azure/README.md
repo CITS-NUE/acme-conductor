@@ -115,6 +115,11 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   `accountProvisioning.privateKeyFiles` として追加される），公開鍵は
   `accountProvisioningPublicKey`（Conductor の設定の
   `accountProvisioning.publicKey`）に渡す．**両方を渡すか，両方とも空にする．**
+  あわせて，CA が EAB を要求する ACME binding の名前を
+  `accountProvisioningBindings`（Conductor の設定の
+  `accountProvisioning.bindings`．`acmeBindings` のいずれか）に渡す．
+  機能を有効にするなら 1 個以上が必須で，無効なら空でなければならない．
+  挙げた binding だけに GUI の投入フォームが出る．
   両方とも空（既定）なら機能は無効のままで，テンプレートの出力はこの機能の
   導入前と変わらない．片方だけを渡すと，デプロイは何も変更しないうちに
   失敗する（空の秘密鍵でシークレットを上書きすると，プロビジョニングの run が

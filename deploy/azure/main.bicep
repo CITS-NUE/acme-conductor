@@ -74,6 +74,9 @@ param accountProvisioningPrivateKeyPem string = ''
 @description('The matching public key (the one-line publicKey of `acme-runner provisioning-keygen`, or PEM), placed into the Conductor configuration as accountProvisioning.publicKey. Give both provisioning parameters or neither.')
 param accountProvisioningPublicKey string = ''
 
+@description('The ACME binding names whose CA requires External Account Binding, placed into the Conductor configuration as accountProvisioning.bindings: only these get the provisioning form in the GUI. Each must be one of acmeBindings. Required (non-empty) when provisioning is enabled; must be empty when it is not.')
+param accountProvisioningBindings array = []
+
 @description('Logical ACME binding names the Conductor registers (must match the Runner configuration).')
 param acmeBindings array
 
@@ -183,6 +186,19 @@ var accountProvisioningEnabled = empty(accountProvisioningPrivateKeyPem) && empt
   : !empty(accountProvisioningPrivateKeyPem) && !empty(accountProvisioningPublicKey)
       ? true
       : fail('accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together (both empty disables encrypted EAB provisioning).')
+
+// The bindings whose CA takes an EAB: named exactly when provisioning is
+// enabled, and each one a registered ACME binding, so that a mistake
+// fails the deployment rather than the Conductor's start.
+var accountProvisioningEabBindings = !accountProvisioningEnabled
+  ? (empty(accountProvisioningBindings)
+      ? []
+      : fail('accountProvisioningBindings must be empty when encrypted EAB provisioning is disabled.'))
+  : empty(accountProvisioningBindings)
+      ? fail('accountProvisioningBindings must name the ACME bindings whose CA requires External Account Binding when encrypted EAB provisioning is enabled.')
+      : empty(filter(accountProvisioningBindings, b => !contains(acmeBindings, b)))
+          ? accountProvisioningBindings
+          : fail('accountProvisioningBindings may only name bindings listed in acmeBindings.')
 
 // --- roles (subscription scope) ----------------------------------------------
 
@@ -543,7 +559,7 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
 var conductorConfig = union(
   conductorConfigBase,
   empty(migration) ? {} : { migration: migration },
-  accountProvisioningEnabled ? { accountProvisioning: { publicKey: accountProvisioningPublicKey } } : {}
+  accountProvisioningEnabled ? { accountProvisioning: { publicKey: accountProvisioningPublicKey, bindings: accountProvisioningEabBindings } } : {}
 )
 
 var conductorConfigBase = {

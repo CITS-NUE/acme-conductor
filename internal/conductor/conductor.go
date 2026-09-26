@@ -184,14 +184,15 @@ func Serve(ctx context.Context, opts Options) int {
 	}
 	migOpts, shadow := buildMigration(cfg, reg, names, log)
 	handler := api.New(api.Options{
-		Registry:        reg,
-		Scheduler:       sched,
-		Bindings:        api.Bindings{Execution: sortStrings(names), ACME: cfg.ACMEBindings, DNS: cfg.DNSBindings, Store: cfg.StoreBindings},
-		Auth:            auth,
-		Logger:          log.With("component", "api"),
-		UI:              uiOpts,
-		Migration:       migOpts,
-		ProvisioningKey: cfg.AccountProvisioning.Key(),
+		Registry:             reg,
+		Scheduler:            sched,
+		Bindings:             api.Bindings{Execution: sortStrings(names), ACME: cfg.ACMEBindings, DNS: cfg.DNSBindings, Store: cfg.StoreBindings},
+		Auth:                 auth,
+		Logger:               log.With("component", "api"),
+		UI:                   uiOpts,
+		Migration:            migOpts,
+		ProvisioningKey:      cfg.AccountProvisioning.Key(),
+		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 	})
 	srv := &http.Server{
 		Handler:           handler,

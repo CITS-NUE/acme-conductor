@@ -726,6 +726,8 @@
     }
     if (!keyInfo) {
       parts.push(notice('error', 'Account provisioning is not configured on this Conductor.'));
+    } else if (!b.externalAccountBinding) {
+      parts.push(el('p', { class: 'hint', text: 'This binding\'s CA does not take an External Account Binding (it is not listed in accountProvisioning.bindings); there is nothing to provision.' }));
     } else if (b.pending) {
       parts.push(el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' }));
     } else if (!x25519Ok) {

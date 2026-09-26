@@ -84,6 +84,10 @@ type Options struct {
 	// key (issue #42): it enables the account-provisioning endpoints and
 	// GUI page. Nil disables them (not_configured).
 	ProvisioningKey *ecdh.PublicKey
+	// ProvisioningBindings are the ACME bindings whose CA requires an
+	// External Account Binding (accountProvisioning.bindings): only these
+	// accept a provisioning request. Ignored when ProvisioningKey is nil.
+	ProvisioningBindings []string
 }
 
 // Server is the API handler.
@@ -100,6 +104,7 @@ type Server struct {
 
 	migration    *MigrationOptions
 	provisioning *ecdh.PublicKey
+	eabBindings  []string
 }
 
 // New builds the handler.
@@ -117,6 +122,9 @@ func New(o Options) *Server {
 		o.Scheduler = noScheduler{}
 	}
 	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), migration: o.Migration, provisioning: o.ProvisioningKey}
+	if o.ProvisioningKey != nil {
+		s.eabBindings = o.ProvisioningBindings
+	}
 	s.routes()
 	return s
 }

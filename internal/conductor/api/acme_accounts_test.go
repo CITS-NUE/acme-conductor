@@ -39,14 +39,16 @@ func newProvEnv(t *testing.T) *provEnv {
 	}
 	t.Cleanup(func() { reg.Close() })
 	sched := &fakeSched{inflight: map[string]bool{}}
-	bind := Bindings{Execution: []string{"local"}, ACME: []string{"letsencrypt-staging"}, DNS: []string{"azure-dns-staging"}, Store: []string{"filesystem-dev"}}
+	// letsencrypt-staging stands in for a CA that requires an EAB (it is
+	// listed in ProvisioningBindings); no-eab-ca for one that does not.
+	bind := Bindings{Execution: []string{"local"}, ACME: []string{"letsencrypt-staging", "no-eab-ca"}, DNS: []string{"azure-dns-staging"}, Store: []string{"filesystem-dev"}}
 	runnerPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
-	h := New(Options{Registry: reg, Scheduler: sched, Bindings: bind, Auth: LocalhostDev{}, Logger: logger, ProvisioningKey: runnerPriv.PublicKey()})
+	h := New(Options{Registry: reg, Scheduler: sched, Bindings: bind, Auth: LocalhostDev{}, Logger: logger, ProvisioningKey: runnerPriv.PublicKey(), ProvisioningBindings: []string{"letsencrypt-staging"}})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	_, port, _ := strings.Cut(strings.TrimPrefix(srv.URL, "http://127.0.0.1:"), "")
@@ -109,15 +111,56 @@ func TestACMEBindingsListAndGet(t *testing.T) {
 	}
 	r := pe.do("GET", Prefix+"/acme-bindings", nil, nil)
 	items := r.items()
-	if r.status != http.StatusOK || len(items) != 1 || items[0]["name"] != "letsencrypt-staging" {
+	if r.status != http.StatusOK || len(items) != 2 || items[0]["name"] != "letsencrypt-staging" || items[1]["name"] != "no-eab-ca" {
 		t.Fatalf("list = %d %+v", r.status, items)
 	}
-	if items[0]["activeGeneration"].(float64) != 0 || items[0]["pending"] != nil {
+	if items[0]["activeGeneration"].(float64) != 0 || items[0]["pending"] != nil || items[0]["externalAccountBinding"] != true {
 		t.Fatalf("binding = %+v", items[0])
 	}
+	if items[1]["externalAccountBinding"] != false {
+		t.Fatalf("binding = %+v", items[1])
+	}
 	r = pe.do("GET", Prefix+"/acme-bindings/letsencrypt-staging", nil, nil)
-	if r.status != http.StatusOK || r.body["name"] != "letsencrypt-staging" {
+	if r.status != http.StatusOK || r.body["name"] != "letsencrypt-staging" || r.body["externalAccountBinding"] != true {
 		t.Fatalf("get = %d %+v", r.status, r.body)
+	}
+	r = pe.do("GET", Prefix+"/acme-bindings/no-eab-ca", nil, nil)
+	if r.status != http.StatusOK || r.body["externalAccountBinding"] != false {
+		t.Fatalf("get = %d %+v", r.status, r.body)
+	}
+}
+
+// Without a provisioning key no binding takes an EAB, whatever
+// ProvisioningBindings says.
+func TestACMEBindingsWithoutProvisioning(t *testing.T) {
+	e := newEnv(t)
+	r := e.do("GET", Prefix+"/acme-bindings", nil, nil)
+	items := r.items()
+	if r.status != http.StatusOK || len(items) == 0 {
+		t.Fatalf("list = %d %+v", r.status, items)
+	}
+	for _, b := range items {
+		if b["externalAccountBinding"] != false {
+			t.Fatalf("binding = %+v", b)
+		}
+	}
+}
+
+// A binding whose CA does not take an EAB refuses a provisioning request
+// before anything is decoded or stored.
+func TestRequestACMEProvisioningRefusesBindingWithoutEAB(t *testing.T) {
+	pe := newProvEnv(t)
+	body := map[string]any{"accountGeneration": 1, "encryptedCredential": sealFor(t, pe.runnerPriv.PublicKey(), "no-eab-ca", 1, "kid-no-eab", "aG1hYw")}
+	r := pe.do("POST", Prefix+"/acme-bindings/no-eab-ca/provisioning", body, nil)
+	if r.status != http.StatusConflict || r.errCode() != "eab_not_required" {
+		t.Fatalf("status=%d code=%s", r.status, r.errCode())
+	}
+	list, err := pe.reg.ListACMEAccounts(context.Background(), "no-eab-ca")
+	if err != nil || len(list) != 0 {
+		t.Fatalf("stored = %+v %v", list, err)
+	}
+	if pe.sched.wakes != 0 {
+		t.Fatalf("scheduler woken %d times", pe.sched.wakes)
 	}
 }
 

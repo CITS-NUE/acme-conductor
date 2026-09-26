@@ -322,6 +322,7 @@ Runner に対する Conductor の ID であって，DNS・Store・クラウド�
 | フィールド | 型 | 既定値 | 備考 |
 |---|---|---|---|
 | `publicKey` | string | —（必須） | Runner の account-provisioning 用 X25519 公開鍵．PEM の `PUBLIC KEY` ブロック，その DER SubjectPublicKeyInfo の標準 base64，または生の 32 バイト鍵の base64url（無パディング）のいずれか（`acme-runner provisioning-keygen` が出力する 1 行の `publicKey:` を含む）． |
+| `bindings` | string の配列 | —（必須，1 個以上） | CA が External Account Binding を要求する ACME binding の名前．どれも `acmeBindings` に列挙されていなければならず，重複は許されない．ここに挙げた binding だけがプロビジョニング要求を受け付け，GUI に投入フォームが出る． |
 
 `accountProvisioning` は省略可であり，省略すると暗号化 EAB プロビジョニングの
 機能全体が無効になる: `GET /account-provisioning/key` と
@@ -338,6 +339,17 @@ EAB は ACME の `newAccount` にしか使われない起動用の資格情報�
 発行・更新には関与しない ―― 詳細は
 [`docs/runner.md`](runner.md#accountprovisioning) を参照．
 [ACME アカウントプロビジョニング](#acme-アカウントプロビジョニング) を参照．
+
+`bindings` が要るのは，Conductor が ACME binding を名前でしか知らないためである
+（binding がどの CA の directory を指すかは Runner の設定にしかない）．
+Conductor には，ある binding の CA が EAB を要求するかどうかを自分で判断する
+手段がない．そこで操作者が，EAB を要求する CA の binding（プライベート CA，
+学内 CA 連携など）をここに明示する．Let's Encrypt のように EAB を要求しない
+CA の binding は挙げない．挙げなかった binding は ACME アカウントのページに
+世代状態を表示するだけで，投入フォームは出ず，
+`POST …/provisioning` は `409`（`eab_not_required`）で拒否される．
+EAB が要るかどうかは真偽の属性にすぎず，シークレットではないので，
+[ADR 0005](adr/0005-conductor-never-touches-secrets.md) には反しない．
 
 ## REST API
 
@@ -387,9 +399,9 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /ui/config` | GUI のサインイン方法: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` または `{"auth":{"mode":"localhost-dev"}}`．認証不要．プロバイダのディスカバリ文書が利用できない間は `503`． |
 | `GET /api/v1alpha1/bindings` | 登録されたバインディング名: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`． |
 | `GET /api/v1alpha1/account-provisioning/key` | Runner の provisioning 公開鍵: `{"version":…,"keyId":…,"publicKey":…}`．`accountProvisioning` が未設定なら `404` `not_configured`． |
-| `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","activeGeneration","pending","generations":[…]}…]}`． |
+| `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","externalAccountBinding","activeGeneration","pending","generations":[…]}…]}`．`externalAccountBinding` は binding が `accountProvisioning.bindings` に挙がっている（CA が EAB を要求する）かどうか． |
 | `GET /api/v1alpha1/acme-bindings/{binding}` | 1 つの binding の世代状態． |
-| `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代），`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．スケジューラを起こす． |
+| `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代），`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．スケジューラを起こす．binding が `accountProvisioning.bindings` に挙がっていなければ `409` `eab_not_required`． |
 | `DELETE /api/v1alpha1/acme-bindings/{binding}/provisioning/{generation}` | 未着手（run にまだ添付されていない）プロビジョニング要求をキャンセル → `200`． |
 | `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`，古い順． |
 | `POST /api/v1alpha1/policies` | ポリシーを作成 → `201` Policy，`Location`． |
@@ -857,7 +869,8 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 `acme-conductor migrate` で行う），そして `accountProvisioning` が設定されて
 いれば ACME アカウントプロビジョニングのページ（"#/acme-bindings"）を扱う．
 このページは binding ごとに活性世代・保留中の状態・登録時刻を表示し（EAB の
-値はいつも決して表示しない），admin には「Provision / Replace EAB」フォーム
+値はいつも決して表示しない），`accountProvisioning.bindings` に挙がった binding
+についてだけ，admin に「Provision / Replace EAB」フォーム
 （KID 入力，HMAC 入力は `type="password"`／`autocomplete="off"`，Runner の
 `keyId` を比較用に表示）を出す．暗号化は専用ファイル `provision.js`（WebCrypto
 で X25519／HKDF-SHA-256／AES-256-GCM を実装し，`acmeConductorSealEAB` を

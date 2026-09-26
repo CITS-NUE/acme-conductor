@@ -504,15 +504,30 @@ func TestAccountProvisioningConfiguration(t *testing.T) {
 	with := func(section string) string {
 		return strings.Replace(minimal, `"database"`, `"accountProvisioning": `+section+`, "database"`, 1)
 	}
-	c, err := Read(strings.NewReader(with(`{"publicKey": ` + string(quoted) + `}`)))
+	withBindings := func(bindings string) string {
+		return with(`{"publicKey": ` + string(quoted) + `, "bindings": ` + bindings + `}`)
+	}
+	c, err := Read(strings.NewReader(strings.Replace(withBindings(`["private-ca"]`), `"acmeBindings": ["letsencrypt-staging"]`, `"acmeBindings": ["letsencrypt-staging", "private-ca"]`, 1)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.AccountProvisioning.KeyID() != v1alpha1.ProvisioningKeyID(priv.PublicKey()) || !c.AccountProvisioning.Key().Equal(priv.PublicKey()) {
 		t.Fatalf("accountProvisioning = %+v", c.AccountProvisioning)
 	}
-	if c, err := Read(strings.NewReader(minimal)); err != nil || c.AccountProvisioning != nil {
+	// Only the listed binding takes an EAB: the Conductor cannot tell on
+	// its own which CA wants one.
+	if !c.AccountProvisioning.RequiresEAB("private-ca") || c.AccountProvisioning.RequiresEAB("letsencrypt-staging") {
+		t.Fatalf("RequiresEAB: bindings = %v", c.AccountProvisioning.Bindings)
+	}
+	if got := c.AccountProvisioning.EABBindings(); len(got) != 1 || got[0] != "private-ca" {
+		t.Fatalf("EABBindings = %v", got)
+	}
+	c, err = Read(strings.NewReader(minimal))
+	if err != nil || c.AccountProvisioning != nil {
 		t.Fatalf("absent section: %+v %v", c, err)
+	}
+	if c.AccountProvisioning.RequiresEAB("letsencrypt-staging") || c.AccountProvisioning.EABBindings() != nil {
+		t.Fatal("an absent section requires an EAB for some binding")
 	}
 
 	signingPub, _, err := v1alpha1.GenerateSigningKey()
@@ -525,10 +540,16 @@ func TestAccountProvisioningConfiguration(t *testing.T) {
 	}
 	signingQuoted, _ := json.Marshal(string(signingPEM))
 	rejects := map[string]string{
-		"empty":         `{}`,
-		"not a key":     `{"publicKey": "bm90LWEta2V5"}`,
-		"signing key":   `{"publicKey": ` + string(signingQuoted) + `}`,
-		"unknown field": `{"publicKey": ` + string(quoted) + `, "privateKey": "x"}`,
+		"empty":              `{}`,
+		"not a key":          `{"publicKey": "bm90LWEta2V5", "bindings": ["letsencrypt-staging"]}`,
+		"signing key":        `{"publicKey": ` + string(signingQuoted) + `, "bindings": ["letsencrypt-staging"]}`,
+		"unknown field":      `{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging"], "privateKey": "x"}`,
+		"no bindings":        `{"publicKey": ` + string(quoted) + `}`,
+		"empty bindings":     `{"publicKey": ` + string(quoted) + `, "bindings": []}`,
+		"unknown binding":    `{"publicKey": ` + string(quoted) + `, "bindings": ["private-ca"]}`,
+		"duplicate binding":  `{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging", "letsencrypt-staging"]}`,
+		"invalid name":       `{"publicKey": ` + string(quoted) + `, "bindings": ["Not A Name"]}`,
+		"binding not string": `{"publicKey": ` + string(quoted) + `, "bindings": [{"name": "letsencrypt-staging"}]}`,
 	}
 	for name, section := range rejects {
 		t.Run(name, func(t *testing.T) {
