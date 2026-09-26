@@ -68,6 +68,14 @@ type Options struct {
 	// still does (docs/migration.md, target source shadow or iac). Runs
 	// left in flight are still swept.
 	IssuanceDisabled bool
+	// ProvisioningBindings are the ACME bindings whose CA requires an
+	// External Account Binding (accountProvisioning.bindings). A run
+	// claims a pending account provisioning request only for one of
+	// these: a pending generation left on any other binding (the binding
+	// was dropped from the list, or provisioning was disabled, after it
+	// was requested) is never sent to a Runner, and stays pending until
+	// an operator cancels it. Empty claims nothing.
+	ProvisioningBindings []string
 }
 
 // Defaults for Options.RecordRetry and Options.RecordWindow.
@@ -90,6 +98,7 @@ type Scheduler struct {
 	recordRetry  time.Duration
 	recordWindow time.Duration
 	disabled     bool
+	eabBindings  map[string]struct{}
 
 	wake chan struct{}
 
@@ -129,11 +138,15 @@ func New(o Options) *Scheduler {
 	if o.RecordWindow <= 0 {
 		o.RecordWindow = DefaultRecordWindow
 	}
+	eab := make(map[string]struct{}, len(o.ProvisioningBindings))
+	for _, b := range o.ProvisioningBindings {
+		eab[b] = struct{}{}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		reg: o.Registry, launchers: o.Launchers, tick: o.Tick, maxRuns: o.MaxConcurrentRuns,
 		backoff: o.RetryBackoff, maxBack: o.MaxRetryBackoff, log: o.Logger, now: o.Now,
-		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, disabled: o.IssuanceDisabled,
+		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, disabled: o.IssuanceDisabled, eabBindings: eab,
 		wake: make(chan struct{}, 1), runsCtx: ctx, cancelRuns: cancel, inflight: map[string]context.CancelFunc{},
 	}
 }
@@ -495,10 +508,13 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		return
 	}
 	// ACME account provisioning (issue #42): claim a pending, unattached
-	// generation for this binding if one exists (spec then carries the
-	// sealed payload for the Runner to open), else fall back to the
-	// binding's active generation (legacy, unversioned account state
-	// otherwise). claimedRunID is cleared once the claim is resolved
+	// generation for this binding if one exists and the binding is one
+	// whose CA takes an EAB (spec then carries the sealed payload for the
+	// Runner to open), else fall back to the binding's active generation
+	// (legacy, unversioned account state otherwise). A pending generation
+	// on a binding no longer configured for EAB is left untouched: the
+	// operator withdrew it from provisioning, so its ciphertext is never
+	// sent, and it can still be cancelled. claimedRunID is cleared once the claim is resolved
 	// (released or completed) so it is only released/completed once.
 	var account *v1alpha1.ACMEAccountRef
 	claimedGeneration := int64(0)
@@ -512,10 +528,14 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		}
 		claimedRunID = ""
 	}
-	acct, sealedJSON, err := s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, run.ID)
-	if err != nil {
-		failed(v1alpha1.ErrorCodeInternal, "acme account provisioning could not be claimed")
-		return
+	var acct *registry.ACMEAccount
+	var sealedJSON string
+	if _, ok := s.eabBindings[policy.ACMEBinding]; ok {
+		acct, sealedJSON, err = s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, run.ID)
+		if err != nil {
+			failed(v1alpha1.ErrorCodeInternal, "acme account provisioning could not be claimed")
+			return
+		}
 	}
 	switch {
 	case acct != nil:

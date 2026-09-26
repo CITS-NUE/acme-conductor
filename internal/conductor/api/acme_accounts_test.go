@@ -162,6 +162,18 @@ func TestRequestACMEProvisioningRefusesBindingWithoutEAB(t *testing.T) {
 	if pe.sched.wakes != 0 {
 		t.Fatalf("scheduler woken %d times", pe.sched.wakes)
 	}
+
+	// A request left pending from before the binding was dropped from
+	// accountProvisioning.bindings is still listed and can be cancelled.
+	if err := pe.reg.RequestACMEAccountProvisioning(context.Background(), &registry.ACMEAccount{Binding: "no-eab-ca", Generation: 1, KeyID: "0123456789abcdef", RequestedBy: "x", RequestedByAuthority: "y"}, "{}", nil); err != nil {
+		t.Fatal(err)
+	}
+	if r := pe.do("GET", Prefix+"/acme-bindings/no-eab-ca", nil, nil); r.status != http.StatusOK || r.body["pending"] == nil {
+		t.Fatalf("get = %d %+v", r.status, r.body)
+	}
+	if r := pe.do("DELETE", Prefix+"/acme-bindings/no-eab-ca/provisioning/1", nil, nil); r.status != http.StatusOK || r.body["status"] != string(registry.ACMEAccountCancelled) {
+		t.Fatalf("cancel = %d %+v", r.status, r.body)
+	}
 }
 
 func TestRequestACMEProvisioningLifecycle(t *testing.T) {

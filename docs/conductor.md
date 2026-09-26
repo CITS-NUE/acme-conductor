@@ -328,8 +328,8 @@ Runner に対する Conductor の ID であって，DNS・Store・クラウド�
 機能全体が無効になる: `GET /account-provisioning/key` と
 `GET /acme-bindings…` は `404`（`not_configured`）を返し，
 `POST …/provisioning` も同様に拒否され，スケジューラは未着手のプロビジョニング
-要求を決して claim しない（要求を作れる経路自体が API しかないので，設定
-なしでは要求そのものが作られない）．設定すると，Conductor はブラウザが
+要求を決して claim しない（以前の設定で作られた要求がデータベースに
+残っていても，Runner には送られない）．設定すると，Conductor はブラウザが
 Runner の公開鍵に封じた暗号文を受け取り，検証し，`acme_accounts` テーブルに
 保存する ―― **これを復号する手段は Conductor に一切ない**．Conductor が
 持つのは公開鍵だけであり，秘密鍵も EAB の平文も決して持たない
@@ -348,6 +348,11 @@ Conductor には，ある binding の CA が EAB を要求するかどうかを�
 CA の binding は挙げない．挙げなかった binding は ACME アカウントのページに
 世代状態を表示するだけで，投入フォームは出ず，
 `POST …/provisioning` は `409`（`eab_not_required`）で拒否される．
+スケジューラも，ここに挙がった binding についてだけ未着手のプロビジョニング
+要求を claim する．binding をリストから外した（または `accountProvisioning`
+自体を外した）時点で残っていた未着手の要求は，run に添付されず Runner にも
+送られない．その binding の run は活性世代（なければ世代なし）で従来通り
+動き，残った要求は `DELETE …/provisioning/{generation}` でキャンセルできる．
 EAB が要るかどうかは真偽の属性にすぎず，シークレットではないので，
 [ADR 0005](adr/0005-conductor-never-touches-secrets.md) には反しない．
 

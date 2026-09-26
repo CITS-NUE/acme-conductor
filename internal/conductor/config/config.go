@@ -178,7 +178,7 @@ type Config struct {
 	// browser, and the Conductor stores and hands out only ciphertext.
 	// Absent disables it: the account-provisioning endpoints answer
 	// not_configured and the scheduler never claims a pending request
-	// (the API is the only way to create one).
+	// (not even one left in the database by an earlier configuration).
 	AccountProvisioning *AccountProvisioning `json:"accountProvisioning,omitempty"`
 }
 

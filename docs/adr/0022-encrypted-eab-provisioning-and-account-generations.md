@@ -86,7 +86,11 @@ run のたびに使われる継続的な資格情報とは性質が異なる．
   Encrypt など）の binding に無意味な EAB を投入させたり，ダミー値の投入を
   誘ったりしないためである．これは真偽の属性であってシークレットではない
   ので，[ADR 0005](0005-conductor-never-touches-secrets.md) には反しない．
-  リストから外した binding に残った未着手の要求は，従来通りキャンセルできる．
+  スケジューラもこのリストにある binding についてだけ未着手の要求を
+  claim する．リストから外すことは操作者の明示的な停止の意思であり，外す
+  前に投入されて残っていた暗号文を後から Runner へ送ってはならないからで
+  ある．残った要求は保留のまま run に添付されず，活性世代があれば通常通り
+  使われ，操作者がキャンセルできる．
 - **Conductor が保存し取り扱えるのは暗号文とメタデータだけである．**
   Conductor の `acme_accounts` テーブル（`internal/conductor/sqlite`）は
   `sealed_payload` に `SealedProvisioning` の JSON をそのまま持つが，これは

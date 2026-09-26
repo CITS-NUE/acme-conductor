@@ -127,14 +127,15 @@ func Serve(ctx context.Context, opts Options) int {
 		log.Warn("issuance disabled: the conductor plans and starts no runs", "targetSource", cfg.Migration.TargetSource)
 	}
 	sched := scheduler.New(scheduler.Options{
-		Registry:          reg,
-		Launchers:         built,
-		Tick:              time.Duration(cfg.Scheduler.TickSeconds) * time.Second,
-		MaxConcurrentRuns: cfg.Scheduler.MaxConcurrentRuns,
-		RetryBackoff:      time.Duration(cfg.Scheduler.RetryBackoffSeconds) * time.Second,
-		MaxRetryBackoff:   time.Duration(cfg.Scheduler.MaxRetryBackoffSeconds) * time.Second,
-		Logger:            log.With("component", "scheduler"),
-		IssuanceDisabled:  !cfg.IssuanceEnabled(),
+		Registry:             reg,
+		Launchers:            built,
+		Tick:                 time.Duration(cfg.Scheduler.TickSeconds) * time.Second,
+		MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
+		RetryBackoff:         time.Duration(cfg.Scheduler.RetryBackoffSeconds) * time.Second,
+		MaxRetryBackoff:      time.Duration(cfg.Scheduler.MaxRetryBackoffSeconds) * time.Second,
+		Logger:               log.With("component", "scheduler"),
+		IssuanceDisabled:     !cfg.IssuanceEnabled(),
+		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 	})
 	if n, err := sched.Recover(ctx); err != nil {
 		log.Error("in-flight runs could not be recovered", "error", err.Error())
