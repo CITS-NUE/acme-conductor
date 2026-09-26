@@ -16,11 +16,13 @@ import (
 
 // The values deploy/azure/main.bicep merges into the operator's Runner
 // configuration (main.bicepparam supplies the first two, the identity
-// resource the third).
+// resource the third; the last only when both account-provisioning
+// parameters are given).
 const (
-	azureTemplateJobSigningPublicKey  = "MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms="
-	azureTemplateResultSigningKeyFile = "/etc/acme-runner/result-signing.pem"
-	azureTemplateRunnerClientID       = "9f8fad5b-d9cb-469f-a165-70867728950e"
+	azureTemplateJobSigningPublicKey        = "MCowBQYDK2VwAyEAXwYpAPJZlUf8sscb1XL7N9EJXgCWGHQnj6+tELbUZms="
+	azureTemplateResultSigningKeyFile       = "/etc/acme-runner/result-signing.pem"
+	azureTemplateRunnerClientID             = "9f8fad5b-d9cb-469f-a165-70867728950e"
+	azureTemplateAccountProvisioningKeyFile = "/etc/acme-runner/account-provisioning.pem"
 )
 
 // TestAzureTemplateRunnerConfigLoads holds deploy/azure to the binding
@@ -35,7 +37,9 @@ const (
 // reached the Key Vault provider, and checks the Bicep expression itself
 // works under binding.config — because the expression is evaluated by
 // Resource Manager at deployment, not here, and a drift would otherwise
-// surface only as a Runner refusing to start on Azure.
+// surface only as a Runner refusing to start on Azure. It does so both
+// without and with the accountProvisioning section the template adds when
+// encrypted EAB provisioning is enabled.
 func TestAzureTemplateRunnerConfigLoads(t *testing.T) {
 	azure := filepath.Join("..", "..", "deploy", "azure")
 
@@ -57,13 +61,44 @@ func TestAzureTemplateRunnerConfigLoads(t *testing.T) {
 		t.Fatalf("main.bicep touches the Key Vault provider's fields somewhere other than binding.config:\n%s", merge)
 	}
 
+	// The provisioning key file the Runner is pointed at is the one the
+	// Job mounts: the file name under the /etc/acme-runner secret volume.
+	_, provisioning, ok := strings.Cut(string(bicep), "var runnerConfig = ")
+	if provisioning, _, ok = strings.Cut(provisioning, "\nresource runnerJob "); !ok {
+		t.Fatal("main.bicep does not declare runnerConfig before the Runner Job")
+	}
+	if !strings.Contains(provisioning, "accountProvisioningEnabled ? {") || !strings.Contains(provisioning, "'"+azureTemplateAccountProvisioningKeyFile+"'") {
+		t.Fatalf("main.bicep does not add accountProvisioning.privateKeyFiles under the enabled condition:\n%s", provisioning)
+	}
+	if !strings.Contains(string(bicep), "secretRef: 'account-provisioning-key'\n              path: '"+filepath.Base(azureTemplateAccountProvisioningKeyFile)+"'") {
+		t.Fatal("main.bicep does not mount the account-provisioning key where runnerConfig points")
+	}
+
 	// The document the template emits for the configuration the example
 	// parameters embed, loaded as the Runner loads it.
 	input, err := os.ReadFile(bicepparamRunnerConfig(t, azure))
 	if err != nil {
 		t.Fatal(err)
 	}
-	emitted := azureTemplateRunnerConfig(t, input)
+	for _, enabled := range []bool{false, true} {
+		testAzureTemplateRunnerConfig(t, input, enabled)
+	}
+
+	// The shape the template emitted before the refactor — the provider's
+	// fields at the binding root — is refused, which is why the merge
+	// above must stay under binding.config.
+	rootLevel := azureTemplateRunnerConfigAt(t, input, true, false)
+	if _, err := config.Read(bytes.NewReader(rootLevel)); !errors.Is(err, config.ErrInvalid) {
+		t.Fatalf("a client ID at the store binding root must be refused as an unknown field, got %v", err)
+	}
+}
+
+// testAzureTemplateRunnerConfig loads the document the template emits for
+// input, with or without encrypted EAB provisioning, and checks the
+// template's edits reached the Runner.
+func testAzureTemplateRunnerConfig(t *testing.T, input []byte, provisioning bool) {
+	t.Helper()
+	emitted := azureTemplateRunnerConfigAt(t, input, false, provisioning)
 	cfg, err := config.Read(bytes.NewReader(emitted))
 	if err != nil {
 		t.Fatalf("the Runner refuses the configuration the template emits: %v", err)
@@ -94,13 +129,11 @@ func TestAzureTemplateRunnerConfigLoads(t *testing.T) {
 	if cfg.JobSigning == nil || len(cfg.JobSigning.Keys()) != 1 || cfg.ResultSigning == nil || cfg.ResultSigning.PrivateKeyFile != azureTemplateResultSigningKeyFile {
 		t.Fatalf("the template's signing settings did not load: %+v %+v", cfg.JobSigning, cfg.ResultSigning)
 	}
-
-	// The shape the template emitted before the refactor — the provider's
-	// fields at the binding root — is refused, which is why the merge
-	// above must stay under binding.config.
-	rootLevel := azureTemplateRunnerConfigAt(t, input, true)
-	if _, err := config.Read(bytes.NewReader(rootLevel)); !errors.Is(err, config.ErrInvalid) {
-		t.Fatalf("a client ID at the store binding root must be refused as an unknown field, got %v", err)
+	switch {
+	case !provisioning && cfg.AccountProvisioning != nil:
+		t.Fatalf("accountProvisioning appeared although provisioning is disabled: %+v", cfg.AccountProvisioning)
+	case provisioning && (cfg.AccountProvisioning == nil || len(cfg.AccountProvisioning.PrivateKeyFiles) != 1 || cfg.AccountProvisioning.PrivateKeyFiles[0] != azureTemplateAccountProvisioningKeyFile):
+		t.Fatalf("the template's accountProvisioning did not load: %+v", cfg.AccountProvisioning)
 	}
 }
 
@@ -135,21 +168,15 @@ func bicepparamRunnerConfig(t *testing.T, azure string) string {
 	return filepath.Join(azure, filepath.FromSlash(string(m[1])))
 }
 
-// azureTemplateRunnerConfig applies the edits deploy/azure/main.bicep
+// azureTemplateRunnerConfigAt applies the edits deploy/azure/main.bicep
 // makes to the operator's RunnerConfig document: jobSigning.publicKeys,
-// resultSigning.privateKeyFile, and the Runner identity's client ID in
-// the config of every Key Vault binding that authenticates with a
-// managed identity.
-func azureTemplateRunnerConfig(t *testing.T, input []byte) []byte {
-	t.Helper()
-	return azureTemplateRunnerConfigAt(t, input, false)
-}
-
-// azureTemplateRunnerConfigAt is azureTemplateRunnerConfig with the
-// client ID written at the binding root instead of into binding.config
-// when atRoot is set (the shape the template emitted before the
+// resultSigning.privateKeyFile, the Runner identity's client ID in the
+// config of every Key Vault binding that authenticates with a managed
+// identity, and accountProvisioning.privateKeyFiles when provisioning is
+// set. With atRoot the client ID is written at the binding root instead
+// of into binding.config (the shape the template emitted before the
 // provider-config refactor).
-func azureTemplateRunnerConfigAt(t *testing.T, input []byte, atRoot bool) []byte {
+func azureTemplateRunnerConfigAt(t *testing.T, input []byte, atRoot, provisioning bool) []byte {
 	t.Helper()
 	var doc map[string]any
 	if err := json.Unmarshal(input, &doc); err != nil {
@@ -157,6 +184,9 @@ func azureTemplateRunnerConfigAt(t *testing.T, input []byte, atRoot bool) []byte
 	}
 	doc["jobSigning"] = map[string]any{"publicKeys": []any{azureTemplateJobSigningPublicKey}}
 	doc["resultSigning"] = map[string]any{"privateKeyFile": azureTemplateResultSigningKeyFile}
+	if provisioning {
+		doc["accountProvisioning"] = map[string]any{"privateKeyFiles": []any{azureTemplateAccountProvisioningKeyFile}}
+	}
 	bindings, _ := doc["storeBindings"].(map[string]any)
 	for name, v := range bindings {
 		b, _ := v.(map[string]any)

@@ -5,6 +5,7 @@
 //   cp main.bicepparam my.bicepparam
 //   export ACME_JOB_SIGNING_PRIVATE_KEY_PEM="$(cat job-signing.pem)"
 //   export ACME_RESULT_SIGNING_PRIVATE_KEY_PEM="$(cat result-signing.pem)"
+//   export ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM="$(cat account-provisioning.pem)"  # optional
 //   az deployment group create --resource-group rg-acme \
 //     --template-file main.bicep --parameters my.bicepparam
 //
@@ -47,6 +48,15 @@ param jobSigningPrivateKeyPem = readEnvironmentVariable('ACME_JOB_SIGNING_PRIVAT
 // From `acme-runner keygen --private result-signing.pem --public result-signing.pub`.
 param resultSigningPublicKey = 'MCowBQYDK2VwAyEA65N/M3oDE8dU2aAKvMDf19gGaRxk3W3gRWTKAj2DPOM='
 param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_PRIVATE_KEY_PEM', '')
+
+// Encrypted EAB provisioning (docs/adr/0022), for a CA that requires
+// External Account Binding: from
+// `acme-runner provisioning-keygen --private account-provisioning.pem --public account-provisioning.pub`
+// (the "publicKey:" line of its output). Give both or neither; both empty
+// (the default) leaves the feature disabled, and one without the other
+// fails the deployment before anything changes.
+// param accountProvisioningPublicKey = '<publicKey from provisioning-keygen>'
+// param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
 
 param runnerConfigJson = loadTextContent('../examples/runner-config.aca.example.json')
 
