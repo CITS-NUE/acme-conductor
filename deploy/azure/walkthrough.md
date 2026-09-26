@@ -374,7 +374,7 @@ Runner の実行が毎分 `Failed` になる場合は，まずログを見る．
 ことを確かめる．`GET /api/v1alpha1/account-provisioning/key` が `keyId` を返し，
 それが手順 3-1 で控えた `keyId` と一致すればよい（未設定なら `404`
 `not_configured`）．API にはトークンが要るので，GUI の EAB 投入画面
-（ACME バインディングの provisioning）に表示される `keyId` で見るのが簡単である．
+（タブ「EAB」）に表示される `keyId` で見るのが簡単である．
 この比較は Conductor を経由しない控えと突き合わせて行う
 （[`docs/conductor.md`](../../docs/conductor.md) の既知の制約を参照）．
 出力の `conductorConfig` にも `accountProvisioning.publicKey` と
@@ -598,7 +598,7 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | what-if／デプロイが `accountProvisioningPrivateKeyPem and accountProvisioningPublicKey must be given together` で失敗する | provisioning 用の公開鍵と秘密鍵の片方だけが渡された（多くは環境変数 `ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM` の設定忘れ） | 環境変数を設定する．機能を使わないなら `accountProvisioning*` の行をすべて消す（手順 3-1） |
 | GUI で EAB を投入しようとすると公開鍵がないと言われる／API が `404 not_configured` | `accountProvisioningPublicKey` を渡していない | 手順 3-1 の鍵を渡して再デプロイする |
 | what-if／デプロイが `accountProvisioningBindings must …` または `accountProvisioningBindings may only …` で失敗する | 有効化したのに `accountProvisioningBindings` が空，無効なのに値がある，または `acmeBindings` にない名前がある | EAB を要求する CA の binding（`acmeBindings` のいずれか）を挙げる．機能を使わないなら `accountProvisioning*` の行をすべて消す |
-| GUI の ACME アカウントのページで，ある binding に投入フォームが出ない／API が `409 eab_not_required` | その binding が `accountProvisioningBindings` に挙がっていない | CA が EAB を要求するなら `accountProvisioningBindings` に加えて再デプロイする．要求しない CA（Let's Encrypt など）なら投入は不要 |
+| GUI の EAB のページに，ある binding が出ない／API が `409 eab_not_required` | その binding が `accountProvisioningBindings` に挙がっていない | CA が EAB を要求するなら `accountProvisioningBindings` に加えて再デプロイする．要求しない CA（Let's Encrypt など）なら投入は不要 |
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |

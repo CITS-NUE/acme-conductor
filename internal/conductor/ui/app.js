@@ -724,10 +724,8 @@
         },
       }, 'Cancel pending provisioning (generation ' + b.pending.generation + ')')));
     }
-    if (!keyInfo) {
-      parts.push(notice('error', 'Account provisioning is not configured on this Conductor.'));
-    } else if (!b.externalAccountBinding) {
-      parts.push(el('p', { class: 'hint', text: 'This binding\'s CA does not take an External Account Binding (it is not listed in accountProvisioning.bindings); there is nothing to provision.' }));
+    if (!b.externalAccountBinding) {
+      parts.push(el('p', { class: 'hint', text: 'This binding is no longer listed in accountProvisioning.bindings: the pending generation is never sent to the Runner. Cancel it.' }));
     } else if (b.pending) {
       parts.push(el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' }));
     } else if (!x25519Ok) {
@@ -738,14 +736,27 @@
     return el('div', { class: 'panel' }, ...parts);
   }
 
-  async function viewACMEBindings() {
-    setNav('acme-bindings');
-    const [keyInfo, res, x25519Ok] = await Promise.all([provisioningKey(), api('GET', '/acme-bindings'), acmeConductorX25519Supported()]);
-    const refresh = () => withErrors(() => viewACMEBindings());
+  // The page lists the bindings whose CA takes an EAB, plus any other
+  // binding still holding a pending request (left from before it was
+  // dropped from accountProvisioning.bindings) so that it can be
+  // cancelled. A binding whose CA takes no EAB has nothing to show here.
+  async function viewEAB() {
+    setNav('eab');
+    const keyInfo = await provisioningKey();
+    const heading = el('h1', { text: 'External Account Binding' });
+    if (!keyInfo) {
+      show(heading, notice('error', 'Account provisioning is not configured on this Conductor.'));
+      return;
+    }
+    const [res, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), acmeConductorX25519Supported()]);
+    const items = res.items.filter((b) => b.externalAccountBinding || b.pending);
+    const refresh = () => withErrors(() => viewEAB());
     show(
-      el('h1', { text: 'ACME accounts' }),
-      el('p', { class: 'notice', text: 'External Account Binding credentials are sealed in this browser and never displayed once submitted.' }),
-      ...res.items.map((b) => acmeBindingPanel(keyInfo, b, x25519Ok, refresh)),
+      heading,
+      el('p', { class: 'notice', text: 'EAB credentials are sealed in this browser and never displayed once submitted.' }),
+      ...(items.length
+        ? items.map((b) => acmeBindingPanel(keyInfo, b, x25519Ok, refresh))
+        : [el('p', { class: 'hint', text: 'No ACME binding is listed in accountProvisioning.bindings.' })]),
     );
   }
 
@@ -762,7 +773,9 @@
     [/^#\/runs(\?.*)?$/, () => viewRuns()],
     [/^#\/audit$/, () => viewAudit()],
     [/^#\/migration$/, () => viewMigration()],
-    [/^#\/acme-bindings$/, () => viewACMEBindings()],
+    [/^#\/eab$/, () => viewEAB()],
+    // The page's former address, kept for bookmarks.
+    [/^#\/acme-bindings$/, () => { location.hash = '#/eab'; }],
   ];
 
   function route() {

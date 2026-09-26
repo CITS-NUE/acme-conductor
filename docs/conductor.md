@@ -345,9 +345,8 @@ EAB は ACME の `newAccount` にしか使われない起動用の資格情報�
 Conductor には，ある binding の CA が EAB を要求するかどうかを自分で判断する
 手段がない．そこで操作者が，EAB を要求する CA の binding（プライベート CA，
 学内 CA 連携など）をここに明示する．Let's Encrypt のように EAB を要求しない
-CA の binding は挙げない．挙げなかった binding は ACME アカウントのページに
-世代状態を表示するだけで，投入フォームは出ず，
-`POST …/provisioning` は `409`（`eab_not_required`）で拒否される．
+CA の binding は挙げない．挙げなかった binding は GUI の EAB のページに
+現れず，`POST …/provisioning` は `409`（`eab_not_required`）で拒否される．
 スケジューラも，ここに挙がった binding についてだけ未着手のプロビジョニング
 要求を claim する．binding をリストから外した（または `accountProvisioning`
 自体を外した）時点で残っていた未着手の要求は，run に添付されず Runner にも
@@ -872,10 +871,14 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 絞り込める一覧，詳細，キャンセル），監査ログ，移行の状態（target source，設定された
 ソース，shadow モードでの直近の比較．読み取り専用で，取り込みは
 `acme-conductor migrate` で行う），そして `accountProvisioning` が設定されて
-いれば ACME アカウントプロビジョニングのページ（"#/acme-bindings"）を扱う．
-このページは binding ごとに活性世代・保留中の状態・登録時刻を表示し（EAB の
-値はいつも決して表示しない），`accountProvisioning.bindings` に挙がった binding
-についてだけ，admin に「Provision / Replace EAB」フォーム
+いれば EAB プロビジョニングのページ（タブ「EAB」，"#/eab"．旧アドレス
+"#/acme-bindings" はここへ転送される）を扱う．このページに並ぶのは
+`accountProvisioning.bindings` に挙がった binding と，リストから外れたが
+未着手の要求が残っている binding（キャンセルのため）だけであり，EAB を
+要求しない CA の binding は現れない．binding ごとに活性世代・保留中の状態・
+登録時刻を表示し（EAB の値はいつも決して表示しない），
+`accountProvisioning.bindings` に挙がった binding についてだけ，admin に
+「Provision / Replace EAB」フォーム
 （KID 入力，HMAC 入力は `type="password"`／`autocomplete="off"`，Runner の
 `keyId` を比較用に表示）を出す．暗号化は専用ファイル `provision.js`（WebCrypto
 で X25519／HKDF-SHA-256／AES-256-GCM を実装し，`acmeConductorSealEAB` を
