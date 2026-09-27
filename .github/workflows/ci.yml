@@ -85,10 +85,14 @@ jobs:
           "$RUNNER_TEMP/bicep" --version
 
       - name: bicep build
-        run: bicep build deploy/azure/main.bicep --stdout > /dev/null
+        run: |
+          bicep build deploy/azure/main.bicep --stdout > /dev/null
+          bicep build deploy/azure/roles.bicep --stdout > /dev/null
 
       - name: bicep lint
-        run: bicep lint deploy/azure/main.bicep
+        run: |
+          bicep lint deploy/azure/main.bicep
+          bicep lint deploy/azure/roles.bicep
 
       - name: bicep build-params
         run: bicep build-params deploy/azure/main.bicepparam --stdout > /dev/null

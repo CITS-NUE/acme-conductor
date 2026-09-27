@@ -28,6 +28,7 @@
 | [0020](0020-migration-from-cert-infra.md) | cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ |
 | [0021](0021-keyvault-pkcs12-content-type.md) | Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする |
 | [0022](0022-encrypted-eab-provisioning-and-account-generations.md) | 暗号化された EAB プロビジョニングと ACME アカウントの世代 |
+| [0023](0023-separate-role-definitions-from-the-deployment.md) | カスタムロールの定義をデプロイから分け，再デプロイを常設の権限だけで行えるようにする |
 
 [`docs/architecture.md`](../architecture.md) と
 [`docs/threat-model.md`](../threat-model.md) も参照．

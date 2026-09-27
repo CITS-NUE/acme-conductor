@@ -33,7 +33,7 @@ Container App として動き，API と GUI のすべての呼び出し元を OI
 | `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーンに **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
 | `<prefix>-runner` (Container Apps Job) | Runner イメージ．Runner の設定と結果署名用の秘密鍵（暗号化 EAB プロビジョニングを有効にした場合は provisioning 用の秘密鍵も）を `/etc/acme-runner/` 配下に，加えて `/exchange`，`/state`，一時的な `/work` をマウント．スケジュールトリガー（`runnerCronExpression`，毎分），実行ごとに 1 レプリカ（`parallelism: 1`．ランチャーのコントラクトは実行ごとに 1 つの run），リトライなし，固定コマンド `reconcile --exchange /exchange`． |
 | `<prefix>-conductor` (Container App) | Conductor イメージ．設定とジョブ署名用の秘密鍵を `/etc/acme-conductor/` 配下に，加えて `/var/lib/acme-conductor` と `/mnt/exchange` をマウント．HTTPS 専用の ingress（既定で外部公開．必要に応じて送信元 CIDR で制限可）の背後に 1 レプリカ，`oidc` 認証，`/healthz` と `/readyz` での liveness/readiness プローブ． |
-| 3 つのカスタムロール定義 (サブスクリプションスコープ) | `modules/roles.bicep` を参照． |
+| 3 つのカスタムロール定義 (サブスクリプションスコープ) | **`main.bicep` ではなく `roles.bicep` が作る**．初回に一度だけ別にデプロイし，`main.bicep` はそれを割り当てるだけである（[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）． |
 
 Conductor の ID は DNS，Key Vault，ストレージデータのいずれの権限も **持たない**．
 Runner の ID は Job，アプリ，ストレージアカウントに対する権限を **持たない**．
@@ -47,9 +47,9 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   Key Vault．後者 2 つは別のリソースグループにあってもよいが，デプロイと
   **同じサブスクリプションになければならない**．カスタムロールはその
   サブスクリプションを唯一の割り当て可能スコープとして定義されており，ロールは
-  割り当て可能スコープの外には割り当てられないからである．デプロイする者には，
-  そこにロール割り当てを作成する権利（Owner または User Access Administrator）
-  と，サブスクリプションスコープにロール定義を作成する権利が必要である．
+  割り当て可能スコープの外には割り当てられないからである．必要な権限は，初回に
+  一度だけのロール定義の作成と，毎回のデプロイとで分かれる
+  （[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）．
   サブスクリプションをまたぐ配置は将来の拡張（サブスクリプションごとのロール
   定義）であり，パラメータにはなっていない．
 - 3〜20 文字の小文字英字・数字・ハイフンからなる `namePrefix`．ストレージ
@@ -127,8 +127,74 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   確認に使う）．鍵のローテーション（`privateKeyFiles` を 2 本にする）には，
   テンプレートはまだ対応していない．
 
+## ロール定義とデプロイの権限
+
+カスタムロールの定義（`roles.bicep`，サブスクリプションスコープ）と，それ以外の
+すべて（`main.bicep`，リソースグループスコープ）は **別のデプロイ** である
+（[ADR 0023](../../docs/adr/0023-separate-role-definitions-from-the-deployment.md)）．
+ロール定義を作る権限（`Microsoft.Authorization/roleDefinitions/write`．`Owner`
+または `User Access Administrator` にしか含まれず，多くの組織では PIM で
+有効化する）が要るのは，初回と，ロール定義を変えるリリースだけである．
+イメージの更新やパラメータの変更で `main.bicep` を再デプロイするときには要らない．
+
+| 作業 | 必要な権限 | 頻度 |
+|---|---|---|
+| `roles.bicep` のデプロイ（`az deployment sub create`） | サブスクリプションの `roleDefinitions/write` と `Microsoft.Resources/deployments/*`（`Owner`，または `User Access Administrator` ＋ サブスクリプションの `Contributor` など） | 初回と，リリースノートがロール定義の変更を告げたときだけ |
+| デプロイする者への条件付き委任の設定（下記） | 割り当て先スコープの `roleAssignments/write`（条件なし．`Owner` / `User Access Administrator`） | 初回だけ |
+| `main.bicep` のデプロイ（`az deployment group create`） | デプロイ先 RG の `Contributor`，DNS ゾーンと Key Vault の RG での `Microsoft.Resources/deployments/*`（ロール割り当ては入れ子のデプロイとしてそれぞれの RG に作られる），そして下記の条件付き `Role Based Access Control Administrator` | 毎回．**常設の権限だけで足り，PIM は要らない** |
+
+**1. ロール定義を作る（初回だけ）．** `roleNamePrefix` はテナント内で一意な
+ロール名の接頭辞で，`main.bicep` にも同じ値を渡す（ロール ID はこの値から
+決定的に計算される）:
+
+```sh
+az deployment sub create --location japaneast -n acme-roles \
+  --template-file roles.bicep --parameters roleNamePrefix='ACME Conductor'
+```
+
+**2. デプロイする者に条件付きの委任を与える（初回だけ）．** `main.bicep` は毎回
+3 つのロール割り当てを PUT するので，内容が同じでも `roleAssignments/write` が
+要る．これを `Owner` や `User Access Administrator` で満たす代わりに，
+[条件付きの委任](https://learn.microsoft.com/azure/role-based-access-control/delegate-role-assignments-overview)
+で `Role Based Access Control Administrator` を与える．`roles.bicep` の出力
+`deployerDelegationCondition` は，その割り当てを「この 3 つのロールを，
+サービスプリンシパル（2 つのマネージド ID）にだけ」追加・削除できるように絞る
+ABAC 条件である．ここまで絞れば，PIM ではなく常設の割り当てでよい:
+
+```sh
+COND=$(az deployment sub show -n acme-roles --query properties.outputs.deployerDelegationCondition.value -o tsv)
+for scope in <デプロイ先 RG の ID> <DNS ゾーンの ID> <Key Vault の ID>; do
+  az role assignment create --role "Role Based Access Control Administrator" \
+    --assignee <デプロイする人・グループ・CI のサービスプリンシパル> --scope "$scope" \
+    --condition "$COND" --condition-version 2.0
+done
+```
+
+スコープは，ロールを割り当てる 3 か所（Runner の Job を含むデプロイ先 RG，
+DNS ゾーン，Key Vault）である．条件がロールと割り当て先の種別を絞っているので，
+サブスクリプションに 1 つだけ割り当ててもよい．「`Owner` などの特権ロール以外は
+すべて許可」という条件付きの委任がすでにあるなら，それでも足りる．
+
+**3. 以後のデプロイ．** 下の [デプロイ](#デプロイ) の手順は，上の表の常設の
+権限だけで実行できる．`what-if` の結果にサブスクリプションスコープのリソースは
+現れない．
+
+ロール定義を変えるリリース（アクションの追加や削除）は，リリースノートでそう
+告げる．そのときは先に `roles.bicep` を同じ `roleNamePrefix` で再デプロイし，
+それから `main.bicep` をデプロイする．`roles.bicep` をデプロイしていない，
+または別の `roleNamePrefix` で `main.bicep` をデプロイすると，ロール割り当てが
+`RoleDefinitionDoesNotExist` で失敗する．
+
+**以前のテンプレートからの移行．** 以前の `main.bicep` は同じロールを同じ名前
+（GUID）で自分で作っていた．すでにデプロイ済みの環境では，ロール定義はその
+まま残っており，`roles.bicep` を再デプロイする必要はない（同じ
+`roleNamePrefix` で実行しても何も変わらない）．新しい `main.bicep` はそれを
+参照するだけで，既存のロール定義を消すことも変えることもない．
+
 ## デプロイ
 
+0. 初回なら，[ロール定義とデプロイの権限](#ロール定義とデプロイの権限) の
+   手順 1 と 2 を済ませる．
 1. Runner の設定を書く
    （[`deploy/examples/runner-config.aca.example.json`](../examples/runner-config.aca.example.json)
    が出発点になる）．`lego.stateDir` は `/state`，`lego.workDir` は `/work`
@@ -280,6 +346,15 @@ Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変�
 ファイルをコピーする．`runner-state` 共有は ACME アカウント鍵（証明書の鍵では
 ない）を保持する．これもバックアップすること．`exchange` 共有には永続的なものは
 何もない．
+
+**イメージの更新．** `main.bicepparam` の 2 つのダイジェストを新しいリリースの
+ものに替え（[前提条件](#前提条件) の検証をしてから），[デプロイ](#デプロイ) の
+手順 3 を再実行する．テンプレートもそのリリースのツリーのものを使う．ロール定義を
+変えるリリースでなければ，常設の権限だけで足りる（[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）．
+Container Apps は，レジストリの更新を検知して自動で新しいイメージに入れ替える
+ことはしない．イメージがダイジェストで固定されているのは，検証したものだけを
+動かすためである．自動化するなら，ダイジェストを更新する PR（Renovate など）を
+レビューしてマージし，CI がこの手順でデプロイする形がこの固定と両立する．
 
 **ロールバック．** 以前のテンプレートとパラメータで `az deployment group create`
 を実行するか，以前のイメージダイジェストを設定する．新しい Conductor の

@@ -3,13 +3,22 @@
 // Each role is the smallest set of actions one identity needs; the point
 // of declaring them here rather than granting built-in roles is that the
 // exact grant is a reviewable, versioned artifact (docs/threat-model.md,
-// T10). Role definitions are subscription-level resources, so this module
-// is deployed at subscription scope by main.bicep; their assignable scope
-// is that subscription, which is why the DNS zone and the Key Vault must
-// live in the same subscription as the deployment.
+// T10). Role definitions are subscription-level resources, so this
+// template is deployed on its own at subscription scope
+// (`az deployment sub create`); their assignable scope is that
+// subscription, which is why the DNS zone and the Key Vault must live in
+// the same subscription as main.bicep's deployment.
+//
+// It is deployed once, before main.bicep, and again only when a release
+// changes a definition below (docs/adr/0023). main.bicep assigns these
+// roles by IDs built from the same names (modules/role-ids.bicep) and
+// never writes a definition, so redeploying it (an image update, a
+// parameter change) needs no roleDefinitions/write and no
+// subscription-scope deployment: the privilege that creates a role, which
+// is usually activated through PIM, is used only here.
 targetScope = 'subscription'
 
-import { roleDefinitionName, roleKeys } from 'role-ids.bicep'
+import { roleDefinitionName, roleKeys } from 'modules/role-ids.bicep'
 
 @description('Prefix for the role names, so several deployments in one tenant do not collide (role names are tenant-unique).')
 @minLength(1)
@@ -105,3 +114,15 @@ resource runnerKeyVaultCertificateWriter 'Microsoft.Authorization/roleDefinition
 output conductorJobObserverRoleId string = conductorJobObserver.id
 output runnerDnsTxtWriterRoleId string = runnerDnsTxtWriter.id
 output runnerKeyVaultCertificateWriterRoleId string = runnerKeyVaultCertificateWriter.id
+
+// An Azure ABAC condition for the role assignment that lets the person or
+// pipeline redeploying main.bicep create its grants without holding
+// Owner or User Access Administrator: "Role Based Access Control
+// Administrator", constrained to adding and removing exactly these three
+// roles, and only for service principals (the two managed identities).
+// With it, a standing assignment is enough for every redeploy; see
+// deploy/azure/README.md for how to assign it.
+var roleGuids = '${conductorJobObserver.name}, ${runnerDnsTxtWriter.name}, ${runnerKeyVaultCertificateWriter.name}'
+
+@description('ABAC condition (version 2.0) constraining Role Based Access Control Administrator to assigning and removing only these three roles, only to service principals.')
+output deployerDelegationCondition string = '((!(ActionMatches{\'Microsoft.Authorization/roleAssignments/write\'})) OR (@Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {${roleGuids}} AND @Request[Microsoft.Authorization/roleAssignments:PrincipalType] ForAnyOfAnyValues:StringEqualsIgnoreCase {\'ServicePrincipal\'})) AND ((!(ActionMatches{\'Microsoft.Authorization/roleAssignments/delete\'})) OR (@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAnyValues:GuidEquals {${roleGuids}} AND @Resource[Microsoft.Authorization/roleAssignments:PrincipalType] ForAnyOfAnyValues:StringEqualsIgnoreCase {\'ServicePrincipal\'}))'
