@@ -155,7 +155,7 @@ func TestRequestACMEProvisioningRefusesBindingWithoutEAB(t *testing.T) {
 	if r.status != http.StatusConflict || r.errCode() != "eab_not_required" {
 		t.Fatalf("status=%d code=%s", r.status, r.errCode())
 	}
-	list, err := pe.reg.ListACMEAccounts(context.Background(), "no-eab-ca")
+	list, err := pe.reg.ListACMEAccounts(context.Background(), "no-eab-ca", "")
 	if err != nil || len(list) != 0 {
 		t.Fatalf("stored = %+v %v", list, err)
 	}
@@ -217,7 +217,7 @@ func TestRequestACMEProvisioningLifecycle(t *testing.T) {
 	if err := pe.reg.RequestACMEAccountProvisioning(context.Background(), &registry.ACMEAccount{Binding: "letsencrypt-staging", Generation: 2, KeyID: "0123456789abcdef", RequestedBy: "x", RequestedByAuthority: "y"}, "{}", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := pe.reg.ClaimACMEAccountProvisioning(context.Background(), "letsencrypt-staging", "run-x"); err != nil {
+	if _, _, err := pe.reg.ClaimACMEAccountProvisioning(context.Background(), "letsencrypt-staging", "", "run-x"); err != nil {
 		t.Fatal(err)
 	}
 	if r := pe.do("DELETE", Prefix+"/acme-bindings/letsencrypt-staging/provisioning/2", nil, nil); r.status != http.StatusConflict {

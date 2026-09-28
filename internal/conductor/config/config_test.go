@@ -522,6 +522,16 @@ func TestAccountProvisioningConfiguration(t *testing.T) {
 	if got := c.AccountProvisioning.EABBindings(); len(got) != 1 || got[0] != "private-ca" {
 		t.Fatalf("EABBindings = %v", got)
 	}
+	if c.AccountProvisioning.TargetScoped() != nil {
+		t.Fatalf("TargetScoped = %v, want none", c.AccountProvisioning.TargetScoped())
+	}
+	c, err = Read(strings.NewReader(with(`{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging"], "targetScopedBindings": ["letsencrypt-staging"]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.AccountProvisioning.TargetScoped(); len(got) != 1 || got[0] != "letsencrypt-staging" {
+		t.Fatalf("TargetScoped = %v", got)
+	}
 	c, err = Read(strings.NewReader(minimal))
 	if err != nil || c.AccountProvisioning != nil {
 		t.Fatalf("absent section: %+v %v", c, err)
@@ -550,6 +560,8 @@ func TestAccountProvisioningConfiguration(t *testing.T) {
 		"duplicate binding":  `{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging", "letsencrypt-staging"]}`,
 		"invalid name":       `{"publicKey": ` + string(quoted) + `, "bindings": ["Not A Name"]}`,
 		"binding not string": `{"publicKey": ` + string(quoted) + `, "bindings": [{"name": "letsencrypt-staging"}]}`,
+		"target-scoped binding not an EAB binding": `{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging"], "targetScopedBindings": ["other"]}`,
+		"duplicate target-scoped binding":          `{"publicKey": ` + string(quoted) + `, "bindings": ["letsencrypt-staging"], "targetScopedBindings": ["letsencrypt-staging", "letsencrypt-staging"]}`,
 	}
 	for name, section := range rejects {
 		t.Run(name, func(t *testing.T) {

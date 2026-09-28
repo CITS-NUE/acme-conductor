@@ -88,6 +88,10 @@ type Options struct {
 	// External Account Binding (accountProvisioning.bindings): only these
 	// accept a provisioning request. Ignored when ProvisioningKey is nil.
 	ProvisioningBindings []string
+	// TargetScopedBindings are the ProvisioningBindings that keep one ACME
+	// account per target (accountProvisioning.targetScopedBindings): they
+	// are provisioned per target, never as a whole.
+	TargetScopedBindings []string
 }
 
 // Server is the API handler.
@@ -105,6 +109,7 @@ type Server struct {
 	migration    *MigrationOptions
 	provisioning *ecdh.PublicKey
 	eabBindings  []string
+	targetScoped []string
 }
 
 // New builds the handler.
@@ -124,6 +129,7 @@ func New(o Options) *Server {
 	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), migration: o.Migration, provisioning: o.ProvisioningKey}
 	if o.ProvisioningKey != nil {
 		s.eabBindings = o.ProvisioningBindings
+		s.targetScoped = o.TargetScopedBindings
 	}
 	s.routes()
 	return s
@@ -167,6 +173,9 @@ func (s *Server) routes() {
 	api("GET "+Prefix+"/acme-bindings/{binding}", s.handleGetACMEBinding)
 	api("POST "+Prefix+"/acme-bindings/{binding}/provisioning", s.handleRequestACMEProvisioning)
 	api("DELETE "+Prefix+"/acme-bindings/{binding}/provisioning/{generation}", s.handleCancelACMEProvisioning)
+	api("GET "+Prefix+"/acme-bindings/{binding}/targets/{id}", s.handleGetTargetACMEAccount)
+	api("POST "+Prefix+"/acme-bindings/{binding}/targets/{id}/provisioning", s.handleRequestTargetACMEProvisioning)
+	api("DELETE "+Prefix+"/acme-bindings/{binding}/targets/{id}/provisioning/{generation}", s.handleCancelTargetACMEProvisioning)
 	if s.ui != nil {
 		s.uiRoutes()
 	}

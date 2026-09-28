@@ -475,7 +475,11 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
 - **アカウントルートの選択．** `stateDir/acme-accounts/<binding>/<generation>`
   を，ステップ 10 でコピーし，ステップ 13 で公開する先として使う（すべての
   パス構成要素は `Lstat` で実ディレクトリと確認され，シンボリックリンクは
-  決して辿らない）．
+  決して辿らない）．`account.scope`（target の id）がある場合，アカウントは
+  その target のものであり（[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)），
+  `stateDir/acme-accounts/<binding>/targets/<scope>/<generation>` を使う．
+  `scope` は `target.id` と一致しなければならない（`Validate` が検査する）ので，
+  ジョブが別の target のアカウントを使うことはない．
 - **`account.provisioning` が無い（世代の再利用）．** その世代のディレクトリが
   すでに登録済み（`accounts/<host>/<email>/account.json` の
   `registration.uri` が非空）でなければ，`lego` を起動する前に
@@ -488,6 +492,9 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
   `accountProvisioning` が未設定なら `InvalidJobSpec`（"this runner has no
   account provisioning key"）．鍵は設定されているが payload を開けなければ
   `InvalidJobSpec`（"account provisioning payload could not be opened"）．
+  `scope` のないアカウントの payload は `x25519-hkdf-sha256-a256gcm/v1`，
+  `scope` のあるアカウントの payload は `…/v2`（AAD に `scope=<scope>` の行が
+  加わる）でなければならず，別の target 向けに封じた payload は開けない．
   開けたら，証明書がすでに要件を満たしていてもステップ 8 の noop 早期
   リターンを **飛ばして** 必ず `lego run` を起動する（`lego` が
   `newAccount` を行うのは `run` の内側だけであり，登録を取り逃さないため）．
@@ -768,7 +775,7 @@ Runner が認識する（`Cancelled`/`Timeout`）．
 | `/usr/local/bin/lego` | バージョン固定しチェックサム検証済みの `lego` v4.35.2 バイナリ（[ADR 0010](adr/0010-pinned-lego-binary.md) を参照）． |
 | `/etc/acme-runner/config.json` | Runner の設定．**読み取り専用** でマウントする． |
 | `/work` | `lego.workDir`．書き込み可能な `tmpfs`/`emptyDir` でなければならない．証明書の秘密鍵はここに 1 回の run の間だけ一時的に存在する． |
-| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録（レガシーな世代なしアカウントに加え，世代スコープのアカウントは `acme-accounts/<binding>/<generation>` に），および（`jobSigning` を使うなら）リプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
+| `/state` | `lego.stateDir`．書き込み可能で **永続的な** ボリュームでなければならない．ACME アカウントの鍵と登録（レガシーな世代なしアカウントに加え，世代スコープのアカウントは `acme-accounts/<binding>/<generation>` に，target ごとのアカウントは `acme-accounts/<binding>/targets/<target>/<generation>` に），および（`jobSigning` を使うなら）リプレイ台帳（`jobs.d/`）だけを保持し，証明書の秘密鍵は決して置かれない． |
 | `/store` | `filesystem` store のルートの例（開発・テスト専用）． |
 
 イメージは `--read-only` / Kubernetes の `readOnlyRootFilesystem: true` に
@@ -800,7 +807,9 @@ docker run --rm \
 フィールドの全一覧は
 [コントラクト](architecture.md#certificatereconcileresult-result) を参照．
 
-`accountProvisioning`（`{ binding, generation, status: "registered"|"failed" }`）は，
+`accountProvisioning`（`{ binding, scope, generation, status: "registered"|"failed" }`．
+`scope` は `acme.account.scope` をそのまま返し，target ごとでないアカウントでは
+省かれる）は，
 ジョブが `acme.account.provisioning` を運び，かつ Runner が認可とバインディング
 解決を終えてプロビジョニングの手順に到達した場合にだけ現れる．それより前の
 失敗（検証エラー，ポリシー違反，未知のバインディング）はこのフィールドを一切
@@ -962,14 +971,16 @@ docker run --rm \
   しまうからである．
 - **世代スコープのアカウント状態も `stateDir` の下に閉じている．**
   `JobSpec.acme.account` が世代を指定する run は，上記のレイアウトを
-  `stateDir/acme-accounts/<binding>/<generation>` の下で使う
+  `stateDir/acme-accounts/<binding>/<generation>`（target ごとのアカウントは
+  `stateDir/acme-accounts/<binding>/targets/<scope>/<generation>`）の下で使う
   （`stateDir` 自身ではない．そちらはレガシーな，世代のないアカウント用
-  である）．3 つのパス構成要素（`acme-accounts`，`<binding>`，
+  である）．パス構成要素（`acme-accounts`，`<binding>`，`targets`，`<scope>`，
   `<generation>`）はそれぞれ作成前に `Lstat` で検査され，実ディレクトリで
   あることだけが受理される（シンボリックリンクや他の種別は拒否）．
-  `<binding>` はコントラクトがすでに検証済みのバインディング名，
-  `<generation>` は範囲の決まった 10 進整数の文字列化であり，どちらも
-  追加のパス構成要素や `..` を注入できない．
+  `<binding>` はコントラクトがすでに検証済みのバインディング名，`<scope>` は
+  英数字と `-`，`_` だけの識別子，`<generation>` は範囲の決まった 10 進整数の
+  文字列化であり，どれも追加のパス構成要素や `..` を注入できない．`targets` は
+  数字でないので，binding 全体の世代のディレクトリと衝突しない．
   [ACME アカウントの世代とプロビジョニング](#acme-アカウントの世代とプロビジョニング)
   を参照．
 - **レイアウト検査が扱わないこと．** これは `stateDir` を所有するのと同じ

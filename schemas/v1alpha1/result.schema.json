@@ -147,6 +147,10 @@
           "maxLength": 63,
           "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
         },
+        "scope": {
+          "$ref": "#/$defs/identifier",
+          "description": "Echoes acme.account.scope of the job; absent for an account scoped to the whole binding."
+        },
         "generation": {
           "type": "integer",
           "minimum": 1,

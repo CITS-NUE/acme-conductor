@@ -166,6 +166,11 @@ func (s *JobSpec) Validate() error {
 		if err := s.ACME.Account.validate("acme.account"); err != nil {
 			return err
 		}
+		// An account scoped to a target is that target's own: a job can
+		// never use another target's account.
+		if s.ACME.Account.Scope != "" && s.ACME.Account.Scope != s.Target.ID {
+			return invalid("acme.account.scope", "must equal target.id")
+		}
 	}
 	if err := validateBindingName("dns.binding", s.DNS.Binding); err != nil {
 		return err
@@ -239,9 +244,17 @@ func (a *ACMEAccountRef) validate(field string) error {
 	if a.Generation < 1 || a.Generation > MaxAccountGeneration {
 		return invalid(field+".generation", fmt.Sprintf("must be between 1 and %d", MaxAccountGeneration))
 	}
+	if a.Scope != "" {
+		if err := validateIdentifier(field+".scope", a.Scope); err != nil {
+			return err
+		}
+	}
 	if a.Provisioning != nil {
 		if err := a.Provisioning.validate(field + ".provisioning"); err != nil {
 			return err
+		}
+		if want := provisioningVersionFor(a.Scope); a.Provisioning.Version != want {
+			return invalid(field+".provisioning.version", fmt.Sprintf("must be %q for this account scope", want))
 		}
 	}
 	return nil
@@ -258,8 +271,8 @@ func (p *SealedProvisioning) Validate() error {
 }
 
 func (p *SealedProvisioning) validate(field string) error {
-	if p.Version != ProvisioningVersion {
-		return invalid(field+".version", fmt.Sprintf("must be %q", ProvisioningVersion))
+	if p.Version != ProvisioningVersion && p.Version != ProvisioningVersionScoped {
+		return invalid(field+".version", fmt.Sprintf("must be one of %q", ProvisioningVersions))
 	}
 	if !provisioningKeyIDRe.MatchString(p.KeyID) {
 		return invalid(field+".keyId", "must be 16 lower-case hex characters")
@@ -409,6 +422,11 @@ func (r *Result) Validate() error {
 	if r.AccountProvisioning != nil {
 		if err := validateBindingName("accountProvisioning.binding", r.AccountProvisioning.Binding); err != nil {
 			return err
+		}
+		if r.AccountProvisioning.Scope != "" {
+			if err := validateIdentifier("accountProvisioning.scope", r.AccountProvisioning.Scope); err != nil {
+				return err
+			}
 		}
 		if r.AccountProvisioning.Generation < 1 || r.AccountProvisioning.Generation > MaxAccountGeneration {
 			return invalid("accountProvisioning.generation", fmt.Sprintf("must be between 1 and %d", MaxAccountGeneration))

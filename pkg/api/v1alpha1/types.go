@@ -88,6 +88,11 @@ const MaxAccountGeneration = 1_000_000
 
 // ACMEAccountRef selects one generation of an ACME account for a binding.
 type ACMEAccountRef struct {
+	// Scope, when present, is the target identifier the account belongs
+	// to: the binding keeps one account (with its own generations) per
+	// target instead of one for the whole binding (docs/adr/0024). It must
+	// equal target.id. Absent means the account is the binding's.
+	Scope string `json:"scope,omitempty"`
 	// Generation is 1..MaxAccountGeneration. Generations are never reused:
 	// a burnt generation number stays burnt even if provisioning fails.
 	Generation int64 `json:"generation"`
@@ -163,7 +168,10 @@ type Result struct {
 // AccountProvisioningResult reports what happened to one ACME account
 // generation's provisioning attempt.
 type AccountProvisioningResult struct {
-	Binding    string                    `json:"binding"`
+	Binding string `json:"binding"`
+	// Scope echoes acme.account.scope of the job; absent for an account
+	// scoped to the whole binding.
+	Scope      string                    `json:"scope,omitempty"`
 	Generation int64                     `json:"generation"`
 	Status     AccountProvisioningStatus `json:"status"`
 }

@@ -1,0 +1,19 @@
+{
+  "description": "Deterministic test vector for the x25519-hkdf-sha256-a256gcm/v2 EAB provisioning scheme: an account scoped to one target (docs/adr/0024). Same inputs as vector.json plus a scope; the AAD gains a scope line, so only the GCM tag differs from the v1 vector. See pkg/api/v1alpha1/provisioning.go and TestProvisioningVector.",
+  "runnerPrivateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VuBCIEIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB\n-----END PRIVATE KEY-----\n",
+  "ephemeralPrivateKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
+  "nonceHex": "030303030303030303030303",
+  "binding": "letsencrypt-staging",
+  "scope": "01JTARGET0000000000000000A",
+  "generation": 1,
+  "kid": "test-kid-0001",
+  "hmac": "dGVzdC1obWFjLWtleS0wMDAx",
+  "expectedPlaintextJson": "{\"kid\":\"test-kid-0001\",\"hmac\":\"dGVzdC1obWFjLWtleS0wMDAx\"}",
+  "expectedSealedProvisioning": {
+    "version": "x25519-hkdf-sha256-a256gcm/v2",
+    "keyId": "1a92f23852dc908d",
+    "ephemeralPublicKey": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+    "nonce": "AwMDAwMDAwMDAwMD",
+    "ciphertext": "19JXJr3se_7zmhhjCyaLm2k01b7-Uy7srjEt4Simh9IcCgXD8vTjBAkHYYGvYlKs0yB7RcT3OPeRdORxrMWfottiwB9VFfRNvw"
+  }
+}

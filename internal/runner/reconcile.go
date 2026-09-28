@@ -411,6 +411,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	if provisioning {
 		ap = &v1alpha1.AccountProvisioningResult{
 			Binding:    spec.ACME.Binding,
+			Scope:      account.Scope,
 			Generation: account.Generation,
 			Status:     v1alpha1.AccountProvisioningFailed,
 		}
@@ -429,6 +430,9 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		}
 		accountRoot = root
 		log = log.With("acmeAccountGeneration", account.Generation)
+		if account.Scope != "" {
+			log = log.With("acmeAccountScope", account.Scope)
+		}
 	}
 
 	st, err := opts.Stores.Open(storeBinding)
@@ -525,7 +529,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 			if err != nil {
 				return nil, failAP(v1alpha1.ErrorCodeInternal, "account provisioning keys could not be loaded", err)
 			}
-			eab, err := account.Provisioning.Open(keys, spec.ACME.Binding, account.Generation)
+			eab, err := account.Provisioning.OpenScoped(keys, spec.ACME.Binding, account.Scope, account.Generation)
 			if err != nil {
 				return nil, failAP(v1alpha1.ErrorCodeInvalidJobSpec, "account provisioning payload could not be opened", err)
 			}

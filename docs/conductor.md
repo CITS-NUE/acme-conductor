@@ -323,6 +323,7 @@ Runner に対する Conductor の ID であって，DNS・Store・クラウド�
 |---|---|---|---|
 | `publicKey` | string | —（必須） | Runner の account-provisioning 用 X25519 公開鍵．PEM の `PUBLIC KEY` ブロック，その DER SubjectPublicKeyInfo の標準 base64，または生の 32 バイト鍵の base64url（無パディング）のいずれか（`acme-runner provisioning-keygen` が出力する 1 行の `publicKey:` を含む）． |
 | `bindings` | string の配列 | —（必須，1 個以上） | CA が External Account Binding を要求する ACME binding の名前．どれも `acmeBindings` に列挙されていなければならず，重複は許されない．ここに挙げた binding だけがプロビジョニング要求を受け付け，GUI に投入フォームが出る． |
+| `targetScopedBindings` | string の配列 | `[]` | `bindings` のうち，ACME アカウントを **target ごとに** 持つ binding の名前．どれも `bindings` に挙がっていなければならず，重複は許されない．後述． |
 
 `accountProvisioning` は省略可であり，省略すると暗号化 EAB プロビジョニングの
 機能全体が無効になる: `GET /account-provisioning/key` と
@@ -354,6 +355,21 @@ CA の binding は挙げない．挙げなかった binding は GUI の EAB の�
 動き，残った要求は `DELETE …/provisioning/{generation}` でキャンセルできる．
 EAB が要るかどうかは真偽の属性にすぎず，シークレットではないので，
 [ADR 0005](adr/0005-conductor-never-touches-secrets.md) には反しない．
+
+`targetScopedBindings` は，1 つの ACME アカウントで発行できる名前を CA が
+アカウントごとに決めている binding のためにある（UPKI ACME では，申請した
+FQDN の集合にアカウントが縛られる．
+[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)）．ここに挙げた
+binding では，Conductor はアカウント（とその世代）を binding 全体ではなく
+**target ごとに** 1 つ持つ．EAB は target ごとに
+`POST /acme-bindings/{binding}/targets/{id}/provisioning` で投入し，binding
+全体への `POST /acme-bindings/{binding}/provisioning` は `409`
+（`target_scoped`）で拒否される．その binding の target の run は，その
+target 自身のアカウントだけを使う．target に活性なアカウントも未着手の
+要求もなければ，run は Runner を起動せずに `AcmeFailure` で失敗する
+（binding 全体のアカウントを代わりに使うことはない）．アカウントを増やす
+のに設定変更も再デプロイも要らない．どの名前をどのアカウントで発行できるかは
+Conductor では検査せず，CA の拒否（`AcmeFailure`）に任せる．
 
 ## REST API
 
@@ -402,11 +418,14 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /ui/`, `/ui/app.js`, `/ui/app.css` | GUI の 3 つの静的ファイル．認証不要（データを含まない）． |
 | `GET /ui/config` | GUI のサインイン方法: `{"auth":{"mode":"oidc","issuer":…,"clientId":…,"scopes":[…],"authorizationEndpoint":…,"tokenEndpoint":…}}` または `{"auth":{"mode":"localhost-dev"}}`．認証不要．プロバイダのディスカバリ文書が利用できない間は `503`． |
 | `GET /api/v1alpha1/bindings` | 登録されたバインディング名: `{"execution":[…],"acme":[…],"dns":[…],"store":[…]}`． |
-| `GET /api/v1alpha1/account-provisioning/key` | Runner の provisioning 公開鍵: `{"version":…,"keyId":…,"publicKey":…}`．`accountProvisioning` が未設定なら `404` `not_configured`． |
-| `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","externalAccountBinding","activeGeneration","pending","generations":[…]}…]}`．`externalAccountBinding` は binding が `accountProvisioning.bindings` に挙がっている（CA が EAB を要求する）かどうか． |
+| `GET /api/v1alpha1/account-provisioning/key` | Runner の provisioning 公開鍵: `{"version":…,"scopedVersion":…,"keyId":…,"publicKey":…}`．`version` は binding 全体のアカウント用，`scopedVersion` は target ごとのアカウント用の封の方式．`accountProvisioning` が未設定なら `404` `not_configured`． |
+| `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","externalAccountBinding","targetScoped","activeGeneration","pending","generations":[…],"targets":[{"targetId","activeGeneration","pending","generations":[…]}…]}…]}`．`externalAccountBinding` は binding が `accountProvisioning.bindings` に挙がっている（CA が EAB を要求する）かどうか，`targetScoped` は `accountProvisioning.targetScopedBindings` に挙がっているかどうか．`targets` は世代が 1 つ以上ある target ごとのアカウント． |
 | `GET /api/v1alpha1/acme-bindings/{binding}` | 1 つの binding の世代状態． |
 | `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代），`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．スケジューラを起こす．binding が `accountProvisioning.bindings` に挙がっていなければ `409` `eab_not_required`． |
 | `DELETE /api/v1alpha1/acme-bindings/{binding}/provisioning/{generation}` | 未着手（run にまだ添付されていない）プロビジョニング要求をキャンセル → `200`． |
+| `GET /api/v1alpha1/acme-bindings/{binding}/targets/{id}` | target ごとのアカウントの世代状態: `{"targetId","activeGeneration","pending","generations":[…]}`．binding が `targetScopedBindings` に挙がっていなければ `409` `not_target_scoped`，target のポリシーの ACME binding が `{binding}` でなければ `409` `conflict`． |
+| `POST /api/v1alpha1/acme-bindings/{binding}/targets/{id}/provisioning` | その target のアカウントに暗号化された EAB を投入 → `201`，`Location`．本文は binding 全体のものと同じで，`encryptedCredential.version` は `scopedVersion`（v2）でなければならない．`409` の条件は上と同じ．binding 全体のエンドポイントは，`targetScopedBindings` の binding には `409` `target_scoped` を返す． |
+| `DELETE /api/v1alpha1/acme-bindings/{binding}/targets/{id}/provisioning/{generation}` | その target のアカウントの未着手の要求をキャンセル → `200`．target が存在すればよい（ポリシーを変えた後に残った要求も取り下げられる）． |
 | `GET /api/v1alpha1/policies` | `{"items":[Policy…]}`，古い順． |
 | `POST /api/v1alpha1/policies` | ポリシーを作成 → `201` Policy，`Location`． |
 | `GET /api/v1alpha1/policies/{id}` | ポリシー 1 件． |
@@ -584,7 +603,10 @@ run が存在するまで `null` であり，run が失敗した場合は `error
 設定されているときだけ動く（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
 1 つの ACME binding について，Conductor が持つ「アカウント」は
 `acme_accounts` テーブルの行であり，1 つの binding × 1 つの世代番号
-（`generation`，1 以上の整数，binding ごとに単調に増える）につき 1 行ある:
+（`generation`，1 以上の整数，binding ごとに単調に増える）につき 1 行ある．
+`targetScopedBindings` の binding では，アカウントは binding × target
+（`scope` 列が target の id）ごとにあり，世代番号も以下の規則もすべて
+target ごとに成り立つ:
 
 ```json
 {
@@ -630,8 +652,8 @@ provisioning ──(登録に成功した run)──> active ──(新しい世
 `409` 競合）を確認して行を `provisioning` で作り，スケジューラを起こす．
 以後は完全にスケジューラ主導である:
 
-1. スケジューラは，その binding を使う **いずれかの** target の次の run を
-   組み立てる際，未着手の `provisioning` 行があれば
+1. スケジューラは，その binding を使う **いずれかの** target（target ごとの
+   アカウントなら，その target）の次の run を組み立てる際，未着手の `provisioning` 行があれば
    `ClaimACMEAccountProvisioning` でそれをアトミックにその run へ添付し
    （`JobSpec.acme.account.provisioning` に暗号文をそのまま積む），無ければ
    現在の `active` 世代（あれば）を `JobSpec.acme.account.generation` に積む．
@@ -639,7 +661,7 @@ provisioning ──(登録に成功した run)──> active ──(新しい世
    この添付が起こる run を早められる** ―― 次の定期スケジュールを待つ必要
    はない．
 2. その run が Runner から `Result` を受け取ると，スケジューラは
-   `Result.accountProvisioning` を見る: 要求した binding／generation と
+   `Result.accountProvisioning` を見る: 要求した binding／scope／generation と
    一致し `status: "registered"` なら `CompleteACMEAccountProvisioning(registered=true)`
    が行を `active` にし（直前の `active` 行を `retired` に落とす）．一致
    するが `"failed"` なら，あるいは run が結果をまったく返さずに終わった
@@ -892,7 +914,9 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 未着手の要求が残っている binding（キャンセルのため）だけであり，EAB を
 要求しない CA の binding は現れない．binding ごとに活性世代・保留中の状態・
 登録時刻を表示し（EAB の値はいつも決して表示しない），
-`accountProvisioning.bindings` に挙がった binding についてだけ，admin に
+`targetScopedBindings` の binding では target ごとのアカウントの一覧を表示する
+（その EAB は target の詳細ページの「ACME account」の節から投入・キャンセル
+する）．それ以外で `accountProvisioning.bindings` に挙がった binding についてだけ，admin に
 「Provision / Replace EAB」フォーム
 （KID 入力，HMAC 入力は `type="password"`／`autocomplete="off"`，Runner の
 `keyId` を比較用に表示）を出す．暗号化は専用ファイル `provision.js`（WebCrypto

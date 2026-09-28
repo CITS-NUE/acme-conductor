@@ -247,7 +247,9 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
 不透明な識別子，正規化された FQDN，ポリシーの値，論理バインディング名だけである．
 
 `acme.account`（任意）は世代スコープの ACME アカウントを選ぶ:
-`{ "generation": N, "provisioning": {...} }`．`provisioning` は，そのアカウント
+`{ "scope": "<target id>", "generation": N, "provisioning": {...} }`．`scope` は
+アカウントを target ごとに持つ binding でだけ現れ，`target.id` と一致しなければ
+ならない（[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)）．`provisioning` は，そのアカウント
 世代を登録する run にだけ現れる `SealedProvisioning`（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）
 であり，Runner の X25519 provisioning 鍵に封じた ACME External Account Binding
 の暗号文だけを運ぶ．「シークレットのためのフィールドがそもそも存在しない」という
@@ -580,7 +582,9 @@ Makefile            build / verify / image のターゲット
   ブラウザの中で ACME External Account Binding を Runner の X25519 鍵に封じ，
   Conductor は暗号文とメタデータだけを保存・中継する（復号する手段を持たない）．
   Runner はアカウントを世代（`stateDir/acme-accounts/<binding>/<generation>`）
-  で管理し，登録に成功した世代だけを活性化する．EAB は ACME の `newAccount`
+  で管理し，登録に成功した世代だけを活性化する．CA がアカウントごとに発行できる
+  名前を決める binding（UPKI など）では，アカウントを target ごとに持てる
+  （`accountProvisioning.targetScopedBindings`，[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)）．EAB は ACME の `newAccount`
   にのみ使う起動用の資格情報であり，通常の発行・更新には関与しない．
   [`docs/runner.md`](runner.md#accountprovisioning)，
   [`docs/conductor.md`](conductor.md#acme-アカウントプロビジョニング)，

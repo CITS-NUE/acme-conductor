@@ -199,6 +199,13 @@ type AccountProvisioning struct {
 	// EAB (the Runner holds the directory URL), so the operator says so
 	// here. Each must be listed in acmeBindings.
 	Bindings []string `json:"bindings"`
+	// TargetScopedBindings are the Bindings whose CA ties an ACME account
+	// to the names it may issue for (UPKI, for example): the Conductor
+	// keeps one account, with its own generations, per target of such a
+	// binding instead of one for the whole binding, and an EAB is
+	// provisioned for one target (docs/adr/0024). Each must be listed in
+	// Bindings. Any other binding keeps one account for all its targets.
+	TargetScopedBindings []string `json:"targetScopedBindings,omitempty"`
 
 	pub *ecdh.PublicKey
 }
@@ -215,6 +222,14 @@ func (a *AccountProvisioning) EABBindings() []string {
 		return nil
 	}
 	return a.Bindings
+}
+
+// TargetScoped returns TargetScopedBindings, or nil if a is nil.
+func (a *AccountProvisioning) TargetScoped() []string {
+	if a == nil {
+		return nil
+	}
+	return a.TargetScopedBindings
 }
 
 // Key returns the parsed provisioning public key.
@@ -244,6 +259,16 @@ func (a *AccountProvisioning) validate(c *Config) error {
 	for _, n := range a.Bindings {
 		if !c.HasACMEBinding(n) {
 			return invalid("accountProvisioning.bindings: %q is not listed in acmeBindings", n)
+		}
+	}
+	if len(a.TargetScopedBindings) > 0 {
+		if err := validateNames("accountProvisioning.targetScopedBindings", a.TargetScopedBindings); err != nil {
+			return err
+		}
+	}
+	for _, n := range a.TargetScopedBindings {
+		if !contains(a.Bindings, n) {
+			return invalid("accountProvisioning.targetScopedBindings: %q is not listed in accountProvisioning.bindings", n)
 		}
 	}
 	a.pub = pub
