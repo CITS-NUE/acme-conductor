@@ -35,7 +35,7 @@ param acmeBindings = ['letsencrypt-staging']
 param dnsBindings = ['azure-dns-staging']
 param storeBindings = ['keyvault-staging']
 
-param dnsZoneName = 'example.ac.jp'
+param dnsZoneNames = ['example.ac.jp']
 param dnsZoneResourceGroup = 'rg-dns-example'
 param keyVaultName = 'kv-acme-staging'
 param keyVaultResourceGroup = 'rg-acme'

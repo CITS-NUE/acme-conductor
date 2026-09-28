@@ -55,7 +55,7 @@ AI に勝手に決めさせない**．案を出させ，人が確定する．
 - namePrefix: acme-stg
 - roleNamePrefix: ACME Conductor Staging
 - Key Vault: 新規 kv-acme-stg-<org>（RBAC）
-- DNS ゾーン: <チャレンジ用ゾーン> / <その RG>（既存．変更しない）
+- DNS ゾーン: <チャレンジ用ゾーン（複数可）> / <その RG>（既存．変更しない．複数なら同じ RG にあること）
 - 最初の target: <CNAME 委任済みの 1 ホスト>
 - バインディング名: acme=letsencrypt-staging / dns=azure-dns-<zone> / store=keyvault-staging
 - ACME の連絡先: <組織の窓口アドレス>
@@ -148,7 +148,7 @@ AI がすること: 秘密鍵を環境変数に読み込み，`az deployment gro
 - **既存の本番リソースへの変更の有無**
 
 人が確認すること: 既存の本番 RG への変更が想定どおりか（今回は DNS
-ゾーンへのロール割り当て 1 つだけ）．
+ゾーンへのロール割り当て，ゾーンごとに 1 つだけ）．
 
 ### フェーズ 7: デプロイ
 

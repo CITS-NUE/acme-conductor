@@ -30,7 +30,7 @@ Container App として動き，API と GUI のすべての呼び出し元を OI
 | `<prefix>-cae` (Container Apps environment) | アプリとジョブをホストする．Consumption プラン，VNet 統合なし． |
 | `<prefix><hash>` (storage account) | 環境にマウントされる 3 つの Azure Files 共有: `conductor-state`（SQLite のレジストリ．`nobrl` でマウント），`runner-state`（ACME アカウントの状態．`/state`），`exchange`（署名付きジョブの入力と結果の出力）． |
 | `<prefix>-id-conductor` (user-assigned identity) | Conductor の ID．Runner の Job に対してのみ **Conductor Job Execution Observer** カスタムロール（実行の読み取り・一覧・停止．開始は不可）を付与． |
-| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーンに **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
+| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーン（`dnsZoneNames` の各ゾーン）に **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
 | `<prefix>-runner` (Container Apps Job) | Runner イメージ．Runner の設定と結果署名用の秘密鍵（暗号化 EAB プロビジョニングを有効にした場合は provisioning 用の秘密鍵も）を `/etc/acme-runner/` 配下に，加えて `/exchange`，`/state`，一時的な `/work` をマウント．スケジュールトリガー（`runnerCronExpression`，毎分），実行ごとに 1 レプリカ（`parallelism: 1`．ランチャーのコントラクトは実行ごとに 1 つの run），リトライなし，固定コマンド `reconcile --exchange /exchange`． |
 | `<prefix>-conductor` (Container App) | Conductor イメージ．設定とジョブ署名用の秘密鍵を `/etc/acme-conductor/` 配下に，加えて `/var/lib/acme-conductor` と `/mnt/exchange` をマウント．HTTPS 専用の ingress（既定で外部公開．必要に応じて送信元 CIDR で制限可）の背後に 1 レプリカ，`oidc` 認証，`/healthz` と `/readyz` での liveness/readiness プローブ． |
 | 3 つのカスタムロール定義 (サブスクリプションスコープ) | **`main.bicep` ではなく `roles.bicep` が作る**．初回に一度だけ別にデプロイし，`main.bicep` はそれを割り当てるだけである（[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）． |
@@ -43,7 +43,7 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
 ## 前提条件
 
 - このデプロイ用のリソースグループ，Runner が TXT レコードを書き込んでよい DNS
-  ゾーン，そして **RBAC** 権限モデル（`enableRbacAuthorization: true`）の
+  ゾーン（1 つ以上．[複数の DNS ゾーン](#複数の-dns-ゾーン)），そして **RBAC** 権限モデル（`enableRbacAuthorization: true`）の
   Key Vault．後者 2 つは別のリソースグループにあってもよいが，デプロイと
   **同じサブスクリプションになければならない**．カスタムロールはその
   サブスクリプションを唯一の割り当て可能スコープとして定義されており，ロールは
@@ -323,6 +323,34 @@ Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変�
 用のコンテナごとのトークンであり，他の passthrough の値と同様に Runner のログ
 から秘匿される．
 
+### 複数の DNS ゾーン
+
+`dnsZoneNames` に並べたゾーンのそれぞれに，Runner の ID の **Runner DNS TXT
+Writer** が割り当てられる．SAN 証明書の名前が複数のゾーンにまたがる場合や，
+target ごとにチャレンジ用ゾーンが違う場合に使う
+（[ADR 0024](../../docs/adr/0024-target-scoped-acme-accounts-and-san.md)）．
+
+```bicep
+param dnsZoneNames = ['example.ac.jp', 'example.jp']
+param dnsZoneResourceGroup = 'rg-dns-example'
+```
+
+- ゾーンはすべて `dnsZoneResourceGroup` にあること（同じサブスクリプション内）．
+- `lego` の `azuredns` プロバイダは `AZURE_ZONE_NAME` で 1 つのゾーンを指すので，
+  Runner 設定にはゾーンごとに DNS バインディングを 1 つ書き，その名前を
+  `dnsBindings` に並べる．
+- ロール割り当ての名前はゾーンの ID から決まる．リストからゾーンを外しても，
+  増分デプロイは既存の割り当てを **消さない**．不要になった割り当ては
+  `az role assignment delete --assignee <runner principalId> --scope <zone id>`
+  で外す．
+
+**`dnsZoneName` からの移行．** 以前の単一ゾーンのパラメータ `dnsZoneName`
+（文字列）は当面受け付け，`dnsZoneNames` に加えて扱う（重複は 1 つにまとまる）．
+割り当ての名前は同じゾーンなら変わらないので，既存のパラメタファイルのまま
+再デプロイしてもロール割り当ては失われない．`param dnsZoneName = 'x'` を
+`param dnsZoneNames = ['x']` に書き換えれば移行は済む．どちらも空なら
+デプロイは失敗する．`dnsZoneName` は将来のリリースで削除する．
+
 ## デプロイ後の運用
 
 **API と GUI には `conductorUrl` で到達できる．** ingress はアプリの FQDN に
@@ -450,6 +478,9 @@ CI はサブスクリプションにデプロイしない．
   レプリカへのホップを暗号化することは，文書化されているが観測していない．
 - **大きな設定．** 多数のバインディングを持つ Runner 設定は，プラットフォームの
   シークレット値の上限を超えるかもしれない．
+- **複数の DNS ゾーン．** `dnsZoneNames` に 2 つ以上のゾーンを並べたデプロイは
+  まだ行っていない．割り当ては 1 ゾーンの場合と同じモジュールをゾーンごとに
+  繰り返すだけである．
 
 新しい環境へのデプロイは，最初から最後まで見守ること．ステージング CA と
 1 つの target から始める．

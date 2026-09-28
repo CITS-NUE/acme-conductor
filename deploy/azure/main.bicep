@@ -90,10 +90,13 @@ param dnsBindings array
 @description('Logical store binding names the Conductor registers (must match the Runner configuration).')
 param storeBindings array
 
-@description('Name of the DNS zone the Runner completes challenges in.')
-param dnsZoneName string
+@description('Names of the DNS zones the Runner completes challenges in (one per DNS binding zone; names of one SAN certificate may span several). The Runner identity gets the DNS TXT writer role on each. All zones must be in dnsZoneResourceGroup.')
+param dnsZoneNames array = []
 
-@description('Resource group of the DNS zone. The zone must be in this subscription (the custom roles are assignable in this subscription only).')
+@description('Deprecated: use dnsZoneNames. A single challenge zone, still accepted and added to dnsZoneNames so parameter files written for one zone keep deploying unchanged.')
+param dnsZoneName string = ''
+
+@description('Resource group of the DNS zones. The zones must be in this subscription (the custom roles are assignable in this subscription only).')
 param dnsZoneResourceGroup string
 
 @description('Name of the Key Vault the Runner stores certificates in (RBAC permission model).')
@@ -219,6 +222,14 @@ var accountProvisioningEabBindings = !accountProvisioningEnabled
 var conductorJobObserverRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.conductorJobObserver))
 var runnerDnsTxtWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerDnsTxtWriter))
 var runnerKeyVaultCertificateWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerKeyVaultCertificateWriter))
+
+// dnsZoneNames plus the deprecated dnsZoneName, without duplicates. The
+// role assignment name is derived from the zone ID, so a zone given either
+// way keeps the assignment an earlier single-zone deployment made.
+var challengeZoneNames = union(dnsZoneNames, empty(dnsZoneName) ? [] : [dnsZoneName])
+var runnerDnsZoneNames = empty(challengeZoneNames)
+  ? fail('dnsZoneNames must name at least one DNS zone.')
+  : challengeZoneNames
 
 // --- identities --------------------------------------------------------------
 
@@ -772,16 +783,16 @@ resource conductorObservesRunner 'Microsoft.Authorization/roleAssignments@2022-0
   }
 }
 
-// Runner identity -> TXT records in the challenge zone.
-module runnerDns 'modules/dns-role-assignment.bicep' = {
-  name: '${deployment().name}-dns'
+// Runner identity -> TXT records in each challenge zone.
+module runnerDns 'modules/dns-role-assignment.bicep' = [for (zoneName, i) in runnerDnsZoneNames: {
+  name: '${deployment().name}-dns-${i}'
   scope: resourceGroup(dnsZoneResourceGroup)
   params: {
-    dnsZoneName: dnsZoneName
+    dnsZoneName: zoneName
     runnerPrincipalId: runnerIdentity.properties.principalId
     roleDefinitionId: runnerDnsTxtWriterRoleId
   }
-}
+}]
 
 // Runner identity -> import certificates into the vault.
 module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {

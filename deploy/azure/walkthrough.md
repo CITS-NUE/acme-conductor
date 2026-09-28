@@ -264,6 +264,7 @@ Runner 設定で書き換えるところ:
 - `authorization.allowed*Bindings` と各バインディング名: 手順 1 で決めた名前にする．
 - `acmeBindings.*.email`: 組織の連絡先にする．
 - `dnsBindings.*.env`: `AZURE_ZONE_NAME`，`AZURE_RESOURCE_GROUP`，`AZURE_SUBSCRIPTION_ID` にチャレンジ用ゾーンの値を入れる．
+  - チャレンジ用ゾーンが複数あるなら，ゾーンごとにバインディングを 1 つ書く（[README](README.md#複数の-dns-ゾーン)）．
   - `LEGO_*` は **書かない**．予約済みで，設定全体が拒否される．
   - `AZURE_AUTH_METHOD` も書かない（[README](README.md#job-内での-runner-の-id)）．
 - `dnsBindings.*.passthroughEnv`: `["AZURE_CLIENT_ID", "IDENTITY_ENDPOINT", "IDENTITY_HEADER"]` のままにする．
@@ -282,7 +283,7 @@ param runnerImage = 'ghcr.io/cits-nue/acme-runner@sha256:<digest>'
 param acmeBindings = ['letsencrypt-staging']
 param dnsBindings = ['azure-dns-<zone>']
 param storeBindings = ['keyvault-staging']
-param dnsZoneName = '<challenge zone>'
+param dnsZoneNames = ['<challenge zone>']   // 複数可．すべて dnsZoneResourceGroup にあること
 param dnsZoneResourceGroup = '<zone rg>'
 param keyVaultName = 'kv-acme-stg-<org>'
 param keyVaultResourceGroup = 'rg-acme-staging'
@@ -322,9 +323,10 @@ az deployment group what-if -g rg-acme-staging -n acme-stg \
 ロール割り当て 1 つである．カスタムロールは `main.bicep` には含まれず，手順 8-1 で
 別にデプロイする（what-if の時点でまだなくてもよい）．
 既存の Key Vault は `* Ignore` になる．Runner の ID へのロール割り当て
-2 つ（DNS ゾーンと Key Vault）は，ID の principalId がデプロイ中にしか
-決まらないため `Unsupported` と表示される．これは正常である．**既存の本番
-RG に対する変更は，DNS ゾーンへのロール割り当て 1 つだけ** であることを確認する．
+（`dnsZoneNames` の各ゾーンに 1 つと Key Vault に 1 つ）は，ID の principalId が
+デプロイ中にしか決まらないため `Unsupported` と表示される．これは正常である．
+**既存の本番 RG に対する変更は，DNS ゾーンへのロール割り当て（ゾーンごとに
+1 つ）だけ** であることを確認する．
 
 ## 8. デプロイ
 
@@ -398,7 +400,7 @@ RG=rg-acme-staging P=acme-stg
 U=$(az deployment group show -g $RG -n $P --query properties.outputs.conductorUrl.value -o tsv)
 # Conductor: healthz/readyz は 200，トークンなしの API は 401 が正常
 for p in healthz readyz api/v1alpha1/targets; do printf "%s: " $p; curl -s -o /dev/null -w "%{http_code}\n" "$U/$p"; done
-# ロール割り当て: Runner に 2 つ（ゾーンと Key Vault），Conductor に 1 つ（Runner の Job）
+# ロール割り当て: Runner にゾーンの数 + 1 つ（各ゾーンと Key Vault），Conductor に 1 つ（Runner の Job）
 for id in $P-id-runner $P-id-conductor; do
   az role assignment list --assignee "$(az identity show -g $RG -n $id --query principalId -o tsv)" --all \
     --query "[].{role:roleDefinitionId,scope:scope}" -o tsv
@@ -616,7 +618,7 @@ ABAC 条件付きの権限の場合は，毎回 `--validation-level Template` �
 ```sh
 # 1. RG の外にある割り当て（DNS ゾーン上の Runner の ID）を先に外す．ID を消すと孤立した割り当てになる
 RUNNER=$(az identity show -g rg-acme-staging -n acme-stg-id-runner --query principalId -o tsv)
-az role assignment delete --assignee "$RUNNER" --scope <dns zone id>
+az role assignment delete --assignee "$RUNNER" --scope <dns zone id>   # dnsZoneNames のゾーンごとに
 # 2. RG ごと削除（アプリ，Job，ID，ストレージ，Key Vault）
 az group delete -n rg-acme-staging
 az keyvault purge -n kv-acme-stg-<org>            # 論理削除された vault を消す（同名で作り直すなら）
