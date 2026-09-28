@@ -38,7 +38,7 @@ func TestACMEAccountLifecycle(t *testing.T) {
 
 	// A wrong generation number is a conflict too (must be max+1 == 2).
 	wrongGen := newACMEAccount(binding, 5)
-	if err := db.CancelACMEAccountProvisioning(ctx, binding, 1, nil); err != nil {
+	if err := db.CancelACMEAccountProvisioning(ctx, binding, "", 1, nil); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	if err := db.RequestACMEAccountProvisioning(ctx, wrongGen, `{"ciphertext":"x"}`, nil); !errors.Is(err, registry.ErrConflict) {
@@ -55,7 +55,7 @@ func TestACMEAccountLifecycle(t *testing.T) {
 
 	// Claim attaches the pending, unattached row and records an audit
 	// event.
-	claimed, sealed, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-1")
+	claimed, sealed, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-1")
 	if err != nil || claimed == nil || claimed.Generation != 2 || claimed.RunID != "run-1" || sealed != `{"ciphertext":"two"}` {
 		t.Fatalf("claim = %+v %q %v", claimed, sealed, err)
 	}
@@ -65,20 +65,20 @@ func TestACMEAccountLifecycle(t *testing.T) {
 	}
 
 	// A second claim attempt finds nothing (already attached).
-	if claimed2, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-2"); err != nil || claimed2 != nil {
+	if claimed2, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-2"); err != nil || claimed2 != nil {
 		t.Fatalf("second claim = %+v %v", claimed2, err)
 	}
 
 	// Complete(registered=true) activates it.
 	cev := &registry.AuditEvent{Actor: "scheduler", Action: registry.AuditACMEAccountActivated}
-	if err := db.CompleteACMEAccountProvisioning(ctx, binding, 2, "run-1", true, cev); err != nil {
+	if err := db.CompleteACMEAccountProvisioning(ctx, binding, "", 2, "run-1", true, cev); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	active, err := db.ActiveACMEAccountGeneration(ctx, binding)
+	active, err := db.ActiveACMEAccountGeneration(ctx, binding, "")
 	if err != nil || active != 2 {
 		t.Fatalf("active generation = %d %v", active, err)
 	}
-	list, err := db.ListACMEAccounts(ctx, binding)
+	list, err := db.ListACMEAccounts(ctx, binding, "")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -98,17 +98,17 @@ func TestACMEAccountLifecycle(t *testing.T) {
 	if err := db.RequestACMEAccountProvisioning(ctx, a3, `{"ciphertext":"three"}`, nil); err != nil {
 		t.Fatalf("request generation 3: %v", err)
 	}
-	if _, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-3"); err != nil {
+	if _, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-3"); err != nil {
 		t.Fatalf("claim generation 3: %v", err)
 	}
-	if err := db.CompleteACMEAccountProvisioning(ctx, binding, 3, "run-3", true, &registry.AuditEvent{Actor: "scheduler", Action: registry.AuditACMEAccountActivated}); err != nil {
+	if err := db.CompleteACMEAccountProvisioning(ctx, binding, "", 3, "run-3", true, &registry.AuditEvent{Actor: "scheduler", Action: registry.AuditACMEAccountActivated}); err != nil {
 		t.Fatalf("complete generation 3: %v", err)
 	}
-	active, _ = db.ActiveACMEAccountGeneration(ctx, binding)
+	active, _ = db.ActiveACMEAccountGeneration(ctx, binding, "")
 	if active != 3 {
 		t.Fatalf("active generation = %d", active)
 	}
-	list, _ = db.ListACMEAccounts(ctx, binding)
+	list, _ = db.ListACMEAccounts(ctx, binding, "")
 	byGen = map[int64]*registry.ACMEAccount{}
 	for _, x := range list {
 		byGen[x.Generation] = x
@@ -140,27 +140,27 @@ func TestACMEAccountFailedAndRelease(t *testing.T) {
 	if err := db.RequestACMEAccountProvisioning(ctx, a, `{"ciphertext":"one"}`, nil); err != nil {
 		t.Fatal(err)
 	}
-	claimed, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-1")
+	claimed, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-1")
 	if err != nil || claimed == nil {
 		t.Fatalf("claim: %+v %v", claimed, err)
 	}
 	// Release detaches it: it stays pending, unattached, claimable again.
-	if err := db.ReleaseACMEAccountProvisioning(ctx, binding, 1, "run-1"); err != nil {
+	if err := db.ReleaseACMEAccountProvisioning(ctx, binding, "", 1, "run-1"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	claimed2, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-2")
+	claimed2, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-2")
 	if err != nil || claimed2 == nil || claimed2.RunID != "run-2" {
 		t.Fatalf("reclaim after release: %+v %v", claimed2, err)
 	}
 	// Complete(registered=false) burns the generation.
-	if err := db.CompleteACMEAccountProvisioning(ctx, binding, 1, "run-2", false, &registry.AuditEvent{Actor: "scheduler", Action: registry.AuditACMEAccountProvisioningFailed}); err != nil {
+	if err := db.CompleteACMEAccountProvisioning(ctx, binding, "", 1, "run-2", false, &registry.AuditEvent{Actor: "scheduler", Action: registry.AuditACMEAccountProvisioningFailed}); err != nil {
 		t.Fatalf("complete failed: %v", err)
 	}
-	list, err := db.ListACMEAccounts(ctx, binding)
+	list, err := db.ListACMEAccounts(ctx, binding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountFailed {
 		t.Fatalf("list = %+v %v", list, err)
 	}
-	active, err := db.ActiveACMEAccountGeneration(ctx, binding)
+	active, err := db.ActiveACMEAccountGeneration(ctx, binding, "")
 	if err != nil || active != 0 {
 		t.Fatalf("active generation = %d %v", active, err)
 	}
@@ -180,23 +180,23 @@ func TestCancelACMEAccountProvisioningOnlyUnattachedPending(t *testing.T) {
 	ctx := context.Background()
 	const binding = "letsencrypt-staging"
 
-	if err := db.CancelACMEAccountProvisioning(ctx, binding, 1, nil); !errors.Is(err, registry.ErrNotFound) {
+	if err := db.CancelACMEAccountProvisioning(ctx, binding, "", 1, nil); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("cancel missing: %v", err)
 	}
 	a := newACMEAccount(binding, 1)
 	if err := db.RequestACMEAccountProvisioning(ctx, a, `{}`, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "run-1"); err != nil {
+	if _, _, err := db.ClaimACMEAccountProvisioning(ctx, binding, "", "run-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CancelACMEAccountProvisioning(ctx, binding, 1, nil); !errors.Is(err, registry.ErrConflict) {
+	if err := db.CancelACMEAccountProvisioning(ctx, binding, "", 1, nil); !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("cancel attached: %v", err)
 	}
-	if err := db.ReleaseACMEAccountProvisioning(ctx, binding, 1, "run-1"); err != nil {
+	if err := db.ReleaseACMEAccountProvisioning(ctx, binding, "", 1, "run-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CancelACMEAccountProvisioning(ctx, binding, 1, &registry.AuditEvent{Actor: "alice", Action: registry.AuditACMEAccountProvisioningCancelled}); err != nil {
+	if err := db.CancelACMEAccountProvisioning(ctx, binding, "", 1, &registry.AuditEvent{Actor: "alice", Action: registry.AuditACMEAccountProvisioningCancelled}); err != nil {
 		t.Fatalf("cancel unattached: %v", err)
 	}
 }

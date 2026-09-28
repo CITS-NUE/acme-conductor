@@ -58,11 +58,11 @@ func TestACMEProvisioningClaimedAndActivated(t *testing.T) {
 	if run.Status != registry.RunSucceeded {
 		t.Fatalf("run = %+v", run)
 	}
-	active, err := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
+	active, err := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || active != 1 {
 		t.Fatalf("active generation = %d %v", active, err)
 	}
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountActive || list[0].RunID != "" {
 		t.Fatalf("list = %+v %v", list, err)
 	}
@@ -104,11 +104,11 @@ func TestACMEProvisioningFailedResultBurnsGeneration(t *testing.T) {
 		return res, nil
 	}
 	f.cycle(t)
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountFailed {
 		t.Fatalf("list = %+v %v", list, err)
 	}
-	active, _ := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
+	active, _ := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding, "")
 	if active != 0 {
 		t.Fatalf("active generation = %d", active)
 	}
@@ -121,7 +121,7 @@ func TestACMEProvisioningNoResultCompletesFailed(t *testing.T) {
 		return nil, errNoResultTest{}
 	}
 	f.cycle(t)
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountFailed || list[0].RunID != "" {
 		t.Fatalf("list = %+v %v", list, err)
 	}
@@ -142,12 +142,12 @@ func TestACMEProvisioningResultWithoutAccountProvisioningIsReleased(t *testing.T
 		return okResult(f.clock(), spec, v1alpha1.ActionIssued, 90), nil
 	}
 	f.cycle(t)
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountProvisioning || list[0].RunID != "" {
 		t.Fatalf("list = %+v %v", list, err)
 	}
 	// Still claimable: the generation was not burnt.
-	claimed, _, err := f.reg.ClaimACMEAccountProvisioning(context.Background(), f.policy.ACMEBinding, "another-run")
+	claimed, _, err := f.reg.ClaimACMEAccountProvisioning(context.Background(), f.policy.ACMEBinding, "", "another-run")
 	if err != nil || claimed == nil {
 		t.Fatalf("reclaim: %+v %v", claimed, err)
 	}
@@ -197,11 +197,11 @@ func TestACMEProvisioningMismatchedResultNeverActivates(t *testing.T) {
 		return res, nil
 	}
 	f.cycle(t)
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 1 || list[0].Status != registry.ACMEAccountFailed || list[0].RunID != "" {
 		t.Fatalf("list = %+v %v", list, err)
 	}
-	active, _ := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
+	active, _ := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding, "")
 	if active != 0 {
 		t.Fatalf("active generation = %d", active)
 	}
@@ -238,11 +238,11 @@ func TestACMEProvisioningFailedResultKeepsPreviousActive(t *testing.T) {
 	if spec := f.fake.specs[len(f.fake.specs)-1]; spec.ACME.Account == nil || spec.ACME.Account.Generation != 2 || spec.ACME.Account.Provisioning == nil {
 		t.Fatalf("second run did not carry generation 2: %+v", spec.ACME.Account)
 	}
-	active, err := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding)
+	active, err := f.reg.ActiveACMEAccountGeneration(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || active != 1 {
 		t.Fatalf("active generation = %d %v", active, err)
 	}
-	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding)
+	list, err := f.reg.ListACMEAccounts(context.Background(), f.policy.ACMEBinding, "")
 	if err != nil || len(list) != 2 || list[0].Generation != 2 || list[0].Status != registry.ACMEAccountFailed || list[1].Status != registry.ACMEAccountActive {
 		t.Fatalf("list = %+v %v", list, err)
 	}
@@ -269,7 +269,7 @@ func TestACMEProvisioningNotClaimedForBindingWithoutEAB(t *testing.T) {
 			// Generation 1 becomes active while fake-ca is an EAB binding.
 			requestProvisioning(t, f, 1)
 			f.cycle(t)
-			if active, err := f.reg.ActiveACMEAccountGeneration(ctx, f.policy.ACMEBinding); err != nil || active != 1 {
+			if active, err := f.reg.ActiveACMEAccountGeneration(ctx, f.policy.ACMEBinding, ""); err != nil || active != 1 {
 				t.Fatalf("active generation = %d %v", active, err)
 			}
 			requestProvisioning(t, f, 2)
@@ -295,15 +295,15 @@ func TestACMEProvisioningNotClaimedForBindingWithoutEAB(t *testing.T) {
 			if run := f.lastRun(t); run.Status != registry.RunSucceeded {
 				t.Fatalf("run = %+v", run)
 			}
-			list, err := f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding)
+			list, err := f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding, "")
 			if err != nil || len(list) != 2 || list[0].Generation != 2 || list[0].Status != registry.ACMEAccountProvisioning || list[0].RunID != "" || list[1].Status != registry.ACMEAccountActive {
 				t.Fatalf("list = %+v %v", list, err)
 			}
 			// The operator can still cancel the stranded request.
-			if err := f.reg.CancelACMEAccountProvisioning(ctx, f.policy.ACMEBinding, 2, nil); err != nil {
+			if err := f.reg.CancelACMEAccountProvisioning(ctx, f.policy.ACMEBinding, "", 2, nil); err != nil {
 				t.Fatalf("cancel: %v", err)
 			}
-			list, err = f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding)
+			list, err = f.reg.ListACMEAccounts(ctx, f.policy.ACMEBinding, "")
 			if err != nil || list[0].Status != registry.ACMEAccountCancelled {
 				t.Fatalf("list after cancel = %+v %v", list, err)
 			}

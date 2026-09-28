@@ -136,6 +136,7 @@ func Serve(ctx context.Context, opts Options) int {
 		Logger:               log.With("component", "scheduler"),
 		IssuanceDisabled:     !cfg.IssuanceEnabled(),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
+		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
 	})
 	if n, err := sched.Recover(ctx); err != nil {
 		log.Error("in-flight runs could not be recovered", "error", err.Error())
@@ -194,6 +195,7 @@ func Serve(ctx context.Context, opts Options) int {
 		Migration:            migOpts,
 		ProvisioningKey:      cfg.AccountProvisioning.Key(),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
+		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
 	})
 	srv := &http.Server{
 		Handler:           handler,

@@ -206,6 +206,40 @@ CREATE TABLE target_names (
 CREATE INDEX target_names_target ON target_names(target_id);
 INSERT INTO target_names (name, target_id) SELECT fqdn, id FROM targets;
 `,
+	// 5: ACME accounts scoped to one target (issue #57, docs/adr/0024).
+	// scope is '' for a binding's own account (every row before this
+	// version) and a target id for an account of that target; the key,
+	// the one-pending and the one-active rules become per (binding,
+	// scope). SQLite cannot change a primary key in place, so the table is
+	// rebuilt: rows are copied as they are, then the old table is dropped
+	// (DROP TABLE does not fire the no-delete trigger, which is recreated
+	// on the new table).
+	`
+CREATE TABLE acme_accounts_v5 (
+  binding                 TEXT    NOT NULL,
+  scope                   TEXT    NOT NULL DEFAULT '',
+  generation              INTEGER NOT NULL CHECK (generation >= 1),
+  status                  TEXT    NOT NULL CHECK (status IN ('provisioning','active','retired','failed','cancelled')),
+  key_id                  TEXT    NOT NULL,
+  sealed_payload          TEXT,
+  run_id                  TEXT,
+  requested_by            TEXT    NOT NULL,
+  requested_by_authority  TEXT    NOT NULL,
+  created_at              TEXT    NOT NULL,
+  updated_at              TEXT    NOT NULL,
+  activated_at            TEXT,
+  PRIMARY KEY (binding, scope, generation)
+);
+INSERT INTO acme_accounts_v5 (binding, scope, generation, status, key_id, sealed_payload, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at)
+  SELECT binding, '', generation, status, key_id, sealed_payload, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at FROM acme_accounts;
+DROP TABLE acme_accounts;
+ALTER TABLE acme_accounts_v5 RENAME TO acme_accounts;
+CREATE UNIQUE INDEX acme_accounts_one_pending ON acme_accounts(binding, scope) WHERE status = 'provisioning';
+CREATE UNIQUE INDEX acme_accounts_one_active  ON acme_accounts(binding, scope) WHERE status = 'active';
+CREATE INDEX acme_accounts_run ON acme_accounts(run_id) WHERE run_id IS NOT NULL;
+CREATE TRIGGER acme_accounts_no_delete BEFORE DELETE ON acme_accounts
+  BEGIN SELECT RAISE(ABORT, 'acme_accounts cannot be deleted'); END;
+`,
 }
 
 // SchemaVersion is the schema version this binary expects.
@@ -913,14 +947,14 @@ const (
 	schedulerAuthority = "scheduler"
 )
 
-const acmeAccountCols = `binding, generation, status, key_id, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at`
+const acmeAccountCols = `binding, scope, generation, status, key_id, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at`
 
 func scanACMEAccount(sc interface{ Scan(...any) error }) (*registry.ACMEAccount, error) {
 	var a registry.ACMEAccount
 	var status string
 	var runID, activated sql.NullString
 	var created, updated string
-	if err := sc.Scan(&a.Binding, &a.Generation, &status, &a.KeyID, &runID, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated); err != nil {
+	if err := sc.Scan(&a.Binding, &a.Scope, &a.Generation, &status, &a.KeyID, &runID, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated); err != nil {
 		return nil, err
 	}
 	a.Status = registry.ACMEAccountStatus(status)
@@ -939,8 +973,17 @@ func scanACMEAccount(sc interface{ Scan(...any) error }) (*registry.ACMEAccount,
 }
 
 // ListACMEAccounts implements registry.Registry.
-func (d *DB) ListACMEAccounts(ctx context.Context, binding string) ([]*registry.ACMEAccount, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT `+acmeAccountCols+` FROM acme_accounts WHERE binding = ? ORDER BY generation DESC`, binding)
+func (d *DB) ListACMEAccounts(ctx context.Context, binding, scope string) ([]*registry.ACMEAccount, error) {
+	return d.queryACMEAccounts(ctx, `SELECT `+acmeAccountCols+` FROM acme_accounts WHERE binding = ? AND scope = ? ORDER BY generation DESC`, binding, scope)
+}
+
+// ListScopedACMEAccounts implements registry.Registry.
+func (d *DB) ListScopedACMEAccounts(ctx context.Context, binding string) ([]*registry.ACMEAccount, error) {
+	return d.queryACMEAccounts(ctx, `SELECT `+acmeAccountCols+` FROM acme_accounts WHERE binding = ? AND scope <> '' ORDER BY scope, generation DESC`, binding)
+}
+
+func (d *DB) queryACMEAccounts(ctx context.Context, q string, args ...any) ([]*registry.ACMEAccount, error) {
+	rows, err := d.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list acme accounts: %w", err)
 	}
@@ -966,7 +1009,7 @@ func (d *DB) RequestACMEAccountProvisioning(ctx context.Context, a *registry.ACM
 	a.ActivatedAt = nil
 	return d.tx(ctx, func(tx *sql.Tx) error {
 		var maxGen sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `SELECT MAX(generation) FROM acme_accounts WHERE binding = ?`, a.Binding).Scan(&maxGen); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(generation) FROM acme_accounts WHERE binding = ? AND scope = ?`, a.Binding, a.Scope).Scan(&maxGen); err != nil {
 			return fmt.Errorf("read max generation: %w", err)
 		}
 		want := int64(1)
@@ -974,14 +1017,14 @@ func (d *DB) RequestACMEAccountProvisioning(ctx context.Context, a *registry.ACM
 			want = maxGen.Int64 + 1
 		}
 		if a.Generation != want {
-			return fmt.Errorf("%w: binding %q next generation is %d, not %d", registry.ErrConflict, a.Binding, want, a.Generation)
+			return fmt.Errorf("%w: %s next generation is %d, not %d", registry.ErrConflict, accountName(a.Binding, a.Scope), want, a.Generation)
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO acme_accounts (binding, generation, status, key_id, sealed_payload, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at)
-			VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)`,
-			a.Binding, a.Generation, string(a.Status), a.KeyID, sealedJSON, a.RequestedBy, a.RequestedByAuthority, fmtTime(a.CreatedAt), fmtTime(a.UpdatedAt))
+		_, err := tx.ExecContext(ctx, `INSERT INTO acme_accounts (binding, scope, generation, status, key_id, sealed_payload, run_id, requested_by, requested_by_authority, created_at, updated_at, activated_at)
+			VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)`,
+			a.Binding, a.Scope, a.Generation, string(a.Status), a.KeyID, sealedJSON, a.RequestedBy, a.RequestedByAuthority, fmtTime(a.CreatedAt), fmtTime(a.UpdatedAt))
 		if err != nil {
 			if isUnique(err) {
-				return fmt.Errorf("%w: binding %q already has a pending provisioning request", registry.ErrConflict, a.Binding)
+				return fmt.Errorf("%w: %s already has a pending provisioning request", registry.ErrConflict, accountName(a.Binding, a.Scope))
 			}
 			return fmt.Errorf("insert acme account: %w", err)
 		}
@@ -990,18 +1033,18 @@ func (d *DB) RequestACMEAccountProvisioning(ctx context.Context, a *registry.ACM
 }
 
 // ClaimACMEAccountProvisioning implements registry.Registry.
-func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding string, runID string) (*registry.ACMEAccount, string, error) {
+func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding, scope string, runID string) (*registry.ACMEAccount, string, error) {
 	var claimed *registry.ACMEAccount
 	var sealedJSON string
 	err := d.tx(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx, `SELECT `+acmeAccountCols+`, sealed_payload FROM acme_accounts
-			WHERE binding = ? AND status = ? AND run_id IS NULL ORDER BY generation LIMIT 1`,
-			binding, string(registry.ACMEAccountProvisioning))
+			WHERE binding = ? AND scope = ? AND status = ? AND run_id IS NULL ORDER BY generation LIMIT 1`,
+			binding, scope, string(registry.ACMEAccountProvisioning))
 		var status string
 		var runIDCol, activated, sealed sql.NullString
 		var created, updated string
 		var a registry.ACMEAccount
-		err := row.Scan(&a.Binding, &a.Generation, &status, &a.KeyID, &runIDCol, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated, &sealed)
+		err := row.Scan(&a.Binding, &a.Scope, &a.Generation, &status, &a.KeyID, &runIDCol, &a.RequestedBy, &a.RequestedByAuthority, &created, &updated, &activated, &sealed)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -1018,8 +1061,8 @@ func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding string, r
 		if a.ActivatedAt, err = parseOptTime(activated); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = ?, updated_at = ? WHERE binding = ? AND generation = ? AND status = ? AND run_id IS NULL`,
-			runID, fmtTime(time.Now().UTC()), a.Binding, a.Generation, string(registry.ACMEAccountProvisioning))
+		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = ?, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND status = ? AND run_id IS NULL`,
+			runID, fmtTime(time.Now().UTC()), a.Binding, a.Scope, a.Generation, string(registry.ACMEAccountProvisioning))
 		if err != nil {
 			return fmt.Errorf("attach acme account: %w", err)
 		}
@@ -1033,7 +1076,7 @@ func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding string, r
 		sealedJSON = sealed.String
 		ev := &registry.AuditEvent{
 			Actor: schedulerActor, ActorAuthority: schedulerAuthority, Action: registry.AuditACMEAccountProvisioningAttached, RunID: runID,
-			Detail: fmt.Sprintf("acme account provisioning attached: binding=%s generation=%d keyId=%s runId=%s", a.Binding, a.Generation, a.KeyID, runID),
+			Detail: fmt.Sprintf("acme account provisioning attached: %s generation=%d keyId=%s runId=%s", accountDetail(a.Binding, a.Scope), a.Generation, a.KeyID, runID),
 		}
 		return insertAudit(ctx, tx, ev)
 	})
@@ -1047,10 +1090,10 @@ func (d *DB) ClaimACMEAccountProvisioning(ctx context.Context, binding string, r
 }
 
 // ReleaseACMEAccountProvisioning implements registry.Registry.
-func (d *DB) ReleaseACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string) error {
+func (d *DB) ReleaseACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, runID string) error {
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`,
-			fmtTime(time.Now().UTC()), binding, generation, runID, string(registry.ACMEAccountProvisioning))
+		_, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET run_id = NULL, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND run_id = ? AND status = ?`,
+			fmtTime(time.Now().UTC()), binding, scope, generation, runID, string(registry.ACMEAccountProvisioning))
 		if err != nil {
 			return fmt.Errorf("release acme account: %w", err)
 		}
@@ -1059,15 +1102,15 @@ func (d *DB) ReleaseACMEAccountProvisioning(ctx context.Context, binding string,
 }
 
 // CompleteACMEAccountProvisioning implements registry.Registry.
-func (d *DB) CompleteACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string, registered bool, ev *registry.AuditEvent) error {
+func (d *DB) CompleteACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, runID string, registered bool, ev *registry.AuditEvent) error {
 	now := time.Now().UTC()
 	return d.tx(ctx, func(tx *sql.Tx) error {
 		if registered {
-			// Retire whatever generation of this binding is currently
+			// Retire whatever generation of this account is currently
 			// active before activating the new one: the partial unique
 			// index allows at most one active row at a time, so the old
 			// one must be gone before the new one can be set.
-			retireRows, err := tx.QueryContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND status = ? AND generation != ?`, binding, string(registry.ACMEAccountActive), generation)
+			retireRows, err := tx.QueryContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND scope = ? AND status = ? AND generation != ?`, binding, scope, string(registry.ACMEAccountActive), generation)
 			if err != nil {
 				return fmt.Errorf("find previous active acme account: %w", err)
 			}
@@ -1085,12 +1128,12 @@ func (d *DB) CompleteACMEAccountProvisioning(ctx context.Context, binding string
 			}
 			retireRows.Close()
 			for _, g := range previous {
-				if _, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, updated_at = ? WHERE binding = ? AND generation = ?`, string(registry.ACMEAccountRetired), fmtTime(now), binding, g); err != nil {
+				if _, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ?`, string(registry.ACMEAccountRetired), fmtTime(now), binding, scope, g); err != nil {
 					return fmt.Errorf("retire previous acme account: %w", err)
 				}
 				rev := &registry.AuditEvent{
 					Actor: ev.Actor, ActorAuthority: ev.ActorAuthority, Action: registry.AuditACMEAccountRetired, RunID: ev.RunID,
-					Detail: fmt.Sprintf("acme account retired: binding=%s generation=%d (superseded by generation=%d)", binding, g, generation),
+					Detail: fmt.Sprintf("acme account retired: %s generation=%d (superseded by generation=%d)", accountDetail(binding, scope), g, generation),
 				}
 				if err := insertAudit(ctx, tx, rev); err != nil {
 					return err
@@ -1100,48 +1143,48 @@ func (d *DB) CompleteACMEAccountProvisioning(ctx context.Context, binding string
 		var q string
 		var args []any
 		if registered {
-			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ?, activated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`
-			args = []any{string(registry.ACMEAccountActive), fmtTime(now), fmtTime(now), binding, generation, runID, string(registry.ACMEAccountProvisioning)}
+			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ?, activated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND run_id = ? AND status = ?`
+			args = []any{string(registry.ACMEAccountActive), fmtTime(now), fmtTime(now), binding, scope, generation, runID, string(registry.ACMEAccountProvisioning)}
 		} else {
-			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND run_id = ? AND status = ?`
-			args = []any{string(registry.ACMEAccountFailed), fmtTime(now), binding, generation, runID, string(registry.ACMEAccountProvisioning)}
+			q = `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND run_id = ? AND status = ?`
+			args = []any{string(registry.ACMEAccountFailed), fmtTime(now), binding, scope, generation, runID, string(registry.ACMEAccountProvisioning)}
 		}
 		res, err := tx.ExecContext(ctx, q, args...)
 		if err != nil {
 			return fmt.Errorf("complete acme account: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("%w: acme account %s/%d is not attached to run %s under status provisioning", registry.ErrConflict, binding, generation, runID)
+			return fmt.Errorf("%w: %s generation %d is not attached to run %s under status provisioning", registry.ErrConflict, accountName(binding, scope), generation, runID)
 		}
 		return insertAudit(ctx, tx, ev)
 	})
 }
 
 // CancelACMEAccountProvisioning implements registry.Registry.
-func (d *DB) CancelACMEAccountProvisioning(ctx context.Context, binding string, generation int64, ev *registry.AuditEvent) error {
+func (d *DB) CancelACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, ev *registry.AuditEvent) error {
 	now := time.Now().UTC()
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, updated_at = ? WHERE binding = ? AND generation = ? AND status = ? AND run_id IS NULL`,
-			string(registry.ACMEAccountCancelled), fmtTime(now), binding, generation, string(registry.ACMEAccountProvisioning))
+		res, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND status = ? AND run_id IS NULL`,
+			string(registry.ACMEAccountCancelled), fmtTime(now), binding, scope, generation, string(registry.ACMEAccountProvisioning))
 		if err != nil {
 			return fmt.Errorf("cancel acme account: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			var exists int
-			_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM acme_accounts WHERE binding = ? AND generation = ?`, binding, generation).Scan(&exists)
+			_ = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM acme_accounts WHERE binding = ? AND scope = ? AND generation = ?`, binding, scope, generation).Scan(&exists)
 			if exists == 0 {
-				return fmt.Errorf("%w: acme account %s/%d", registry.ErrNotFound, binding, generation)
+				return fmt.Errorf("%w: %s generation %d", registry.ErrNotFound, accountName(binding, scope), generation)
 			}
-			return fmt.Errorf("%w: acme account %s/%d is not an unattached pending request", registry.ErrConflict, binding, generation)
+			return fmt.Errorf("%w: %s generation %d is not an unattached pending request", registry.ErrConflict, accountName(binding, scope), generation)
 		}
 		return insertAudit(ctx, tx, ev)
 	})
 }
 
 // ActiveACMEAccountGeneration implements registry.Registry.
-func (d *DB) ActiveACMEAccountGeneration(ctx context.Context, binding string) (int64, error) {
+func (d *DB) ActiveACMEAccountGeneration(ctx context.Context, binding, scope string) (int64, error) {
 	var g int64
-	err := d.db.QueryRowContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND status = ?`, binding, string(registry.ACMEAccountActive)).Scan(&g)
+	err := d.db.QueryRowContext(ctx, `SELECT generation FROM acme_accounts WHERE binding = ? AND scope = ? AND status = ?`, binding, scope, string(registry.ACMEAccountActive)).Scan(&g)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -1149,4 +1192,22 @@ func (d *DB) ActiveACMEAccountGeneration(ctx context.Context, binding string) (i
 		return 0, fmt.Errorf("active acme account generation: %w", err)
 	}
 	return g, nil
+}
+
+// accountName names an account in an error: "acme binding "b"" or
+// "acme binding "b" target t".
+func accountName(binding, scope string) string {
+	if scope == "" {
+		return fmt.Sprintf("acme binding %q", binding)
+	}
+	return fmt.Sprintf("acme binding %q target %s", binding, scope)
+}
+
+// accountDetail names an account in an audit detail: "binding=b" or
+// "binding=b scope=t".
+func accountDetail(binding, scope string) string {
+	if scope == "" {
+		return "binding=" + binding
+	}
+	return "binding=" + binding + " scope=" + scope
 }

@@ -76,6 +76,11 @@ type Options struct {
 	// was requested) is never sent to a Runner, and stays pending until
 	// an operator cancels it. Empty claims nothing.
 	ProvisioningBindings []string
+	// TargetScopedBindings are the ProvisioningBindings that keep one
+	// ACME account per target (accountProvisioning.targetScopedBindings,
+	// docs/adr/0024): a run of a target under one of them claims and uses
+	// only that target's account, never the binding's own.
+	TargetScopedBindings []string
 }
 
 // Defaults for Options.RecordRetry and Options.RecordWindow.
@@ -99,6 +104,7 @@ type Scheduler struct {
 	recordWindow time.Duration
 	disabled     bool
 	eabBindings  map[string]struct{}
+	targetScoped map[string]struct{}
 
 	wake chan struct{}
 
@@ -142,11 +148,15 @@ func New(o Options) *Scheduler {
 	for _, b := range o.ProvisioningBindings {
 		eab[b] = struct{}{}
 	}
+	scoped := make(map[string]struct{}, len(o.TargetScopedBindings))
+	for _, b := range o.TargetScopedBindings {
+		scoped[b] = struct{}{}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		reg: o.Registry, launchers: o.Launchers, tick: o.Tick, maxRuns: o.MaxConcurrentRuns,
 		backoff: o.RetryBackoff, maxBack: o.MaxRetryBackoff, log: o.Logger, now: o.Now,
-		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, disabled: o.IssuanceDisabled, eabBindings: eab,
+		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, disabled: o.IssuanceDisabled, eabBindings: eab, targetScoped: scoped,
 		wake: make(chan struct{}, 1), runsCtx: ctx, cancelRuns: cancel, inflight: map[string]context.CancelFunc{},
 	}
 }
@@ -516,6 +526,16 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	// operator withdrew it from provisioning, so its ciphertext is never
 	// sent, and it can still be cancelled. claimedRunID is cleared once the claim is resolved
 	// (released or completed) so it is only released/completed once.
+	//
+	// A binding that keeps one account per target (docs/adr/0024) does
+	// all of this for the target's own account (scope = target id) and
+	// never for the binding's: a target without an active account of its
+	// own and no pending one cannot run, since any other account would be
+	// one the CA does not let issue for its names.
+	scope := ""
+	if _, ok := s.targetScoped[policy.ACMEBinding]; ok {
+		scope = target.ID
+	}
 	var account *v1alpha1.ACMEAccountRef
 	claimedGeneration := int64(0)
 	claimedRunID := ""
@@ -523,7 +543,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		if claimedRunID == "" {
 			return
 		}
-		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, policy.ACMEBinding, claimedGeneration, claimedRunID); err != nil {
+		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, policy.ACMEBinding, scope, claimedGeneration, claimedRunID); err != nil {
 			log.Error("acme account provisioning could not be released", "binding", policy.ACMEBinding, "generation", claimedGeneration, "error", err.Error())
 		}
 		claimedRunID = ""
@@ -531,7 +551,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	var acct *registry.ACMEAccount
 	var sealedJSON string
 	if _, ok := s.eabBindings[policy.ACMEBinding]; ok {
-		acct, sealedJSON, err = s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, run.ID)
+		acct, sealedJSON, err = s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, scope, run.ID)
 		if err != nil {
 			failed(v1alpha1.ErrorCodeInternal, "acme account provisioning could not be claimed")
 			return
@@ -545,21 +565,25 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 			// run of this binding; burn the generation instead (the active
 			// one, if any, stays active) so the operator provisions anew.
 			log.Error("stored acme account sealed payload is corrupt", "binding", policy.ACMEBinding, "generation", acct.Generation, "error", err.Error())
-			s.finishProvisioning(ctx, log, policy.ACMEBinding, acct.Generation, run.ID, nil, errors.New("stored sealed payload is corrupt"))
+			s.finishProvisioning(ctx, log, policy.ACMEBinding, scope, acct.Generation, run.ID, nil, errors.New("stored sealed payload is corrupt"))
 			failed(v1alpha1.ErrorCodeInternal, "acme account provisioning payload is corrupt")
 			return
 		}
 		claimedGeneration = acct.Generation
 		claimedRunID = run.ID
-		account = &v1alpha1.ACMEAccountRef{Generation: acct.Generation, Provisioning: &sealed}
+		account = &v1alpha1.ACMEAccountRef{Scope: scope, Generation: acct.Generation, Provisioning: &sealed}
 	default:
-		active, err := s.reg.ActiveACMEAccountGeneration(ctx, policy.ACMEBinding)
+		active, err := s.reg.ActiveACMEAccountGeneration(ctx, policy.ACMEBinding, scope)
 		if err != nil {
 			failed(v1alpha1.ErrorCodeInternal, "acme account active generation could not be loaded")
 			return
 		}
-		if active > 0 {
-			account = &v1alpha1.ACMEAccountRef{Generation: active}
+		switch {
+		case active > 0:
+			account = &v1alpha1.ACMEAccountRef{Scope: scope, Generation: active}
+		case scope != "":
+			failed(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q keeps one account per target and this target has none yet: provision one with an EAB", policy.ACMEBinding))
+			return
 		}
 	}
 	spec := BuildJobSpec(run, target, policy, account)
@@ -617,7 +641,7 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 			log.Warn("run start still could not be recorded", "error", rerr.Error())
 		}
 	}
-	s.finishProvisioning(ctx, log, policy.ACMEBinding, claimedGeneration, claimedRunID, res, err)
+	s.finishProvisioning(ctx, log, policy.ACMEBinding, scope, claimedGeneration, claimedRunID, res, err)
 	if err != nil {
 		log.Error("runner produced no result", "launcher", l.Type(), "error", err.Error())
 		switch launcher.ReasonOf(err) {
@@ -657,8 +681,9 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 // payload once the Runner has finished (or failed to report), independent
 // of the run's own outcome (Result.Status/Action are independent of
 // AccountProvisioning.Status). runID is the run that claimed generation
-// of binding, or "" if this run carried no provisioning payload.
-func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, binding string, generation int64, runID string, res *v1alpha1.Result, waitErr error) {
+// of the account (binding, scope), or "" if this run carried no
+// provisioning payload.
+func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, binding, scope string, generation int64, runID string, res *v1alpha1.Result, waitErr error) {
 	if runID == "" {
 		if res != nil && res.AccountProvisioning != nil {
 			log.Warn("result reported account provisioning though none was requested; ignored", "binding", res.AccountProvisioning.Binding, "generation", res.AccountProvisioning.Generation)
@@ -670,11 +695,15 @@ func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, bi
 		if !registered {
 			action, verb = registry.AuditACMEAccountProvisioningFailed, "failed"
 		}
+		detail := "binding=" + binding
+		if scope != "" {
+			detail += " scope=" + scope
+		}
 		ev := &registry.AuditEvent{
 			Actor: Actor, ActorAuthority: Authority, Action: action, RunID: runID,
-			Detail: fmt.Sprintf("acme account provisioning %s: binding=%s generation=%d runId=%s", verb, binding, generation, runID),
+			Detail: fmt.Sprintf("acme account provisioning %s: %s generation=%d runId=%s", verb, detail, generation, runID),
 		}
-		if err := s.reg.CompleteACMEAccountProvisioning(ctx, binding, generation, runID, registered, ev); err != nil {
+		if err := s.reg.CompleteACMEAccountProvisioning(ctx, binding, scope, generation, runID, registered, ev); err != nil {
 			log.Error("acme account provisioning outcome could not be recorded", "binding", binding, "generation", generation, "registered", registered, "error", err.Error())
 		}
 	}
@@ -684,19 +713,19 @@ func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, bi
 		// is never silently reused against an account that may or may
 		// not have been registered.
 		complete(false)
-	case res.AccountProvisioning != nil && res.AccountProvisioning.Binding == binding && res.AccountProvisioning.Generation == generation:
+	case res.AccountProvisioning != nil && res.AccountProvisioning.Binding == binding && res.AccountProvisioning.Scope == scope && res.AccountProvisioning.Generation == generation:
 		complete(res.AccountProvisioning.Status == v1alpha1.AccountProvisioningRegistered)
 	case res.AccountProvisioning != nil:
 		// A report about something this run was not sent never activates
 		// anything, and the outcome of what it was sent is unknown: burn
 		// the generation rather than leave it attached to this run forever.
-		log.Warn("result reported account provisioning for another binding/generation; generation marked failed", "binding", res.AccountProvisioning.Binding, "generation", res.AccountProvisioning.Generation, "expectedBinding", binding, "expectedGeneration", generation)
+		log.Warn("result reported account provisioning for another account or generation; generation marked failed", "binding", res.AccountProvisioning.Binding, "scope", res.AccountProvisioning.Scope, "generation", res.AccountProvisioning.Generation, "expectedBinding", binding, "expectedScope", scope, "expectedGeneration", generation)
 		complete(false)
 	default:
 		// The Runner never attempted the payload (it failed before that
 		// step, or the job did not reach the provisioning path): the
 		// generation is still available to a later run.
-		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, binding, generation, runID); err != nil {
+		if err := s.reg.ReleaseACMEAccountProvisioning(ctx, binding, scope, generation, runID); err != nil {
 			log.Error("acme account provisioning could not be released", "binding", binding, "generation", generation, "error", err.Error())
 		}
 	}

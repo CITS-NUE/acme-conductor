@@ -219,12 +219,18 @@ func (s ACMEAccountStatus) Valid() bool {
 	return false
 }
 
-// ACMEAccount is one generation of an ACME account for a binding. The
-// sealed provisioning payload is deliberately not a field of this model:
-// it is returned only by ClaimACMEAccountProvisioning, to the scheduler,
-// and never by a List or Get.
+// ACMEAccount is one generation of an ACME account for a binding, or for
+// one target of a binding. The sealed provisioning payload is deliberately
+// not a field of this model: it is returned only by
+// ClaimACMEAccountProvisioning, to the scheduler, and never by a List or
+// Get.
 type ACMEAccount struct {
-	Binding    string
+	Binding string
+	// Scope is "" for the binding's own account, or the id of the target
+	// the account belongs to when the binding keeps one account per
+	// target (docs/adr/0024). Generations, the one-active and one-pending
+	// rules all apply per (Binding, Scope).
+	Scope      string
 	Generation int64
 	Status     ACMEAccountStatus
 	// KeyID is the Runner provisioning key the (now possibly cleared)
@@ -328,43 +334,53 @@ type Registry interface {
 	AppendAudit(ctx context.Context, ev *AuditEvent) error
 	ListAudit(ctx context.Context, opts ListAuditOptions) ([]*AuditEvent, error)
 
-	// ListACMEAccounts returns every generation recorded for binding,
-	// newest generation first. The sealed payload is never included.
-	ListACMEAccounts(ctx context.Context, binding string) ([]*ACMEAccount, error)
-	// RequestACMEAccountProvisioning records a new pending generation:
-	// acct.Generation must equal (the binding's highest recorded
-	// generation)+1, or ErrConflict; a binding may have at most one
-	// pending (provisioning, unattached or attached) generation at a
-	// time, or ErrConflict. sealedJSON is the JSON encoding of the
-	// v1alpha1.SealedProvisioning the caller validated; the Conductor
-	// never inspects it beyond storing it.
+	// An ACME account is addressed by (binding, scope): scope is "" for
+	// the binding's own account and a target id for an account scoped to
+	// that target. Every rule below holds per (binding, scope).
+	//
+	// ListACMEAccounts returns every generation recorded for (binding,
+	// scope), newest generation first. The sealed payload is never
+	// included.
+	ListACMEAccounts(ctx context.Context, binding, scope string) ([]*ACMEAccount, error)
+	// ListScopedACMEAccounts returns every generation of every
+	// target-scoped account of binding (scope non-empty), ordered by scope
+	// then newest generation first.
+	ListScopedACMEAccounts(ctx context.Context, binding string) ([]*ACMEAccount, error)
+	// RequestACMEAccountProvisioning records a new pending generation of
+	// (acct.Binding, acct.Scope): acct.Generation must equal the highest
+	// generation recorded for it plus one, or ErrConflict; an account may
+	// have at most one pending (provisioning, unattached or attached)
+	// generation at a time, or ErrConflict. sealedJSON is the JSON
+	// encoding of the v1alpha1.SealedProvisioning the caller validated;
+	// the Conductor never inspects it beyond storing it.
 	RequestACMEAccountProvisioning(ctx context.Context, acct *ACMEAccount, sealedJSON string, ev *AuditEvent) error
-	// ClaimACMEAccountProvisioning atomically attaches binding's pending,
-	// unattached generation (if any) to runID and returns it with its
-	// sealed payload; (nil, "", nil) when there is none to claim (no
-	// pending generation, or it is already attached to another run). It
-	// records an acme_account.provisioning_attached audit event itself.
-	ClaimACMEAccountProvisioning(ctx context.Context, binding string, runID string) (*ACMEAccount, string, error)
+	// ClaimACMEAccountProvisioning atomically attaches the pending,
+	// unattached generation of (binding, scope) (if any) to runID and
+	// returns it with its sealed payload; (nil, "", nil) when there is none
+	// to claim (no pending generation, or it is already attached to
+	// another run). It records an acme_account.provisioning_attached audit
+	// event itself.
+	ClaimACMEAccountProvisioning(ctx context.Context, binding, scope string, runID string) (*ACMEAccount, string, error)
 	// ReleaseACMEAccountProvisioning detaches generation from runID
 	// (RunID cleared, status left provisioning) without recording an
 	// audit event: the run ended without the Runner ever attempting the
 	// payload, so the generation stays available to a later run.
-	ReleaseACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string) error
+	ReleaseACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, runID string) error
 	// CompleteACMEAccountProvisioning resolves an attached generation.
 	// registered true moves it to active (activated_at set, sealed
 	// payload cleared, RunID cleared) and retires whatever generation of
-	// the same binding was previously active; false moves it to failed
+	// the same account was previously active; false moves it to failed
 	// (sealed payload cleared, RunID cleared; the generation number is
 	// burnt, never reused). ErrConflict if generation is not attached to
 	// runID under status provisioning.
-	CompleteACMEAccountProvisioning(ctx context.Context, binding string, generation int64, runID string, registered bool, ev *AuditEvent) error
+	CompleteACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, runID string, registered bool, ev *AuditEvent) error
 	// CancelACMEAccountProvisioning moves generation to cancelled
 	// (sealed payload cleared); ErrConflict unless it is currently
 	// provisioning and unattached.
-	CancelACMEAccountProvisioning(ctx context.Context, binding string, generation int64, ev *AuditEvent) error
-	// ActiveACMEAccountGeneration returns binding's active generation, or
-	// 0 when none.
-	ActiveACMEAccountGeneration(ctx context.Context, binding string) (int64, error)
+	CancelACMEAccountProvisioning(ctx context.Context, binding, scope string, generation int64, ev *AuditEvent) error
+	// ActiveACMEAccountGeneration returns the active generation of
+	// (binding, scope), or 0 when none.
+	ActiveACMEAccountGeneration(ctx context.Context, binding, scope string) (int64, error)
 
 	Ping(ctx context.Context) error
 	Close() error
