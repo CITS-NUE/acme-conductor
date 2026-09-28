@@ -3,7 +3,7 @@
 // The Runner never re-implements ACME or DNS providers. It builds an argv
 // slice and a from-scratch environment for lego from administrator
 // configuration plus the few JobSpec values that are allowed to influence
-// the run (the FQDN and the key type), executes lego once with a timeout
+// the run (the names and the key type), executes lego once with a timeout
 // and a process group, and reads the files lego wrote. Nothing from the
 // JobSpec is ever interpolated into a shell string.
 package lego
@@ -40,10 +40,15 @@ const (
 type Params struct {
 	Binary  string
 	WorkDir string
-	FQDN    string
-	KeyType v1alpha1.KeyType
-	ACME    config.ACMEBinding
-	DNS     config.DNSBinding
+	// FQDN is the certificate's primary name (its subject CN): lego
+	// requests it first and names its output files after it.
+	FQDN string
+	// AdditionalNames are the certificate's other names, requested after
+	// FQDN in this order.
+	AdditionalNames []string
+	KeyType         v1alpha1.KeyType
+	ACME            config.ACMEBinding
+	DNS             config.DNSBinding
 	// LookupEnv resolves passthrough and EAB environment variables from the
 	// Runner's own environment (os.LookupEnv in production).
 	LookupEnv func(string) (string, bool)
@@ -98,9 +103,14 @@ func Build(p Params) (*Invocation, error) {
 		"--server", p.ACME.DirectoryURL,
 		"--dns", p.DNS.Provider,
 		"--domains", p.FQDN,
+	}
+	for _, name := range p.AdditionalNames {
+		inv.Argv = append(inv.Argv, "--domains", name)
+	}
+	inv.Argv = append(inv.Argv,
 		"--key-type", string(p.KeyType),
 		"--path", p.WorkDir,
-	}
+	)
 	if p.DNS.PropagationWaitSeconds > 0 {
 		inv.Argv = append(inv.Argv, "--dns.propagation-wait", strconv.Itoa(p.DNS.PropagationWaitSeconds)+"s")
 	}

@@ -129,6 +129,16 @@ func TestRead_Rejections(t *testing.T) {
 			wantSubstr: "bogus",
 		},
 		{
+			name:       "negative maxNames",
+			mutate:     func(m map[string]any) { authSection(m)["maxNames"] = -1 },
+			wantSubstr: "authorization.maxNames",
+		},
+		{
+			name:       "maxNames above the contract limit",
+			mutate:     func(m map[string]any) { authSection(m)["maxNames"] = 101 },
+			wantSubstr: "authorization.maxNames",
+		},
+		{
 			name:       "unknown nested field",
 			mutate:     func(m map[string]any) { legoSection(m)["bogus"] = "x" },
 			wantSubstr: "bogus",
@@ -542,6 +552,14 @@ func TestConfig_Policy(t *testing.T) {
 	again := c.Policy()
 	if !reflect.DeepEqual(again, want) {
 		t.Fatalf("Policy() after mutating a previous result = %+v, want unchanged %+v", again, want)
+	}
+}
+
+func TestConfig_PolicyMaxNames(t *testing.T) {
+	m := validDoc()
+	authSection(m)["maxNames"] = 8
+	if got := mustAccept(t, marshalDoc(t, m)).Policy().MaxNames; got != 8 {
+		t.Fatalf("Policy().MaxNames = %d, want 8", got)
 	}
 }
 

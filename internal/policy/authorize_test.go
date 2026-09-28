@@ -88,6 +88,40 @@ func TestAuthorizeRejects(t *testing.T) {
 	}
 }
 
+func TestAuthorizeAdditionalNames(t *testing.T) {
+	p := trustedPolicy()
+	r := okRequest()
+	r.AdditionalNames = []string{"www.example.ac.jp"}
+	if err := p.Authorize(r); !errors.Is(err, ErrTooManyNames) {
+		t.Fatalf("MaxNames unset: Authorize() = %v, want %v", err, ErrTooManyNames)
+	}
+	p.MaxNames = 3
+	if err := p.Authorize(r); err != nil {
+		t.Fatalf("within MaxNames: %v", err)
+	}
+	cases := []struct {
+		name  string
+		names []string
+		want  error
+	}{
+		{"more names than MaxNames", []string{"a.example.ac.jp", "b.example.ac.jp", "c.example.ac.jp"}, ErrTooManyNames},
+		{"additional name outside trusted suffix", []string{"www.evil.com"}, ErrSuffixNotAllowed},
+		{"additional wildcard denied", []string{"*.example.ac.jp"}, ErrWildcardNotAllowed},
+		{"additional name not normalized", []string{"WWW.example.ac.jp"}, ErrNotNormalized},
+		{"additional name repeats the fqdn", []string{"wiki.example.ac.jp"}, ErrDuplicateName},
+		{"additional names repeat each other", []string{"www.example.ac.jp", "www.example.ac.jp"}, ErrDuplicateName},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := okRequest()
+			r.AdditionalNames = c.names
+			if err := p.Authorize(r); !errors.Is(err, c.want) {
+				t.Fatalf("Authorize() = %v, want %v", err, c.want)
+			}
+		})
+	}
+}
+
 // TestAuthorizeIgnoresEmbeddedPolicy documents the boundary: a request that
 // would be self-consistent under a forged JobSpec policy snapshot (fqdn and
 // suffix changed together) is still rejected by the trusted policy, because

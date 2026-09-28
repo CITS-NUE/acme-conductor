@@ -34,3 +34,18 @@ fqdn-numeric-tld.json
 # behavior. Only pkg/api/v1alpha1/decode.go's checkDuplicateKeys rejects
 # this document.
 duplicate-top-level-key.json
+
+# A target.additionalNames entry equal to target.fqdn is a Go-only
+# cross-field rule (internal/policy.CheckDistinct); uniqueItems only
+# compares the entries with each other.
+additional-name-equals-fqdn.json
+
+# Suffix membership and the wildcard rule apply to every additional name
+# exactly as to target.fqdn, and are Go-only cross-field checks.
+additional-name-outside-suffix.json
+additional-name-wildcard-not-allowed.json
+
+# 1 + len(target.additionalNames) <= policy.maxSANs (absent: 1) is a
+# Go-only cross-field rule.
+additional-names-exceed-maxsans.json
+additional-names-without-maxsans.json

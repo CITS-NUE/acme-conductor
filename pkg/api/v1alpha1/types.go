@@ -27,9 +27,16 @@ type JobSpec struct {
 // optimistic-locking revision at the time the job was created so that a
 // Result can be matched to the exact target state it was produced for.
 type TargetRef struct {
-	ID       string `json:"id"`
-	FQDN     string `json:"fqdn"`
-	Revision int64  `json:"revision"`
+	ID string `json:"id"`
+	// FQDN is the certificate's primary name, its subject CN.
+	FQDN string `json:"fqdn"`
+	// AdditionalNames are the certificate's other names (subject
+	// alternative names besides FQDN), in the order they are requested.
+	// Absent means a single-name certificate. A Runner that predates the
+	// field rejects a document carrying it (strict decoding), so it never
+	// issues a single-name certificate in place of a multi-name one.
+	AdditionalNames []string `json:"additionalNames,omitempty"`
+	Revision        int64    `json:"revision"`
 }
 
 // PolicySpec is the snapshot of the certificate policy the Conductor
@@ -43,6 +50,11 @@ type PolicySpec struct {
 	AllowWildcard      bool     `json:"allowWildcard"`
 	RenewBeforeDays    int      `json:"renewBeforeDays"`
 	KeyType            KeyType  `json:"keyType"`
+	// MaxSANs bounds the names on the certificate, target.fqdn included.
+	// Absent means 1. The Conductor sets it only on a job whose target has
+	// additional names, so a single-name job stays readable by a Runner
+	// that predates the field.
+	MaxSANs *int `json:"maxSANs,omitempty"`
 }
 
 // KeyType is the certificate key algorithm. Values mirror lego's

@@ -41,6 +41,9 @@ const (
 	EnvNotBeforeHours = "FAKE_LEGO_NOTBEFORE_HOURS"
 	// EnvExtraSAN adds a second subject alternative name to the certificate.
 	EnvExtraSAN = "FAKE_LEGO_EXTRA_SAN"
+	// EnvDropSANs, when set, leaves every --domains after the first out of
+	// the certificate, as a CA that issued fewer names than requested.
+	EnvDropSANs = "FAKE_LEGO_DROP_SANS"
 	// EnvKeyTypeOverride generates the certificate key with this lego key
 	// type instead of the one requested on the command line.
 	EnvKeyTypeOverride = "FAKE_LEGO_KEYTYPE_OVERRIDE"
@@ -78,6 +81,7 @@ type Record struct {
 // the exit code.
 func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	flags := parseFlags(args)
+	domains := repeatedFlag(args, "domains")
 	if rec := getenv(EnvRecord); rec != "" {
 		dir, _ := os.Getwd()
 		data, _ := json.Marshal(Record{Argv: args, Env: os.Environ(), Dir: dir})
@@ -94,7 +98,10 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		mode = "ok"
 	}
 	path := flags["path"]
-	domain := flags["domains"]
+	domain := ""
+	if len(domains) > 0 {
+		domain = domains[0]
+	}
 	if path == "" || domain == "" || flags["server"] == "" || flags["email"] == "" || flags["dns"] == "" {
 		fmt.Fprintln(stderr, "fake lego: missing required flags")
 		return 2
@@ -198,7 +205,12 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 			notBefore = n
 		}
 	}
-	names := []string{certDomain}
+	// Like lego: the first --domains is the subject CN and names the
+	// output files; every --domains becomes a subject alternative name.
+	names := append([]string{certDomain}, domains[1:]...)
+	if getenv(EnvDropSANs) != "" {
+		names = names[:1]
+	}
 	if extra := getenv(EnvExtraSAN); extra != "" {
 		names = append(names, extra)
 	}
@@ -256,6 +268,19 @@ func parseFlags(args []string) map[string]string {
 		}
 		if i+1 < len(args) {
 			out[name] = args[i+1]
+			i++
+		}
+	}
+	return out
+}
+
+// repeatedFlag returns every value of a flag given more than once, in
+// order (parseFlags keeps only the last).
+func repeatedFlag(args []string, name string) []string {
+	var out []string
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--"+name {
+			out = append(out, args[i+1])
 			i++
 		}
 	}
