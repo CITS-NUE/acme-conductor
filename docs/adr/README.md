@@ -29,7 +29,7 @@
 | [0021](0021-keyvault-pkcs12-content-type.md) | Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする |
 | [0022](0022-encrypted-eab-provisioning-and-account-generations.md) | 暗号化された EAB プロビジョニングと ACME アカウントの世代 |
 | [0023](0023-separate-role-definitions-from-the-deployment.md) | カスタムロールの定義をデプロイから分け，再デプロイを常設の権限だけで行えるようにする |
-| [0024](0024-name-bound-acme-accounts-and-san.md) | 名前集合に縛られた ACME アカウント（UPKI）と SAN 証明書（提案） |
+| [0024](0024-target-scoped-acme-accounts-and-san.md) | target 単位の ACME アカウントと SAN 証明書（提案） |
 
 [`docs/architecture.md`](../architecture.md) と
 [`docs/threat-model.md`](../threat-model.md) も参照．
