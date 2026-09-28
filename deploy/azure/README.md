@@ -30,7 +30,7 @@ Container App として動き，API と GUI のすべての呼び出し元を OI
 | `<prefix>-cae` (Container Apps environment) | アプリとジョブをホストする．Consumption プラン，VNet 統合なし． |
 | `<prefix><hash>` (storage account) | 環境にマウントされる 3 つの Azure Files 共有: `conductor-state`（SQLite のレジストリ．`nobrl` でマウント），`runner-state`（ACME アカウントの状態．`/state`），`exchange`（署名付きジョブの入力と結果の出力）． |
 | `<prefix>-id-conductor` (user-assigned identity) | Conductor の ID．Runner の Job に対してのみ **Conductor Job Execution Observer** カスタムロール（実行の読み取り・一覧・停止．開始は不可）を付与． |
-| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーンに **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
+| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーン（だけ．[複数の DNS ゾーン](#複数の-dns-ゾーン)）に **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
 | `<prefix>-runner` (Container Apps Job) | Runner イメージ．Runner の設定と結果署名用の秘密鍵（暗号化 EAB プロビジョニングを有効にした場合は provisioning 用の秘密鍵も）を `/etc/acme-runner/` 配下に，加えて `/exchange`，`/state`，一時的な `/work` をマウント．スケジュールトリガー（`runnerCronExpression`，毎分），実行ごとに 1 レプリカ（`parallelism: 1`．ランチャーのコントラクトは実行ごとに 1 つの run），リトライなし，固定コマンド `reconcile --exchange /exchange`． |
 | `<prefix>-conductor` (Container App) | Conductor イメージ．設定とジョブ署名用の秘密鍵を `/etc/acme-conductor/` 配下に，加えて `/var/lib/acme-conductor` と `/mnt/exchange` をマウント．HTTPS 専用の ingress（既定で外部公開．必要に応じて送信元 CIDR で制限可）の背後に 1 レプリカ，`oidc` 認証，`/healthz` と `/readyz` での liveness/readiness プローブ． |
 | 3 つのカスタムロール定義 (サブスクリプションスコープ) | **`main.bicep` ではなく `roles.bicep` が作る**．初回に一度だけ別にデプロイし，`main.bicep` はそれを割り当てるだけである（[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）． |
@@ -322,6 +322,34 @@ Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変�
 資格情報の値はどこにも現れない．`IDENTITY_HEADER` はローカルの ID エンドポイント
 用のコンテナごとのトークンであり，他の passthrough の値と同様に Runner のログ
 から秘匿される．
+
+## 複数の DNS ゾーン
+
+1 枚の証明書の名前（SAN）が複数の DNS ゾーンにまたがるとき
+（`www.example.ac.jp` と `www.example.org` など）も，**委任** で対応する．
+各名前の `_acme-challenge.<name>` をチャレンジ用ゾーン（`dnsZoneName`）の中の
+名前へ CNAME で委任し，DNS バインディングの `AZURE_ZONE_NAME` はチャレンジ用
+ゾーンのままにする．`lego` は既定で CNAME をたどり，`AZURE_ZONE_NAME` が
+あればすべての TXT をそのゾーンに書く（`azuredns` プロバイダ，4.35.2）ので，
+名前がいくつのゾーンにまたがっても，Runner が書き込めるのはチャレンジ用
+ゾーン 1 つのままである．テンプレートもロール割り当ても変わらない．
+
+SAN の名前の **1 つ 1 つ** に委任が要る．1 つでも欠けていれば，その名前の
+チャレンジが通らずに run が `AcmeFailure` になる．証明書に名前を足す前に，
+それぞれ確かめる（[walkthrough の手順 10](walkthrough.md)）．
+
+```sh
+dig +short CNAME _acme-challenge.<name>   # チャレンジ用ゾーン内の名前が返ればよい
+```
+
+**親ゾーンへ直接書かせる構成は採らない．** `AZURE_ZONE_NAME` を外して
+Runner に親ゾーン（`example.ac.jp`，`example.org` など）の TXT を直接書かせる
+こともできるが，それには Runner の ID に本番の親ゾーンへの書き込み権限を
+与えることになる．Runner が侵害されれば，そのゾーンの任意の名前について
+DNS-01 チャレンジを通せてしまう．Runner に書かせるのはチャレンジ用ゾーン
+だけ，という前提（[脅威モデル](../../docs/threat-model.md) の T4）を崩すので，
+このテンプレートはチャレンジ用ゾーン以外への割り当てを用意しない．
+親ゾーンの側で必要なのは，名前ごとに一度 CNAME を置くことだけである．
 
 ## デプロイ後の運用
 
