@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -299,8 +300,9 @@ func (s *Scheduler) sweep(ctx context.Context, summary, detailPrefix string) (in
 }
 
 // Plan records a queued run for every enabled target that is due and has
-// no active run. It returns the number of runs created. It records
-// nothing while issuance is disabled.
+// no active run, and for every ACME account provisioning request no run
+// will otherwise carry (see planProvisioning). It returns the number of
+// runs created. It records nothing while issuance is disabled.
 func (s *Scheduler) Plan(ctx context.Context) (int, error) {
 	if s.disabled {
 		return 0, nil
@@ -312,6 +314,9 @@ func (s *Scheduler) Plan(ctx context.Context) (int, error) {
 	}
 	created := 0
 	policies := map[string]*registry.Policy{}
+	// bindingCands collects, per binding-wide EAB binding, the targets
+	// whose run could carry that binding's pending provisioning request.
+	bindingCands := map[string][]provisioningCandidate{}
 	for _, t := range targets {
 		if ctx.Err() != nil {
 			return created, ctx.Err()
@@ -332,10 +337,22 @@ func (s *Scheduler) Plan(ctx context.Context) (int, error) {
 		if err != nil {
 			return created, err
 		}
+		_, eab := s.eabBindings[p.ACMEBinding]
+		_, scoped := s.targetScoped[p.ACMEBinding]
+		if eab && !scoped {
+			bindingCands[p.ACMEBinding] = append(bindingCands[p.ACMEBinding], provisioningCandidate{t: t, sum: sum})
+		}
 		if sum.LastRun != nil && sum.LastRun.Status.Active() {
 			continue
 		}
 		due, why := Due(t, p, sum, s.now(), s.backoff, s.maxBack)
+		if !due && eab && scoped {
+			acct, err := s.pendingProvisioning(ctx, p.ACMEBinding, t.ID)
+			if err != nil {
+				return created, err
+			}
+			due, why = s.provisioningDue(p.ACMEBinding, acct, sum)
+		}
 		if !due {
 			continue
 		}
@@ -350,8 +367,121 @@ func (s *Scheduler) Plan(ctx context.Context) (int, error) {
 		}
 		s.log.Info("run queued", "runId", run.ID, "targetId", t.ID, "fqdn", t.FQDN, "reason", why)
 		created++
+		if c := bindingCands[p.ACMEBinding]; len(c) > 0 && c[len(c)-1].t == t {
+			c[len(c)-1].queued = true
+		}
+	}
+	for binding, cands := range bindingCands {
+		n, err := s.planBindingProvisioning(ctx, binding, cands)
+		created += n
+		if err != nil {
+			return created, err
+		}
 	}
 	return created, nil
+}
+
+// provisioningCandidate is a target whose run could carry a binding-wide
+// provisioning request, with its run summary as Plan read it.
+type provisioningCandidate struct {
+	t      *registry.Target
+	sum    *registry.TargetRunSummary
+	queued bool // Plan queued a run for it in this pass
+}
+
+// pendingProvisioning returns the pending generation of the account
+// (binding, scope) that no run carries yet, or nil.
+func (s *Scheduler) pendingProvisioning(ctx context.Context, binding, scope string) (*registry.ACMEAccount, error) {
+	list, err := s.reg.ListACMEAccounts(ctx, binding, scope)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range list {
+		if a.Status == registry.ACMEAccountProvisioning && a.RunID == "" {
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// provisioningDue reports whether a target with no active run must run
+// now to carry acct, the pending provisioning request of an account of
+// binding that no run carries (nil: none) (issue #59). A provisioning request only reaches a Runner
+// attached to a run, and nothing else makes the run happen before the
+// certificate falls due: a request submitted while the target's run was
+// already starting or running is not carried by that run, and the target
+// may be in its retry backoff because it had no account yet. So the
+// certificate's expiry and a backoff from failures before the request
+// was made are ignored; a failure after it (a launcher that cannot start
+// the Runner, say) holds the target back as usual, so a pending request
+// never makes the scheduler retry every tick.
+func (s *Scheduler) provisioningDue(binding string, acct *registry.ACMEAccount, sum *registry.TargetRunSummary) (bool, string) {
+	if acct == nil {
+		return false, ""
+	}
+	if last := sum.LastRun; last != nil && (last.Status == registry.RunFailed || last.Status == registry.RunCancelled) && !last.RequestedAt.Before(acct.CreatedAt) {
+		wait := Backoff(sum.ConsecutiveFailures, s.backoff, s.maxBack)
+		ref := last.RequestedAt
+		if last.FinishedAt != nil {
+			ref = *last.FinishedAt
+		}
+		if s.now().Before(ref.Add(wait)) {
+			return false, ""
+		}
+	}
+	return true, fmt.Sprintf("acme account provisioning pending: binding=%s generation=%d", binding, acct.Generation)
+}
+
+// planBindingProvisioning queues one run to carry the pending
+// provisioning request of a binding-wide account when no run will: no
+// candidate has a queued run (a queued run claims the request when it
+// starts; one already starting or running has built its job without
+// it). The candidate is the one whose certificate expires soonest (never
+// reconciled first) among those with no active run that provisioningDue
+// allows.
+func (s *Scheduler) planBindingProvisioning(ctx context.Context, binding string, cands []provisioningCandidate) (int, error) {
+	acct, err := s.pendingProvisioning(ctx, binding, "")
+	if err != nil || acct == nil {
+		return 0, err
+	}
+	for _, c := range cands {
+		if c.queued || (c.sum.LastRun != nil && c.sum.LastRun.Status == registry.RunQueued) {
+			return 0, nil
+		}
+	}
+	expiry := func(c provisioningCandidate) int64 {
+		if ok := c.sum.LastSucceeded; ok != nil && ok.ExpiresAt != nil {
+			return ok.ExpiresAt.Unix()
+		}
+		return 0
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		if ei, ej := expiry(cands[i]), expiry(cands[j]); ei != ej {
+			return ei < ej
+		}
+		return cands[i].t.ID < cands[j].t.ID
+	})
+	for _, c := range cands {
+		if c.sum.LastRun != nil && c.sum.LastRun.Status.Active() {
+			continue
+		}
+		due, why := s.provisioningDue(binding, acct, c.sum)
+		if !due {
+			continue
+		}
+		run := &registry.Run{TargetID: c.t.ID, TargetRevision: c.t.Revision, RequestedBy: Actor, RequestedByAuthority: Authority}
+		ev := &registry.AuditEvent{Actor: Actor, ActorAuthority: Authority, Action: registry.AuditRunRequested, Detail: "run requested by scheduler: " + why}
+		err = s.reg.CreateRun(ctx, run, ev)
+		switch {
+		case errors.Is(err, registry.ErrRunActive):
+			continue
+		case err != nil:
+			return 0, err
+		}
+		s.log.Info("run queued", "runId", run.ID, "targetId", c.t.ID, "fqdn", c.t.FQDN, "reason", why)
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // Due decides whether target t under policy p is due for a run at now.

@@ -47,9 +47,17 @@
     return document.getElementById('main');
   }
 
+  // flash is a notice shown once, above the next page rendered (the
+  // outcome of an action that re-renders the page).
+  let flash = null;
+
   function show(...children) {
     const m = main();
     clear(m);
+    if (flash) {
+      m.append(flash);
+      flash = null;
+    }
     m.append(...children);
   }
 
@@ -692,6 +700,18 @@
     return { binding, scope: a.targetId, path: '/acme-bindings/' + encodeURIComponent(binding) + '/targets/' + encodeURIComponent(a.targetId), activeGeneration: a.activeGeneration, pending: a.pending, generations: a.generations };
   }
 
+  // provisioningRunNotice says which run carries a provisioning request
+  // just recorded, or why none was started.
+  function provisioningRunNotice(run) {
+    if (!run) return null;
+    if (run.started) {
+      return el('p', { class: 'notice' }, 'EAB recorded. Run ', link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), ' was started to register the account.');
+    }
+    const parts = ['EAB recorded; no run was started: ' + run.reason + '.'];
+    if (run.runId) parts.push(' Run ', link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), '.');
+    return el('p', { class: 'notice' }, ...parts);
+  }
+
   function provisioningForm(keyInfo, acct, onDone) {
     const kid = input('text', '', { autocomplete: 'off' });
     const hmac = input('password', '', { autocomplete: 'off' });
@@ -707,7 +727,8 @@
           const generation = nextGeneration(acct);
           const encryptedCredential = await acmeConductorSealEAB(keyInfo, acct.binding, generation, k, h, acct.scope);
           clearInputs();
-          await api('POST', acct.path + '/provisioning', { accountGeneration: generation, encryptedCredential });
+          const res = await api('POST', acct.path + '/provisioning', { accountGeneration: generation, encryptedCredential });
+          flash = provisioningRunNotice(res.run);
           onDone();
         } catch (err) {
           clearInputs();
