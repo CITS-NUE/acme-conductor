@@ -417,3 +417,24 @@ func TestShadowRunStopsWithContext(t *testing.T) {
 		t.Fatalf("state: %+v", c)
 	}
 }
+
+func TestDiffListsAdditionalNamesAsChanged(t *testing.T) {
+	f := newFixture(t)
+	portal := f.target("portal.example.ac.jp", func(t *registry.Target) { t.AdditionalNames = []string{"www.example.ac.jp"} })
+	rep, err := f.m.Diff(f.ctx, []string{"portal.example.ac.jp", "www.example.ac.jp"}, "inline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Summary.Added != 0 || rep.Summary.Rejected != 0 || rep.Summary.Unchanged != 1 || rep.Summary.Changed != 1 || rep.Summary.Missing != 0 {
+		t.Fatalf("summary = %s", rep.Summary)
+	}
+	c := rep.Changed[0]
+	if c.FQDN != "www.example.ac.jp" || c.TargetID != portal.ID || len(c.Differences) != 1 || c.Differences[0].Registry != "additional name of portal.example.ac.jp" {
+		t.Fatalf("changed = %+v", c)
+	}
+	// An import creates nothing for it and is not refused because of it.
+	res, err := f.m.Import(f.ctx, []string{"portal.example.ac.jp", "www.example.ac.jp"}, ImportOptions{Actor: "t", Source: "inline"})
+	if err != nil || !res.Applied || len(res.Created) != 0 {
+		t.Fatalf("import = %+v, %v", res, err)
+	}
+}

@@ -775,7 +775,7 @@ func (s *Scheduler) record(ctx context.Context, log *slog.Logger, run *registry.
 // The policy is copied by value (a snapshot), so the run can be audited
 // from the document alone.
 func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy, account *v1alpha1.ACMEAccountRef) *v1alpha1.JobSpec {
-	return &v1alpha1.JobSpec{
+	spec := &v1alpha1.JobSpec{
 		APIVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindCertificateReconcileJob,
 		RunID:      run.ID,
@@ -790,6 +790,14 @@ func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy, acc
 		DNS:   v1alpha1.DNSRef{Binding: t.DNSBinding},
 		Store: v1alpha1.StoreRef{Binding: t.StoreBinding},
 	}
+	// A single-name job carries neither field, so a Runner that predates
+	// multi-name certificates keeps accepting it.
+	if len(t.AdditionalNames) > 0 {
+		maxSANs := p.MaxSANs
+		spec.Target.AdditionalNames = append([]string(nil), t.AdditionalNames...)
+		spec.Policy.MaxSANs = &maxSANs
+	}
+	return spec
 }
 
 // sanitize bounds and cleans a summary built from validated values.

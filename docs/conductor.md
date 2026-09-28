@@ -455,7 +455,11 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 - `acmeBinding` — 設定の `acmeBindings` に列挙されていなければならない．
 - `renewBeforeDays` — `1`–`365`．`keyType` — `ec256`，`ec384`，`rsa2048`，
   `rsa3072`，`rsa4096` のいずれか．
-- `maxSANs` — 省略可．`1` でなければならない（FQDN 1 つにつき証明書 1 枚）．
+- `maxSANs` — 省略可．このポリシーの下の target の証明書に載せられる名前の
+  上限で，FQDN を含めて数える（`1`–`100`）．作成時の既定は `1`（単一名の
+  証明書），更新時の既定は現在の値．Runner 側にも独立した上限
+  （[`authorization.maxNames`](runner.md#authorization)）があり，両方を
+  満たさなければ発行されない．
 - `enabled` — 省略可．作成時の既定は `true`，更新時の既定は現在の値．無効化された
   ポリシーは，その下のすべての target をスケジューリングから遠ざける．
 
@@ -495,6 +499,7 @@ run の監査証跡には常に，その run が実行された時点の値が�
 ```json
 {
   "fqdn": "wiki.example.ac.jp",
+  "additionalNames": ["www.example.ac.jp"],
   "owner": "web-team",
   "policyRef": "01JPOLICY…",
   "executionBinding": "local",
@@ -504,25 +509,35 @@ run の監査証跡には常に，その run が実行された時点の値が�
 }
 ```
 
-- `fqdn` — 入力時に正規化され（`internal/policy.NormalizeFQDN`），一意である．
-  指定したポリシーを満たさなければならず（ラベル境界でのサフィックス照合．
-  ワイルドカードはポリシーが許す場合のみ），そうでなければリクエストは
-  `policy_violation` で拒否され，監査される．FQDN はその後 **不変** である．
-  target は 1 つの FQDN である．
+- `fqdn` — 証明書の主たる名前（subject の CN）．入力時に正規化される
+  （`internal/policy.NormalizeFQDN`）．FQDN はその後 **不変** である
+  （Store のオブジェクト名もこれから決まる）．
+- `additionalNames` — 省略可．証明書に載せる残りの名前（SAN）を要求順に並べる．
+  各エントリは `fqdn` と同じく正規化される．省略または空で単一名の証明書になる．
+- 名前（`fqdn` と各 `additionalNames`）はどれも指定したポリシーを満たさなければ
+  ならない（ラベル境界でのサフィックス照合．ワイルドカードはポリシーが許す
+  場合のみ）．正規化後に同じ名前が 2 度現れてはならず，名前の数は FQDN を含めて
+  ポリシーの `maxSANs` 以下でなければならない．これらに反するリクエストは
+  `policy_violation` で拒否され，監査される．
+- 1 つの名前は 1 つの target にしか属せない．別の target の `fqdn` または
+  `additionalNames` にすでにある名前は `409 conflict` で拒否される．
 - `owner` — 印字可能な UTF-8 で 1–128 バイト．人間向けの自由記述．
 - `policyRef` — 既存のポリシー id．3 つのバインディング名は設定に列挙されて
   いなければならない．
 
-更新（`PUT`）: `{"revision": N, …}` に `owner`，`policyRef`，`executionBinding`，
-`dnsBinding`，`storeBinding`，`enabled` のいずれかを添える．省略したフィールドは
-値を保つ．`revision` は現在の値でなければならず（そうでなければ
+更新（`PUT`）: `{"revision": N, …}` に `additionalNames`，`owner`，`policyRef`，
+`executionBinding`，`dnsBinding`，`storeBinding`，`enabled` のいずれかを添える．
+省略したフィールドは値を保つ．`additionalNames` は一覧ごと置き換わり，`[]` で
+単一名に戻る．名前の変更はリビジョンを進めるので，次の run がすぐ期限到来し，
+Runner は名前の一致しない格納済みの証明書を再発行する．`revision` は現在の値でなければならず（そうでなければ
 `stale_revision`），成功時にインクリメントされる．
 
 レスポンス:
 
 ```json
 {
-  "id": "01JTARGET…", "fqdn": "wiki.example.ac.jp", "enabled": true, "owner": "web-team",
+  "id": "01JTARGET…", "fqdn": "wiki.example.ac.jp", "additionalNames": ["www.example.ac.jp"],
+  "enabled": true, "owner": "web-team",
   "policyRef": "01JPOLICY…", "executionBinding": "local", "dnsBinding": "azure-dns-staging",
   "storeBinding": "filesystem-dev", "createdAt": "…", "updatedAt": "…", "revision": 1,
   "certificate": {

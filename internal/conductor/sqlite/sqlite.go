@@ -191,6 +191,21 @@ CREATE INDEX acme_accounts_run ON acme_accounts(run_id) WHERE run_id IS NOT NULL
 CREATE TRIGGER acme_accounts_no_delete BEFORE DELETE ON acme_accounts
   BEGIN SELECT RAISE(ABORT, 'acme_accounts cannot be deleted'); END;
 `,
+	// 4: multi-name (SAN) certificates (issue #56, docs/adr/0024).
+	// targets.additional_names is the JSON list read back with the target;
+	// target_names holds every name of every target (the FQDN and each
+	// additional name) once, so that no name can belong to two targets.
+	// Rows for a target's additional names are replaced when they change;
+	// the change itself is recorded in the audit log.
+	`
+ALTER TABLE targets ADD COLUMN additional_names TEXT NOT NULL DEFAULT '[]';
+CREATE TABLE target_names (
+  name      TEXT NOT NULL PRIMARY KEY,
+  target_id TEXT NOT NULL REFERENCES targets(id)
+);
+CREATE INDEX target_names_target ON target_names(target_id);
+INSERT INTO target_names (name, target_id) SELECT fqdn, id FROM targets;
+`,
 }
 
 // SchemaVersion is the schema version this binary expects.
@@ -499,16 +514,22 @@ func (d *DB) UpdatePolicy(ctx context.Context, p *registry.Policy, ev *registry.
 
 // ---- targets ----------------------------------------------------------
 
-const targetCols = `id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision`
+const targetCols = `id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names`
 
 func scanTarget(sc interface{ Scan(...any) error }) (*registry.Target, error) {
 	var t registry.Target
 	var enabled int
-	var created, updated string
-	if err := sc.Scan(&t.ID, &t.FQDN, &enabled, &t.Owner, &t.PolicyRef, &t.ExecutionBinding, &t.DNSBinding, &t.StoreBinding, &created, &updated, &t.Revision); err != nil {
+	var created, updated, additional string
+	if err := sc.Scan(&t.ID, &t.FQDN, &enabled, &t.Owner, &t.PolicyRef, &t.ExecutionBinding, &t.DNSBinding, &t.StoreBinding, &created, &updated, &t.Revision, &additional); err != nil {
 		return nil, err
 	}
 	t.Enabled = enabled != 0
+	if err := json.Unmarshal([]byte(additional), &t.AdditionalNames); err != nil {
+		return nil, fmt.Errorf("corrupt additional names of target %s: %w", t.ID, err)
+	}
+	if len(t.AdditionalNames) == 0 {
+		t.AdditionalNames = nil
+	}
 	var err error
 	if t.CreatedAt, err = parseTime(created); err != nil {
 		return nil, err
@@ -519,10 +540,55 @@ func scanTarget(sc interface{ Scan(...any) error }) (*registry.Target, error) {
 	return &t, nil
 }
 
+// additionalNamesJSON encodes a target's additional names for the
+// additional_names column; none is "[]".
+func additionalNamesJSON(names []string) (string, error) {
+	if names == nil {
+		names = []string{}
+	}
+	data, err := json.Marshal(names)
+	return string(data), err
+}
+
+// claimNames records names as belonging to targetID; names it already
+// has are kept. ErrConflict names each name another target already has,
+// and that target's FQDN.
+func claimNames(ctx context.Context, tx *sql.Tx, targetID string, names []string) error {
+	var taken, free []string
+	for _, n := range names {
+		var ownerID, ownerFQDN string
+		err := tx.QueryRowContext(ctx, `SELECT n.target_id, t.fqdn FROM target_names n JOIN targets t ON t.id = n.target_id WHERE n.name = ?`, n).Scan(&ownerID, &ownerFQDN)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			free = append(free, n)
+		case err != nil:
+			return fmt.Errorf("check target names: %w", err)
+		case ownerID != targetID:
+			taken = append(taken, fmt.Sprintf("%q (target %s)", n, ownerFQDN))
+		}
+	}
+	if len(taken) > 0 {
+		return fmt.Errorf("%w: already a name of another target: %s", registry.ErrConflict, strings.Join(taken, ", "))
+	}
+	for _, n := range free {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO target_names (name, target_id) VALUES (?, ?)`, n, targetID); err != nil {
+			if isUnique(err) {
+				return fmt.Errorf("%w: %q is already a name of another target", registry.ErrConflict, n)
+			}
+			return fmt.Errorf("insert target name: %w", err)
+		}
+	}
+	return nil
+}
+
 // CreateTarget inserts t at revision 1. ID and timestamps are assigned
-// when empty. ErrConflict if the FQDN is taken; ErrNotFound if the policy
-// does not exist.
+// when empty. ErrConflict if the FQDN or an additional name is already a
+// name of a target; ErrNotFound if the policy does not exist.
 func (d *DB) CreateTarget(ctx context.Context, t *registry.Target, ev *registry.AuditEvent) error {
+	additional, err := additionalNamesJSON(t.AdditionalNames)
+	if err != nil {
+		return err
+	}
 	if t.ID == "" {
 		t.ID = registry.NewID()
 	}
@@ -535,8 +601,8 @@ func (d *DB) CreateTarget(ctx context.Context, t *registry.Target, ev *registry.
 		ev.TargetID = t.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO targets (`+targetCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			t.ID, t.FQDN, boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, fmtTime(t.CreatedAt), fmtTime(t.UpdatedAt), t.Revision)
+		_, err := tx.ExecContext(ctx, `INSERT INTO targets (`+targetCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			t.ID, t.FQDN, boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, fmtTime(t.CreatedAt), fmtTime(t.UpdatedAt), t.Revision, additional)
 		if err != nil {
 			switch {
 			case isUnique(err):
@@ -545,6 +611,9 @@ func (d *DB) CreateTarget(ctx context.Context, t *registry.Target, ev *registry.
 				return fmt.Errorf("%w: policy %s", registry.ErrNotFound, t.PolicyRef)
 			}
 			return fmt.Errorf("insert target: %w", err)
+		}
+		if err := claimNames(ctx, tx, t.ID, append([]string{t.FQDN}, t.AdditionalNames...)); err != nil {
+			return err
 		}
 		return insertAudit(ctx, tx, ev)
 	})
@@ -594,13 +663,17 @@ func (d *DB) ListTargets(ctx context.Context, opts registry.ListTargetsOptions) 
 // UpdateTarget applies t's mutable fields if the stored revision equals
 // expectedRevision, bumping the revision.
 func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevision int64, ev *registry.AuditEvent) error {
+	additional, err := additionalNamesJSON(t.AdditionalNames)
+	if err != nil {
+		return err
+	}
 	t.UpdatedAt = time.Now().UTC()
 	if ev != nil {
 		ev.TargetID = t.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE targets SET enabled = ?, owner = ?, policy_id = ?, execution_binding = ?, dns_binding = ?, store_binding = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
-			boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, fmtTime(t.UpdatedAt), t.ID, expectedRevision)
+		res, err := tx.ExecContext(ctx, `UPDATE targets SET enabled = ?, owner = ?, policy_id = ?, execution_binding = ?, dns_binding = ?, store_binding = ?, additional_names = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
+			boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, additional, fmtTime(t.UpdatedAt), t.ID, expectedRevision)
 		if err != nil {
 			if isForeignKey(err) {
 				return fmt.Errorf("%w: policy %s", registry.ErrNotFound, t.PolicyRef)
@@ -616,6 +689,19 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 				return fmt.Errorf("%w: target %s", registry.ErrNotFound, t.ID)
 			}
 			return fmt.Errorf("%w: target %s is not at revision %d", registry.ErrStaleRevision, t.ID, expectedRevision)
+		}
+		// The FQDN is immutable, so only the additional names' rows change:
+		// drop this target's rows other than its FQDN, then claim the
+		// current names (the FQDN's row is kept as is).
+		var fqdn string
+		if err := tx.QueryRowContext(ctx, `SELECT fqdn FROM targets WHERE id = ?`, t.ID).Scan(&fqdn); err != nil {
+			return fmt.Errorf("update target: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM target_names WHERE target_id = ? AND name <> ?`, t.ID, fqdn); err != nil {
+			return fmt.Errorf("update target names: %w", err)
+		}
+		if err := claimNames(ctx, tx, t.ID, append([]string{fqdn}, t.AdditionalNames...)); err != nil {
+			return err
 		}
 		t.Revision = expectedRevision + 1
 		return insertAudit(ctx, tx, ev)

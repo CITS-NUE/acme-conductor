@@ -308,7 +308,7 @@
     setNav('targets');
     const res = await api('GET', '/targets');
     const rows = res.items.map((t) => [
-      td(link('#/targets/' + encodeURIComponent(t.id), t.fqdn), 'mono'),
+      el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: ' +' + t.additionalNames.length + ' names' }) : ''),
       enabledBadge(t.enabled),
       t.owner,
       td(link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef), 'mono'),
@@ -350,6 +350,7 @@
       ),
       props([
         ['Id', el('span', { class: 'mono', text: t.id })],
+        ['Additional names', t.additionalNames.length ? el('span', { class: 'mono', text: t.additionalNames.join(', ') }) : 'none (single-name certificate)'],
         ['Owner', t.owner],
         ['Policy', link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef, 'mono')],
         ['Execution binding', t.executionBinding],
@@ -372,6 +373,9 @@
     const policies = (await api('GET', '/policies')).items.map((p) => p.id);
     const isNew = !t;
     const fqdn = input('text', t ? t.fqdn : '', { placeholder: 'host.example.ac.jp', required: true, disabled: !isNew });
+    const additional = el('textarea', { rows: 3, placeholder: 'www.example.ac.jp\nalias.example.ac.jp' });
+    additional.value = t ? t.additionalNames.join('\n') : '';
+    const additionalNames = () => additional.value.split(/[\s,]+/).map((s) => s.trim()).filter((s) => s);
     const owner = input('text', t ? t.owner : '', { required: true, maxlength: 128 });
     const policy = select(policies, t ? t.policyRef : policies[0]);
     const exec = select(b.execution, t ? t.executionBinding : b.execution[0]);
@@ -387,13 +391,13 @@
         try {
           if (isNew) {
             const created = await api('POST', '/targets', {
-              fqdn: fqdn.value.trim(), owner: owner.value, policyRef: policy.value,
+              fqdn: fqdn.value.trim(), additionalNames: additionalNames(), owner: owner.value, policyRef: policy.value,
               executionBinding: exec.value, dnsBinding: dns.value, storeBinding: store.value, enabled: enabled.checked,
             });
             location.hash = '#/targets/' + encodeURIComponent(created.id);
           } else {
             await api('PUT', '/targets/' + encodeURIComponent(t.id), {
-              revision: t.revision, owner: owner.value, policyRef: policy.value,
+              revision: t.revision, additionalNames: additionalNames(), owner: owner.value, policyRef: policy.value,
               executionBinding: exec.value, dnsBinding: dns.value, storeBinding: store.value, enabled: enabled.checked,
             });
             route();
@@ -404,7 +408,8 @@
       },
     },
     status,
-    field('FQDN', fqdn, isNew ? 'One host name, ASCII, no trailing dot; a wildcard needs a policy that allows it.' : 'A target is one FQDN; create a new target to manage another name.'),
+    field('FQDN', fqdn, isNew ? 'The certificate\'s primary name (its subject CN), ASCII, no trailing dot; a wildcard needs a policy that allows it.' : 'The primary name cannot change; create a new target to manage the certificate under another one.'),
+    field('Additional names', additional, 'Optional. One per line: the certificate\'s other names (subject alternative names). The policy\'s Max SANs bounds the total, the FQDN included. A change reissues the certificate at the next run.'),
     field('Owner', owner, 'Who to contact about this certificate.'),
     field('Policy', policy),
     field('Execution binding', exec),
@@ -435,11 +440,12 @@
       p.acmeBinding,
       String(p.renewBeforeDays) + ' days',
       p.keyType,
+      String(p.maxSANs),
     ]);
     show(
       el('h1', { text: 'Certificate policies' }),
       el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/policies/new', 'New policy', 'button')),
-      table(['Id', 'State', 'Allowed suffixes', 'Wildcard', 'ACME binding', 'Renew before', 'Key'], rows),
+      table(['Id', 'State', 'Allowed suffixes', 'Wildcard', 'ACME binding', 'Renew before', 'Key', 'Max SANs'], rows),
     );
   }
 
@@ -452,6 +458,7 @@
     const acme = select(b.acme, p ? p.acmeBinding : b.acme[0]);
     const renew = input('number', p ? p.renewBeforeDays : 30, { min: 1, max: 365 });
     const keyType = select(['ec256', 'ec384', 'rsa2048', 'rsa3072', 'rsa4096'], p ? p.keyType : 'ec256');
+    const maxSANs = input('number', p ? p.maxSANs : 1, { min: 1, max: 100 });
     const enabled = checkbox(p ? p.enabled : true);
     const status = el('div');
     const body = () => ({
@@ -460,6 +467,7 @@
       acmeBinding: acme.value,
       renewBeforeDays: Number(renew.value),
       keyType: keyType.value,
+      maxSANs: Number(maxSANs.value),
       enabled: enabled.checked,
     });
     return el('form', {
@@ -486,6 +494,7 @@
     field('ACME binding', acme),
     field('Renew before (days)', renew),
     field('Key type', keyType),
+    field('Max SANs', maxSANs, 'The most names one certificate may carry, the FQDN included. 1 means single-name certificates. Runners also cap this with their own authorization.maxNames.'),
     field('Enabled', enabled),
     el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, isNew ? 'Create policy' : 'Save changes')),
     );
@@ -498,7 +507,6 @@
       el('h1', null, el('span', { class: 'mono', text: p.id }), ' ', enabledBadge(p.enabled)),
       props([
         ['Created / updated', when(p.createdAt) + ' / ' + when(p.updatedAt)],
-        ['Max SANs', String(p.maxSANs)],
         ['Targets under this policy', String(targets.items.length)],
       ]),
       el('h2', { text: 'Edit' }),

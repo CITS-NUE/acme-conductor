@@ -145,16 +145,18 @@ Conductor の停止が，すでに起動された Runner ジョブの完了を�
 [`docs/conductor.md`](conductor.md) を参照．コントラクトとストレージ設計が
 一致するよう，ここに記述する．
 
-- **`Target`** — `{id, fqdn (normalized ASCII, unique), enabled, owner,
-  policyRef, executionBinding, dnsBinding, storeBinding, createdAt,
-  updatedAt, revision}`．1 つの `Target` は 1 つの FQDN である（MVP: FQDN ごとに
-  証明書 1 枚，SAN なし）．`revision` は楽観的ロックのカウンタで，その target 向けに
+- **`Target`** — `{id, fqdn (normalized ASCII, immutable), additionalNames,
+  enabled, owner, policyRef, executionBinding, dnsBinding, storeBinding,
+  createdAt, updatedAt, revision}`．1 つの `Target` は 1 枚の証明書であり，
+  `fqdn` が主たる名前（subject の CN），`additionalNames` が残りの SAN である
+  （省略で単一名）．1 つの名前は 1 つの target にしか属さない
+  （[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)）．`revision` は楽観的ロックのカウンタで，その target 向けに
   生成されるすべての `JobSpec` にも現れるため，`Result` は常にそれが生成された時点の
   正確な target の状態に対応付けられる．
 - **`CertificatePolicy`** — `{id, allowedDnsSuffixes, allowWildcard,
-  acmeBinding, renewBeforeDays, keyType, maxSANs, enabled}`．`maxSANs` は表現は
-  あるものの MVP のドメインモデルでは 1 に固定される．v1alpha1 の JobSpec コントラクト
-  には SAN の一覧がそもそもないためである（[非目標](#非目標)を参照）．
+  acmeBinding, renewBeforeDays, keyType, maxSANs, enabled}`．`maxSANs` はその
+  ポリシーの下の証明書 1 枚に載せられる名前の上限で，FQDN を含めて数える
+  （既定 1）．
 - **バインディング** — `ExecutionBinding`，`DnsBinding`，`StoreBinding`，
   `AcmeBinding`: 管理者が登録した論理名で，起動時の設定から読み込まれる．
   [バインディングモデル](#バインディングモデル)を参照．

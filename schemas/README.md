@@ -46,6 +46,11 @@ ACME の External Account Binding（kid + hmac）であり，暗号文以外の�
 - すべて数字のトップレベルラベルと `xn--`（IDNA）ラベルの拒否．
 - ワイルドカード FQDN には `policy.allowWildcard` が必要であるという
   フィールド横断の規則．
+- `target.additionalNames` の各エントリに対する，`target.fqdn` と同じ正規化・
+  サフィックス照合・ワイルドカードの規則．エントリが `target.fqdn` と同じで
+  ないこと（`uniqueItems` はエントリ同士しか比べない）．名前の数
+  （`1 + len(target.additionalNames)`）が `policy.maxSANs`（省略時は 1）以下で
+  あるというフィールド横断の規則．
 - `policy.allowedDnsSuffixes` における（正規化後の）厳密な重複検出
   （JSON Schema の `uniqueItems` は，すでにバイト単位で同一な文字列の重複しか
   捕捉しない）．

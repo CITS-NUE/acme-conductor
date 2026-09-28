@@ -144,6 +144,7 @@ acme-runner --help
 | `allowedAcmeBindings` | []string | —（必須，空でないこと） | 名前は整形式のバインディング名であり，**かつ** `acmeBindings` に定義されていなければならない． |
 | `allowedDnsBindings` | []string | —（必須，空でないこと） | 同上．`dnsBindings` に対して． |
 | `allowedStoreBindings` | []string | —（必須，空でないこと） | 同上．`storeBindings` に対して． |
+| `maxNames` | int | `1`（`0` または省略のとき） | 証明書 1 枚に載せてよい名前の上限．`target.fqdn` を含めて数える．`1`–`100`．既定では単一名の証明書しか発行せず，SAN（`target.additionalNames`）付きのジョブは `PolicyViolation` で拒否する．`allowedDnsSuffixes` と `allowWildcard` は `target.fqdn` と同じく各追加名にも適用される． |
 
 ### `lego`
 
@@ -403,9 +404,10 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
    未知のフィールド，重複キー，末尾の余分なデータはすべて拒否される．
    これは文書の自己整合性の検査であり，認可ではない．
 4. その設定から組み立てた `RunnerAuthorizationPolicy` で要求を認可する．
-   既定で拒否，サフィックスはラベル境界で照合，ワイルドカードは
-   `allowWildcard` で制御，3 つのバインディング名はすべて許可リストに
-   照らして検査する．
+   既定で拒否，名前の数は `maxNames` 以下，各名前（`target.fqdn` と
+   `target.additionalNames`）はサフィックスをラベル境界で照合し，
+   ワイルドカードは `allowWildcard` で制御，同じ名前の重複は拒否，
+   3 つのバインディング名はすべて許可リストに照らして検査する．
 5. 3 つのバインディング名（`acme`，`dns`，`store`）を
    `acmeBindings`/`dnsBindings`/`storeBindings` に対して解決する．認可された
    名前が定義されていなければ `BindingNotFound` で失敗する．
@@ -414,11 +416,12 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
    後述の各 store を参照）について，現在の証明書を store に問い合わせる
    （`Store.Current`）．
 8. 何かする必要があるかを判断する．証明書が格納されており，その SAN
-   リストが target の FQDN を含み，すでに有効で（`NotBefore` が時計のずれの
+   リストが target の名前（FQDN と追加名）と過不足なく一致し，すでに有効で（`NotBefore` が時計のずれの
    許容範囲内），公開鍵がポリシーの `keyType` であり，`NotAfter` が依然として
    `now + renewBeforeDays` より後であれば，run はここで **noop** として
    停止する．`lego` は決して起動されない．そうでなければ（格納済みの
-   証明書がない，SAN が FQDN を含まない，まだ有効でない，鍵の種別が
+   証明書がない，SAN が target の名前と一致しない（名前を足した・外した
+   場合を含む），まだ有効でない，鍵の種別が
    `policy.keyType` と異なる — この run で適用されるポリシー変更 — または
    `renewBeforeDays` 以内に期限が来る）Runner は発行に進む．
 9. run ごとのプライベートな作業ディレクトリ `<workDir>/run-<runId>-<rand>`
@@ -439,9 +442,10 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
     参照）．これは `lego` の成否にかかわらず行い，run をまたぐアカウントの
     継続性がこの run の結果に依存しないようにする．
 14. `lego` が書いたものを検証する．証明書がパースでき，subject alternative
-    name をちょうど 1 つ持ち，それが target の FQDN であること
-    （ワイルドカードを考慮した照合はしない．`*.example.ac.jp` のジョブは
-    SAN が文字通り `*.example.ac.jp` である証明書を生成しなければならない），
+    name の集合が target の名前（FQDN と追加名）と過不足なく一致すること
+    （大文字小文字は区別しない．ワイルドカードを考慮した照合はしない．
+    `*.example.ac.jp` のジョブは SAN が文字通り `*.example.ac.jp` である証明書を
+    生成しなければならない），
     秘密鍵が証明書の公開鍵と一致すること，鍵のアルゴリズムとサイズが
     要求された `keyType` と一致すること，証明書がすでに失効していないこと，
     `NotBefore` が 5 分以上未来でないこと．
@@ -518,6 +522,7 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
   --server <acme.directoryURL> \
   --dns <dns.provider> \
   --domains <target.fqdn> \
+  [--domains <target.additionalNames[0]> ...] \
   --key-type <policy.keyType> \
   --path <workDir> \
   [--dns.propagation-wait <N>s] \
@@ -525,6 +530,10 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
   [--eab] \
   run
 ```
+
+`target.additionalNames` の各名前は，要求順に `--domains` を 1 つずつ加える．
+`lego` は最初の `--domains`（`target.fqdn`）を証明書の CN にし，出力ファイルの
+名前にも使う．
 
 `--dns.propagation-wait` と `--dns.resolvers` は DNS バインディングが
 `propagationWaitSeconds`/`resolvers` を設定している場合にのみ現れる．
@@ -823,7 +832,7 @@ docker run --rm \
 | `AcmeFailure` | `lego` が非ゼロのステータスで終了した． | `lego exited with status <n>` |
 | `AcmeFailure` | `lego` が `0` で終了したが，読める証明書／鍵ファイルを書かなかった． | `lego exited successfully but produced no usable certificate` |
 | `AcmeFailure` | `lego` が書いた証明書をパースできなかった． | `lego produced an unreadable certificate` |
-| `AcmeFailure` | 発行された証明書の SAN リストが target の FQDN を正確に含んでいない． | `issued certificate does not cover the target fqdn` |
+| `AcmeFailure` | 発行された証明書の SAN の集合が target の名前（FQDN と追加名）と一致しない． | `issued certificate's subject alternative names differ from the target's names` |
 | `AcmeFailure` | 発行された証明書と `lego` が書いた秘密鍵が一致しない． | `issued certificate and private key do not match` |
 | `AcmeFailure` | 発行された証明書がすでに失効している． | `issued certificate is already expired` |
 | `StoreFailure` | Certificate Store を開けなかった，読めなかった（`Current`），または書けなかった（`Put`）． | `certificate store could not be opened` / `... read failed` / `... write failed` |
