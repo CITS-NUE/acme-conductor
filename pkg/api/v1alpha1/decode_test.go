@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ func TestDecodeJobSpecRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeJobSpec: %v\n%s", err, data)
 	}
-	if got.RunID != want.RunID || got.Target != want.Target || got.Policy.KeyType != want.Policy.KeyType {
+	if got.RunID != want.RunID || !reflect.DeepEqual(got.Target, want.Target) || got.Policy.KeyType != want.Policy.KeyType {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }

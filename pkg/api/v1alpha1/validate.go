@@ -19,6 +19,9 @@ const (
 	MaxBindingNameLength = 63
 	// MaxAllowedSuffixes bounds the policy suffix list.
 	MaxAllowedSuffixes = 64
+	// MaxNames bounds the names on one certificate: target.fqdn plus
+	// target.additionalNames, and so policy.maxSANs.
+	MaxNames = policy.MaxNames
 	// MinRenewBeforeDays and MaxRenewBeforeDays bound the renewal window.
 	MinRenewBeforeDays = 1
 	MaxRenewBeforeDays = 365
@@ -138,6 +141,21 @@ func (s *JobSpec) Validate() error {
 	if err := validateNormalizedFQDN("target.fqdn", s.Target.FQDN); err != nil {
 		return err
 	}
+	if s.Target.AdditionalNames != nil && len(s.Target.AdditionalNames) == 0 {
+		return invalid("target.additionalNames", "must be omitted rather than empty")
+	}
+	if len(s.Target.AdditionalNames) > MaxNames-1 {
+		return invalid("target.additionalNames", fmt.Sprintf("must have at most %d entries", MaxNames-1))
+	}
+	for i, n := range s.Target.AdditionalNames {
+		if err := validateNormalizedFQDN(fmt.Sprintf("target.additionalNames[%d]", i), n); err != nil {
+			return err
+		}
+	}
+	names := policy.Names(s.Target.FQDN, s.Target.AdditionalNames)
+	if err := policy.CheckDistinct(names); err != nil {
+		return invalidErr("target.additionalNames", "names must be distinct", err)
+	}
 	if err := s.Policy.validate(); err != nil {
 		return err
 	}
@@ -163,6 +181,21 @@ func (s *JobSpec) Validate() error {
 		AllowWildcard:      s.Policy.AllowWildcard,
 	}); err != nil {
 		return invalidErr("target.fqdn", "inconsistent with embedded policy snapshot", err)
+	}
+	for i, n := range s.Target.AdditionalNames {
+		if _, err := policy.Evaluate(n, policy.Policy{
+			AllowedDnsSuffixes: s.Policy.AllowedDnsSuffixes,
+			AllowWildcard:      s.Policy.AllowWildcard,
+		}); err != nil {
+			return invalidErr(fmt.Sprintf("target.additionalNames[%d]", i), "inconsistent with embedded policy snapshot", err)
+		}
+	}
+	maxSANs := 1
+	if s.Policy.MaxSANs != nil {
+		maxSANs = *s.Policy.MaxSANs
+	}
+	if err := policy.CheckCount(len(names), maxSANs); err != nil {
+		return invalidErr("target.additionalNames", "inconsistent with embedded policy snapshot", err)
 	}
 	return nil
 }
@@ -194,6 +227,9 @@ func (p *PolicySpec) validate() error {
 	}
 	if !p.KeyType.Valid() {
 		return invalid("policy.keyType", fmt.Sprintf("must be one of %v", KeyTypes))
+	}
+	if p.MaxSANs != nil && (*p.MaxSANs < 1 || *p.MaxSANs > MaxNames) {
+		return invalid("policy.maxSANs", fmt.Sprintf("must be between 1 and %d", MaxNames))
 	}
 	return nil
 }

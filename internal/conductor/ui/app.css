@@ -66,6 +66,7 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
 td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .empty { color: var(--muted); padding: 24px 0; }
+.aside { color: var(--muted); font-size: 12px; }
 .notice { padding: 10px 12px; border-radius: 6px; margin: 0 0 12px; border: 1px solid var(--line); background: var(--panel); }
 .notice.error { border-color: var(--bad); color: var(--bad); }
 .notice.ok { border-color: var(--ok); color: var(--ok); }

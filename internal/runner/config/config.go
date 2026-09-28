@@ -271,6 +271,10 @@ type Authorization struct {
 	AllowedACMEBindings  []string `json:"allowedAcmeBindings"`
 	AllowedDNSBindings   []string `json:"allowedDnsBindings"`
 	AllowedStoreBindings []string `json:"allowedStoreBindings"`
+	// MaxNames bounds the names on one certificate, the FQDN included.
+	// Omitted (0) means 1: this Runner issues multi-name (SAN)
+	// certificates only when its administrator explicitly allows them.
+	MaxNames int `json:"maxNames,omitempty"`
 }
 
 // Lego locates the lego binary and the directories the Runner uses.
@@ -572,6 +576,9 @@ func (a *Authorization) validate(c *Config) error {
 	if len(a.AllowedDnsSuffixes) == 0 {
 		return invalid("authorization.allowedDnsSuffixes must not be empty")
 	}
+	if a.MaxNames < 0 || a.MaxNames > policy.MaxNames {
+		return invalid("authorization.maxNames must be between 1 and %d (0 or omitted means 1)", policy.MaxNames)
+	}
 	for i, s := range a.AllowedDnsSuffixes {
 		n, err := policy.NormalizeSuffix(s)
 		if err != nil {
@@ -612,6 +619,7 @@ func (c *Config) Policy() policy.RunnerAuthorizationPolicy {
 		AllowedACMEBindings:  append([]string(nil), c.Authorization.AllowedACMEBindings...),
 		AllowedDNSBindings:   append([]string(nil), c.Authorization.AllowedDNSBindings...),
 		AllowedStoreBindings: append([]string(nil), c.Authorization.AllowedStoreBindings...),
+		MaxNames:             c.Authorization.MaxNames,
 	}
 }
 

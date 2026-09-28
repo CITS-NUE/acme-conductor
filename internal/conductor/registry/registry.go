@@ -22,8 +22,9 @@ import (
 var (
 	// ErrNotFound: the addressed policy, target or run does not exist.
 	ErrNotFound = errors.New("not found")
-	// ErrConflict: a uniqueness rule was violated (for example a second
-	// target with the same FQDN) or the expected state did not match.
+	// ErrConflict: a uniqueness rule was violated (for example a name
+	// that another target already has) or the expected state did not
+	// match.
 	ErrConflict = errors.New("conflict")
 	// ErrStaleRevision: an update named a target revision that is no
 	// longer current (optimistic locking).
@@ -41,18 +42,24 @@ type Policy struct {
 	ACMEBinding        string
 	RenewBeforeDays    int
 	KeyType            v1alpha1.KeyType
-	// MaxSANs is fixed at 1 in the MVP (one certificate per FQDN).
+	// MaxSANs bounds the names on one certificate of a target under this
+	// policy, the FQDN included (1..v1alpha1.MaxNames).
 	MaxSANs   int
 	Enabled   bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
-// Target is one FQDN under management.
+// Target is one certificate under management: its FQDN (the subject CN)
+// and, optionally, additional names (subject alternative names).
 type Target struct {
 	ID string
-	// FQDN is stored normalized (policy.NormalizeFQDN) and is unique.
-	FQDN             string
+	// FQDN is stored normalized (policy.NormalizeFQDN) and is immutable.
+	FQDN string
+	// AdditionalNames are stored normalized, in request order; nil or
+	// empty means a single-name certificate. No name, FQDN or additional,
+	// belongs to two targets.
+	AdditionalNames  []string
 	Enabled          bool
 	Owner            string
 	PolicyRef        string
@@ -298,7 +305,9 @@ type Registry interface {
 	// UpdateTarget replaces the mutable fields of the target with id t.ID
 	// if its current revision equals expectedRevision, and increments the
 	// revision (t.Revision is set to the new value on return). FQDN is
-	// immutable and ignored. Returns ErrStaleRevision otherwise.
+	// immutable and ignored; AdditionalNames is replaced. Returns
+	// ErrStaleRevision otherwise, and ErrConflict if another target has
+	// one of the names.
 	UpdateTarget(ctx context.Context, t *Target, expectedRevision int64, ev *AuditEvent) error
 
 	// CreateRun records a new queued run. Returns ErrRunActive if the

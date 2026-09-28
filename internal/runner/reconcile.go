@@ -372,14 +372,19 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	// Authorization against trusted configuration. This is the check that
 	// bounds what any JobSpec, forged or not, can make this Runner do.
 	req := policy.AuthorizationRequest{
-		FQDN:         spec.Target.FQDN,
-		ACMEBinding:  spec.ACME.Binding,
-		DNSBinding:   spec.DNS.Binding,
-		StoreBinding: spec.Store.Binding,
+		FQDN:            spec.Target.FQDN,
+		AdditionalNames: spec.Target.AdditionalNames,
+		ACMEBinding:     spec.ACME.Binding,
+		DNSBinding:      spec.DNS.Binding,
+		StoreBinding:    spec.Store.Binding,
 	}
 	if err := cfg.Policy().Authorize(req); err != nil {
 		return nil, fail(v1alpha1.ErrorCodePolicyViolation, summarize("runner authorization policy rejected the job", err), err)
 	}
+	// names is what the certificate must carry, exactly: the FQDN first
+	// (the subject CN), then the additional names. Authorize has checked
+	// each one and that none repeats.
+	names := policy.Names(spec.Target.FQDN, spec.Target.AdditionalNames)
 	acme, ok := cfg.ACMEBindings[spec.ACME.Binding]
 	if !ok {
 		return nil, fail(v1alpha1.ErrorCodeBindingNotFound, fmt.Sprintf("acme binding %q is not defined in runner configuration", spec.ACME.Binding), nil)
@@ -443,7 +448,10 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		return nil, classifyCtx(ctx, failAP(v1alpha1.ErrorCodeStoreFailure, "certificate store read failed", err))
 	default:
 		renewBefore := time.Duration(spec.Policy.RenewBeforeDays) * 24 * time.Hour
-		covers := containsFold(current.DNSNames, spec.Target.FQDN)
+		// The stored certificate must carry exactly the target's names: a
+		// name added to or removed from the target takes effect at its
+		// next run, not at the next renewal.
+		covers := sameNames(current.DNSNames, names)
 		valid := !current.NotBefore.After(now.Add(clockSkewTolerance))
 		// A policy whose keyType changed takes effect at the target's next
 		// run: a stored certificate with another key type is reissued.
@@ -460,7 +468,7 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 		}
 		switch {
 		case !covers:
-			log.Warn("stored certificate does not cover the target; reissuing", "fingerprintSha256", current.FingerprintSHA256)
+			log.Warn("stored certificate's names differ from the target's; reissuing", "fingerprintSha256", current.FingerprintSHA256)
 		case !valid:
 			log.Warn("stored certificate is not yet valid; reissuing", "fingerprintSha256", current.FingerprintSHA256, "notBefore", current.NotBefore.Format(time.RFC3339))
 		case !keyOK:
@@ -541,15 +549,16 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	}
 
 	inv, err := lego.Build(lego.Params{
-		Binary:     cfg.Lego.Binary,
-		WorkDir:    work,
-		FQDN:       spec.Target.FQDN,
-		KeyType:    spec.Policy.KeyType,
-		ACME:       acme,
-		DNS:        dns,
-		LookupEnv:  opts.LookupEnv,
-		EAB:        legoEAB,
-		DisableEAB: disableEAB,
+		Binary:          cfg.Lego.Binary,
+		WorkDir:         work,
+		FQDN:            spec.Target.FQDN,
+		AdditionalNames: spec.Target.AdditionalNames,
+		KeyType:         spec.Policy.KeyType,
+		ACME:            acme,
+		DNS:             dns,
+		LookupEnv:       opts.LookupEnv,
+		EAB:             legoEAB,
+		DisableEAB:      disableEAB,
 	})
 	if err != nil {
 		if errors.Is(err, lego.ErrMissingEnv) && strings.Contains(err.Error(), "dns binding") {
@@ -629,8 +638,8 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	if err != nil {
 		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "lego produced an unreadable certificate", err)
 	}
-	if !store.Covers(leaf, spec.Target.FQDN) {
-		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not cover the target fqdn", nil)
+	if !sameNames(leaf.DNSNames, names) {
+		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate's subject alternative names differ from the target's names", nil)
 	}
 	if err := store.PrivateKeyMatches(leaf, keyPEM); err != nil {
 		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate and private key do not match", err)
@@ -640,9 +649,6 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	}
 	if leaf.NotBefore.After(now.Add(clockSkewTolerance)) {
 		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate is not yet valid", nil)
-	}
-	if len(leaf.DNSNames) != 1 {
-		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate does not contain exactly one subject alternative name", nil)
 	}
 	if err := store.KeyMatchesType(leaf, spec.Policy.KeyType); err != nil {
 		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, "issued certificate key does not match the requested key type", err)
@@ -792,13 +798,23 @@ func causeText(err error) string {
 	return err.Error()
 }
 
-func containsFold(names []string, want string) bool {
-	for _, n := range names {
-		if strings.EqualFold(n, want) {
-			return true
+// sameNames reports whether a certificate's DNS names are exactly want, as
+// a set and ignoring case: every wanted name is present and nothing else
+// is.
+func sameNames(dnsNames, want []string) bool {
+	have := make(map[string]struct{}, len(dnsNames))
+	for _, n := range dnsNames {
+		have[strings.ToLower(n)] = struct{}{}
+	}
+	if len(have) != len(want) {
+		return false
+	}
+	for _, n := range want {
+		if _, ok := have[strings.ToLower(n)]; !ok {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func zero(b []byte) {

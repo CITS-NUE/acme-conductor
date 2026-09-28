@@ -18,34 +18,42 @@ const MaxOwnerLength = 128
 
 // TargetCreateInput is the request body for creating a target.
 type TargetCreateInput struct {
-	FQDN             string `json:"fqdn"`
-	Owner            string `json:"owner"`
-	PolicyRef        string `json:"policyRef"`
-	ExecutionBinding string `json:"executionBinding"`
-	DNSBinding       string `json:"dnsBinding"`
-	StoreBinding     string `json:"storeBinding"`
+	FQDN string `json:"fqdn"`
+	// AdditionalNames are the certificate's other names (subject
+	// alternative names besides FQDN). Omitted or empty means a
+	// single-name certificate.
+	AdditionalNames  []string `json:"additionalNames,omitempty"`
+	Owner            string   `json:"owner"`
+	PolicyRef        string   `json:"policyRef"`
+	ExecutionBinding string   `json:"executionBinding"`
+	DNSBinding       string   `json:"dnsBinding"`
+	StoreBinding     string   `json:"storeBinding"`
 	// Enabled defaults to true.
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // TargetUpdateInput is the request body for updating a target. Revision
 // must equal the target's current revision (optimistic locking); omitted
-// fields keep their value. The FQDN cannot be changed: a target is one
-// FQDN.
+// fields keep their value. The FQDN cannot be changed: it is the
+// certificate's subject and names its store object. AdditionalNames, when
+// present, replaces the list; an empty list makes the target single-name.
 type TargetUpdateInput struct {
-	Revision         int64   `json:"revision"`
-	Owner            *string `json:"owner,omitempty"`
-	PolicyRef        *string `json:"policyRef,omitempty"`
-	ExecutionBinding *string `json:"executionBinding,omitempty"`
-	DNSBinding       *string `json:"dnsBinding,omitempty"`
-	StoreBinding     *string `json:"storeBinding,omitempty"`
-	Enabled          *bool   `json:"enabled,omitempty"`
+	Revision         int64     `json:"revision"`
+	AdditionalNames  *[]string `json:"additionalNames,omitempty"`
+	Owner            *string   `json:"owner,omitempty"`
+	PolicyRef        *string   `json:"policyRef,omitempty"`
+	ExecutionBinding *string   `json:"executionBinding,omitempty"`
+	DNSBinding       *string   `json:"dnsBinding,omitempty"`
+	StoreBinding     *string   `json:"storeBinding,omitempty"`
+	Enabled          *bool     `json:"enabled,omitempty"`
 }
 
 // TargetResource is the response representation of a target.
 type TargetResource struct {
-	ID               string    `json:"id"`
-	FQDN             string    `json:"fqdn"`
+	ID   string `json:"id"`
+	FQDN string `json:"fqdn"`
+	// AdditionalNames is always present; [] for a single-name target.
+	AdditionalNames  []string  `json:"additionalNames"`
 	Enabled          bool      `json:"enabled"`
 	Owner            string    `json:"owner"`
 	PolicyRef        string    `json:"policyRef"`
@@ -87,7 +95,7 @@ func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetRes
 		return nil, err
 	}
 	res := &TargetResource{
-		ID: t.ID, FQDN: t.FQDN, Enabled: t.Enabled, Owner: t.Owner, PolicyRef: t.PolicyRef,
+		ID: t.ID, FQDN: t.FQDN, AdditionalNames: append([]string{}, t.AdditionalNames...), Enabled: t.Enabled, Owner: t.Owner, PolicyRef: t.PolicyRef,
 		ExecutionBinding: t.ExecutionBinding, DNSBinding: t.DNSBinding, StoreBinding: t.StoreBinding,
 		CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt, Revision: t.Revision,
 	}
@@ -136,7 +144,45 @@ func (s *Server) checkBindings(t *registry.Target) error {
 	return nil
 }
 
-// checkPolicy verifies that the target's FQDN satisfies its policy. A
+// normalizeAdditionalNames normalizes the requested additional names in
+// order. Empty means a single-name target (nil). Whether the names are
+// distinct, allowed and few enough is checkNames' job.
+func normalizeAdditionalNames(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	if len(in) > v1alpha1.MaxNames-1 {
+		return nil, badRequest("additionalNames must have at most %d entries", v1alpha1.MaxNames-1)
+	}
+	out := make([]string, 0, len(in))
+	for i, raw := range in {
+		n, err := policy.NormalizeFQDN(raw)
+		if err != nil {
+			return nil, badRequest("additionalNames[%d]: %v", i, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// checkNames reports whether every name of t (the FQDN and each
+// additional name) is allowed by p, appears once, and whether there are
+// no more of them than p.MaxSANs.
+func checkNames(t *registry.Target, p *registry.Policy) error {
+	names := policy.Names(t.FQDN, t.AdditionalNames)
+	pol := policy.Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}
+	for _, n := range names {
+		if _, err := policy.Evaluate(n, pol); err != nil {
+			return err
+		}
+	}
+	if err := policy.CheckDistinct(names); err != nil {
+		return err
+	}
+	return policy.CheckCount(len(names), p.MaxSANs)
+}
+
+// checkPolicy verifies that the target's names satisfy its policy. A
 // rejection is audited as policy.rejected before it is reported.
 func (s *Server) checkPolicy(r *http.Request, t *registry.Target) (*registry.Policy, error) {
 	if !identifierRe.MatchString(t.PolicyRef) {
@@ -146,20 +192,20 @@ func (s *Server) checkPolicy(r *http.Request, t *registry.Target) (*registry.Pol
 	if err != nil {
 		return nil, badRequest("policyRef %q: %v", t.PolicyRef, err)
 	}
-	if _, err := policy.Evaluate(t.FQDN, policy.Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}); err != nil {
+	if err := checkNames(t, p); err != nil {
 		detail := fmt.Sprintf("target %s rejected by policy %s: %v", t.FQDN, p.ID, err)
 		caller := PrincipalFrom(r.Context())
 		ev := &registry.AuditEvent{Actor: caller.Name, ActorAuthority: caller.Authority, Action: registry.AuditPolicyRejected, TargetID: t.ID, PolicyID: p.ID, Detail: detail}
 		if aerr := s.reg.AppendAudit(r.Context(), ev); aerr != nil {
 			return nil, aerr
 		}
-		return nil, &apiError{status: http.StatusBadRequest, code: "policy_violation", message: fmt.Sprintf("fqdn %q is not allowed by policy %s: %v", t.FQDN, p.ID, err)}
+		return nil, &apiError{status: http.StatusBadRequest, code: "policy_violation", message: fmt.Sprintf("target %q is not allowed by policy %s: %v", t.FQDN, p.ID, err)}
 	}
 	return p, nil
 }
 
 func targetDetail(t *registry.Target) string {
-	return fmt.Sprintf("fqdn=%s policy=%s execution=%s dns=%s store=%s enabled=%t owner=%s", t.FQDN, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, t.Enabled, t.Owner)
+	return fmt.Sprintf("fqdn=%s additionalNames=[%s] policy=%s execution=%s dns=%s store=%s enabled=%t owner=%s", t.FQDN, strings.Join(t.AdditionalNames, " "), t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, t.Enabled, t.Owner)
 }
 
 func (s *Server) handleListTargets(w http.ResponseWriter, r *http.Request) {
@@ -201,13 +247,18 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, badRequest("fqdn: %v", err))
 		return
 	}
+	additional, err := normalizeAdditionalNames(in.AdditionalNames)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	owner, err := validateOwner(in.Owner)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	t := &registry.Target{
-		FQDN: fqdn, Owner: owner, PolicyRef: in.PolicyRef, Enabled: true,
+		FQDN: fqdn, AdditionalNames: additional, Owner: owner, PolicyRef: in.PolicyRef, Enabled: true,
 		ExecutionBinding: in.ExecutionBinding, DNSBinding: in.DNSBinding, StoreBinding: in.StoreBinding,
 	}
 	if in.Enabled != nil {
@@ -283,6 +334,15 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var changed []string
+	if in.AdditionalNames != nil {
+		additional, err := normalizeAdditionalNames(*in.AdditionalNames)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		t.AdditionalNames = additional
+		changed = append(changed, "additionalNames")
+	}
 	if in.Owner != nil {
 		owner, err := validateOwner(*in.Owner)
 		if err != nil {

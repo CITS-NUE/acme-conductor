@@ -148,8 +148,9 @@ type Summary struct {
 //
 //   - Added: in the list, not in the registry (an import would create it).
 //   - Changed: in both, but the registry target is disabled or names a
-//     policy or binding other than the profile's. Never touched by an
-//     import; the operator decides.
+//     policy or binding other than the profile's, or the listed name is
+//     another target's additional name rather than a target of its own.
+//     Never touched by an import; the operator decides.
 //   - Missing: in the registry, not in the list. Never touched: the
 //     migration deletes nothing.
 //   - Unchanged: in both and alike.
@@ -244,8 +245,12 @@ func (m *Migrator) Diff(ctx context.Context, fqdns []string, source string) (*Re
 		return nil, err
 	}
 	byFQDN := make(map[string]*registry.Target, len(targets))
+	byAdditional := map[string]*registry.Target{}
 	for _, t := range targets {
 		byFQDN[t.FQDN] = t
+		for _, n := range t.AdditionalNames {
+			byAdditional[n] = t
+		}
 	}
 	rep := &Report{ComparedAt: m.now(), Source: source, Added: []Entry{}, Changed: []Entry{}, Missing: []Entry{}, Unchanged: []Entry{}, Rejected: []Entry{}}
 	listed := make(map[string]struct{}, len(fqdns))
@@ -253,6 +258,15 @@ func (m *Migrator) Diff(ctx context.Context, fqdns []string, source string) (*Re
 		listed[f] = struct{}{}
 		t, ok := byFQDN[f]
 		if !ok {
+			// A name that the registry issues as another target's
+			// additional name is managed, but not as a target of its own:
+			// an import cannot create it, and the operator decides.
+			if t, ok := byAdditional[f]; ok {
+				rep.Changed = append(rep.Changed, Entry{FQDN: f, TargetID: t.ID, Enabled: boolPtr(t.Enabled), Differences: []Difference{
+					{Field: "fqdn", Registry: "additional name of " + t.FQDN, Expected: f},
+				}})
+				continue
+			}
 			if _, err := policy.Evaluate(f, rules); err != nil {
 				rep.Rejected = append(rep.Rejected, Entry{FQDN: f, Reason: fmt.Sprintf("not allowed by policy %s: %v", pol.ID, err)})
 				continue

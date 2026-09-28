@@ -45,8 +45,8 @@
   <div class="cards">
     <div class="card cp">
       <h3>Target</h3>
-      <p>管理対象の FQDN（ホスト名）1 つを表すレコードです．どの CertificatePolicy に従うか，
-      どのバインディング名を使うかを持ちます．1 つの Target は 1 つの FQDN です（SAN は増やせません）．</p>
+      <p>管理対象の証明書 1 枚を表すレコードです．主たる FQDN（ホスト名）と，必要なら追加の名前（SAN）を持ち，
+      どの CertificatePolicy に従うか，どのバインディング名を使うかを持ちます．1 つの名前は 1 つの Target にしか属しません．</p>
     </div>
     <div class="card cp">
       <h3>CertificatePolicy</h3>
@@ -341,7 +341,7 @@
     <div class="card dp">
       <h3>Runner 側: 実際に lego を起動するかどうか</h3>
       <p>Runner は Certificate Store に現在の証明書を問い合わせ，格納済みの証明書が
-      target の FQDN を SAN に含み，すでに有効で，鍵の種別がポリシー通りで，
+      target の名前（FQDN と追加名）と SAN が過不足なく一致し，すでに有効で，鍵の種別がポリシー通りで，
       <code>renewBeforeDays</code> より先まで有効なら，その場で
       <span class="badge dp">noop</span> として終了します．lego は一度も起動されません．
       そうでなければ発行・更新に進みます．</p>
@@ -370,7 +370,7 @@
     <li><strong>作業ディレクトリを作る</strong> — <code>&lt;workDir&gt;/run-&lt;runId&gt;-&lt;rand&gt;</code>（モード 0700）．ACME アカウントの状態だけを状態ディレクトリからコピーする．</li>
     <li><strong>lego の argv と環境をゼロから組み立てる</strong> — Runner プロセス自身の環境は継承しない．JobSpec の値がシェル文字列に補間されることはない．</li>
     <li><strong>lego をちょうど 1 回起動する</strong> — 専用のプロセスグループで，タイムアウト付きで実行する．</li>
-    <li><strong>生成された証明書を検証する</strong> — SAN が target の FQDN と一致すること，鍵が一致すること，まだ失効していないことなどを確認する．</li>
+    <li><strong>生成された証明書を検証する</strong> — SAN が target の名前と一致すること，鍵が一致すること，まだ失効していないことなどを確認する．</li>
     <li><strong>Certificate Store に格納する</strong> — ここでのみ証明書と秘密鍵が永続化される．</li>
     <li><strong>作業ディレクトリを破棄する</strong> — <code>defer</code> により，成功・失敗を問わずすべての経路で実行される．これが秘密鍵のローカルコピーを消す唯一の処理である．</li>
     <li><strong>Result を出力して終了する</strong> — stdout に 1 行の JSON，指定があればファイルにも．</li>

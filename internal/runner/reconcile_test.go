@@ -453,10 +453,10 @@ func TestReconcileFailures(t *testing.T) {
 	}{
 		{name: "lego fails", mode: "fail", code: v1alpha1.ErrorCodeACMEFailure, summary: "lego exited with status 1", legoRan: true},
 		{name: "lego writes no output", mode: "missingoutput", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},
-		{name: "lego writes wrong domain", mode: "wrongdomain", code: v1alpha1.ErrorCodeACMEFailure, summary: "does not cover the target fqdn", legoRan: true},
+		{name: "lego writes wrong domain", mode: "wrongdomain", code: v1alpha1.ErrorCodeACMEFailure, summary: "subject alternative names differ from the target's names", legoRan: true},
 		{name: "lego writes no key", mode: "nokey", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},
 		{name: "lego writes not-yet-valid certificate", mode: "ok", extraEnv: map[string]string{fakelego.EnvNotBeforeHours: "24"}, code: v1alpha1.ErrorCodeACMEFailure, summary: "not yet valid", legoRan: true},
-		{name: "lego writes certificate with extra SAN", mode: "ok", extraEnv: map[string]string{fakelego.EnvExtraSAN: "other.example.ac.jp"}, code: v1alpha1.ErrorCodeACMEFailure, summary: "exactly one subject alternative name", legoRan: true},
+		{name: "lego writes certificate with extra SAN", mode: "ok", extraEnv: map[string]string{fakelego.EnvExtraSAN: "other.example.ac.jp"}, code: v1alpha1.ErrorCodeACMEFailure, summary: "subject alternative names differ from the target's names", legoRan: true},
 		{name: "lego writes garbage", mode: "garbage", code: v1alpha1.ErrorCodeACMEFailure, summary: "unreadable certificate", legoRan: true},
 		{name: "lego hangs", mode: "hang", code: v1alpha1.ErrorCodeTimeout, summary: "did not finish within", legoRan: true,
 			prepare: func(h *harness) { h.setTimeout(1) }},

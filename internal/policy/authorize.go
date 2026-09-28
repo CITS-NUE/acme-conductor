@@ -29,16 +29,23 @@ type RunnerAuthorizationPolicy struct {
 	AllowedACMEBindings  []string
 	AllowedDNSBindings   []string
 	AllowedStoreBindings []string
+	// MaxNames bounds the names on one certificate, the FQDN included.
+	// Zero means 1: a Runner issues single-name certificates unless its
+	// configuration explicitly allows more.
+	MaxNames int
 }
 
 // AuthorizationRequest is the subset of a JobSpec that authorization
 // decides on. The embedded policy snapshot of the JobSpec is deliberately
 // not part of it: the snapshot is untrusted input.
 type AuthorizationRequest struct {
-	FQDN         string
-	ACMEBinding  string
-	DNSBinding   string
-	StoreBinding string
+	FQDN string
+	// AdditionalNames are the certificate's other names, each authorized
+	// exactly like FQDN.
+	AdditionalNames []string
+	ACMEBinding     string
+	DNSBinding      string
+	StoreBinding    string
 }
 
 // ErrBindingNotAllowed is returned when a binding name is not in the
@@ -51,18 +58,29 @@ var ErrBindingNotAllowed = errors.New("binding is not allowed by runner authoriz
 var ErrNotNormalized = errors.New("value is not normalized")
 
 // Authorize decides whether req may be acted upon under p. It returns nil
-// only if the FQDN is normalized and lies under an allowed suffix on a
-// label boundary, wildcards are allowed when the FQDN is one, and all three
-// binding names appear in their respective allow-lists.
+// only if the certificate carries no more names than p.MaxNames, every name
+// (the FQDN and each additional name) is normalized, appears once and lies
+// under an allowed suffix on a label boundary, wildcards are allowed when a
+// name is one, and all three binding names appear in their respective
+// allow-lists.
 func (p RunnerAuthorizationPolicy) Authorize(req AuthorizationRequest) error {
-	name, err := NormalizeFQDN(req.FQDN)
-	if err != nil {
+	names := Names(req.FQDN, req.AdditionalNames)
+	if err := CheckCount(len(names), p.MaxNames); err != nil {
 		return err
 	}
-	if name != req.FQDN {
-		return fmt.Errorf("%w: fqdn %q (expected %q)", ErrNotNormalized, req.FQDN, name)
+	for _, n := range names {
+		name, err := NormalizeFQDN(n)
+		if err != nil {
+			return err
+		}
+		if name != n {
+			return fmt.Errorf("%w: fqdn %q (expected %q)", ErrNotNormalized, n, name)
+		}
+		if _, err := Evaluate(name, Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}); err != nil {
+			return err
+		}
 	}
-	if _, err := Evaluate(name, Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}); err != nil {
+	if err := CheckDistinct(names); err != nil {
 		return err
 	}
 	if err := allowBinding("acme", req.ACMEBinding, p.AllowedACMEBindings); err != nil {

@@ -18,7 +18,9 @@ type PolicyInput struct {
 	ACMEBinding        string           `json:"acmeBinding"`
 	RenewBeforeDays    int              `json:"renewBeforeDays"`
 	KeyType            v1alpha1.KeyType `json:"keyType"`
-	// MaxSANs defaults to 1 and must be 1 in the MVP.
+	// MaxSANs bounds the names on a target's certificate, the FQDN
+	// included (1..v1alpha1.MaxNames). It defaults to 1 on create and to
+	// the current value on update when omitted.
 	MaxSANs *int `json:"maxSANs,omitempty"`
 	// Enabled defaults to true on create and to the current value on
 	// update when omitted.
@@ -81,12 +83,15 @@ func (s *Server) applyPolicyInput(in *PolicyInput, p *registry.Policy, create bo
 	if !in.KeyType.Valid() {
 		return badRequest("keyType must be one of %v", v1alpha1.KeyTypes)
 	}
-	maxSANs := 1
-	if in.MaxSANs != nil {
+	maxSANs := p.MaxSANs
+	switch {
+	case in.MaxSANs != nil:
 		maxSANs = *in.MaxSANs
+	case create:
+		maxSANs = 1
 	}
-	if maxSANs != 1 {
-		return badRequest("maxSANs must be 1 (one certificate per FQDN)")
+	if maxSANs < 1 || maxSANs > v1alpha1.MaxNames {
+		return badRequest("maxSANs must be between 1 and %d", v1alpha1.MaxNames)
 	}
 	p.AllowedDnsSuffixes = suffixes
 	p.AllowWildcard = in.AllowWildcard
@@ -104,8 +109,8 @@ func (s *Server) applyPolicyInput(in *PolicyInput, p *registry.Policy, create bo
 }
 
 func policyDetail(p *registry.Policy) string {
-	return fmt.Sprintf("suffixes=[%s] wildcard=%t acme=%s renewBeforeDays=%d keyType=%s enabled=%t",
-		strings.Join(p.AllowedDnsSuffixes, " "), p.AllowWildcard, p.ACMEBinding, p.RenewBeforeDays, p.KeyType, p.Enabled)
+	return fmt.Sprintf("suffixes=[%s] wildcard=%t acme=%s renewBeforeDays=%d keyType=%s maxSANs=%d enabled=%t",
+		strings.Join(p.AllowedDnsSuffixes, " "), p.AllowWildcard, p.ACMEBinding, p.RenewBeforeDays, p.KeyType, p.MaxSANs, p.Enabled)
 }
 
 func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +193,7 @@ func (s *Server) handleUpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	var offending []string
 	for _, t := range targets {
-		if _, err := policy.Evaluate(t.FQDN, policy.Policy{AllowedDnsSuffixes: p.AllowedDnsSuffixes, AllowWildcard: p.AllowWildcard}); err != nil {
+		if err := checkNames(t, p); err != nil {
 			offending = append(offending, t.FQDN)
 		}
 	}
