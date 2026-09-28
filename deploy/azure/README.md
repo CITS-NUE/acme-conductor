@@ -120,6 +120,12 @@ Runner の ID は Job，アプリ，ストレージアカウントに対する�
   `accountProvisioning.bindings`．`acmeBindings` のいずれか）に渡す．
   機能を有効にするなら 1 個以上が必須で，無効なら空でなければならない．
   挙げた binding だけに GUI の投入フォームが出る．
+  そのうち，アカウントで発行できる名前が CA 側で決まっている binding
+  （UPKI ACME など）は `accountProvisioningTargetScopedBindings`（Conductor の
+  設定の `accountProvisioning.targetScopedBindings`）にも挙げる．その binding では
+  アカウントを target ごとに持ち，EAB は target のページから投入する
+  （[`docs/account-scoped-ca.md`](../../docs/account-scoped-ca.md)）．既定は空で，そのときの Conductor の設定は
+  この項目の導入前と変わらない．
   両方とも空（既定）なら機能は無効のままで，テンプレートの出力はこの機能の
   導入前と変わらない．片方だけを渡すと，デプロイは何も変更しないうちに
   失敗する（空の秘密鍵でシークレットを上書きすると，プロビジョニングの run が

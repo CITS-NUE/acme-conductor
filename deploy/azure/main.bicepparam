@@ -60,6 +60,9 @@ param resultSigningPrivateKeyPem = readEnvironmentVariable('ACME_RESULT_SIGNING_
 // param accountProvisioningPublicKey = '<publicKey from provisioning-keygen>'
 // param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
 // param accountProvisioningBindings = ['<acme binding whose CA requires EAB>']
+// For a CA whose ACME account may issue only the names it was registered
+// for (UPKI ACME, docs/account-scoped-ca.md): one account per target of these bindings.
+// param accountProvisioningTargetScopedBindings = ['<one of accountProvisioningBindings>']
 
 param runnerConfigJson = loadTextContent('../examples/runner-config.aca.example.json')
 

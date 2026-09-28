@@ -105,6 +105,7 @@ docs/                 アーキテクチャ，脅威モデル，ADR
 - [アーキテクチャ](docs/architecture.md)
 - [Conductor 運用ガイド](docs/conductor.md)
 - [Runner 運用ガイド](docs/runner.md)
+- [アカウントごとに発行範囲が決まる CA の運用ガイド（UPKI ACME）](docs/account-scoped-ca.md)
 - [脅威モデル](docs/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)
 

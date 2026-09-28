@@ -81,6 +81,9 @@ param accountProvisioningPublicKey string = ''
 @description('The ACME binding names whose CA requires External Account Binding, placed into the Conductor configuration as accountProvisioning.bindings: only these get the provisioning form in the GUI. Each must be one of acmeBindings. Required (non-empty) when provisioning is enabled; must be empty when it is not.')
 param accountProvisioningBindings array = []
 
+@description('The accountProvisioningBindings whose CA ties an ACME account to the names it may issue for (UPKI ACME, for example), placed into the Conductor configuration as accountProvisioning.targetScopedBindings: the Conductor keeps one account per target of such a binding, provisioned from the target\'s page (docs/adr/0024, docs/account-scoped-ca.md). Each must be one of accountProvisioningBindings. Empty, the default, keeps one account per binding.')
+param accountProvisioningTargetScopedBindings array = []
+
 @description('Logical ACME binding names the Conductor registers (must match the Runner configuration).')
 param acmeBindings array
 
@@ -203,6 +206,12 @@ var accountProvisioningEabBindings = !accountProvisioningEnabled
       : empty(filter(accountProvisioningBindings, b => !contains(acmeBindings, b)))
           ? accountProvisioningBindings
           : fail('accountProvisioningBindings may only name bindings listed in acmeBindings.')
+
+// The EAB bindings that keep one account per target: a subset of
+// accountProvisioningEabBindings (so empty when provisioning is disabled).
+var accountProvisioningTargetScoped = empty(filter(accountProvisioningTargetScopedBindings, b => !contains(accountProvisioningEabBindings, b)))
+  ? accountProvisioningTargetScopedBindings
+  : fail('accountProvisioningTargetScopedBindings may only name bindings listed in accountProvisioningBindings.')
 
 // --- roles -------------------------------------------------------------------
 
@@ -561,7 +570,14 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
 var conductorConfig = union(
   conductorConfigBase,
   empty(migration) ? {} : { migration: migration },
-  accountProvisioningEnabled ? { accountProvisioning: { publicKey: accountProvisioningPublicKey, bindings: accountProvisioningEabBindings } } : {}
+  accountProvisioningEnabled
+    ? {
+        accountProvisioning: union(
+          { publicKey: accountProvisioningPublicKey, bindings: accountProvisioningEabBindings },
+          empty(accountProvisioningTargetScoped) ? {} : { targetScopedBindings: accountProvisioningTargetScoped }
+        )
+      }
+    : {}
 )
 
 var conductorConfigBase = {

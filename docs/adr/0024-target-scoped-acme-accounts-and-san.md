@@ -1,14 +1,15 @@
 # 0024: target 単位の ACME アカウントと SAN 証明書
 
-- ステータス: 提案（issue #53 の方針案．未採択）
+- ステータス: 採択（#56，#57，#58，#59，#60 で実装した．決定 2 の Azure の複数ゾーン対応は，ロールの追加ではなく CNAME 委任で行うことにした（#58））
 - 日付: 2026-09-28
 
 ## 背景
 
 issue #53 は，UPKI ACME の次の仕様が現行モデルと噛み合わないことを
 洗い出した．1 つの ACME アカウント（EAB）で発行できるのは，申請時に登録した
-FQDN の集合（CN を含めて最大 8 個）だけである．集合を変えるには再申請して
-新しい EAB でアカウントを登録し直す必要がある．
+FQDN の集合（CN を含めて最大 8 個）だけである．集合を変えるには UPKI 側の
+手続き（CN の変更は新しい ACME アカウントの登録，dNSName などの変更は ACME
+アカウント更新）を経て，受け取った EAB でアカウントを登録し直す必要がある．
 
 EAB を要求する CA では，アカウントごとに発行できる名前の範囲が決まっている
 のが一般的である（Sectigo，DigiCert，HARICA などは組織単位で事前検証した
@@ -109,10 +110,14 @@ UPKI では「UPKI の申請 1 つ = アカウント 1 つ = target 1 つ（CN �
 - Runner: 既存証明書の SAN 集合が要求と一致するときだけ noop とし，不一致なら
   再発行する．
 - Store のオブジェクト名は主名由来のまま（`store.ObjectName`）．
-- DNS-01: 各名前にチャレンジが要る．Azure では `dnsZoneName` を配列
-  `dnsZoneNames` に広げ，ロール割り当てを各ゾーンに付ける．
-- 移行（[ADR 0020](0020-migration-from-cert-infra.md)）: cert-infra の定義に
-  SAN があれば `additionalNames` として取り込む．
+- DNS-01: 各名前にチャレンジが要る．名前が複数のゾーンにまたがっても，
+  各名前の `_acme-challenge` をチャレンジ用ゾーンへ CNAME で委任すれば，
+  Runner が書くのはチャレンジ用ゾーン 1 つのままでよい（#58 で確認．当初案の
+  `dnsZoneNames` で各ゾーンにロールを割り当てる方式は，Runner に本番の親ゾーンへの
+  書き込み権限を与えるので採らなかった．[`deploy/azure/README.md`](../../deploy/azure/README.md#複数の-dns-ゾーン)）．
+- 移行（[ADR 0020](0020-migration-from-cert-infra.md)）: cert-infra の一覧は
+  FQDN しか持たないので，SAN を取り込む処理はない（#56）．一覧にある名前が
+  別の target の追加名なら，target を作らず `changed` として報告する．
 
 ### 3. EAB を投入したらすぐ run を起こす
 
@@ -128,7 +133,7 @@ UPKI では「UPKI の申請 1 つ = アカウント 1 つ = target 1 つ（CN �
   プロビジョニング run は ADR 0022 の通り noop を飛ばして必ず `lego run` する．
 - これで EAB の投入から登録までの待ちがなくなり（問題 4），EAB が短期間で
   失効する CA（Google Trust Services など）でも使える．
-- 名前集合を変えるとき（UPKI の再申請など）は，target の編集と新 EAB の投入を
+- 名前集合を変えるとき（UPKI の ACME アカウント更新など）は，target の編集と新 EAB の投入を
   別々の操作として行えばよい．両者を 1 トランザクションで結び付ける仕組みは
   作らない．順序を誤れば CA がオーダーを拒否し，run に残る．
 
@@ -158,8 +163,8 @@ EAB を投入したら手動で run を起こす．
 2. #57 target スコープのアカウント（`targetScopedBindings`，`acme_accounts.scope`，
    `ACMEAccountRef.scope`，provisioning v2 AAD，Runner の状態パス，GUI）．
 3. #59 EAB 投入時の即時 run．
-4. #58 Azure の複数 DNS ゾーン（`dnsZoneNames`）．1 と並行可．
-5. #60 UPKI を例にした運用ドキュメント（申請内容と target の対応，設定例）．
+4. #58 Azure の複数 DNS ゾーン（CNAME 委任で対応．ドキュメントのみ）．
+5. #60 UPKI を例にした運用ドキュメント（[`docs/account-scoped-ca.md`](../account-scoped-ca.md)）．
 
 1 と 2 は独立しており，どちらからでも着手できる．
 
