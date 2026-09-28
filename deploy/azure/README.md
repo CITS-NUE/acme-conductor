@@ -30,7 +30,7 @@ Container App として動き，API と GUI のすべての呼び出し元を OI
 | `<prefix>-cae` (Container Apps environment) | アプリとジョブをホストする．Consumption プラン，VNet 統合なし． |
 | `<prefix><hash>` (storage account) | 環境にマウントされる 3 つの Azure Files 共有: `conductor-state`（SQLite のレジストリ．`nobrl` でマウント），`runner-state`（ACME アカウントの状態．`/state`），`exchange`（署名付きジョブの入力と結果の出力）． |
 | `<prefix>-id-conductor` (user-assigned identity) | Conductor の ID．Runner の Job に対してのみ **Conductor Job Execution Observer** カスタムロール（実行の読み取り・一覧・停止．開始は不可）を付与． |
-| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーン（と `additionalDnsZones` の各ゾーン．[複数の DNS ゾーン](#複数の-dns-ゾーン)）に **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
+| `<prefix>-id-runner` (user-assigned identity) | Runner の ID．チャレンジ用ゾーン（だけ．[複数の DNS ゾーン](#複数の-dns-ゾーン)）に **Runner DNS TXT Writer** カスタムロール，Key Vault に **Runner Key Vault Certificate Writer** カスタムロールを付与． |
 | `<prefix>-runner` (Container Apps Job) | Runner イメージ．Runner の設定と結果署名用の秘密鍵（暗号化 EAB プロビジョニングを有効にした場合は provisioning 用の秘密鍵も）を `/etc/acme-runner/` 配下に，加えて `/exchange`，`/state`，一時的な `/work` をマウント．スケジュールトリガー（`runnerCronExpression`，毎分），実行ごとに 1 レプリカ（`parallelism: 1`．ランチャーのコントラクトは実行ごとに 1 つの run），リトライなし，固定コマンド `reconcile --exchange /exchange`． |
 | `<prefix>-conductor` (Container App) | Conductor イメージ．設定とジョブ署名用の秘密鍵を `/etc/acme-conductor/` 配下に，加えて `/var/lib/acme-conductor` と `/mnt/exchange` をマウント．HTTPS 専用の ingress（既定で外部公開．必要に応じて送信元 CIDR で制限可）の背後に 1 レプリカ，`oidc` 認証，`/healthz` と `/readyz` での liveness/readiness プローブ． |
 | 3 つのカスタムロール定義 (サブスクリプションスコープ) | **`main.bicep` ではなく `roles.bicep` が作る**．初回に一度だけ別にデプロイし，`main.bicep` はそれを割り当てるだけである（[ロール定義とデプロイの権限](#ロール定義とデプロイの権限)）． |
@@ -326,54 +326,30 @@ Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変�
 ## 複数の DNS ゾーン
 
 1 枚の証明書の名前（SAN）が複数の DNS ゾーンにまたがるとき
-（`www.example.ac.jp` と `www.example.org` など），名前ごとに DNS-01
-チャレンジの TXT レコードが要る．Runner が使う `lego` の `azuredns`
-プロバイダ（4.35.2）は，TXT を書くゾーンを次のように決める．
+（`www.example.ac.jp` と `www.example.org` など）も，**委任** で対応する．
+各名前の `_acme-challenge.<name>` をチャレンジ用ゾーン（`dnsZoneName`）の中の
+名前へ CNAME で委任し，DNS バインディングの `AZURE_ZONE_NAME` はチャレンジ用
+ゾーンのままにする．`lego` は既定で CNAME をたどり，`AZURE_ZONE_NAME` が
+あればすべての TXT をそのゾーンに書く（`azuredns` プロバイダ，4.35.2）ので，
+名前がいくつのゾーンにまたがっても，Runner が書き込めるのはチャレンジ用
+ゾーン 1 つのままである．テンプレートもロール割り当ても変わらない．
 
-- DNS バインディングの `env` に `AZURE_ZONE_NAME` があれば，すべての名前の
-  TXT をそのゾーンに書く．
-- なければ，名前ごとに（`_acme-challenge.<name>` の CNAME をたどった先の）
-  ゾーンを DNS で調べ，Azure Resource Graph で見つけた同名のゾーンに書く．
-  探す範囲は `AZURE_SUBSCRIPTION_ID` と `AZURE_RESOURCE_GROUP`（あれば）で
-  絞られる．
+SAN の名前の **1 つ 1 つ** に委任が要る．1 つでも欠けていれば，その名前の
+チャレンジが通らずに run が `AcmeFailure` になる．証明書に名前を足す前に，
+それぞれ確かめる（[walkthrough の手順 10](walkthrough.md)）．
 
-これに合わせて，やり方は 2 つある．
-
-**委任方式（推奨．テンプレートの変更は不要）．** 各名前の
-`_acme-challenge.<name>` をチャレンジ用ゾーン（`dnsZoneName`）の中の名前へ
-CNAME で委任し，DNS バインディングの `AZURE_ZONE_NAME` はチャレンジ用ゾーンの
-ままにする．`lego` は CNAME をたどってチャレンジ用ゾーンに書くので，名前が
-いくつのゾーンにまたがっても，Runner が書き込めるのはチャレンジ用ゾーン
-1 つだけで済む．親ゾーンの側では名前ごとに CNAME を 1 回作るだけであり，
-Runner に親ゾーンを書き換える権限を与えない．SAN の名前の **1 つ 1 つ** に
-委任が要ることに注意する（`dig +short CNAME _acme-challenge.<name>` で確かめる．
-[walkthrough の手順 10](walkthrough.md)）．
-
-**直接方式．** 委任できないゾーンがある場合は，Runner がそのゾーンに直接
-TXT を書く．
-
-1. `additionalDnsZones` に，チャレンジ用ゾーン以外で直接書くゾーンを
-   `{ name, resourceGroup }` で並べる（同じサブスクリプション内．
-   `dnsZoneName` は繰り返さない）．テンプレートは Runner の ID に，各ゾーンの
-   **Runner DNS TXT Writer** を割り当てる．
-   チャレンジ用ゾーンの割り当ては，このパラメタの有無で変わらない．
-2. DNS バインディングの `env` から `AZURE_ZONE_NAME` を **外す**（あると，
-   すべての名前がそのゾーンに書かれる）．ゾーンがリソースグループをまたぐ
-   なら `AZURE_RESOURCE_GROUP` も外し，`AZURE_SUBSCRIPTION_ID` だけを残す．
-   Resource Graph が返すのは，Runner の ID が読めるゾーン（ロールを割り当てた
-   ゾーン）だけである．
-
-```bicep
-param additionalDnsZones = [
-  { name: 'example.org', resourceGroup: 'rg-dns-org' }
-]
+```sh
+dig +short CNAME _acme-challenge.<name>   # チャレンジ用ゾーン内の名前が返ればよい
 ```
 
-2 つの方式は 1 つの DNS バインディングの中では混ぜられない
-（`AZURE_ZONE_NAME` の有無で決まる）．委任済みの名前と直接書く名前を
-1 枚の証明書に混ぜたいときは直接方式にし，委任済みの名前はそのまま CNAME を
-たどらせる（`AZURE_ZONE_NAME` がなくても `lego` は CNAME をたどるので，
-委任先のチャレンジ用ゾーンに書く）．
+**親ゾーンへ直接書かせる構成は採らない．** `AZURE_ZONE_NAME` を外して
+Runner に親ゾーン（`example.ac.jp`，`example.org` など）の TXT を直接書かせる
+こともできるが，それには Runner の ID に本番の親ゾーンへの書き込み権限を
+与えることになる．Runner が侵害されれば，そのゾーンの任意の名前について
+DNS-01 チャレンジを通せてしまう．Runner に書かせるのはチャレンジ用ゾーン
+だけ，という前提（[脅威モデル](../../docs/threat-model.md) の T4）を崩すので，
+このテンプレートはチャレンジ用ゾーン以外への割り当てを用意しない．
+親ゾーンの側で必要なのは，名前ごとに一度 CNAME を置くことだけである．
 
 ## デプロイ後の運用
 
