@@ -26,9 +26,9 @@ make images    # 両方のコンテナイメージをビルドし，問題なく
 ```
 
 `deploy/azure` 配下の変更は，Bicep CLI でのコンパイルと lint，パラメータ例の
-ビルドも通さなければならない（`bicep build deploy/azure/main.bicep`，`bicep lint
-deploy/azure/main.bicep`，`bicep build-params deploy/azure/main.bicepparam`）．
-CI の `bicep` ジョブも同じ 3 つを実行する．テンプレートが Runner の設定に加える
+ビルドも通さなければならない（`main.bicep` と `roles.bicep` それぞれの
+`bicep build` と `bicep lint`，`bicep build-params deploy/azure/main.bicepparam`）．
+CI の `bicep` ジョブも同じものを実行する．テンプレートが Runner の設定に加える
 編集は `cmd/acme-runner/deploy_azure_test.go` が Runner の設定ローダと store
 プロバイダのレジストリを通して検査するので，バインディングの形を変える変更は
 テンプレートとこのテストの両方を更新すること．

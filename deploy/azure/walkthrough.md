@@ -23,7 +23,7 @@
  5. Entra ID のアプリ登録（API と GUI）
  6. Runner 設定とパラメタファイルの作成（ローカル）
  7. build-params と what-if（読み取りのみ）
- 8. デプロイ
+ 8. デプロイ（初回は，先にロール定義と条件付き委任）
  9. デプロイ後の確認とリダイレクト URI の登録
 10. 最初の target で発行テスト（staging CA）
 11. 利用側への組み込み（本番 CA の証明書を実際のサービスで使う）  ← 利用側の管理者と行う
@@ -37,17 +37,22 @@ Container Apps 環境の作成（5〜10 分）が占める．
 | 作業 | 必要な権限 | 備考 |
 |---|---|---|
 | Azure リソースの作成（手順 4，8） | デプロイ先 RG の `Contributor` | |
-| サブスクリプションスコープのネストしたデプロイ（手順 8） | サブスクリプションの `Microsoft.Resources/deployments/*`（サブスクリプションの `Contributor` や `Owner` に含まれる） | `main.bicep` はカスタムロールを `scope: subscription()` の module（`modules/roles.bicep`）で作るため，**RG の `Contributor` だけでは足りない**．`User Access Administrator` にも含まれない |
-| カスタムロール定義の作成（手順 8） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`） | `Contributor` と `Role Based Access Control Administrator` には **含まれない** |
-| ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 条件（ABAC）付きの委任でもよい（#37 以降）．[手順 8](#8-デプロイ) を参照 |
+| DNS ゾーンと Key Vault の RG への入れ子のデプロイ（手順 8） | それぞれの RG の `Microsoft.Resources/deployments/*` | `main.bicep` はそこへのロール割り当てを入れ子のデプロイで作る．デプロイ先 RG と同じ RG なら追加は要らない |
+| **初回だけ**: カスタムロール定義の作成（手順 8-1，`roles.bicep`） | サブスクリプションの `Microsoft.Authorization/roleDefinitions/write`（`Owner` または `User Access Administrator`）と `Microsoft.Resources/deployments/*`（サブスクリプションスコープのデプロイ） | `Contributor` と `Role Based Access Control Administrator` には `roleDefinitions/write` が **含まれない**．`User Access Administrator` には `deployments/*` が含まれない．ロール定義を変えるリリースでも要る |
+| **初回だけ**: デプロイする者への条件付き委任（手順 8-2） | 割り当て先スコープの条件なしの `roleAssignments/write`（`Owner` または `User Access Administrator`） | |
+| ロール割り当て（手順 8） | 割り当て先スコープ（Runner の Job，DNS ゾーン，Key Vault）の `Microsoft.Authorization/roleAssignments/write` | 手順 8-2 の条件（ABAC）付き `Role Based Access Control Administrator` で足りる．常設でよい |
 | アプリ登録の作成（手順 5） | Entra の `Application Developer` 以上 | テナント設定で一般ユーザーのアプリ作成が禁止されている場合 |
 | 管理者の同意，アプリロールの割り当て（手順 5） | Entra の `Application Administrator` / `Cloud Application Administrator` | 自テナントの API への委任許可の同意ならこれで足りる |
 
-たとえば「RG の `Contributor`＋サブスクリプションの `User Access Administrator`」の
-組み合わせは十分に見えるが，サブスクリプションスコープのネストしたデプロイを
-開始できないため失敗する．実施した環境では，サブスクリプションの `Contributor`
-（常設）と `User Access Administrator`（PIM で有効化）の組み合わせでこの要件を
-満たした．
+PIM などで一時的に有効化する特権が要るのは **初回だけ** の 2 行である．
+以後の再デプロイ（イメージの更新を含む）は，常設の `Contributor` と条件付きの
+`Role Based Access Control Administrator` だけで行える
+（[ADR 0023](../../docs/adr/0023-separate-role-definitions-from-the-deployment.md)）．
+初回のロール定義の作成では，たとえば「RG の `Contributor`＋サブスクリプションの
+`User Access Administrator`」の組み合わせは十分に見えるが，サブスクリプション
+スコープのデプロイを開始できないため失敗する．実施した環境では，サブスクリプションの
+`Contributor`（常設）と `User Access Administrator`（PIM で有効化）の組み合わせで
+この要件を満たした．
 
 権限を確認するコマンドを示す（読み取りのみ）:
 
@@ -121,7 +126,8 @@ az rest --method post \
 
 [役割と必要な権限](#役割と必要な権限) の表と確認コマンドで不足を洗い出す．
 PIM の対象になっているロールは本人がポータルで有効化する．有効化には
-期限があるので，**手順 5 と 8 の直前に** 行う．
+期限があるので，**手順 5 と 8 の直前に** 行う．手順 8 で特権が要るのは初回の
+8-1 と 8-2 だけであり，再デプロイでは要らない．
 
 ## 3. 署名鍵ペアの生成
 
@@ -312,14 +318,50 @@ az deployment group what-if -g rg-acme-staging -n acme-stg \
   --template-file main.bicep --parameters staging.bicepparam --result-format ResourceIdOnly
 ```
 
-新しい環境なら，すべて `+ Create` になる．内訳は，サブスクリプションスコープに
-カスタムロール 3 つ，RG に 14 リソースと Job へのロール割り当て 1 つである．
+新しい環境なら，すべて `+ Create` になる．内訳は，RG に 14 リソースと Job への
+ロール割り当て 1 つである．カスタムロールは `main.bicep` には含まれず，手順 8-1 で
+別にデプロイする（what-if の時点でまだなくてもよい）．
 既存の Key Vault は `* Ignore` になる．Runner の ID へのロール割り当て
 2 つ（DNS ゾーンと Key Vault）は，ID の principalId がデプロイ中にしか
 決まらないため `Unsupported` と表示される．これは正常である．**既存の本番
 RG に対する変更は，DNS ゾーンへのロール割り当て 1 つだけ** であることを確認する．
 
 ## 8. デプロイ
+
+### 8-1. ロール定義（初回だけ）
+
+カスタムロール 3 つをサブスクリプションスコープに作る．`roleNamePrefix` は手順 1 で
+決めた値で，パラメタファイルの `roleNamePrefix` と一致させる．特権（手順 2）が
+要るのはここと 8-2 だけである．
+
+```sh
+az deployment sub what-if --location japaneast -n acme-stg-roles \
+  --template-file roles.bicep --parameters roleNamePrefix='ACME Conductor Staging'
+az deployment sub create --location japaneast -n acme-stg-roles \
+  --template-file roles.bicep --parameters roleNamePrefix='ACME Conductor Staging'
+```
+
+ロール定義を変えるリリースのときも，`main.bicep` の前にこれを再実行する．
+
+### 8-2. デプロイする者への条件付き委任（初回だけ）
+
+以後のデプロイを常設の権限だけで行えるように，デプロイする人（またはグループ，
+CI のサービスプリンシパル）に，3 つのロールをサービスプリンシパルにだけ割り当て
+られる `Role Based Access Control Administrator` を与える．条件は 8-1 の出力に
+ある（[README](README.md#ロール定義とデプロイの権限)）:
+
+```sh
+COND=$(az deployment sub show -n acme-stg-roles --query properties.outputs.deployerDelegationCondition.value -o tsv)
+for scope in $(az group show -n rg-acme-staging --query id -o tsv) <dns zone id> $(az keyvault show -n kv-acme-stg-<org> --query id -o tsv); do
+  az role assignment create --role "Role Based Access Control Administrator" \
+    --assignee <デプロイする者> --scope "$scope" --condition "$COND" --condition-version 2.0
+done
+```
+
+すでに「`Owner` などの特権ロール以外はすべて許可」という条件付きの委任を持って
+いるなら，この手順は省いてよい．
+
+### 8-3. main.bicep
 
 ```sh
 az deployment group create -g rg-acme-staging -n acme-stg \
@@ -368,7 +410,7 @@ az containerapp job logs show -g $RG -n $P-runner --execution <execution name> -
 
 Runner の実行が毎分 `Failed` になる場合は，まずログを見る．ログに
 `runner configuration could not be loaded` と出ていれば Runner 設定の誤りである．
-直して手順 8 を再実行する．
+直して手順 8-3 を再実行する．
 
 暗号化 EAB プロビジョニングを有効にした場合は，Conductor が公開鍵を持っている
 ことを確かめる．`GET /api/v1alpha1/account-provisioning/key` が `keyId` を返し，
@@ -461,7 +503,7 @@ Runner の ID が持つのは証明書の書き込み権限だけで，誰に読
   認識されないディレクトリは，これがないと拒否される
   （[`docs/runner.md`](../../docs/runner.md)）．
 - あわせて `authorization.allowedAcmeBindings` とパラメタの `acmeBindings` にも追加し，
-  再デプロイする（手順 8）．
+  再デプロイする（手順 8-3）．
 - ポリシーの `acmeBinding` をそのバインディングにして，target の run が `succeeded` に
   なるのを待つ．
 
@@ -563,8 +605,10 @@ echo | openssl s_client -connect <fqdn>:443 -servername <fqdn> 2>/dev/null \
 
 ## 再デプロイ
 
-パラメタや Runner 設定を変えたら，手順 7 の環境変数を設定して手順 8 のコマンドを
-再実行する．内容が同じなら何度実行しても結果は変わらない．#37 より前のテンプレートで，
+パラメタや Runner 設定，イメージのダイジェストを変えたら，手順 7 の環境変数を
+設定して手順 8-3 のコマンドを再実行する．内容が同じなら何度実行しても結果は
+変わらない．8-1 と 8-2 は繰り返さない（ロール定義を変えるリリースのときだけ 8-1 を
+先に再実行する）ので，PIM の有効化は要らない．#37 より前のテンプレートで，
 ABAC 条件付きの権限の場合は，毎回 `--validation-level Template` が要る．
 
 ## 片付け（staging を捨てるとき）
@@ -590,8 +634,10 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | 症状 | 原因 | 対処 |
 |---|---|---|
 | preflight で `roleAssignments/write` が拒否される | ABAC 条件付きの RBAC 委任で，`roleDefinitionId` が事前検証の時点で未確定（#34） | #37 以降のテンプレートを使う．古いものは `what-if` で確認後に `--validation-level Template` |
-| デプロイ時にロール定義の作成で失敗する（想定） | `roleDefinitions/write` がない | PIM で `User Access Administrator` などを有効化する |
-| サブスクリプションスコープの `roles` デプロイで失敗する（想定） | RG の `Contributor` だけで，サブスクリプションで `Microsoft.Resources/deployments/*` を持たない | サブスクリプションの `Contributor` などを用意する |
+| 手順 8-1 でロール定義の作成に失敗する（想定） | `roleDefinitions/write` がない | PIM で `User Access Administrator` などを有効化する |
+| 手順 8-1 の `az deployment sub create` が開始できない（想定） | RG の `Contributor` だけで，サブスクリプションで `Microsoft.Resources/deployments/*` を持たない | サブスクリプションの `Contributor` などを用意する |
+| 手順 8-3 のロール割り当てが `RoleDefinitionDoesNotExist` で失敗する（想定） | `roles.bicep` をデプロイしていない，または `roleNamePrefix` が 8-1 と違う | 8-1 を同じ `roleNamePrefix` で実行してから再デプロイする |
+| 手順 8-3 の DNS ゾーンや Key Vault への入れ子のデプロイが `AuthorizationFailed` になる（想定） | その RG で `Microsoft.Resources/deployments/*` を持たない | その RG の `Contributor` などを用意する |
 | アプリ登録を作れない | テナントで一般ユーザーのアプリ作成が禁止されている | Entra の `Application Developer` / `Application Administrator` を有効化する |
 | デプロイは成功するが Runner が毎分 `Failed` になる | Runner 設定が読み込み時に拒否されている（例: `LEGO_DISABLE_CNAME_SUPPORT` は予約済み） | ログで理由を確認し，設定を直して再デプロイ |
 | 鍵生成用の Go・コンテナがない | ― | OpenSSL で同じ形式の鍵を作る（手順 3） |

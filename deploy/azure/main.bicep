@@ -27,6 +27,10 @@
 // No DNS or Key Vault credential exists anywhere: both are the Runner's
 // managed identity. See deploy/azure/README.md for what this template does
 // not verify and how to operate the result.
+//
+// The three custom roles the grants use are defined by roles.bicep, a
+// separate subscription-scope deployment made once beforehand; this
+// template writes nothing outside resource groups.
 targetScope = 'resourceGroup'
 
 import { roleDefinitionName, roleKeys } from 'modules/role-ids.bicep'
@@ -41,7 +45,7 @@ param location string = resourceGroup().location
 @maxLength(20)
 param namePrefix string = 'acme'
 
-@description('Prefix for the custom role names (tenant-unique).')
+@description('Prefix of the custom role names: the same value roles.bicep was deployed with, which defines the roles this template assigns.')
 param roleNamePrefix string = 'ACME Conductor'
 
 @description('Conductor container image, pinned by digest for anything but development.')
@@ -200,23 +204,21 @@ var accountProvisioningEabBindings = !accountProvisioningEnabled
           ? accountProvisioningBindings
           : fail('accountProvisioningBindings may only name bindings listed in acmeBindings.')
 
-// --- roles (subscription scope) ----------------------------------------------
+// --- roles -------------------------------------------------------------------
 
-// The role definition IDs are built here from the same names the roles
-// module uses, not taken from its outputs, so that they are known at
-// preflight (see modules/role-ids.bicep). The grants below depend on the
-// module explicitly instead.
+// The custom role definitions are not deployed here: roles.bicep creates
+// them once at subscription scope, before this template, and again only
+// when a release changes one (docs/adr/0023). This template only assigns
+// them, by IDs built from the same names roles.bicep uses (see
+// modules/role-ids.bicep), so a redeploy needs neither
+// roleDefinitions/write nor a subscription-scope deployment. The IDs are
+// known at preflight, which an ABAC-constrained delegation on the role
+// assignments needs (issue #34). If roles.bicep has not been deployed
+// with the same roleNamePrefix, the grants below fail with
+// RoleDefinitionDoesNotExist.
 var conductorJobObserverRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.conductorJobObserver))
 var runnerDnsTxtWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerDnsTxtWriter))
 var runnerKeyVaultCertificateWriterRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitionName(subscription().id, roleNamePrefix, roleKeys.runnerKeyVaultCertificateWriter))
-
-module roles 'modules/roles.bicep' = {
-  name: '${deployment().name}-roles'
-  scope: subscription()
-  params: {
-    roleNamePrefix: roleNamePrefix
-  }
-}
 
 // --- identities --------------------------------------------------------------
 
@@ -759,7 +761,7 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
 // --- grants ------------------------------------------------------------------
 
 // Conductor identity -> observe and stop executions of this Job only
-// (never start one; see modules/roles.bicep).
+// (never start one; see roles.bicep).
 resource conductorObservesRunner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(runnerJob.id, conductorIdentity.id, 'job-observer')
   scope: runnerJob
@@ -768,9 +770,6 @@ resource conductorObservesRunner 'Microsoft.Authorization/roleAssignments@2022-0
     principalType: 'ServicePrincipal'
     roleDefinitionId: conductorJobObserverRoleId
   }
-  dependsOn: [
-    roles
-  ]
 }
 
 // Runner identity -> TXT records in the challenge zone.
@@ -782,9 +781,6 @@ module runnerDns 'modules/dns-role-assignment.bicep' = {
     runnerPrincipalId: runnerIdentity.properties.principalId
     roleDefinitionId: runnerDnsTxtWriterRoleId
   }
-  dependsOn: [
-    roles
-  ]
 }
 
 // Runner identity -> import certificates into the vault.
@@ -796,9 +792,6 @@ module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {
     runnerPrincipalId: runnerIdentity.properties.principalId
     roleDefinitionId: runnerKeyVaultCertificateWriterRoleId
   }
-  dependsOn: [
-    roles
-  ]
 }
 
 // --- outputs -----------------------------------------------------------------

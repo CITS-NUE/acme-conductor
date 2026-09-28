@@ -1,9 +1,10 @@
 // Names of the custom role definitions, in one place.
 //
-// modules/roles.bicep creates the definitions under these names and
-// main.bicep assigns them by the IDs built from the same names. main.bicep
-// must not take the IDs from the roles module's outputs: a module output
-// is unknown at preflight, and a role assignment whose roleDefinitionId is
+// roles.bicep creates the definitions under these names and main.bicep
+// assigns them by the IDs built from the same names. The two are separate
+// deployments (docs/adr/0023), and even if they were not, main.bicep must
+// not take the IDs from a roles module's outputs: a module output is
+// unknown at preflight, and a role assignment whose roleDefinitionId is
 // unknown then cannot be checked against an ABAC condition on
 // @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] (the
 // usual "may assign anything but Owner / User Access Administrator"

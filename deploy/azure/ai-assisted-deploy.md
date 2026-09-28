@@ -111,7 +111,7 @@ AI がすること（読み取り）:
 - 有効な割り当てと条件（`roleAssignmentScheduleInstances`）を取得する．
 - PIM で有効化できるロール（`roleEligibilityScheduleInstances`）を取得する．
 - Entra のディレクトリロールと，一般ユーザーがアプリを作れるかを確認する．
-- 不足を表にする．例: 「`roleDefinitions/write` がない → PIM の `User Access Administrator`」「サブスクリプションで `Microsoft.Resources/deployments/*` がない（RG の `Contributor` だけ）→ サブスクリプションスコープの `roles` デプロイが開始できない」「アプリ作成不可 → `Application Administrator`」．
+- 不足を表にする．初回だけ要る特権（ロール定義の作成と条件付き委任の設定）と，毎回のデプロイに要る常設の権限を分けて示す．例: 「`roleDefinitions/write` がない → 初回の `roles.bicep` に PIM の `User Access Administrator`」「サブスクリプションで `Microsoft.Resources/deployments/*` がない（RG の `Contributor` だけ）→ `roles.bicep` のサブスクリプションスコープのデプロイが開始できない」「条件付きの `Role Based Access Control Administrator` がない → `main.bicep` のロール割り当てが拒否される」「アプリ作成不可 → `Application Administrator`」．
 
 人が確認すること: PIM の有効化は **人がポータルで** 行う．AI には「有効化した」と伝える．
 
@@ -152,7 +152,10 @@ AI がすること: 秘密鍵を環境変数に読み込み，`az deployment gro
 
 ### フェーズ 7: デプロイ
 
-AI がすること: デプロイコマンドを用意する．人が実行し，出力を返す．
+AI がすること: デプロイコマンドを用意する．人が実行し，出力を返す．初回は
+`roles.bicep`（サブスクリプションスコープ）と条件付き委任の設定を先に行う
+（[walkthrough の手順 8-1，8-2](walkthrough.md#8-デプロイ)）．再デプロイでは
+`main.bicep` だけを実行し，PIM の有効化は求めない．
 
 失敗した場合は，AI に **切り分けを計画させる**．手を動かす前に，仮説と検証手順，
 それぞれの結果が何を意味するかを示させる．今回の例を示す:
@@ -251,7 +254,8 @@ AI がすること:
 ## チェックリスト
 
 - [ ] パラメタシートを渡し，命名を確定した
-- [ ] 必要な権限（Azure と Entra）を確認し，PIM を有効化した
+- [ ] 必要な権限（Azure と Entra）を確認し，初回だけ要る特権を PIM で有効化した
+- [ ] 初回: `roles.bicep` をデプロイし，デプロイする者に条件付きの委任を与えた
 - [ ] 鍵と組織固有のファイルがリポジトリの外，またはコミット対象外にある
 - [ ] アプリ登録のスクリプトを読んでから実行した
 - [ ] what-if で既存の本番リソースへの影響を確認した
