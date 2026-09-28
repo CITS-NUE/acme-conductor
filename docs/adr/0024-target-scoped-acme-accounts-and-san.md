@@ -137,15 +137,15 @@ UPKI のアカウント 1 つにつき binding 1 つ・ポリシー 1 つ・targ
 静的に並べ，申請する名前は利用管理者 FQDN 1 つだけ（SAN なし）にする．
 EAB を投入したら手動で run を起こす．
 
-## 実装の分割（別 issue 案）
+## 実装の分割
 
-1. SAN 対応（コントラクト `additionalNames`，JSON Schema，`target_names`，
+1. #56 SAN 対応（コントラクト `additionalNames`，JSON Schema，`target_names`，
    ポリシー `maxSANs`，Runner の認可・`lego` 引数・noop 判定，GUI，移行）．
-2. target スコープのアカウント（`accountScope`，`acme_accounts.scope`，
+2. #57 target スコープのアカウント（`accountScope`，`acme_accounts.scope`，
    `ACMEAccountRef.scope`，provisioning v2 AAD，Runner の状態パス，GUI）．
-3. EAB 投入時の即時 run．
-4. Azure の複数 DNS ゾーン（`dnsZoneNames`）．1 と並行可．
-5. UPKI を例にした運用ドキュメント（申請内容と target の対応，設定例）．
+3. #59 EAB 投入時の即時 run．
+4. #58 Azure の複数 DNS ゾーン（`dnsZoneNames`）．1 と並行可．
+5. #60 UPKI を例にした運用ドキュメント（申請内容と target の対応，設定例）．
 
 1 と 2 は独立しており，どちらからでも着手できる．
 
