@@ -173,12 +173,21 @@ UPKI の申請が部局ごとに違うサフィックスを持つなら，ポリ
 
 ### Azure へのデプロイ
 
-`deploy/azure` のテンプレートはまだ `targetScopedBindings` を Conductor の設定に
-渡さない（パラメータがない）．Azure で target ごとのアカウントを使うには，
-テンプレートの対応を待つか，それまでは
-[binding 全体のアカウントで運用する](#binding-全体のアカウントで運用する場合)．
-Runner の設定（`maxNames`，UPKI の binding）は `runnerConfigJson` パラメータに
-そのまま書ける．
+`deploy/azure` のテンプレートでは，Conductor の `accountProvisioning` を
+パラメータで渡す．
+
+```bicep
+param accountProvisioningPublicKey = '<provisioning-keygen の publicKey>'
+param accountProvisioningPrivateKeyPem = readEnvironmentVariable('ACME_ACCOUNT_PROVISIONING_PRIVATE_KEY_PEM', '')
+param accountProvisioningBindings = ['upki']
+param accountProvisioningTargetScopedBindings = ['upki']
+```
+
+`accountProvisioningTargetScopedBindings` が Conductor の設定の
+`accountProvisioning.targetScopedBindings` になる（`accountProvisioningBindings` の
+いずれかでなければデプロイが失敗する）．Runner の設定（`maxNames`，UPKI の
+binding）は `runnerConfigJson` パラメータにそのまま書ける
+（[`deploy/azure/README.md`](../deploy/azure/README.md)）．
 
 名前が複数の DNS ゾーンにまたがるときは，各名前の `_acme-challenge` を
 チャレンジ用ゾーンへ CNAME で委任する
@@ -197,7 +206,9 @@ Runner の設定（`maxNames`，UPKI の binding）は `runnerConfigJson` パラ
    dNSName を並べ，`policyRef` に UPKI のポリシーを指定する．
    作った直後にスケジューラが最初の run を起こすが，まだアカウントがないので，
    Runner を起動せずに上の要約の `AcmeFailure` で失敗する．これは想定通りで
-   ある．
+   ある．この失敗を残したくなければ，target を無効（「Enabled」を外す）で作り，
+   次の手順で EAB を投入してから有効にする．有効にした時点で run が起き，
+   保存された EAB を運ぶ．
 4. target の詳細ページの「ACME account」の節から EAB を投入する（Key ID と
    HMAC Key を入力する．ブラウザの中で Runner の公開鍵に封じられ，暗号文だけが
    Conductor に送られる）．投入と同時に，その target の run が 1 つ起こる．
@@ -235,8 +246,10 @@ EAB より後のものなので，名前を編集した後の run はバック�
 待たずに進めるには `POST /targets/{id}/runs`（GUI の run の要求）を使う．
 
 Conductor は target の編集と EAB の投入を 1 つの操作に結び付けない
-（ADR 0024）．どちらの順序でも最後は収束するが，上の順序なら余分な失敗が
-残らない．
+（ADR 0024）．どちらの順序でも最後は収束するが，上の順序なら失敗は手順 2 の
+1 回だけで済み，バックオフも待たない．その 1 回も残したくなければ，手順 2 の
+前に target を無効にし，名前を編集して EAB を投入してから有効にする．有効に
+した時点で run が起き，保存された EAB を運ぶ．
 
 ### CN（利用管理者 FQDN）を変える
 
@@ -278,9 +291,9 @@ info ログにも残らない．理由を run から読めるようにするの�
 
 ## binding 全体のアカウントで運用する場合
 
-`targetScopedBindings` を使えない（Azure のテンプレートがまだ対応していない
-など）ときは，UPKI のアカウント 1 つにつき **binding 1 つ・ポリシー 1 つ・
-target 1 つ** を静的に並べる（ADR 0024 の暫定運用）．
+`targetScopedBindings` を使えない（`acme.account.scope` を知らない古い Runner を
+使い続けるなど）ときは，UPKI のアカウント 1 つにつき **binding 1 つ・
+ポリシー 1 つ・target 1 つ** を静的に並べる（ADR 0024 の暫定運用）．
 
 - Runner の `acmeBindings` に `upki-<名前>` のような binding を申請ごとに
   定義する（directory URL と email は同じでよい）．`authorization.allowedAcmeBindings`
