@@ -369,7 +369,8 @@ target 自身のアカウントだけを使う．target に活性なアカウン
 要求もなければ，run は Runner を起動せずに `AcmeFailure` で失敗する
 （binding 全体のアカウントを代わりに使うことはない）．アカウントを増やす
 のに設定変更も再デプロイも要らない．どの名前をどのアカウントで発行できるかは
-Conductor では検査せず，CA の拒否（`AcmeFailure`）に任せる．
+Conductor では検査せず，CA の拒否（`AcmeFailure`）に任せる．UPKI を例にした
+運用手順と設定例は [`docs/account-scoped-ca.md`](account-scoped-ca.md) を参照．
 
 ## REST API
 
