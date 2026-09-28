@@ -10,8 +10,8 @@
 //     executions of the Runner Job and nothing else — never start one,
 //     since the start operation's execution template could replace the
 //     Runner's image (docs/adr/0014); the Runner's may write TXT records
-//     in one DNS zone and import certificates into one Key Vault, and
-//     nothing else;
+//     in the challenge DNS zone (and in any additionalDnsZones) and
+//     import certificates into one Key Vault, and nothing else;
 //   - the Runner as a scheduled Container Apps Job whose executions take
 //     the jobs the Conductor offers on the exchange share;
 //   - the Conductor as a single-replica Container App behind the
@@ -95,6 +95,17 @@ param dnsZoneName string
 
 @description('Resource group of the DNS zone. The zone must be in this subscription (the custom roles are assignable in this subscription only).')
 param dnsZoneResourceGroup string
+
+@description('A DNS zone the Runner writes challenge TXT records in directly.')
+type dnsZone = {
+  @description('Name of the existing DNS zone.')
+  name: string
+  @description('Its resource group, in this subscription.')
+  resourceGroup: string
+}
+
+@description('More DNS zones the Runner writes challenge TXT records in directly, besides dnsZoneName: only for certificates whose names (SAN) span zones whose _acme-challenge names are not CNAME-delegated to dnsZoneName (README, "複数の DNS ゾーン"). Empty, the default, when every name is delegated. Do not repeat dnsZoneName here.')
+param additionalDnsZones dnsZone[] = []
 
 @description('Name of the Key Vault the Runner stores certificates in (RBAC permission model).')
 param keyVaultName string
@@ -782,6 +793,21 @@ module runnerDns 'modules/dns-role-assignment.bicep' = {
     roleDefinitionId: runnerDnsTxtWriterRoleId
   }
 }
+
+// Runner identity -> TXT records in each additional zone it writes in
+// directly. Separate from runnerDns so that adding zones never changes the
+// deployment (or the assignment) of the challenge zone.
+module runnerDnsAdditional 'modules/dns-role-assignment.bicep' = [
+  for (zone, i) in additionalDnsZones: {
+    name: '${deployment().name}-dns-${i}'
+    scope: resourceGroup(zone.resourceGroup)
+    params: {
+      dnsZoneName: zone.name
+      runnerPrincipalId: runnerIdentity.properties.principalId
+      roleDefinitionId: runnerDnsTxtWriterRoleId
+    }
+  }
+]
 
 // Runner identity -> import certificates into the vault.
 module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {

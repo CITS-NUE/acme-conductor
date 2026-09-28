@@ -284,6 +284,8 @@ param dnsBindings = ['azure-dns-<zone>']
 param storeBindings = ['keyvault-staging']
 param dnsZoneName = '<challenge zone>'
 param dnsZoneResourceGroup = '<zone rg>'
+// 委任せずに直接 TXT を書くゾーンがあるときだけ（README の「複数の DNS ゾーン」）
+// param additionalDnsZones = [ { name: '<zone>', resourceGroup: '<zone rg>' } ]
 param keyVaultName = 'kv-acme-stg-<org>'
 param keyVaultResourceGroup = 'rg-acme-staging'
 param jobSigningPublicKey = '<job-signing.pub.b64>'

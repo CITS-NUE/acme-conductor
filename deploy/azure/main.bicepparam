@@ -37,6 +37,11 @@ param storeBindings = ['keyvault-staging']
 
 param dnsZoneName = 'example.ac.jp'
 param dnsZoneResourceGroup = 'rg-dns-example'
+// Only for zones the Runner writes in directly instead of through a CNAME
+// delegation to dnsZoneName (README, "複数の DNS ゾーン"):
+// param additionalDnsZones = [
+//   { name: 'example.org', resourceGroup: 'rg-dns-org' }
+// ]
 param keyVaultName = 'kv-acme-staging'
 param keyVaultResourceGroup = 'rg-acme'
 

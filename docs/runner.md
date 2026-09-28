@@ -200,7 +200,10 @@ IP リテラルであるか，ホストのラベル（`.` と `-` で分割）�
 `LEGO_DISABLE_CNAME_SUPPORT` のような `LEGO_*` 変数は持ち込めない．その多くは
 不要である．`lego` は既定で `_acme-challenge.<name>` の CNAME をたどるので，
 チャレンジを別ゾーンへ委任している場合も，`AZURE_ZONE_NAME` などで委任先の
-ゾーンを指せばそのまま動く．予約済みの名前を含む設定は読み込みの時点で拒否され，
+ゾーンを指せばそのまま動く．SAN の名前が複数のゾーンにまたがる証明書では，
+名前の 1 つ 1 つに委任が要る．委任しないゾーンに直接書く場合は
+[`deploy/azure/README.md` の「複数の DNS ゾーン」](../deploy/azure/README.md#複数の-dns-ゾーン)
+を参照．予約済みの名前を含む設定は読み込みの時点で拒否され，
 Runner はジョブを 1 つも取らずに失敗で終了し，
 `runner configuration could not be loaded; taking no job` とその理由をログに
 残す．Container Apps Job では，デプロイ自体は成功し，その後の実行が毎回
