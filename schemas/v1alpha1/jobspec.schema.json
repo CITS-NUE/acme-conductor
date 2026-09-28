@@ -145,6 +145,10 @@
       "additionalProperties": false,
       "required": ["generation"],
       "properties": {
+        "scope": {
+          "$ref": "#/$defs/identifier",
+          "description": "The target id the account belongs to, for a binding that keeps one account per target (docs/adr/0024). Absent: the account is the whole binding's. Go validation additionally requires it to equal target.id and requires provisioning.version to be x25519-hkdf-sha256-a256gcm/v2 when present and /v1 when absent; the schema cannot express those cross-field rules."
+        },
         "generation": {
           "type": "integer",
           "minimum": 1,
@@ -164,7 +168,8 @@
       "description": "An EAB (kid + hmac) sealed to a Runner provisioning key. Opaque to everything but the Runner holding the matching private key; the exact scheme is Go-only (pkg/api/v1alpha1/provisioning.go) and not expressible in JSON Schema.",
       "properties": {
         "version": {
-          "const": "x25519-hkdf-sha256-a256gcm/v1"
+          "enum": ["x25519-hkdf-sha256-a256gcm/v1", "x25519-hkdf-sha256-a256gcm/v2"],
+          "description": "v1 seals an account scoped to a whole binding, v2 one scoped to a target (its AAD adds the scope)."
         },
         "keyId": {
           "type": "string",

@@ -59,18 +59,19 @@ globalThis.window = globalThis;
 const src = readFileSync(process.argv[2], 'utf8');
 (0, eval)(src);
 const keyInfo = JSON.parse(process.argv[3]);
-const [binding, generationStr, kid, hmac] = process.argv.slice(4);
+const [binding, generationStr, kid, hmac, scope] = process.argv.slice(4);
 const generation = Number(generationStr);
-const payload = await window.acmeConductorSealEAB(keyInfo, binding, generation, kid, hmac);
+const payload = await window.acmeConductorSealEAB(keyInfo, binding, generation, kid, hmac, scope);
 process.stdout.write(JSON.stringify(payload));
 `
 	if err := os.WriteFile(driver, []byte(driverSrc), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	keyInfo := map[string]string{
-		"version":   ProvisioningVersion,
-		"keyId":     keyID,
-		"publicKey": base64.RawURLEncoding.EncodeToString(pub.Bytes()),
+		"version":       ProvisioningVersion,
+		"scopedVersion": ProvisioningVersionScoped,
+		"keyId":         keyID,
+		"publicKey":     base64.RawURLEncoding.EncodeToString(pub.Bytes()),
 	}
 	keyInfoJSON, err := json.Marshal(keyInfo)
 	if err != nil {
@@ -113,5 +114,31 @@ process.stdout.write(JSON.stringify(payload));
 	}
 	if _, err := sealed.Open(keys, binding, generation+1); err == nil {
 		t.Fatal("opened with the wrong generation")
+	}
+
+	// The same for an account scoped to one target (v2): the browser's
+	// AAD carries the scope line exactly where Go expects it.
+	const target = "01JTARGET0000000000000000A"
+	cmd = exec.Command(nodePath, driver, provisionJS, string(keyInfoJSON), binding, "7", kid, hmac, target)
+	stdout.Reset()
+	stderr.Reset()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("node driver failed (scoped): %v\nstderr: %s", err, stderr.String())
+	}
+	var scoped SealedProvisioning
+	if err := json.Unmarshal(stdout.Bytes(), &scoped); err != nil {
+		t.Fatalf("parse node output %q: %v", stdout.String(), err)
+	}
+	if scoped.Version != ProvisioningVersionScoped {
+		t.Fatalf("scoped version = %q", scoped.Version)
+	}
+	got, err = scoped.OpenScoped(keys, binding, target, generation)
+	if err != nil || got.KID != kid || got.HMAC != hmac {
+		t.Fatalf("Go could not open the browser-sealed scoped payload: %+v, %v", got, err)
+	}
+	if _, err := scoped.OpenScoped(keys, binding, "01JTARGET0000000000000000B", generation); err == nil {
+		t.Fatal("opened with the wrong scope")
 	}
 }

@@ -20,6 +20,8 @@ package v1alpha1
 //  5. key            := HKDF-SHA256(secret=shared, salt, info, 32)  (AES-256 key)
 //  6. nonce          := 12 random bytes
 //  7. aad            := ProvisioningAAD(version, keyId, binding, generation)
+//                       (v2, an account scoped to one target:
+//                       ProvisioningScopedAAD(version, keyId, binding, scope, generation))
 //  8. plaintext      := JSON {"kid":"<kid>","hmac":"<hmac>"}, exactly those two fields
 //  9. ciphertext     := AES-256-GCM Seal(key, nonce, plaintext, aad)
 //
@@ -57,9 +59,21 @@ import (
 )
 
 // ProvisioningVersion identifies the sealing scheme implemented by this
-// file. It is carried in SealedProvisioning.Version and bound into the AAD
-// so that a future scheme change can never be mistaken for this one.
+// file for an account scoped to a whole binding. It is carried in
+// SealedProvisioning.Version and bound into the AAD so that a future
+// scheme change can never be mistaken for this one.
 const ProvisioningVersion = "x25519-hkdf-sha256-a256gcm/v1"
+
+// ProvisioningVersionScoped is the same scheme for an account scoped to
+// one target of a binding (docs/adr/0024): the key derivation and the
+// cipher are exactly those of ProvisioningVersion, and the AAD gains a
+// "scope=<scope>" line (ProvisioningScopedAAD), so that an EAB sealed for
+// one target can never register another target's account. A v1 payload is
+// only ever opened unscoped and a v2 payload only ever scoped.
+const ProvisioningVersionScoped = "x25519-hkdf-sha256-a256gcm/v2"
+
+// ProvisioningVersions lists the accepted SealedProvisioning.Version values.
+var ProvisioningVersions = []string{ProvisioningVersion, ProvisioningVersionScoped}
 
 // provisioningInfo is the fixed HKDF info string. It names the exact
 // purpose (never reused for anything else) and the contract version.
@@ -159,10 +173,45 @@ func ProvisioningAAD(version, keyID, binding string, generation int64) []byte {
 	))
 }
 
+// ProvisioningScopedAAD is ProvisioningAAD for ProvisioningVersionScoped:
+// the same lines with "scope=<scope>" between binding and generation.
+func ProvisioningScopedAAD(version, keyID, binding, scope string, generation int64) []byte {
+	return []byte(fmt.Sprintf(
+		"acme-conductor.cits-nue.github.io/v1alpha1\naccount-provisioning\nversion=%s\nkeyId=%s\nbinding=%s\nscope=%s\ngeneration=%d",
+		version, keyID, binding, scope, generation,
+	))
+}
+
+// provisioningVersionFor is the scheme version for an account scope: v1
+// for a whole binding (scope ""), v2 for one target.
+func provisioningVersionFor(scope string) string {
+	if scope == "" {
+		return ProvisioningVersion
+	}
+	return ProvisioningVersionScoped
+}
+
+// provisioningAADFor builds the AAD of version; version must be
+// provisioningVersionFor(scope).
+func provisioningAADFor(version, keyID, binding, scope string, generation int64) []byte {
+	if version == ProvisioningVersionScoped {
+		return ProvisioningScopedAAD(version, keyID, binding, scope, generation)
+	}
+	return ProvisioningAAD(version, keyID, binding, generation)
+}
+
 // SealProvisioning seals eab to runnerPub, scoped to binding and
 // generation. Each call uses a fresh ephemeral key and nonce, so sealing
 // the same EAB twice never produces the same ciphertext.
 func SealProvisioning(runnerPub *ecdh.PublicKey, binding string, generation int64, eab ProvisioningEAB) (*SealedProvisioning, error) {
+	return SealScopedProvisioning(runnerPub, binding, "", generation, eab)
+}
+
+// SealScopedProvisioning seals eab to runnerPub, scoped to binding, scope
+// and generation. An empty scope is SealProvisioning (ProvisioningVersion);
+// a non-empty one, a target identifier, seals with
+// ProvisioningVersionScoped.
+func SealScopedProvisioning(runnerPub *ecdh.PublicKey, binding, scope string, generation int64, eab ProvisioningEAB) (*SealedProvisioning, error) {
 	if runnerPub == nil || runnerPub.Curve() != ecdh.X25519() {
 		return nil, errors.New("provisioning: runner public key must be X25519")
 	}
@@ -174,15 +223,15 @@ func SealProvisioning(runnerPub *ecdh.PublicKey, binding string, generation int6
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
 		return nil, fmt.Errorf("provisioning: generate nonce: %w", err)
 	}
-	return sealProvisioningWith(runnerPub, binding, generation, eab, eph, nonce[:])
+	return sealScopedProvisioningWith(runnerPub, binding, scope, generation, eab, eph, nonce[:])
 }
 
-// sealProvisioningWith is SealProvisioning with the ephemeral key and nonce
-// supplied by the caller instead of generated randomly. It exists so tests
-// (and the pinned cross-implementation vector in
-// testdata/provisioning/vector.json) can reproduce one exact ciphertext;
-// production code must always go through SealProvisioning.
-func sealProvisioningWith(runnerPub *ecdh.PublicKey, binding string, generation int64, eab ProvisioningEAB, eph *ecdh.PrivateKey, nonce []byte) (*SealedProvisioning, error) {
+// sealScopedProvisioningWith is SealScopedProvisioning with the ephemeral
+// key and nonce supplied by the caller instead of generated randomly. It
+// exists so tests (and the pinned cross-implementation vectors in
+// testdata/provisioning/) can reproduce one exact ciphertext; production
+// code must always go through SealProvisioning or SealScopedProvisioning.
+func sealScopedProvisioningWith(runnerPub *ecdh.PublicKey, binding, scope string, generation int64, eab ProvisioningEAB, eph *ecdh.PrivateKey, nonce []byte) (*SealedProvisioning, error) {
 	if err := validateProvisioningEAB(eab); err != nil {
 		return nil, fmt.Errorf("provisioning: %w", err)
 	}
@@ -190,15 +239,19 @@ func sealProvisioningWith(runnerPub *ecdh.PublicKey, binding string, generation 
 	if err != nil {
 		return nil, fmt.Errorf("provisioning: marshal plaintext: %w", err)
 	}
-	return sealProvisioningRawWith(runnerPub, binding, generation, plaintext, eph, nonce)
+	return sealScopedProvisioningRawWith(runnerPub, binding, scope, generation, plaintext, eph, nonce)
 }
 
-// sealProvisioningRawWith is sealProvisioningWith without the EAB shape
+// sealProvisioningRawWith is sealScopedProvisioningWith, unscoped, without the EAB shape
 // check and JSON marshaling: it seals whatever plaintext bytes it is
 // given. Tests use it to produce payloads whose plaintext Open must
 // reject (wrong shape, extra fields, out-of-range values) — something
 // SealProvisioning can never be asked to produce.
 func sealProvisioningRawWith(runnerPub *ecdh.PublicKey, binding string, generation int64, plaintext []byte, eph *ecdh.PrivateKey, nonce []byte) (*SealedProvisioning, error) {
+	return sealScopedProvisioningRawWith(runnerPub, binding, "", generation, plaintext, eph, nonce)
+}
+
+func sealScopedProvisioningRawWith(runnerPub *ecdh.PublicKey, binding, scope string, generation int64, plaintext []byte, eph *ecdh.PrivateKey, nonce []byte) (*SealedProvisioning, error) {
 	if len(nonce) != 12 {
 		return nil, errors.New("provisioning: nonce must be 12 bytes")
 	}
@@ -208,18 +261,24 @@ func sealProvisioningRawWith(runnerPub *ecdh.PublicKey, binding string, generati
 	if generation < 1 || generation > MaxAccountGeneration {
 		return nil, fmt.Errorf("provisioning: generation must be between 1 and %d", MaxAccountGeneration)
 	}
+	if scope != "" {
+		if err := validateIdentifier("scope", scope); err != nil {
+			return nil, err
+		}
+	}
+	version := provisioningVersionFor(scope)
 	keyID := ProvisioningKeyID(runnerPub)
 	shared, err := eph.ECDH(runnerPub)
 	if err != nil {
 		return nil, fmt.Errorf("provisioning: ecdh: %w", err)
 	}
-	aead, aad, err := provisioningAEAD(shared, eph.PublicKey().Bytes(), runnerPub.Bytes(), keyID, binding, generation)
+	aead, aad, err := provisioningAEAD(shared, eph.PublicKey().Bytes(), runnerPub.Bytes(), version, keyID, binding, scope, generation)
 	if err != nil {
 		return nil, err
 	}
 	ciphertext := aead.Seal(nil, nonce, plaintext, aad)
 	return &SealedProvisioning{
-		Version:            ProvisioningVersion,
+		Version:            version,
 		KeyID:              keyID,
 		EphemeralPublicKey: base64.RawURLEncoding.EncodeToString(eph.PublicKey().Bytes()),
 		Nonce:              base64.RawURLEncoding.EncodeToString(nonce),
@@ -232,13 +291,27 @@ func sealProvisioningRawWith(runnerPub *ecdh.PublicKey, binding string, generati
 // a structurally invalid payload, a tampered field, or a mismatched
 // binding/generation/version/keyId in the AAD — returns a wrapped
 // ErrProvisioningOpen (or ErrProvisioningUnknownKey) that carries neither
-// the plaintext nor key material.
+// the plaintext nor key material. Open only ever opens a
+// ProvisioningVersion (unscoped) payload; see OpenScoped.
 func (p *SealedProvisioning) Open(keys map[string]*ecdh.PrivateKey, binding string, generation int64) (ProvisioningEAB, error) {
+	return p.OpenScoped(keys, binding, "", generation)
+}
+
+// OpenScoped is Open for an account scoped to one target: scope is the
+// target identifier the job is for, and the payload must have been sealed
+// with ProvisioningVersionScoped to exactly that scope. An empty scope is
+// Open. A payload whose version does not match the scope (a v1 payload
+// for a scoped account, or a v2 one for an unscoped account) is refused
+// before any cryptography.
+func (p *SealedProvisioning) OpenScoped(keys map[string]*ecdh.PrivateKey, binding, scope string, generation int64) (ProvisioningEAB, error) {
 	if p == nil {
 		return ProvisioningEAB{}, fmt.Errorf("%w: nil payload", ErrProvisioningOpen)
 	}
 	if err := p.validate("$"); err != nil {
 		return ProvisioningEAB{}, fmt.Errorf("%w: %v", ErrProvisioningOpen, err)
+	}
+	if want := provisioningVersionFor(scope); p.Version != want {
+		return ProvisioningEAB{}, fmt.Errorf("%w: version %s does not match the account scope (want %s)", ErrProvisioningOpen, p.Version, want)
 	}
 	priv, ok := keys[p.KeyID]
 	if !ok || priv == nil {
@@ -264,7 +337,7 @@ func (p *SealedProvisioning) Open(keys map[string]*ecdh.PrivateKey, binding stri
 	if err != nil {
 		return ProvisioningEAB{}, fmt.Errorf("%w: ecdh", ErrProvisioningOpen)
 	}
-	aead, aad, err := provisioningAEAD(shared, eph.Bytes(), priv.PublicKey().Bytes(), p.KeyID, binding, generation)
+	aead, aad, err := provisioningAEAD(shared, eph.Bytes(), priv.PublicKey().Bytes(), p.Version, p.KeyID, binding, scope, generation)
 	if err != nil {
 		return ProvisioningEAB{}, fmt.Errorf("%w: %v", ErrProvisioningOpen, err)
 	}
@@ -286,9 +359,9 @@ func (p *SealedProvisioning) Open(keys map[string]*ecdh.PrivateKey, binding stri
 // provisioningAEAD derives the AES-256-GCM AEAD and the AAD shared by
 // SealProvisioning and Open from the ECDH shared secret, the two public
 // keys in the fixed salt order (ephemeral, then Runner — see the scheme
-// comment at the top of this file), and the scope (keyId, binding,
-// generation).
-func provisioningAEAD(shared, ephPub, runnerPub []byte, keyID, binding string, generation int64) (cipher.AEAD, []byte, error) {
+// comment at the top of this file), and the scope (version, keyId,
+// binding, account scope, generation).
+func provisioningAEAD(shared, ephPub, runnerPub []byte, version, keyID, binding, scope string, generation int64) (cipher.AEAD, []byte, error) {
 	salt := append(append([]byte{}, ephPub...), runnerPub...)
 	key, err := hkdf.Key(sha256.New, shared, salt, provisioningInfo, 32)
 	if err != nil {
@@ -302,7 +375,7 @@ func provisioningAEAD(shared, ephPub, runnerPub []byte, keyID, binding string, g
 	if err != nil {
 		return nil, nil, fmt.Errorf("provisioning: gcm: %w", err)
 	}
-	aad := ProvisioningAAD(ProvisioningVersion, keyID, binding, generation)
+	aad := provisioningAADFor(version, keyID, binding, scope, generation)
 	return aead, aad, nil
 }
 

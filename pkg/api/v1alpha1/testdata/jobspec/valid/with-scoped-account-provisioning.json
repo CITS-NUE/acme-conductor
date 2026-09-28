@@ -8,7 +8,9 @@
     "revision": 3
   },
   "policy": {
-    "allowedDnsSuffixes": ["example.ac.jp"],
+    "allowedDnsSuffixes": [
+      "example.ac.jp"
+    ],
     "allowWildcard": false,
     "renewBeforeDays": 30,
     "keyType": "ec256"
@@ -16,16 +18,21 @@
   "acme": {
     "binding": "letsencrypt-staging",
     "account": {
+      "scope": "01JABCDEFGHJKMNPQRSTVWXYZ1",
       "generation": 1,
       "provisioning": {
-        "version": "x25519-hkdf-sha256-a256gcm/v3",
+        "version": "x25519-hkdf-sha256-a256gcm/v2",
         "keyId": "1a92f23852dc908d",
         "ephemeralPublicKey": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
         "nonce": "AwMDAwMDAwMDAwMD",
-        "ciphertext": "19JXJr3se_7zmhhjCyaLm2k01b7-Uy7srjEt4Simh9IcCgXD8vTjBAkHYYGvYlKs0yB7RcT3OPeRsDE3CEFXbogqQCajAAtYvg"
+        "ciphertext": "19JXJr3se_7zmhhjCyaLm2k01b7-Uy7srjEt4Simh9IcCgXD8vTjBAkHYYGvYlKs0yB7RcT3OPeRdORxrMWfottiwB9VFfRNvw"
       }
     }
   },
-  "dns": { "binding": "azure-dns-staging" },
-  "store": { "binding": "filesystem-dev" }
+  "dns": {
+    "binding": "azure-dns-staging"
+  },
+  "store": {
+    "binding": "filesystem-dev"
+  }
 }

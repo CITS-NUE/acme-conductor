@@ -22,18 +22,28 @@ import (
 // #42): stateDir/acme-accounts/<binding>/<generation>.
 const accountGenerationsDir = "acme-accounts"
 
+// accountTargetsDir holds the accounts of a binding that keeps one account
+// per target (docs/adr/0024):
+// stateDir/acme-accounts/<binding>/targets/<target>/<generation>. It is
+// not a number, so it never collides with a binding-wide generation
+// directory next to it, whatever the target identifier looks like.
+const accountTargetsDir = "targets"
+
 // accountsRoot returns the ACME account state directory to use for one
 // job: stateDir itself, unchanged, when account is nil (the legacy,
 // unversioned account state), or
 // stateDir/acme-accounts/<binding>/<generation> when it names a
-// generation. The generation path is built one component at a time and
+// generation of the binding's account, or
+// stateDir/acme-accounts/<binding>/targets/<scope>/<generation> when the
+// account is scoped to a target. The generation path is built one component at a time and
 // every component is Lstat-checked: it must already be a real directory,
 // or absent (in which case it is created 0700). A component that is a
 // symbolic link, or exists as anything other than a directory, is refused
 // rather than followed or replaced, so a pre-planted link anywhere along
 // the path can never make the Runner read or write outside stateDir.
-// binding is already validated by the contract (a DNS-label-like name)
-// and the generation is a bounded integer, so neither can inject an extra
+// binding and scope are already validated by the contract (a
+// DNS-label-like name and an identifier of letters, digits, '-' and '_')
+// and the generation is a bounded integer, so none can inject an extra
 // path component or a traversal sequence.
 func accountsRoot(stateDir, binding string, account *v1alpha1.ACMEAccountRef) (string, error) {
 	if account == nil {
@@ -42,8 +52,13 @@ func accountsRoot(stateDir, binding string, account *v1alpha1.ACMEAccountRef) (s
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return "", err
 	}
+	comps := []string{accountGenerationsDir, binding}
+	if account.Scope != "" {
+		comps = append(comps, accountTargetsDir, account.Scope)
+	}
+	comps = append(comps, strconv.FormatInt(account.Generation, 10))
 	dir := stateDir
-	for _, comp := range []string{accountGenerationsDir, binding, strconv.FormatInt(account.Generation, 10)} {
+	for _, comp := range comps {
 		next := filepath.Join(dir, comp)
 		if err := mkdirRealComponent(next); err != nil {
 			return "", err

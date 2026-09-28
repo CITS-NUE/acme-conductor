@@ -9,9 +9,12 @@
 // fields it read the kid/hmac from.
 //
 // Exposes one global: acmeConductorSealEAB(keyInfo, binding, generation,
-// kid, hmac) -> Promise<payload>, where keyInfo is
-// { publicKey (base64url, raw 32 bytes), keyId, version } as served by
-// GET /api/v1alpha1/account-provisioning/key, and payload is the exact
+// kid, hmac, scope) -> Promise<payload>, where keyInfo is
+// { publicKey (base64url, raw 32 bytes), keyId, version, scopedVersion } as
+// served by GET /api/v1alpha1/account-provisioning/key, scope is the
+// target id of an account scoped to one target (omitted or '' for an
+// account scoped to the whole binding: keyInfo.version, v1; otherwise
+// keyInfo.scopedVersion, v2, whose AAD adds a scope line), and payload is the exact
 // shape of v1alpha1.SealedProvisioning (the "encryptedCredential" body of
 // POST .../provisioning). Also exposes acmeConductorX25519Supported(), a
 // feature check the page runs before showing the provisioning form.
@@ -49,13 +52,14 @@
     return out;
   }
 
-  function provisioningAAD(version, keyId, binding, generation) {
+  function provisioningAAD(version, keyId, binding, scope, generation) {
     return utf8(
       'acme-conductor.cits-nue.github.io/v1alpha1\n' +
       'account-provisioning\n' +
       'version=' + version + '\n' +
       'keyId=' + keyId + '\n' +
       'binding=' + binding + '\n' +
+      (scope ? 'scope=' + scope + '\n' : '') +
       'generation=' + String(generation)
     );
   }
@@ -75,11 +79,17 @@
   }
 
   // acmeConductorSealEAB seals { kid, hmac } to keyInfo's Runner public
-  // key, scoped to binding and generation. See provisioning.go for the
-  // exact steps this mirrors.
-  async function acmeConductorSealEAB(keyInfo, binding, generation, kid, hmac) {
+  // key, scoped to binding, scope (a target id, or '' for the whole
+  // binding) and generation. See provisioning.go for the exact steps this
+  // mirrors.
+  async function acmeConductorSealEAB(keyInfo, binding, generation, kid, hmac, scope) {
     if (!(window.crypto && window.crypto.subtle)) {
       throw new Error('this browser has no WebCrypto support');
+    }
+    scope = scope || '';
+    const version = scope ? keyInfo.scopedVersion : keyInfo.version;
+    if (!version) {
+      throw new Error('the conductor did not name a sealing version for this account scope');
     }
     const runnerPubBytes = b64urlDecode(keyInfo.publicKey);
     if (runnerPubBytes.length !== 32) {
@@ -99,14 +109,14 @@
       ['encrypt']
     );
     const nonce = crypto.getRandomValues(new Uint8Array(12));
-    const aad = provisioningAAD(keyInfo.version, keyInfo.keyId, binding, generation);
+    const aad = provisioningAAD(version, keyInfo.keyId, binding, scope, generation);
     // The plaintext's field order (kid, then hmac) and lack of whitespace
     // must match encoding/json's Marshal of provisioningPlaintext exactly
     // (see pkg/api/v1alpha1/testdata/provisioning/vector.json).
     const plaintext = utf8('{"kid":' + JSON.stringify(kid) + ',"hmac":' + JSON.stringify(hmac) + '}');
     const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 }, aesKey, plaintext);
     return {
-      version: keyInfo.version,
+      version,
       keyId: keyInfo.keyId,
       ephemeralPublicKey: b64urlEncode(ephPubBytes),
       nonce: b64urlEncode(nonce),

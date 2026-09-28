@@ -49,3 +49,9 @@ additional-name-wildcard-not-allowed.json
 # Go-only cross-field rule.
 additional-names-exceed-maxsans.json
 additional-names-without-maxsans.json
+
+# acme.account.scope must equal target.id, and the provisioning version
+# must match the scope (v2 scoped, v1 unscoped): Go-only cross-field rules.
+account-scope-other-target.json
+account-scope-with-v1-provisioning.json
+account-unscoped-with-v2-provisioning.json

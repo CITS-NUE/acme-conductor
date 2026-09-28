@@ -22,7 +22,10 @@ import (
 // ProvisioningKeyResource is the response body of
 // GET /account-provisioning/key.
 type ProvisioningKeyResource struct {
-	Version string `json:"version"`
+	// Version seals an account scoped to a whole binding; ScopedVersion
+	// one scoped to a target (docs/adr/0024).
+	Version       string `json:"version"`
+	ScopedVersion string `json:"scopedVersion"`
 	KeyID   string `json:"keyId"`
 	// PublicKey is the base64url (no padding) of the raw 32-byte X25519
 	// public key: the exact form ParseProvisioningPublicKey accepts back
@@ -36,7 +39,8 @@ func (s *Server) handleProvisioningKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ProvisioningKeyResource{
-		Version:   v1alpha1.ProvisioningVersion,
+		Version:       v1alpha1.ProvisioningVersion,
+		ScopedVersion: v1alpha1.ProvisioningVersionScoped,
 		KeyID:     v1alpha1.ProvisioningKeyID(s.provisioning),
 		PublicKey: base64.RawURLEncoding.EncodeToString(s.provisioning.Bytes()),
 	})

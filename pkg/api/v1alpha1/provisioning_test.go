@@ -118,9 +118,65 @@ func TestProvisioningWrongKeyIDVersionFails(t *testing.T) {
 	}
 
 	byVersion := *sealed
-	byVersion.Version = "x25519-hkdf-sha256-a256gcm/v2"
+	byVersion.Version = "x25519-hkdf-sha256-a256gcm/v3"
 	if err := byVersion.Validate(); err == nil {
 		t.Fatal("Validate must reject an unknown version")
+	}
+	// Relabelling a v1 payload as v2 is caught by the AAD, which binds
+	// the version: it opens neither scoped nor unscoped.
+	relabelled := *sealed
+	relabelled.Version = ProvisioningVersionScoped
+	if _, err := relabelled.OpenScoped(keys, "letsencrypt-staging", "01JTARGET0000000000000000A", 1); !errors.Is(err, ErrProvisioningOpen) {
+		t.Fatalf("relabelled v1 opened scoped: %v", err)
+	}
+	if _, err := relabelled.Open(keys, "letsencrypt-staging", 1); !errors.Is(err, ErrProvisioningOpen) {
+		t.Fatalf("relabelled v1 opened unscoped: %v", err)
+	}
+}
+
+func TestProvisioningScoped(t *testing.T) {
+	_, pub, keys := testProvisioningKeys(t)
+	eab := ProvisioningEAB{KID: "kid-123", HMAC: "aGVsbG8td29ybGQ"}
+	const target = "01JTARGET0000000000000000A"
+	sealed, err := SealScopedProvisioning(pub, "upki", target, 2, eab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.Version != ProvisioningVersionScoped {
+		t.Fatalf("version = %q", sealed.Version)
+	}
+	got, err := sealed.OpenScoped(keys, "upki", target, 2)
+	if err != nil || got.KID != eab.KID || got.HMAC != eab.HMAC {
+		t.Fatalf("OpenScoped = %+v, %v", got, err)
+	}
+	for _, c := range []struct {
+		name    string
+		binding string
+		scope   string
+		gen     int64
+	}{
+		{"another target", "upki", "01JTARGET0000000000000000B", 2},
+		{"unscoped", "upki", "", 2},
+		{"another binding", "other", target, 2},
+		{"another generation", "upki", target, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := sealed.OpenScoped(keys, c.binding, c.scope, c.gen); !errors.Is(err, ErrProvisioningOpen) {
+				t.Fatalf("err = %v, want ErrProvisioningOpen", err)
+			}
+		})
+	}
+	// A v1 (binding-scoped) payload never opens for a target-scoped
+	// account.
+	v1, err := SealProvisioning(pub, "upki", 2, eab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v1.OpenScoped(keys, "upki", target, 2); !errors.Is(err, ErrProvisioningOpen) {
+		t.Fatalf("v1 payload opened scoped: %v", err)
+	}
+	if _, err := SealScopedProvisioning(pub, "upki", "../x", 2, eab); err == nil {
+		t.Fatal("sealed to a scope that is not an identifier")
 	}
 }
 
@@ -330,6 +386,7 @@ type provisioningVector struct {
 	EphemeralPrivateKeyHex     string `json:"ephemeralPrivateKeyHex"`
 	NonceHex                   string `json:"nonceHex"`
 	Binding                    string `json:"binding"`
+	Scope                      string `json:"scope"`
 	Generation                 int64  `json:"generation"`
 	KID                        string `json:"kid"`
 	HMAC                       string `json:"hmac"`
@@ -350,7 +407,13 @@ type provisioningVector struct {
 // this test ever needs to change, testdata/provisioning/vector.json (and
 // any JS-side copy of it) must change with it.
 func TestProvisioningVector(t *testing.T) {
-	data, err := os.ReadFile("testdata/provisioning/vector.json")
+	for _, file := range []string{"vector.json", "vector-scoped.json"} {
+		t.Run(file, func(t *testing.T) { testProvisioningVector(t, "testdata/provisioning/"+file) })
+	}
+}
+
+func testProvisioningVector(t *testing.T, path string) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +439,7 @@ func TestProvisioningVector(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sealed, err := sealProvisioningWith(runnerPriv.PublicKey(), v.Binding, v.Generation, ProvisioningEAB{KID: v.KID, HMAC: v.HMAC}, eph, nonce)
+	sealed, err := sealScopedProvisioningWith(runnerPriv.PublicKey(), v.Binding, v.Scope, v.Generation, ProvisioningEAB{KID: v.KID, HMAC: v.HMAC}, eph, nonce)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +455,7 @@ func TestProvisioningVector(t *testing.T) {
 	// The pinned payload opens back to the exact plaintext, both through
 	// the public API and byte for byte against the recorded plaintext.
 	keys := map[string]*ecdh.PrivateKey{sealed.KeyID: runnerPriv}
-	got, err := sealed.Open(keys, v.Binding, v.Generation)
+	got, err := sealed.OpenScoped(keys, v.Binding, v.Scope, v.Generation)
 	if err != nil {
 		t.Fatal(err)
 	}
