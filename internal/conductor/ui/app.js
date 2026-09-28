@@ -361,6 +361,7 @@
         ['Certificate', cert ? el('span', null, 'expires ' + when(cert.expiresAt) + ', stored as ', el('span', { class: 'mono', text: cert.storeObjectRef }), ', fingerprint ', el('span', { class: 'mono', text: cert.fingerprintSha256 })) : 'none recorded'],
         ['Last successful run', cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
       ]),
+      (await targetAccountSection(t)) || '',
       el('h2', { text: 'Edit' }),
       await targetForm(t),
       el('h2', { text: 'Runs' }),
@@ -674,11 +675,24 @@
     }
   }
 
-  function nextGeneration(b) {
-    return b.generations.length ? b.generations[0].generation + 1 : 1;
+  function nextGeneration(acct) {
+    return acct.generations.length ? acct.generations[0].generation + 1 : 1;
   }
 
-  function provisioningForm(keyInfo, b, onDone) {
+  // An account is { binding, scope, path, activeGeneration, pending,
+  // generations }: scope is '' and path '/acme-bindings/<b>' for a
+  // binding's own account, or the target id and
+  // '/acme-bindings/<b>/targets/<id>' for a target's account on a binding
+  // that keeps one account per target (sealed with the scoped version).
+  function bindingAccount(b) {
+    return { binding: b.name, scope: '', path: '/acme-bindings/' + encodeURIComponent(b.name), activeGeneration: b.activeGeneration, pending: b.pending, generations: b.generations };
+  }
+
+  function targetAccount(binding, a) {
+    return { binding, scope: a.targetId, path: '/acme-bindings/' + encodeURIComponent(binding) + '/targets/' + encodeURIComponent(a.targetId), activeGeneration: a.activeGeneration, pending: a.pending, generations: a.generations };
+  }
+
+  function provisioningForm(keyInfo, acct, onDone) {
     const kid = input('text', '', { autocomplete: 'off' });
     const hmac = input('password', '', { autocomplete: 'off' });
     const status = el('div');
@@ -690,10 +704,10 @@
         clear(status);
         const k = kid.value, h = hmac.value;
         try {
-          const generation = nextGeneration(b);
-          const encryptedCredential = await acmeConductorSealEAB(keyInfo, b.name, generation, k, h);
+          const generation = nextGeneration(acct);
+          const encryptedCredential = await acmeConductorSealEAB(keyInfo, acct.binding, generation, k, h, acct.scope);
           clearInputs();
-          await api('POST', '/acme-bindings/' + encodeURIComponent(b.name) + '/provisioning', { accountGeneration: generation, encryptedCredential });
+          await api('POST', acct.path + '/provisioning', { accountGeneration: generation, encryptedCredential });
           onDone();
         } catch (err) {
           clearInputs();
@@ -702,45 +716,74 @@
       },
     },
     status,
-    el('p', { class: 'hint', text: 'Sealed in this browser to Runner key ' + keyInfo.keyId + ' before it is sent; the Conductor never sees the key id or HMAC.' }),
+    el('p', { class: 'hint', text: 'Sealed in this browser to Runner key ' + keyInfo.keyId + (acct.scope ? ' for this target only' : '') + ' before it is sent; the Conductor never sees the key id or HMAC.' }),
     field('EAB key id (kid)', kid),
     field('EAB HMAC key', hmac, 'Never displayed once submitted.'),
-    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, 'Provision / replace EAB (generation ' + nextGeneration(b) + ')')),
+    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, 'Provision / replace EAB (generation ' + nextGeneration(acct) + ')')),
     );
   }
 
-  function acmeBindingPanel(keyInfo, b, x25519Ok, refresh) {
+  // accountDetails lists an account's generations, with the cancel button
+  // for an unattached pending one.
+  function accountDetails(acct, refresh) {
     const parts = [
-      el('h2', { text: b.name }),
       props([
-        ['Active generation', b.activeGeneration || '—'],
-        ['Pending', b.pending ? b.pending.generation + ' (' + b.pending.status + (b.pending.runId ? ', attached to run ' + b.pending.runId : '') + ')' : '—'],
+        ['Active generation', acct.activeGeneration || '—'],
+        ['Pending', acct.pending ? acct.pending.generation + ' (' + acct.pending.status + (acct.pending.runId ? ', attached to run ' + acct.pending.runId : '') + ')' : '—'],
       ]),
       table(['Generation', 'Status', 'Key id', 'Requested by', 'Created', 'Activated'],
-        b.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), g.requestedBy, when(g.createdAt), when(g.activatedAt)])),
+        acct.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), g.requestedBy, when(g.createdAt), when(g.activatedAt)])),
     ];
-    if (b.pending && !b.pending.runId) {
+    if (acct.pending && !acct.pending.runId) {
       parts.push(el('div', { class: 'actions' }, el('button', {
         class: 'danger',
         onclick: async () => {
           try {
-            await api('DELETE', '/acme-bindings/' + encodeURIComponent(b.name) + '/provisioning/' + encodeURIComponent(b.pending.generation));
+            await api('DELETE', acct.path + '/provisioning/' + encodeURIComponent(acct.pending.generation));
             refresh();
           } catch (err) {
             parts.push(notice('error', describe(err)));
           }
         },
-      }, 'Cancel pending provisioning (generation ' + b.pending.generation + ')')));
+      }, 'Cancel pending provisioning (generation ' + acct.pending.generation + ')')));
     }
-    if (!b.externalAccountBinding) {
-      parts.push(el('p', { class: 'hint', text: 'This binding is no longer listed in accountProvisioning.bindings: the pending generation is never sent to the Runner. Cancel it.' }));
-    } else if (b.pending) {
-      parts.push(el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' }));
-    } else if (!x25519Ok) {
-      parts.push(notice('error', 'This browser has no WebCrypto X25519 support; account provisioning needs a browser that does.'));
-    } else {
-      parts.push(el('h3', { text: 'Provision / replace EAB' }), provisioningForm(keyInfo, b, refresh));
+    return parts;
+  }
+
+  // accountForm is the provisioning form for acct, or why there is none.
+  function accountForm(keyInfo, acct, eabRequired, x25519Ok, refresh) {
+    if (!eabRequired) {
+      return [el('p', { class: 'hint', text: 'This binding is no longer listed in accountProvisioning.bindings: the pending generation is never sent to the Runner. Cancel it.' })];
     }
+    if (acct.pending) {
+      return [el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' })];
+    }
+    if (!x25519Ok) {
+      return [notice('error', 'This browser has no WebCrypto X25519 support; account provisioning needs a browser that does.')];
+    }
+    return [el('h3', { text: 'Provision / replace EAB' }), provisioningForm(keyInfo, acct, refresh)];
+  }
+
+  function acmeBindingPanel(keyInfo, b, targets, x25519Ok, refresh) {
+    const parts = [el('h2', { text: b.name })];
+    if (b.targetScoped) {
+      const byId = new Map(targets.map((t) => [t.id, t]));
+      parts.push(
+        el('p', { class: 'hint', text: 'This binding keeps one ACME account per target: provision each target\'s EAB from the target\'s page.' }),
+        table(['Target', 'Active generation', 'Pending'], b.targets.map((a) => {
+          const t = byId.get(a.targetId);
+          return [link('#/targets/' + encodeURIComponent(a.targetId), t ? t.fqdn : a.targetId, 'mono'), a.activeGeneration || '—', a.pending ? String(a.pending.generation) : '—'];
+        })),
+      );
+      // A binding-wide account left from before the binding became
+      // target-scoped is still listed, to be seen and cancelled.
+      if (b.generations.length) {
+        parts.push(el('h3', { text: 'Binding-wide account (not used)' }), ...accountDetails(bindingAccount(b), refresh));
+      }
+      return el('div', { class: 'panel' }, ...parts);
+    }
+    const acct = bindingAccount(b);
+    parts.push(...accountDetails(acct, refresh), ...accountForm(keyInfo, acct, b.externalAccountBinding, x25519Ok, refresh));
     return el('div', { class: 'panel' }, ...parts);
   }
 
@@ -756,15 +799,37 @@
       show(heading, notice('error', 'Account provisioning is not configured on this Conductor.'));
       return;
     }
-    const [res, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), acmeConductorX25519Supported()]);
-    const items = res.items.filter((b) => b.externalAccountBinding || b.pending);
+    const [res, targets, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), api('GET', '/targets'), acmeConductorX25519Supported()]);
+    const items = res.items.filter((b) => b.externalAccountBinding || b.pending || b.targets.some((a) => a.pending));
     const refresh = () => withErrors(() => viewEAB());
     show(
       heading,
       el('p', { class: 'notice', text: 'EAB credentials are sealed in this browser and never displayed once submitted.' }),
       ...(items.length
-        ? items.map((b) => acmeBindingPanel(keyInfo, b, x25519Ok, refresh))
+        ? items.map((b) => acmeBindingPanel(keyInfo, b, targets.items, x25519Ok, refresh))
         : [el('p', { class: 'hint', text: 'No ACME binding is listed in accountProvisioning.bindings.' })]),
+    );
+  }
+
+  // targetAccountSection is the target page's ACME account section when
+  // the target's binding keeps one account per target; null otherwise.
+  async function targetAccountSection(t) {
+    const keyInfo = await provisioningKey();
+    if (!keyInfo) return null;
+    const policy = await api('GET', '/policies/' + encodeURIComponent(t.policyRef));
+    const b = await api('GET', '/acme-bindings/' + encodeURIComponent(policy.acmeBinding));
+    if (!b.targetScoped) return null;
+    const [a, x25519Ok] = await Promise.all([
+      api('GET', '/acme-bindings/' + encodeURIComponent(b.name) + '/targets/' + encodeURIComponent(t.id)),
+      acmeConductorX25519Supported(),
+    ]);
+    const acct = targetAccount(b.name, a);
+    const refresh = () => route();
+    return el('div', null,
+      el('h2', { text: 'ACME account (' + b.name + ')' }),
+      el('p', { class: 'hint', text: 'This binding keeps one ACME account per target. Register the EAB issued for this target\'s names; the next run registers the account.' }),
+      ...accountDetails(acct, refresh),
+      ...accountForm(keyInfo, acct, b.externalAccountBinding, x25519Ok, refresh),
     );
   }
 
