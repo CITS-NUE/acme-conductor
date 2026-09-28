@@ -46,6 +46,9 @@ ACME の External Account Binding（kid + hmac）であり，暗号文以外の�
 - すべて数字のトップレベルラベルと `xn--`（IDNA）ラベルの拒否．
 - ワイルドカード FQDN には `policy.allowWildcard` が必要であるという
   フィールド横断の規則．
+- `acme.account.scope` が `target.id` と一致すること，および
+  `acme.account.provisioning.version` が scope の有無に合うこと（scope ありなら
+  `…/v2`，なしなら `…/v1`）というフィールド横断の規則．
 - `target.additionalNames` の各エントリに対する，`target.fqdn` と同じ正規化・
   サフィックス照合・ワイルドカードの規則．エントリが `target.fqdn` と同じで
   ないこと（`uniqueItems` はエントリ同士しか比べない）．名前の数

@@ -48,10 +48,12 @@ FQDN の固定集合で持つ，最も粒度の細かい例である．
 
 ### 1. アカウントのスコープを binding ごとに選べるようにする
 
-- Conductor の設定で binding ごとに `accountScope: binding | target` を持つ．
-  既定は `binding` で，現行の挙動と既存データは一切変わらない．`target` は
-  `accountProvisioning.bindings`（EAB を投入できる binding）に列挙された
-  binding にだけ許す．
+- Conductor の設定 `accountProvisioning.targetScopedBindings` に，アカウントを
+  target ごとに持つ binding を列挙する（#57 の実装で，binding ごとの
+  `accountScope: binding | target` をこのリストの形にした）．挙げなかった
+  binding は従来どおり binding 全体で 1 つのアカウントを持ち，挙動も既存
+  データも変わらない．挙げられるのは `accountProvisioning.bindings`（EAB を
+  投入できる binding）に列挙された binding だけである．
 - `target` スコープでは，アカウントの世代を target ごとに持つ．
   `acme_accounts` に `scope`（`binding` スコープでは `''`，`target` スコープでは
   target ID）を加え，主キーを `(binding, scope, generation)`，「活性 1 つ」
@@ -63,11 +65,17 @@ FQDN の固定集合で持つ，最も粒度の細かい例である．
   （directory URL，email）だけを表す静的な設定のまま残る．
 - プロビジョニング payload はその target の run にしか添付されないので，
   問題 3 は構造的に起きない．
+- target ごとのアカウントを持つ binding の target は，自分のアカウントしか
+  使わない．活性なアカウントも未着手の要求もなければ，run は Runner を起動
+  せずに `AcmeFailure` で失敗する．binding 全体のアカウントを代わりに使うと，
+  CA がその target の名前を発行させないアカウントで発行を試みることになる
+  からである．
 - コントラクト（v1alpha1 への追加のみ．[ADR 0004](0004-versioned-jobspec-result-contract.md)）:
   `ACMEAccountRef.scope`（省略可．指定されたら `target.id` と一致しなければ
   `Validate` で拒否）．Runner の状態ディレクトリは
-  `stateDir/acme-accounts/<binding>/<scope>/<generation>`（scope なしは現行の
-  パスのまま）．
+  `stateDir/acme-accounts/<binding>/targets/<scope>/<generation>`（scope なしは
+  現行のパスのまま．`targets` は数字でないので，target の id がどんな形でも
+  binding 全体の世代のディレクトリと衝突しない）．
 - 暗号化 payload の AAD に scope を含める．`ProvisioningVersion` に
   `x25519-hkdf-sha256-a256gcm/v2` を追加し，AAD に `scope=<scope>` 行を加える
   （鍵導出と暗号方式は v1 と同じ）．v1 は binding スコープ専用として残し，
@@ -141,7 +149,7 @@ EAB を投入したら手動で run を起こす．
 
 1. #56 SAN 対応（コントラクト `additionalNames`，JSON Schema，`target_names`，
    ポリシー `maxSANs`，Runner の認可・`lego` 引数・noop 判定，GUI，移行）．
-2. #57 target スコープのアカウント（`accountScope`，`acme_accounts.scope`，
+2. #57 target スコープのアカウント（`targetScopedBindings`，`acme_accounts.scope`，
    `ACMEAccountRef.scope`，provisioning v2 AAD，Runner の状態パス，GUI）．
 3. #59 EAB 投入時の即時 run．
 4. #58 Azure の複数 DNS ゾーン（`dnsZoneNames`）．1 と並行可．
