@@ -664,8 +664,17 @@ run を起こせなかったとき（target やポリシーが無効，binding �
 ない，`migration.targetSource` が `registry` でない，すべての候補に実行中の
 run がある）も要求は記録され，レスポンスの `run.started` は `false`，
 `run.reason` にその理由が入る（候補の実行中の run があれば `run.runId` も）．
-その場合，要求は後でその binding（または target）の run が始まったときに
-運ばれる．起こした run は，要求した操作者の名前で `run.requested` として
+いずれの場合も，スケジューラは **run に添付されていない未着手の要求そのもの**を
+run を起こす理由として扱う: 対象（target ごとのアカウントならその target，
+binding 全体のアカウントなら上と同じ規則で選んだ 1 つの target）に動いている
+run がなければ，証明書の期限にもかかわらず，また要求より **前** の失敗による
+バックオフも無視して run を起こす．投入時に target の run がすでに実行中で
+（その run はもうジョブを組み立てているので）要求を運ばなかった場合も，
+Conductor を再起動した場合も，これで次の tick に収束する．要求より **後** に
+起きた失敗（Runner を起動できないランチャーなど）のバックオフは守るので，
+未着手の要求があっても tick ごとに起動を繰り返すことはない．binding 全体の
+アカウントでは，候補のどれかに待機中の run があれば，その run が開始時に
+要求を claim するので新たには起こさない．起こした run は，要求した操作者の名前で `run.requested` として
 監査され，detail に `to carry acme account provisioning binding=… generation=…`
 が入る．以後はスケジューラ主導である:
 

@@ -20,8 +20,9 @@ import (
 // request. Started is true when the request itself created the run; an
 // already active run of the chosen target is reported with Started
 // false. RunID is empty, and Reason says why, when no run could be
-// started: the request then stays pending until a run of a target of the
-// binding (or of the target) starts.
+// started. Either way the scheduler keeps starting a run for a pending
+// request no run carries (scheduler.provisioningDue), so this is the fast
+// path, not the only one.
 type ProvisioningRunResource struct {
 	Started  bool               `json:"started"`
 	RunID    string             `json:"runId,omitempty"`
@@ -149,7 +150,7 @@ func (s *Server) startProvisioningRun(r *http.Request, binding string, t *regist
 		if busy.Status == registry.RunQueued {
 			res.Reason = "a queued run of the target carries the request when it starts"
 		} else {
-			res.Reason = "a run of the target is already in flight; the target's next run carries the request"
+			res.Reason = "a run of the target is already in flight without the request; the scheduler starts another run for it once that one ends"
 		}
 		return res
 	}
