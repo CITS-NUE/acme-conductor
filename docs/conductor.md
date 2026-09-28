@@ -421,7 +421,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /api/v1alpha1/account-provisioning/key` | Runner の provisioning 公開鍵: `{"version":…,"scopedVersion":…,"keyId":…,"publicKey":…}`．`version` は binding 全体のアカウント用，`scopedVersion` は target ごとのアカウント用の封の方式．`accountProvisioning` が未設定なら `404` `not_configured`． |
 | `GET /api/v1alpha1/acme-bindings` | 設定された ACME binding ごとの世代状態の一覧: `{"items":[{"name","externalAccountBinding","targetScoped","activeGeneration","pending","generations":[…],"targets":[{"targetId","activeGeneration","pending","generations":[…]}…]}…]}`．`externalAccountBinding` は binding が `accountProvisioning.bindings` に挙がっている（CA が EAB を要求する）かどうか，`targetScoped` は `accountProvisioning.targetScopedBindings` に挙がっているかどうか．`targets` は世代が 1 つ以上ある target ごとのアカウント． |
 | `GET /api/v1alpha1/acme-bindings/{binding}` | 1 つの binding の世代状態． |
-| `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代），`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．スケジューラを起こす．binding が `accountProvisioning.bindings` に挙がっていなければ `409` `eab_not_required`． |
+| `POST /api/v1alpha1/acme-bindings/{binding}/provisioning` | 暗号化された EAB を投入 → `201` ACME アカウント（世代）に，それを運ぶ run を表す `"run": {"started","runId","targetId","status","reason"}` を加えたもの，`Location`．本文 `{"accountGeneration": N, "encryptedCredential": {...}}`．投入と同時に run を 1 つ起こす（後述）．binding が `accountProvisioning.bindings` に挙がっていなければ `409` `eab_not_required`． |
 | `DELETE /api/v1alpha1/acme-bindings/{binding}/provisioning/{generation}` | 未着手（run にまだ添付されていない）プロビジョニング要求をキャンセル → `200`． |
 | `GET /api/v1alpha1/acme-bindings/{binding}/targets/{id}` | target ごとのアカウントの世代状態: `{"targetId","activeGeneration","pending","generations":[…]}`．binding が `targetScopedBindings` に挙がっていなければ `409` `not_target_scoped`，target のポリシーの ACME binding が `{binding}` でなければ `409` `conflict`． |
 | `POST /api/v1alpha1/acme-bindings/{binding}/targets/{id}/provisioning` | その target のアカウントに暗号化された EAB を投入 → `201`，`Location`．本文は binding 全体のものと同じで，`encryptedCredential.version` は `scopedVersion`（v2）でなければならない．`409` の条件は上と同じ．binding 全体のエンドポイントは，`targetScopedBindings` の binding には `409` `target_scoped` を返す． |
@@ -649,17 +649,34 @@ provisioning ──(登録に成功した run)──> active ──(新しい世
 する．Conductor は暗号文の形（`SealedProvisioning.Validate`）と `keyId` が
 設定された鍵と一致することだけを検査し（**平文は決して見ない**），
 `accountGeneration` が binding の最大世代 + 1 であること（そうでなければ
-`409` 競合）を確認して行を `provisioning` で作り，スケジューラを起こす．
-以後は完全にスケジューラ主導である:
+`409` 競合）を確認して行を `provisioning` で作り，**同時に，その要求を運ぶ
+run を 1 つ起こす**（issue #59）．証明書の期限も，直前の失敗による再試行の
+待ち（バックオフ）も待たない．EAB に有効期限がある CA でも，次の更新期限まで
+待たされることがない．run を起こす target は:
+
+- target ごとのアカウントなら，その target．
+- binding 全体のアカウントなら，その binding を使う有効なポリシーの下の
+  有効な target のうち，最後に発行した証明書の期限がいちばん近いもの
+  （一度も発行していない target を最優先）．その target に実行中の run が
+  あれば次の候補に移る．
+
+run を起こせなかったとき（target やポリシーが無効，binding を使う target が
+ない，`migration.targetSource` が `registry` でない，すべての候補に実行中の
+run がある）も要求は記録され，レスポンスの `run.started` は `false`，
+`run.reason` にその理由が入る（候補の実行中の run があれば `run.runId` も）．
+その場合，要求は後でその binding（または target）の run が始まったときに
+運ばれる．起こした run は，要求した操作者の名前で `run.requested` として
+監査され，detail に `to carry acme account provisioning binding=… generation=…`
+が入る．以後はスケジューラ主導である:
 
 1. スケジューラは，その binding を使う **いずれかの** target（target ごとの
    アカウントなら，その target）の次の run を組み立てる際，未着手の `provisioning` 行があれば
    `ClaimACMEAccountProvisioning` でそれをアトミックにその run へ添付し
    （`JobSpec.acme.account.provisioning` に暗号文をそのまま積む），無ければ
    現在の `active` 世代（あれば）を `JobSpec.acme.account.generation` に積む．
-   **admin は「今すぐ run を要求する」（`POST /targets/{id}/runs`）ことで，
-   この添付が起こる run を早められる** ―― 次の定期スケジュールを待つ必要
-   はない．
+   投入時に起こした run がふつうはこれに当たる．起こせなかったときは，
+   admin は「今すぐ run を要求する」（`POST /targets/{id}/runs`）ことで，
+   この添付が起こる run を早められる．
 2. その run が Runner から `Result` を受け取ると，スケジューラは
    `Result.accountProvisioning` を見る: 要求した binding／scope／generation と
    一致し `status: "registered"` なら `CompleteACMEAccountProvisioning(registered=true)`
@@ -924,7 +941,7 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 唯一のグローバル関数として公開する．[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）で
 行われ，暗号化された結果だけが `POST` される．入力欄はどの経路でも（成功，
 失敗，キャンセル）送信後にクリアされ，X25519 に対応しないブラウザではその旨を
-表示するだけで失敗する．未着手の保留分には Cancel ボタンがある．
+表示するだけで失敗する．投入後は，その要求を運ぶために起こした run（起こせなかったときはその理由）をページの上部に表示する．未着手の保留分には Cancel ボタンがある．
 バイナリに埋め込まれた静的ファイル（ページ，`app.js`，`provision.js`，
 スタイルシート）で，フレームワークもビルド手順もない．表示するものはすべて
 DOM のメソッドで描画し，データからマークアップを組み立てることは決してなく，

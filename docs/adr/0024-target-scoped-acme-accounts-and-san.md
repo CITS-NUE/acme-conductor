@@ -118,7 +118,10 @@ UPKI では「UPKI の申請 1 つ = アカウント 1 つ = target 1 つ（CN �
 
 - EAB を投入（新しい世代を保留）したら，その世代を使う run を期限と無関係に
   1 つ enqueue する．`target` スコープではその target の run，`binding`
-  スコープではその binding を使う target のうち 1 つの run である．
+  スコープではその binding を使う target のうち 1 つの run である（#59 の
+  実装では，最後の証明書の期限がいちばん近い target．一度も発行していない
+  target を最優先し，実行中の run がある target は飛ばす）．run を起こせな
+  ければ，要求は記録したうえで理由を返す．
   プロビジョニング run は ADR 0022 の通り noop を飛ばして必ず `lego run` する．
 - これで EAB の投入から登録までの待ちがなくなり（問題 4），EAB が短期間で
   失効する CA（Google Trust Services など）でも使える．

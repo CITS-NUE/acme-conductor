@@ -346,8 +346,9 @@ func (s *Server) requestProvisioning(w http.ResponseWriter, r *http.Request, bin
 	}
 	s.log.Info("acme account provisioning requested", "binding", binding, "scope", scope, "generation", acct.Generation, "actor", caller.Name)
 	s.sched.Wake()
+	res := ACMEProvisioningResource{ACMEAccountResource: acmeAccountResource(acct), Run: s.startProvisioningRun(r, binding, t, acct.Generation)}
 	w.Header().Set("Location", location)
-	writeJSON(w, http.StatusCreated, acmeAccountResource(acct))
+	writeJSON(w, http.StatusCreated, res)
 }
 
 func (s *Server) handleCancelACMEProvisioning(w http.ResponseWriter, r *http.Request) {
