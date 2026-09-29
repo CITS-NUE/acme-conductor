@@ -23,13 +23,9 @@ Certificate Store（開発・テスト専用）または Azure Key Vault に格�
 `deploy/azure` には，環境・両方の ID とその最小権限ロール・API と GUI が応答する
 HTTPS ingress をプロビジョニングする Bicep がある．バージョンタグを打つと両方の
 イメージが SBOM と provenance 付きで `ghcr.io/cits-nue` に公開される．
-`acme-conductor migrate` は既存のインフラ定義からホスト一覧を読み，レジストリと
-比較して取り込む（既定は dry-run．更新も削除も決して行わない）．また
-`migration.targetSource` フラグにより，操作者が切り替えるまで Conductor は発行を
-行わず，フラグを戻せばロールバックになる．各部の実行・設定・デプロイ・移行の方法は
+各部の実行・設定・デプロイの方法は
 [`docs/conductor.md`](docs/conductor.md)，[`docs/runner.md`](docs/runner.md)，
-[`deploy/azure/README.md`](deploy/azure/README.md)，
-[`docs/migration.md`](docs/migration.md) を，各部で何が実装済みかは
+[`deploy/azure/README.md`](deploy/azure/README.md) を，各部で何が実装済みかは
 [実装済みの機能](docs/architecture.md#実装済みの機能)を参照．自動テストは本物の ACME CA や
 DNS プロバイダを決して呼ばない．`lego` / `acme-runner` の偽物（テストダブル）に対して
 実行される．
@@ -106,6 +102,8 @@ docs/                 アーキテクチャ，脅威モデル，ADR
 - [Conductor 運用ガイド](docs/conductor.md)
 - [Runner 運用ガイド](docs/runner.md)
 - [アカウントごとに発行範囲が決まる CA の運用ガイド（UPKI ACME）](docs/account-scoped-ca.md)
+- [UPKI 証明書の発行手順（登録担当者向け）](docs/upki-guide.md)
+- [発行された証明書の使い方（ケース別）](docs/certificate-usage.md)
 - [脅威モデル](docs/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)
 

@@ -16,10 +16,11 @@
     <a class="brand" href="index.html">ACME <span>Conductor</span></a>
     <nav class="nav" aria-label="ページ">
       <a href="index.html">概要</a>
+      <a href="upki-guide.html">証明書の発行手順</a>
+      <a href="certificate-usage.html">証明書の使い方</a>
       <a href="how-it-works.html">仕組み</a>
       <a href="security.html">安全設計</a>
       <a href="deploy.html">導入ガイド</a>
-      <a href="migration.html">既存環境からの移行</a>
       <a href="status.html" aria-current="page">現状と制限</a>
       <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
     </nav>
@@ -64,10 +65,6 @@
     <div class="card">
       <h3>リリースパイプライン</h3>
       <p>両イメージをダイジェスト固定のベースから SBOM と provenance 付きで GHCR に公開するリリースワークフロー．</p>
-    </div>
-    <div class="card dp">
-      <h3>cert-infra からの移行ツール</h3>
-      <p>既存の IaC 管理ホスト一覧を読み，レジストリと比較し（<code>added</code> <code>changed</code> <code>missing</code> <code>unchanged</code> <code>rejected</code> の 5 分類），冪等に取り込みます（既定は dry-run．更新も削除も決して行いません）．詳しくは<a href="migration.html">既存環境からの移行</a>を参照してください．</p>
     </div>
   </div>
   <p class="muted">出典: <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/architecture.md#実装済みの機能">docs/architecture.md「実装済みの機能」</a>．</p>
@@ -118,7 +115,6 @@
     <li><strong>ポリシー変更はバージョン管理も push もされない</strong> — 更新は各 target の次の run で適用され，run にポリシーのリビジョンはなく，各 JobSpec 内のスナップショットがあるだけです．</li>
     <li><strong>ローカルランチャーでは署名は任意</strong> — <code>jobSigning</code> なしでは生の JobSpec を渡し，end-to-end で認証するものがありません．1 ホスト上でのみ許容されます．</li>
     <li><strong>メトリクスエンドポイントはまだない</strong> — <code>/healthz</code>・<code>/readyz</code> はありますが，Prometheus の <code>/metrics</code> はありません．</li>
-    <li><strong>移行は名前だけを移す</strong> — 証明書やアカウントは移行されず，利用側の参照先の付け替えは操作者が行います．shadow 比較が比べるのは一覧であって Store 内の証明書ではありません．</li>
   </ul>
 
   <h3>Runner 側</h3>
@@ -193,7 +189,7 @@
         <tr><td>0017</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0017-release-pipeline.md">リリースパイプライン: SBOM と provenance 付きの GHCR イメージとダイジェスト固定のベース</a></td></tr>
         <tr><td>0018</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0018-authority-qualified-principals.md">監査プリンシパルは権威（issuer，localhost-dev，scheduler）で修飾する</a></td></tr>
         <tr><td>0019</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0019-provider-boundary.md">プロバイダ境界: 公開コントラクト，合成層のレジストリ，単一モジュール，deploy/azure は残す</a></td></tr>
-        <tr><td>0020</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0020-migration-from-cert-infra.md">cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ</a></td></tr>
+        <tr><td>0020</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0020-migration-from-cert-infra.md">既存環境（IaC の一覧）からの移行: 一覧の取り込み，shadow 比較，target-source フラグ（ADR 0025 で廃止）</a></td></tr>
         <tr><td>0021</td><td><a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/adr/0021-keyvault-pkcs12-content-type.md">Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする</a></td></tr>
       </tbody>
     </table>
@@ -206,7 +202,6 @@
     挙げます（詳細は<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/threat-model.md#残存リスクと未対策事項">脅威モデル「残存リスクと未対策事項」</a>を参照）:
   </p>
   <ul>
-    <li>移行の shadow モードは一覧を比較するのであって証明書を比較するのではなく，古いジョブが更新をやめたホストには気づきません（T16）．</li>
     <li>ベアラートークンは期限切れまで有効で，失効確認は行いません（T14）．</li>
     <li><code>localhost-dev</code> はすべてのループバックのピアを信頼する開発モードです（T13）．</li>
     <li>GitHub Actions はダイジェストではなくタグで固定されており，リリースワークフローはまだ実行されていません（T8）．</li>
@@ -251,7 +246,7 @@
   </div>
 
   <div class="next">
-    <a href="migration.html"><small>前へ</small>既存環境からの移行</a>
+    <a href="deploy.html"><small>前へ</small>導入ガイド</a>
     <a class="fwd" href="index.html"><small>次へ</small>概要に戻る</a>
   </div>
 </main>

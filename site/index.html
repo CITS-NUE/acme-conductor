@@ -16,10 +16,11 @@
     <a class="brand" href="index.html">ACME <span>Conductor</span></a>
     <nav class="nav" aria-label="ページ">
       <a href="index.html" aria-current="page">概要</a>
+      <a href="upki-guide.html">証明書の発行手順</a>
+      <a href="certificate-usage.html">証明書の使い方</a>
       <a href="how-it-works.html">仕組み</a>
       <a href="security.html">安全設計</a>
       <a href="deploy.html">導入ガイド</a>
-      <a href="migration.html">既存環境からの移行</a>
       <a href="status.html">現状と制限</a>
       <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
     </nav>
@@ -36,6 +37,21 @@
       秘密鍵や DNS・Key Vault の資格情報は管理サーバに一切持たせない設計になっています．
     </p>
   </section>
+
+  <div class="callout" id="for-clerks">
+    <p><strong>証明書を発行したい方（UPKI の登録担当者・事務担当者）はこちら</strong></p>
+    <p>DNS や Azure に詳しくなくても進められるよう，最初から順に説明したページを用意しています．</p>
+    <div class="cards">
+      <a class="card cp" href="upki-guide.html">
+        <h3>証明書の発行手順</h3>
+        <p>ホスト名の決定，UPKI への申請，DNS の設定から，ACME Conductor での発行確認までの 7 手順．</p>
+      </a>
+      <a class="card dp" href="certificate-usage.html">
+        <h3>証明書の使い方</h3>
+        <p>発行された証明書を Azure，Linux・Windows のサーバ，機器，他部署で使う方法を，ケース別に．</p>
+      </a>
+    </div>
+  </div>
 
   <div class="cards">
     <div class="card cp">
@@ -199,8 +215,6 @@
   <ol class="steps">
     <li><strong>手元で試す</strong> — 開発用の認証（<code>localhost-dev</code>）とローカルプロセスのランチャー，ファイルの証明書ストアで，1 台のマシン上に全体を動かします．ACME は Let's Encrypt の <em>ステージング</em> を使います．<br><a href="deploy.html#local">導入ガイド: 手元で試す</a></li>
     <li><strong>Azure にデプロイする</strong> — 同梱の Bicep テンプレートで，Container Apps 上に Conductor と Runner，権限の重ならない 2 つのマネージド ID を作ります．まずはステージング CA と 1 つのホスト名から．<br><a href="deploy.html#azure">導入ガイド: Azure にデプロイする</a></li>
-    <li><strong>既存の一覧を取り込んで見比べる</strong> — いま別の仕組み（IaC など）で証明書を更新しているなら，ホスト名の一覧を取り込み，Conductor には発行させずに差分だけを監視する <code>shadow</code> モードで様子を見ます．<br><a href="migration.html">既存環境からの移行</a></li>
-    <li><strong>切り替える</strong> — 設定のフラグを <code>registry</code> にして再起動すると Conductor が発行を始めます．戻すときもフラグを戻すだけです．</li>
   </ol>
 
   <h2 id="principles">守っている約束</h2>
@@ -217,7 +231,7 @@
 
   <div class="next">
     <span></span>
-    <a class="fwd" href="how-it-works.html"><small>次へ</small>仕組み: 1 枚の証明書が更新されるまで</a>
+    <a class="fwd" href="upki-guide.html"><small>次へ</small>証明書の発行手順</a>
   </div>
 </main>
 

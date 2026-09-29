@@ -11,6 +11,10 @@ Conductor は CA ごとの発行範囲を写し持たず，事前検査もしな
 停止されたアカウントは CA がオーダーを拒否し，`AcmeFailure` として run に残る．
 CA 専用の推奨値もコードには持たず，本書の設定例として置く．
 
+初めて手続きする登録担当者は [`docs/upki-guide.md`](upki-guide.md)（発行手順）を，
+発行後の証明書の利用は [`docs/certificate-usage.md`](certificate-usage.md)
+（ケース別の使い方）を読む．本書は運用担当者向けのリファレンスである．
+
 設定項目そのものの説明は [`docs/conductor.md`](conductor.md) と
 [`docs/runner.md`](runner.md) を参照．
 

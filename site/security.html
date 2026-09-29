@@ -16,10 +16,11 @@
     <a class="brand" href="index.html">ACME <span>Conductor</span></a>
     <nav class="nav" aria-label="ページ">
       <a href="index.html">概要</a>
+      <a href="upki-guide.html">証明書の発行手順</a>
+      <a href="certificate-usage.html">証明書の使い方</a>
       <a href="how-it-works.html">仕組み</a>
       <a href="security.html" aria-current="page">安全設計</a>
       <a href="deploy.html">導入ガイド</a>
-      <a href="migration.html">既存環境からの移行</a>
       <a href="status.html">現状と制限</a>
       <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
     </nav>
@@ -367,7 +368,7 @@
         <tr><td>T13</td><td>意図しない呼び出し元による API 到達</td><td>localhost-dev はループバック限定＋Host/Origin/Sec-Fetch-Site 検査．oidc モードは署名・issuer・audience・ロールを検証するベアラートークン必須．</td></tr>
         <tr><td>T14</td><td>盗まれた／過剰付与のベアラートークン</td><td>TLS 必須．GUI はトークンをタブのセッションストレージにのみ保持．監査ログは安定識別子＋issuer で記録．失効検査は未対応（残存リスク）．</td></tr>
         <tr><td>T15</td><td>攻撃面としての GUI</td><td>DOM 描画のみで XSS を防止．厳格な CSP．frame-ancestors 'none'．PKCE 付き認可コードフロー．</td></tr>
-        <tr><td>T16</td><td>入力チャネルとしての移行一覧</td><td>一覧は FQDN のみを供給し，ポリシー・バインディングは選べない．正規化・ポリシー検証を通過しない一覧は全体を拒否．取り込みは既定 dry-run で冪等．</td></tr>
+        <tr><td>T16</td><td>（削除）入力チャネルとしての移行一覧</td><td>移行ツールの削除により対象がなくなりました（ADR 0025）．</td></tr>
       </tbody>
     </table>
   </div>
