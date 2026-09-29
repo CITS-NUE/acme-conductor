@@ -125,6 +125,15 @@ param jobSigningValiditySeconds int = 900
 @maxValue(86400)
 param claimTimeoutSeconds int = 300
 
+@description('Log level of the Runner (its --log-level). Keep info in normal operation; debug additionally records every redacted lego output line and is meant for a redeployment while investigating a failure (docs/runner.md, logs and redaction).')
+@allowed([
+  'debug'
+  'info'
+  'warn'
+  'error'
+])
+param runnerLogLevel string = 'info'
+
 @description('Cron schedule on which the platform starts Runner executions; each execution takes one offered job or exits at once. Every minute is the finest schedule Container Apps supports and bounds the start latency of a run.')
 param runnerCronExpression string = '* * * * *'
 
@@ -492,12 +501,15 @@ resource runnerJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'runner'
           image: runnerImage
           // Claim mode: take one offered job from the exchange share
-          // (docs/runner.md). The arguments are fixed here; nothing about
-          // an execution is chosen by the Conductor.
+          // (docs/runner.md). The arguments are fixed here (only the log
+          // level is a parameter); nothing about an execution is chosen by
+          // the Conductor.
           args: [
             'reconcile'
             '--exchange'
             '/exchange'
+            '--log-level'
+            runnerLogLevel
           ]
           env: [
             {

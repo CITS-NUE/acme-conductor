@@ -192,8 +192,9 @@ const DefaultGracePeriod = 10 * time.Second
 // Executor runs invocations.
 type Executor struct {
 	Timeout time.Duration
-	// Logger receives redacted lego output lines at debug level and a
-	// summary line at info/error level. Never nil after New.
+	// Logger receives redacted lego output lines at debug level, a
+	// summary line at info/error level and, when lego exits non-zero, the
+	// last redacted stderr lines at warn level. Never nil after New.
 	Logger *slog.Logger
 	// GracePeriod is how long to wait after SIGTERM before SIGKILL.
 	GracePeriod time.Duration
@@ -237,8 +238,8 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 
 	secrets := inv.Secrets()
 	// One sink per stream: PEM suppression is stateful.
-	stdout := newLineSink(logger, "stdout", NewRedactor(secrets))
-	stderr := newLineSink(logger, "stderr", NewRedactor(secrets))
+	stdout := newLineSink(logger, "stdout", NewRedactor(secrets), 0)
+	stderr := newLineSink(logger, "stderr", NewRedactor(secrets), failureTailLines)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -280,6 +281,16 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 		out.Cancelled = true
 	}
 	logger.Info("lego finished", "exitCode", out.ExitCode, "durationMs", out.Duration.Milliseconds(), "timedOut", out.TimedOut, "cancelled", out.Cancelled)
+	// The per-line output is at debug level, which a deployment usually
+	// does not keep; on failure the redacted tail of stderr (where lego
+	// writes its errors) is repeated at warn level so the cause can be
+	// read from the Runner's own log. It goes to the log only, never to
+	// the Result.
+	if out.ExitCode != 0 {
+		if tail := stderr.Tail(); len(tail) > 0 {
+			logger.Warn("lego failed; last stderr lines", "exitCode", out.ExitCode, "lines", tail)
+		}
+	}
 	return out, nil
 }
 
@@ -288,20 +299,27 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 // block on a full pipe.
 const maxLogLine = 8 * 1024
 
+// failureTailLines is how many of the last redacted stderr lines Run
+// repeats at warn level when lego exits non-zero.
+const failureTailLines = 20
+
 // lineSink is an io.Writer that splits a stream into lines, redacts them
 // and logs them. os/exec writes to it from its own goroutine, so no
-// locking is needed beyond what Write's caller provides.
+// locking is needed beyond what Write's caller provides. With a non-zero
+// tailCap it also keeps the last tailCap redacted lines for Tail.
 type lineSink struct {
 	logger    *slog.Logger
 	stream    string
 	redact    *Redactor
 	buf       []byte
 	truncated bool
+	tail      []string
+	tailCap   int
 	mu        sync.Mutex
 }
 
-func newLineSink(logger *slog.Logger, stream string, r *Redactor) *lineSink {
-	return &lineSink{logger: logger, stream: stream, redact: r}
+func newLineSink(logger *slog.Logger, stream string, r *Redactor, tailCap int) *lineSink {
+	return &lineSink{logger: logger, stream: stream, redact: r, tailCap: tailCap}
 }
 
 func (s *lineSink) Write(p []byte) (int, error) {
@@ -342,9 +360,54 @@ func (s *lineSink) emit() {
 	out, keep := s.redact.Line(line)
 	if keep {
 		s.logger.Debug("lego output", "stream", s.stream, "line", out, "truncated", s.truncated)
+		if s.tailCap > 0 {
+			if len(s.tail) == s.tailCap {
+				s.tail = append(s.tail[:0], s.tail[1:]...)
+			}
+			s.tail = append(s.tail, maskCredentialShapes(out))
+		}
 	}
 	s.buf = s.buf[:0]
 	s.truncated = false
+}
+
+// credentialShapes are the shapes maskCredentialShapes masks, each with its
+// replacement. They mirror the secret markers of the Result contract
+// (pkg/api/v1alpha1, validateOpaqueText): a heuristic, not a detector.
+var credentialShapes = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	// name=value and JSON "name":"value", where the name ends in a
+	// credential word (hmac=, client_secret=, "access_token":, sig=, ...).
+	// A bare "name: text" is left alone: lego's own diagnostics read
+	// "error presenting token: azuredns: ...".
+	{regexp.MustCompile(`(?i)\b([a-z0-9_.-]*(?:hmac|password|passwd|pwd|secret|token|sig|signature|key|credential)s?\s*=\s*)("[^"]*"|'[^']*'|[^\s,;&"']+)`), "${1}[REDACTED]"},
+	{regexp.MustCompile(`(?i)("[a-z0-9_.-]*(?:hmac|password|passwd|pwd|secret|token|sig|signature|key|credential)s?"\s*:\s*)"[^"]*"`), `${1}"[REDACTED]"`},
+	{regexp.MustCompile(`(?i)\b(authorization\s*:\s*).*`), "${1}[REDACTED]"},
+	{regexp.MustCompile(`(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+`), "${1} [REDACTED]"},
+	// JWT / JWS / ACME EAB (base64url JSON header), AWS and GitHub tokens.
+	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)*|\bAKIA[0-9A-Z]{12,}|\bghp_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+`), "[REDACTED]"},
+}
+
+// maskCredentialShapes masks credential-shaped values in an already
+// redacted line. The Redactor masks only the secrets the Runner itself
+// resolved; the failure tail is logged at warn level, which a deployment
+// keeps by default, so it additionally loses anything that looks like a
+// credential lego may have printed on its own. The per-line debug output is
+// left as it was.
+func maskCredentialShapes(line string) string {
+	for _, c := range credentialShapes {
+		line = c.re.ReplaceAllString(line, c.repl)
+	}
+	return line
+}
+
+// Tail returns a copy of the last redacted lines kept, oldest first.
+func (s *lineSink) Tail() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.tail...)
 }
 
 // Flush logs a trailing line without a newline.

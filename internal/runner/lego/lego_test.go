@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -453,7 +455,7 @@ func TestRedactor_Line(t *testing.T) {
 func TestLineSinkTruncatesAndFlushes(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	sink := newLineSink(logger, "stdout", NewRedactor(nil))
+	sink := newLineSink(logger, "stdout", NewRedactor(nil), 0)
 	long := strings.Repeat("x", 300*1024)
 	for _, chunk := range []string{"sho", "rt\n" + long[:1000], long[1000:] + "\nla", "st"} {
 		if _, err := sink.Write([]byte(chunk)); err != nil {
@@ -525,13 +527,17 @@ func TestExecutor_Run_OK(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	exec := &Executor{Timeout: 10 * time.Second}
+	var logs bytes.Buffer
+	exec := &Executor{Timeout: 10 * time.Second, Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
 	out, err := exec.Run(context.Background(), inv)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if out.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d, want 0", out.ExitCode)
+	}
+	if strings.Contains(logs.String(), `"level":"WARN"`) {
+		t.Errorf("a successful run logged at warn level:\n%s", logs.String())
 	}
 
 	certPath, keyPath, issuerPath := OutputFiles(workDir, "wiki.example.ac.jp")
@@ -594,6 +600,101 @@ func TestExecutor_Run_Fail(t *testing.T) {
 	}
 	if strings.Contains(logs, fakelego.LeakedSecret) {
 		t.Errorf("captured logs leaked the secret value")
+	}
+}
+
+// TestExecutor_Run_FailLogsStderrTail checks that a failed run repeats the
+// redacted tail of lego's stderr at warn level, so the cause is visible at
+// the default info level without the per-line debug output.
+func TestExecutor_Run_FailLogsStderrTail(t *testing.T) {
+	t.Setenv("FAKE_TOKEN", fakelego.LeakedSecret)
+	p := fakeParams(t, t.TempDir(), map[string]string{"FAKE_LEGO_MODE": "fail"})
+	p.DNS.PassthroughEnv = []string{"FAKE_TOKEN"}
+	inv, err := Build(p)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	out, err := (&Executor{Timeout: 10 * time.Second, Logger: logger}).Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.ExitCode != 1 {
+		t.Fatalf("ExitCode = %d, want 1", out.ExitCode)
+	}
+
+	logs := buf.String()
+	if strings.Contains(logs, `"msg":"lego output"`) {
+		t.Errorf("per-line output logged above debug level:\n%s", logs)
+	}
+	if strings.Contains(logs, fakelego.LeakedSecret) || strings.Contains(logs, "ZmFrZS1sZWFrZWQta2V5") {
+		t.Fatalf("captured logs leaked a secret or PEM body:\n%s", logs)
+	}
+	var rec struct {
+		Level    string   `json:"level"`
+		ExitCode int      `json:"exitCode"`
+		Lines    []string `json:"lines"`
+	}
+	found := false
+	for _, l := range strings.Split(strings.TrimSpace(logs), "\n") {
+		if !strings.Contains(l, `"msg":"lego failed; last stderr lines"`) {
+			continue
+		}
+		found = true
+		if err := json.Unmarshal([]byte(l), &rec); err != nil {
+			t.Fatalf("unmarshal %q: %v", l, err)
+		}
+	}
+	if !found {
+		t.Fatalf("no stderr tail logged:\n%s", logs)
+	}
+	want := []string{
+		"fake lego: Could not obtain certificates: acme: error: 403 :: urn:ietf:params:acme:error:unauthorized :: hmac=[REDACTED]",
+		"[REDACTED PEM]",
+	}
+	if rec.Level != "WARN" || rec.ExitCode != 1 || !slices.Equal(rec.Lines, want) {
+		t.Errorf("tail record = %+v, want WARN, exitCode 1, lines %q", rec, want)
+	}
+}
+
+func TestLineSinkTailKeepsLastLines(t *testing.T) {
+	sink := newLineSink(testLogger(t), "stderr", NewRedactor([]string{"s3cret"}), 3)
+	for i := range 5 {
+		if _, err := fmt.Fprintf(sink, "line %d s3cret\n", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := sink.Write([]byte("no newline")); err != nil {
+		t.Fatal(err)
+	}
+	sink.Flush()
+	want := []string{"line 3 [REDACTED]", "line 4 [REDACTED]", "no newline"}
+	if got := sink.Tail(); !slices.Equal(got, want) {
+		t.Errorf("Tail() = %q, want %q", got, want)
+	}
+	if got := newLineSink(testLogger(t), "stdout", NewRedactor(nil), 0); len(got.Tail()) != 0 {
+		t.Errorf("a sink without tailCap kept lines")
+	}
+}
+
+func TestMaskCredentialShapes(t *testing.T) {
+	for in, want := range map[string]string{
+		"acme: error: 403 :: urn:ietf:params:acme:error:unauthorized :: hmac=abc123": "acme: error: 403 :: urn:ietf:params:acme:error:unauthorized :: hmac=[REDACTED]",
+		`client_secret="a b c", {"access_token": "xyz", "kid":"k"}; ok`:              `client_secret=[REDACTED], {"access_token": "[REDACTED]", "kid":"k"}; ok`,
+		"GET https://x.blob.core.windows.net/c?sv=1&sig=AbC%2F&se=2":                 "GET https://x.blob.core.windows.net/c?sv=1&sig=[REDACTED]&se=2",
+		"Authorization: Bearer abc.def":                                              "Authorization: [REDACTED]",
+		"sent bearer abc.def-ghi to server":                                          "sent bearer [REDACTED] to server",
+		"kid eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig and AKIAABCDEFGHIJKLMNOP":      "kid [REDACTED] and [REDACTED]",
+		"token ghp_abcdef0123 and github_pat_11ABC_def":                              "token [REDACTED] and [REDACTED]",
+		// Ordinary lego diagnostics pass through unchanged.
+		"[wiki.example.ac.jp] acme: error presenting token: azuredns: zone example.ac.jp not found": "[wiki.example.ac.jp] acme: error presenting token: azuredns: zone example.ac.jp not found",
+		"acme: Waiting for DNS record propagation.":                                                 "acme: Waiting for DNS record propagation.",
+	} {
+		if got := maskCredentialShapes(in); got != want {
+			t.Errorf("maskCredentialShapes(%q)\n got  %q\n want %q", in, got, want)
+		}
 	}
 }
 
