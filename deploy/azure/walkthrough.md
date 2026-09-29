@@ -647,4 +647,6 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | GUI の EAB のページに，ある binding が出ない／API が `409 eab_not_required` | その binding が `accountProvisioningBindings` に挙がっていない | CA が EAB を要求するなら `accountProvisioningBindings` に加えて再デプロイする．要求しない CA（Let's Encrypt など）なら投入は不要 |
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
-| run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
+| run が `PolicyViolation`（`fqdn is not under any allowed DNS suffix`）で失敗する | target の名前が Runner の `authorization.allowedDnsSuffixes` の下にない | Runner 設定の `allowedDnsSuffixes` に加えて再デプロイする |
+| run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない（`lego finished` の `durationMs` が数秒） | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
+| EAB を要求する CA（UPKI など）で，run が `AcmeFailure lego exited with status 1` で失敗する（`durationMs` が数十秒．チャレンジ用ゾーンに `TXT/write` の記録がある） | ポリシーの `keyType` が，EAB を発行した証明書プロファイルの鍵種別と合わない（例: RSA のプロファイルに `rsa4096`） | ポリシーの `keyType` をプロファイルに合わせ（UPKI の RSA なら `rsa2048`），run を起こし直す．EAB の投入し直しは不要（[運用ガイド](../../docs/account-scoped-ca.md#失敗の読み方)） |
