@@ -81,3 +81,8 @@ param oidcAdminRoles = ['ACME.Admin']
 param oidcViewerRoles = ['ACME.Viewer']
 param ingressExternal = true
 param ingressAllowedCidrs = []
+
+// Optional custom domain (README, custom domain): create its CNAME and asuid
+// TXT first, deploy with false, then with true.
+// param conductorCustomDomain = 'acme.example.ac.jp'
+// param conductorCustomDomainCertificateIssued = false
