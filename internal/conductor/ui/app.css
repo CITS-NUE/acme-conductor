@@ -45,7 +45,7 @@ a:hover { text-decoration: underline; }
 }
 .brand { font-weight: 600; color: var(--fg); }
 #nav { display: flex; gap: 16px; }
-#nav a { color: var(--muted); padding: 4px 0; border-bottom: 2px solid transparent; }
+#nav a { color: var(--muted); white-space: nowrap; padding: 4px 0; border-bottom: 2px solid transparent; }
 #nav a.active { color: var(--fg); border-bottom-color: var(--accent); }
 .lang {
   font: inherit;
