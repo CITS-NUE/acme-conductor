@@ -282,6 +282,10 @@ func (s *Server) handleRequestTargetACMEProvisioning(w http.ResponseWriter, r *h
 		s.fail(w, r, err)
 		return
 	}
+	if t.Retired() {
+		s.fail(w, r, errRetired(t))
+		return
+	}
 	s.requestProvisioning(w, r, binding, t)
 }
 

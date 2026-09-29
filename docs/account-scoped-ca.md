@@ -372,17 +372,29 @@ target の `fqdn` は作成後に変えられない（Store のオブジェク�
 
 1. UPKI で新しい CN の ACME アカウントを申請し，EAB を受け取る．
 2. 旧 target を無効にする（`POST /targets/{id}/disable`）．旧い CN の証明書を
-   更新し続けないためである．
+   更新し続けないためである．旧 target の名前を新しい target で使うなら，続けて
+   退役させる（下記）．
 3. 新しい CN の target を作り，[新しい申請を追加する](#新しい申請を追加する)の
    手順 4 から進める（新しい名前の委任を確かめてから）．
 4. 証明書の利用側（Key Vault の参照など）を，新しい target の Store の
    オブジェクトに切り替える．
 
-1 つの名前は 1 つの target にしか属せず，無効にした target も名前を持った
-ままである（target を削除する API はない）．新しい target に旧 target の
-`additionalNames` にあった名前を載せるなら，先に旧 target の
-`additionalNames` からその名前を外す（無効にしてから編集すれば run は
-起きない）．旧 target の `fqdn` だった名前は新しい target に載せられない．
+1 つの名前は 1 つの target にしか属せず，無効にしただけの target は名前を持った
+ままである．旧 target の名前（`fqdn` と `additionalNames`）を新しい target に
+載せるには，旧 target を **退役** させて名前を解放する（無効にした後
+`POST /targets/{id}/retire`．GUI では旧 target の詳細ページの「退役」．
+[ADR 0026](adr/0026-retire-targets.md)）．退役は履歴（実行履歴，操作記録）を残し，
+旧 target の証明書を Key Vault から消さない．更新されなくなり，期限で切れる．
+退役は元に戻せず，実行中の run があるときはできない．
+
+したがって手順は，旧 target を無効にし（手順 2），旧 target を退役させ，新しい
+target を作る（手順 3），の順になる．旧 target を退役させる前に新しい target を
+作ると，同じ名前を載せたときに `409` `conflict` になる．新しい CN に旧 target の
+`additionalNames` の名前だけを引き継ぐなら，退役の代わりに旧 target の
+`additionalNames` からその名前を外してもよい（無効にしてから編集すれば run は
+起きない）．旧 target の `fqdn` だった名前は，退役させるまで新しい target に
+載せられない．退役させた旧 target と同じ名前の新しい target は，Store の
+同じ名前の証明書に新しいバージョンを書く．
 
 ## 失敗の読み方
 

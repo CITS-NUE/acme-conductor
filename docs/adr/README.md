@@ -31,6 +31,7 @@
 | [0023](0023-separate-role-definitions-from-the-deployment.md) | カスタムロールの定義をデプロイから分け，再デプロイを常設の権限だけで行えるようにする |
 | [0024](0024-target-scoped-acme-accounts-and-san.md) | target 単位の ACME アカウントと SAN 証明書 |
 | [0025](0025-remove-migration-tooling.md) | 移行ツールを削除する |
+| [0026](0026-retire-targets.md) | target を退役させる: 履歴を残したまま運用から外し，名前を解放する（purge ではない） |
 
 [`docs/architecture.md`](../architecture.md) と
 [`docs/threat-model.md`](../threat-model.md) も参照．

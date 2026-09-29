@@ -85,11 +85,11 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 .notice.next strong { color: var(--fg); }
 .notice .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
 td .hint, dd .hint { color: var(--muted); font-size: 12px; }
-.status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.status { display: inline-block; white-space: nowrap; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
 .status.succeeded, .status.enabled { color: var(--ok); border-color: var(--ok); }
 .status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
-.status.cancelled { color: var(--muted); }
+.status.cancelled, .status.target-retired { color: var(--muted); }
 button, .button {
   font: inherit;
   padding: 5px 12px;
@@ -101,6 +101,17 @@ button, .button {
 }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.danger { color: var(--bad); border-color: var(--bad); }
+input.filter, .retire input[type=text] {
+  font: inherit;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+input.filter { min-width: 260px; flex: 1 1 260px; max-width: 420px; }
+.retire { border: 1px solid var(--bad); border-radius: 8px; padding: 0 16px 16px; max-width: 640px; margin-top: 20px; }
+.retire h2 { color: var(--bad); }
 button:disabled { opacity: 0.5; cursor: default; }
 form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); max-width: 640px; }
 .field { display: grid; grid-template-columns: 180px 1fr; gap: 8px 12px; align-items: center; margin-bottom: 10px; }

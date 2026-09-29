@@ -133,6 +133,10 @@ func (s *Server) handleRequestRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if t.Retired() {
+		s.fail(w, r, errRetired(t))
+		return
+	}
 	if in.Revision != 0 && in.Revision != t.Revision {
 		s.fail(w, r, fmt.Errorf("%w: target %s is at revision %d, not %d", registry.ErrStaleRevision, t.ID, t.Revision, in.Revision))
 		return
