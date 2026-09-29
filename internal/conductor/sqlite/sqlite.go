@@ -283,6 +283,13 @@ CREATE TRIGGER targets_no_delete BEFORE DELETE ON targets
 CREATE TRIGGER targets_retired_is_final BEFORE UPDATE ON targets WHEN OLD.retired_at IS NOT NULL
   BEGIN SELECT RAISE(ABORT, 'a retired target cannot be changed'); END;
 `,
+	// 7: optional policy display name. '' means none; a non-empty name is
+	// unique (ASCII case-insensitively here; the registry also compares
+	// with Unicode case folding before writing).
+	`
+ALTER TABLE policies ADD COLUMN name TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX policies_name ON policies(name COLLATE NOCASE) WHERE name <> '';
+`,
 }
 
 // foreignKeysOffMigrations are the migrations that rebuild a table other
@@ -557,13 +564,13 @@ func limit(n int) int {
 
 // ---- policies ---------------------------------------------------------
 
-const policyCols = `id, allowed_dns_suffixes, allow_wildcard, acme_binding, renew_before_days, key_type, max_sans, enabled, created_at, updated_at`
+const policyCols = `id, name, allowed_dns_suffixes, allow_wildcard, acme_binding, renew_before_days, key_type, max_sans, enabled, created_at, updated_at`
 
 func scanPolicy(sc interface{ Scan(...any) error }) (*registry.Policy, error) {
 	var p registry.Policy
 	var suffixes, keyType, created, updated string
 	var wildcard, enabled int
-	if err := sc.Scan(&p.ID, &suffixes, &wildcard, &p.ACMEBinding, &p.RenewBeforeDays, &keyType, &p.MaxSANs, &enabled, &created, &updated); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &suffixes, &wildcard, &p.ACMEBinding, &p.RenewBeforeDays, &keyType, &p.MaxSANs, &enabled, &created, &updated); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(suffixes), &p.AllowedDnsSuffixes); err != nil {
@@ -580,6 +587,29 @@ func scanPolicy(sc interface{ Scan(...any) error }) (*registry.Policy, error) {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// checkPolicyName returns ErrPolicyNameTaken if a policy other than id
+// already has name (Unicode case-folded). An empty name is never taken.
+func checkPolicyName(ctx context.Context, tx *sql.Tx, id, name string) error {
+	if name == "" {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM policies WHERE name <> '' AND id <> ?`, id)
+	if err != nil {
+		return fmt.Errorf("check policy name: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var other string
+		if err := rows.Scan(&other); err != nil {
+			return err
+		}
+		if strings.EqualFold(other, name) {
+			return fmt.Errorf("%w: %q", registry.ErrPolicyNameTaken, name)
+		}
+	}
+	return rows.Err()
 }
 
 // CreatePolicy inserts p. ID, CreatedAt and UpdatedAt are assigned when
@@ -601,9 +631,15 @@ func (d *DB) CreatePolicy(ctx context.Context, p *registry.Policy, ev *registry.
 		ev.PolicyID = p.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO policies (`+policyCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.ID, string(suffixes), boolInt(p.AllowWildcard), p.ACMEBinding, p.RenewBeforeDays, string(p.KeyType), p.MaxSANs, boolInt(p.Enabled), fmtTime(p.CreatedAt), fmtTime(p.UpdatedAt))
+		if err := checkPolicyName(ctx, tx, p.ID, p.Name); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO policies (`+policyCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.ID, p.Name, string(suffixes), boolInt(p.AllowWildcard), p.ACMEBinding, p.RenewBeforeDays, string(p.KeyType), p.MaxSANs, boolInt(p.Enabled), fmtTime(p.CreatedAt), fmtTime(p.UpdatedAt))
 		if err != nil {
+			if isUnique(err) && strings.Contains(err.Error(), "policies.name") {
+				return fmt.Errorf("%w: %q", registry.ErrPolicyNameTaken, p.Name)
+			}
 			if isUnique(err) {
 				return fmt.Errorf("%w: policy %s exists", registry.ErrConflict, p.ID)
 			}
@@ -654,9 +690,15 @@ func (d *DB) UpdatePolicy(ctx context.Context, p *registry.Policy, ev *registry.
 		ev.PolicyID = p.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE policies SET allowed_dns_suffixes = ?, allow_wildcard = ?, acme_binding = ?, renew_before_days = ?, key_type = ?, max_sans = ?, enabled = ?, updated_at = ? WHERE id = ?`,
-			string(suffixes), boolInt(p.AllowWildcard), p.ACMEBinding, p.RenewBeforeDays, string(p.KeyType), p.MaxSANs, boolInt(p.Enabled), fmtTime(p.UpdatedAt), p.ID)
+		if err := checkPolicyName(ctx, tx, p.ID, p.Name); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE policies SET name = ?, allowed_dns_suffixes = ?, allow_wildcard = ?, acme_binding = ?, renew_before_days = ?, key_type = ?, max_sans = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+			p.Name, string(suffixes), boolInt(p.AllowWildcard), p.ACMEBinding, p.RenewBeforeDays, string(p.KeyType), p.MaxSANs, boolInt(p.Enabled), fmtTime(p.UpdatedAt), p.ID)
 		if err != nil {
+			if isUnique(err) && strings.Contains(err.Error(), "policies.name") {
+				return fmt.Errorf("%w: %q", registry.ErrPolicyNameTaken, p.Name)
+			}
 			return fmt.Errorf("update policy: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {

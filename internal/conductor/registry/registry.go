@@ -35,13 +35,19 @@ var (
 	// ErrRetired: the target is retired (docs/adr/0026); nothing about it
 	// can change any more.
 	ErrRetired = errors.New("target is retired")
+	// ErrPolicyNameTaken: another policy already has this display name
+	// (compared case-insensitively).
+	ErrPolicyNameTaken = errors.New("policy name is taken")
 	// ErrTargetEnabled: a target must be disabled before it is retired.
 	ErrTargetEnabled = errors.New("target is enabled")
 )
 
 // Policy is a CertificatePolicy: the rules a Target is issued under.
 type Policy struct {
-	ID                 string
+	ID string
+	// Name is an optional display name, unique among policies
+	// (case-insensitively) when non-empty; '' for policies that have none.
+	Name               string
 	AllowedDnsSuffixes []string
 	AllowWildcard      bool
 	ACMEBinding        string

@@ -269,6 +269,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, "run_active", err.Error(), nil)
 	case errors.Is(err, registry.ErrRetired):
 		writeError(w, http.StatusConflict, "target_retired", err.Error(), nil)
+	case errors.Is(err, registry.ErrPolicyNameTaken):
+		writeError(w, http.StatusConflict, "policy_name_taken", err.Error(), nil)
 	case errors.Is(err, registry.ErrTargetEnabled):
 		writeError(w, http.StatusConflict, "target_enabled", err.Error(), nil)
 	case errors.Is(err, registry.ErrConflict):

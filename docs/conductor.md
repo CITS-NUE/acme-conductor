@@ -372,6 +372,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | 403 | `forbidden` | `localhost-dev`: モードの規則により拒否．`oidc`: トークンは検証に通ったが，この API が与えるロールを持たない，または viewer が `GET` 以外を呼んだ． |
 | 404 | `not_found` | 該当するポリシー，target，run，エンドポイントがない． |
 | 409 | `conflict` | 同じ FQDN に対する 2 つ目の target．既存の target をカバーしなくなるポリシー編集．キャンセルできない run のキャンセル． |
+| 409 | `policy_name_taken` | 別のポリシーがすでに同じ `name` を持っている（大文字小文字を区別しない）． |
 | 409 | `stale_revision` | リクエストの `revision` が target の現在のリビジョンではない． |
 | 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）．退役の要求では，実行中の run があるので退役できない，の意味になる． |
 | 409 | `target_disabled` | 無効化された target に run が要求された． |
@@ -427,6 +428,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 
 ```json
 {
+  "name": "UPKI 本番",
   "allowedDnsSuffixes": ["example.ac.jp"],
   "allowWildcard": false,
   "acmeBinding": "letsencrypt-staging",
@@ -437,6 +439,13 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 }
 ```
 
+- `name` — 省略可．GUI などに表示する名前．前後の空白は取り除かれ，64 文字
+  （バイトではなく文字）以内で，制御文字を含められない．空でなければ，ポリシー間で
+  一意（大文字小文字を区別しない）でなければならず，重複すると `409`
+  `policy_name_taken` になる．省略すると，作成時は空，更新時は現在の値のまま
+  （空文字列 `""` で消せる）．既存のポリシーの名前は空で，GUI は名前がないとき
+  `acmeBinding`・サフィックス・鍵種別から作った表示名を使う．名前は
+  `policy.created` / `policy.updated` の監査詳細にも記録される．
 - `allowedDnsSuffixes` — 1–64 個のエントリ．それぞれ入力時に正規化される
   （`internal/policy.NormalizeSuffix`: 前後の空白除去，小文字化，末尾のドット除去．
   ワイルドカード不可．ASCII のみで `xn--` 不可）．正規化後に重複するものは

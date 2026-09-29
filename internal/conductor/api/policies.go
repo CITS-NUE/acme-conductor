@@ -5,14 +5,24 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/internal/policy"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
 
+// MaxPolicyNameLen bounds a policy's display name, in characters.
+const MaxPolicyNameLen = 64
+
 // PolicyInput is the request body for creating or replacing a policy.
 type PolicyInput struct {
+	// Name is an optional display name (at most 64 characters, no control
+	// characters, trimmed, unique case-insensitively when non-empty). Omitted
+	// on create it is empty, omitted on update it keeps the current name,
+	// and "" clears it.
+	Name               *string          `json:"name,omitempty"`
 	AllowedDnsSuffixes []string         `json:"allowedDnsSuffixes"`
 	AllowWildcard      bool             `json:"allowWildcard"`
 	ACMEBinding        string           `json:"acmeBinding"`
@@ -30,6 +40,7 @@ type PolicyInput struct {
 // PolicyResource is the response representation of a policy.
 type PolicyResource struct {
 	ID                 string           `json:"id"`
+	Name               string           `json:"name"`
 	AllowedDnsSuffixes []string         `json:"allowedDnsSuffixes"`
 	AllowWildcard      bool             `json:"allowWildcard"`
 	ACMEBinding        string           `json:"acmeBinding"`
@@ -43,7 +54,7 @@ type PolicyResource struct {
 
 func policyResource(p *registry.Policy) PolicyResource {
 	return PolicyResource{
-		ID: p.ID, AllowedDnsSuffixes: append([]string{}, p.AllowedDnsSuffixes...), AllowWildcard: p.AllowWildcard,
+		ID: p.ID, Name: p.Name, AllowedDnsSuffixes: append([]string{}, p.AllowedDnsSuffixes...), AllowWildcard: p.AllowWildcard,
 		ACMEBinding: p.ACMEBinding, RenewBeforeDays: p.RenewBeforeDays, KeyType: p.KeyType, MaxSANs: p.MaxSANs,
 		Enabled: p.Enabled, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
@@ -52,6 +63,16 @@ func policyResource(p *registry.Policy) PolicyResource {
 // applyPolicyInput validates in and writes it into p. Suffixes are
 // normalized; the ACME binding must be registered.
 func (s *Server) applyPolicyInput(in *PolicyInput, p *registry.Policy, create bool) error {
+	name := p.Name
+	if in.Name != nil {
+		name = strings.TrimSpace(*in.Name)
+	}
+	if utf8.RuneCountInString(name) > MaxPolicyNameLen {
+		return badRequest("name must be at most %d characters", MaxPolicyNameLen)
+	}
+	if strings.ContainsFunc(name, unicode.IsControl) || !utf8.ValidString(name) {
+		return badRequest("name must not contain control characters")
+	}
 	if len(in.AllowedDnsSuffixes) == 0 {
 		return badRequest("allowedDnsSuffixes must not be empty")
 	}
@@ -93,6 +114,7 @@ func (s *Server) applyPolicyInput(in *PolicyInput, p *registry.Policy, create bo
 	if maxSANs < 1 || maxSANs > v1alpha1.MaxNames {
 		return badRequest("maxSANs must be between 1 and %d", v1alpha1.MaxNames)
 	}
+	p.Name = name
 	p.AllowedDnsSuffixes = suffixes
 	p.AllowWildcard = in.AllowWildcard
 	p.ACMEBinding = in.ACMEBinding
@@ -109,8 +131,8 @@ func (s *Server) applyPolicyInput(in *PolicyInput, p *registry.Policy, create bo
 }
 
 func policyDetail(p *registry.Policy) string {
-	return fmt.Sprintf("suffixes=[%s] wildcard=%t acme=%s renewBeforeDays=%d keyType=%s maxSANs=%d enabled=%t",
-		strings.Join(p.AllowedDnsSuffixes, " "), p.AllowWildcard, p.ACMEBinding, p.RenewBeforeDays, p.KeyType, p.MaxSANs, p.Enabled)
+	return fmt.Sprintf("name=%q suffixes=[%s] wildcard=%t acme=%s renewBeforeDays=%d keyType=%s maxSANs=%d enabled=%t",
+		p.Name, strings.Join(p.AllowedDnsSuffixes, " "), p.AllowWildcard, p.ACMEBinding, p.RenewBeforeDays, p.KeyType, p.MaxSANs, p.Enabled)
 }
 
 func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {

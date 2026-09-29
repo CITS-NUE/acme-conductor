@@ -242,6 +242,39 @@
     return c;
   }
 
+  // ---- names ----------------------------------------------------------------
+  //
+  // Policies and targets are shown by name (a policy's display name, a
+  // target's FQDN), never by id; the id stays in links and in the filter.
+  // A policy without a name gets a label derived from its rules.
+
+  function policyLabel(p) {
+    if (p.name) return p.name;
+    const sfx = p.allowedDnsSuffixes;
+    return p.acmeBinding + ' · ' + (sfx.length ? sfx[0] : '—') + (sfx.length > 1 ? ' +' + (sfx.length - 1) : '') + ' · ' + p.keyType;
+  }
+
+  // directory loads, once per page render, every policy and every target
+  // (retired ones too, so that history resolves) and answers id -> name; an
+  // unknown id is shown as it is.
+  async function directory() {
+    const [targets, policies] = await Promise.all([api('GET', '/targets?retired=include'), api('GET', '/policies')]);
+    const tById = new Map(targets.items.map((t) => [t.id, t]));
+    const pById = new Map(policies.items.map((p) => [p.id, p]));
+    return {
+      policies: policies.items,
+      target: (id) => (tById.has(id) ? tById.get(id).fqdn : id),
+      policy: (id) => (pById.has(id) ? policyLabel(pById.get(id)) : id),
+      // policyOfTarget is the label of the policy a target is under, for
+      // the filter.
+      policyOfTarget: (id) => (tById.has(id) ? (pById.has(tById.get(id).policyRef) ? policyLabel(pById.get(tById.get(id).policyRef)) : tById.get(id).policyRef) : ''),
+    };
+  }
+
+  async function policyList() {
+    return (await api('GET', '/policies')).items;
+  }
+
   // ---- errors ---------------------------------------------------------------
 
   class ApiError extends Error {
@@ -445,13 +478,14 @@
   async function viewTargets() {
     setNav('targets');
     const showRetired = hashParams().get('retired') === '1';
-    const res = await api('GET', '/targets' + (showRetired ? '?retired=include' : ''));
+    const [res, policies] = await Promise.all([api('GET', '/targets' + (showRetired ? '?retired=include' : '')), policyList()]);
+    const pName = new Map(policies.map((p) => [p.id, policyLabel(p)]));
     const entries = res.items.map((t) => ({
       cells: [
         el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: tr('targets.moreNames', { n: t.additionalNames.length }) }) : ''),
         targetBadge(t),
         t.owner,
-        td(link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef), 'mono'),
+        link('#/policies/' + encodeURIComponent(t.policyRef), pName.get(t.policyRef) || t.policyRef),
         t.executionBinding + ' / ' + t.dnsBinding + ' / ' + t.storeBinding,
         t.certificate ? when(t.certificate.expiresAt) : '—',
         t.lastRun ? el('span', null, statusBadge(t.lastRun.status), ' ', t.lastRun.errorCode ? el('span', { class: 'mono', text: t.lastRun.errorCode }) : '') : '—',
@@ -474,7 +508,7 @@
 
   async function viewTarget(id) {
     setNav('targets');
-    const [t, runs] = await Promise.all([api('GET', '/targets/' + encodeURIComponent(id)), api('GET', '/targets/' + encodeURIComponent(id) + '/runs?limit=50')]);
+    const [t, runs, dir] = await Promise.all([api('GET', '/targets/' + encodeURIComponent(id)), api('GET', '/targets/' + encodeURIComponent(id) + '/runs?limit=50'), directory()]);
     const status = el('div');
     const refresh = () => route();
     const act = (label, method, path, cls, body) => el('button', {
@@ -505,7 +539,7 @@
         [tr('target.id'), el('span', { class: 'mono', text: t.id })],
         [tr('target.additional'), t.additionalNames.length ? el('span', { class: 'mono', text: t.additionalNames.join(', ') }) : tr('target.singleName')],
         [tr('target.owner'), t.owner],
-        [tr('target.policy'), link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef, 'mono')],
+        [tr('target.policy'), link('#/policies/' + encodeURIComponent(t.policyRef), dir.policy(t.policyRef))],
         [tr('target.exec'), t.executionBinding],
         [tr('target.dns'), t.dnsBinding],
         [tr('target.store'), t.storeBinding],
@@ -519,7 +553,7 @@
       t.retired ? '' : await targetForm(t),
       t.retired ? '' : retirePanel(t),
       el('h2', { text: tr('common.runs') }),
-      runsTable(runs.items, false),
+      runsTable(runs.items, false, dir),
     );
   }
 
@@ -592,14 +626,16 @@
 
   async function targetForm(t) {
     const b = await bindings();
-    const policies = (await api('GET', '/policies')).items.map((p) => p.id);
+    const policyItems = await policyList();
+    const policies = policyItems.map((p) => p.id);
+    const policyNames = new Map(policyItems.map((p) => [p.id, policyLabel(p)]));
     const isNew = !t;
     const fqdn = input('text', t ? t.fqdn : '', { placeholder: 'host.example.ac.jp', required: true, disabled: !isNew });
     const additional = el('textarea', { rows: 3, placeholder: 'www.example.ac.jp\nalias.example.ac.jp' });
     additional.value = t ? t.additionalNames.join('\n') : '';
     const additionalNames = () => additional.value.split(/[\s,]+/).map((s) => s.trim()).filter((s) => s);
     const owner = input('text', t ? t.owner : '', { required: true, maxlength: 128 });
-    const policy = select(policies, t ? t.policyRef : policies[0]);
+    const policy = select(policies, t ? t.policyRef : policies[0], (id) => policyNames.get(id));
     const exec = select(b.execution, t ? t.executionBinding : b.execution[0]);
     const dns = select(b.dns, t ? t.dnsBinding : b.dns[0]);
     const store = select(b.store, t ? t.storeBinding : b.store[0]);
@@ -656,7 +692,7 @@
     const res = await api('GET', '/policies');
     const entries = res.items.map((p) => ({
       cells: [
-        td(link('#/policies/' + encodeURIComponent(p.id), p.id), 'mono'),
+        link('#/policies/' + encodeURIComponent(p.id), policyLabel(p)),
         enabledBadge(p.enabled),
         td(p.allowedDnsSuffixes.join(', '), 'mono'),
         p.allowWildcard ? tr('common.yes') : tr('common.no'),
@@ -665,18 +701,19 @@
         p.keyType,
         String(p.maxSANs),
       ],
-      extra: [p.id],
+      extra: [p.id, p.name],
     }));
     show(
       el('h1', { text: tr('policies.title') }),
       el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/policies/new', tr('policies.new'), 'button')),
-      filteredTable({ headers: [tr('th.id'), tr('th.state'), tr('th.suffixes'), tr('th.wildcard'), tr('th.acmeBinding'), tr('th.renew'), tr('th.key'), tr('th.maxSans')], entries }),
+      filteredTable({ headers: [tr('th.name'), tr('th.state'), tr('th.suffixes'), tr('th.wildcard'), tr('th.acmeBinding'), tr('th.renew'), tr('th.key'), tr('th.maxSans')], entries }),
     );
   }
 
   async function policyForm(p) {
     const b = await bindings();
     const isNew = !p;
+    const name = input('text', p ? p.name : '', { required: isNew, maxlength: 64, autocomplete: 'off' });
     const suffixes = el('textarea', { rows: 3, placeholder: 'example.ac.jp\nlab.example.ac.jp' });
     suffixes.value = p ? p.allowedDnsSuffixes.join('\n') : '';
     const wildcard = checkbox(p ? p.allowWildcard : false);
@@ -687,6 +724,7 @@
     const enabled = checkbox(p ? p.enabled : true);
     const status = el('div');
     const body = () => ({
+      name: name.value.trim(),
       allowedDnsSuffixes: suffixes.value.split(/[\s,]+/).map((s) => s.trim()).filter((s) => s),
       allowWildcard: wildcard.checked,
       acmeBinding: acme.value,
@@ -714,6 +752,7 @@
       },
     },
     status,
+    field(tr('policy.name'), name, tr('policy.nameHint')),
     field(tr('policy.suffixes'), suffixes, tr('policy.suffixesHint')),
     field(tr('policy.wildcard'), wildcard),
     field(tr('policy.acme'), acme, tr('policy.acmeHint')),
@@ -729,8 +768,9 @@
     setNav('policies');
     const [p, targets] = await Promise.all([api('GET', '/policies/' + encodeURIComponent(id)), api('GET', '/targets?policyRef=' + encodeURIComponent(id))]);
     show(
-      el('h1', null, el('span', { class: 'mono', text: p.id }), ' ', enabledBadge(p.enabled)),
+      el('h1', null, policyLabel(p), ' ', enabledBadge(p.enabled)),
       props([
+        [tr('policy.id'), el('span', { class: 'mono', text: p.id })],
         [tr('policy.createdUpdated'), when(p.createdAt) + ' / ' + when(p.updatedAt)],
         [tr('policy.targetCount'), String(targets.items.length)],
       ]),
@@ -749,7 +789,7 @@
 
   // Runs
 
-  function runEntries(items, withTarget) {
+  function runEntries(items, withTarget, dir) {
     const headers = [tr('th.run'), tr('th.status'), tr('th.requested'), tr('th.finished'), tr('th.action'), tr('th.error'), tr('th.requestedBy')];
     if (withTarget) headers.splice(1, 0, tr('th.target'));
     const entries = items.map((r) => {
@@ -762,14 +802,14 @@
         r.error ? errorCell(r.error) : '—',
         r.requestedBy,
       ];
-      if (withTarget) cells.splice(1, 0, td(link('#/targets/' + encodeURIComponent(r.targetId), r.targetId), 'mono'));
-      return { cells, extra: [r.id, r.targetId, r.status, r.error ? r.error.code : '', r.requestedByAuthority || '', r.externalExecutionId || ''] };
+      if (withTarget) cells.splice(1, 0, td(link('#/targets/' + encodeURIComponent(r.targetId), dir.target(r.targetId)), 'mono'));
+      return { cells, extra: [r.id, r.targetId, dir.target(r.targetId), dir.policyOfTarget(r.targetId), r.status, r.error ? r.error.code : '', r.requestedByAuthority || '', r.externalExecutionId || ''] };
     });
     return { headers, entries };
   }
 
-  function runsTable(items, withTarget) {
-    const { headers, entries } = runEntries(items, withTarget);
+  function runsTable(items, withTarget, dir) {
+    const { headers, entries } = runEntries(items, withTarget, dir);
     return table(headers, entries.map((e) => e.cells));
   }
 
@@ -778,7 +818,7 @@
   async function viewRuns() {
     setNav('runs');
     const status = hashParams().get('status') || '';
-    const res = await api('GET', '/runs?limit=' + RUNS_LIMIT + (status ? '&status=' + encodeURIComponent(status) : ''));
+    const [res, dir] = await Promise.all([api('GET', '/runs?limit=' + RUNS_LIMIT + (status ? '&status=' + encodeURIComponent(status) : '')), directory()]);
     const sel = select(['', 'queued', 'starting', 'running', 'succeeded', 'failed', 'cancelled'], status, (v) => (v ? tr('status.' + v) : tr('common.all')));
     sel.addEventListener('change', () => {
       const params = hashParams();
@@ -786,7 +826,7 @@
       else params.delete('status');
       location.hash = hashWith(params);
     });
-    const { headers, entries } = runEntries(res.items, true);
+    const { headers, entries } = runEntries(res.items, true, dir);
     show(
       el('h1', { text: tr('runs.title') }),
       filteredTable({ headers, entries, controls: [el('label', { text: tr('common.status') + ' ' }), sel], limit: RUNS_LIMIT }),
@@ -795,7 +835,7 @@
 
   async function viewRun(id) {
     setNav('runs');
-    const r = await api('GET', '/runs/' + encodeURIComponent(id));
+    const [r, dir] = await Promise.all([api('GET', '/runs/' + encodeURIComponent(id)), directory()]);
     const status = el('div');
     const cancellable = ['queued', 'starting', 'running'].includes(r.status);
     show(
@@ -814,7 +854,7 @@
         },
       }, tr('run.cancel')) : null),
       props([
-        [tr('run.target'), link('#/targets/' + encodeURIComponent(r.targetId), r.targetId, 'mono')],
+        [tr('run.target'), link('#/targets/' + encodeURIComponent(r.targetId), dir.target(r.targetId), 'mono')],
         [tr('run.revision'), String(r.targetRevision)],
         [tr('run.requestedBy'), el('span', null, el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
         [tr('run.times'), when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
@@ -834,19 +874,19 @@
 
   async function viewAudit() {
     setNav('audit');
-    const res = await api('GET', '/audit?limit=' + AUDIT_LIMIT);
+    const [res, dir] = await Promise.all([api('GET', '/audit?limit=' + AUDIT_LIMIT), directory()]);
     const entries = res.items.map((e) => ({
       cells: [
         when(e.time),
         td(e.actor, 'mono'),
         e.actorAuthority ? td(e.actorAuthority, 'mono') : '—',
         td(e.action, 'mono'),
-        e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), e.targetId), 'mono') : '—',
+        e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), dir.target(e.targetId)), 'mono') : '—',
         e.runId ? td(link('#/runs/' + encodeURIComponent(e.runId), e.runId), 'mono') : '—',
-        e.policyId ? td(link('#/policies/' + encodeURIComponent(e.policyId), e.policyId), 'mono') : '—',
+        e.policyId ? link('#/policies/' + encodeURIComponent(e.policyId), dir.policy(e.policyId)) : '—',
         e.detail,
       ],
-      extra: [e.id, e.time],
+      extra: [e.id, e.time, e.targetId || '', e.policyId || '', e.targetId ? dir.policyOfTarget(e.targetId) : ''],
     }));
     show(
       el('h1', { text: tr('audit.title') }),
@@ -1006,7 +1046,7 @@
       show(heading, notice('error', tr('eab.notConfigured')));
       return;
     }
-    const [res, targets, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), api('GET', '/targets'), acmeConductorX25519Supported()]);
+    const [res, targets, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), api('GET', '/targets?retired=include'), acmeConductorX25519Supported()]);
     const items = res.items.filter((b) => b.externalAccountBinding || b.pending || b.targets.some((a) => a.pending));
     const refresh = () => withErrors(() => viewEAB());
     show(
