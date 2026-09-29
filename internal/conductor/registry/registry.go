@@ -32,6 +32,11 @@ var (
 	// ErrRunActive: a run is already queued, starting or running for the
 	// target; at most one run per target may be active at a time.
 	ErrRunActive = errors.New("a run is already active for this target")
+	// ErrRetired: the target is retired (docs/adr/0026); nothing about it
+	// can change any more.
+	ErrRetired = errors.New("target is retired")
+	// ErrTargetEnabled: a target must be disabled before it is retired.
+	ErrTargetEnabled = errors.New("target is enabled")
 )
 
 // Policy is a CertificatePolicy: the rules a Target is issued under.
@@ -71,7 +76,17 @@ type Target struct {
 	// Revision is an optimistic-locking counter, incremented on every
 	// update; every JobSpec produced for the target carries it.
 	Revision int64
+	// RetiredAt is set once the target is retired (docs/adr/0026): out of
+	// service for good, its names released, its rows and history kept.
+	// Nil for a target in service (enabled or disabled). RetiredBy and
+	// RetiredByAuthority name who retired it, as for an audit actor.
+	RetiredAt          *time.Time
+	RetiredBy          string
+	RetiredByAuthority string
 }
+
+// Retired reports whether the target is retired.
+func (t *Target) Retired() bool { return t.RetiredAt != nil }
 
 // RunStatus is the lifecycle state of a Run.
 type RunStatus string
@@ -140,6 +155,7 @@ const (
 	AuditTargetUpdated  AuditAction = "target.updated"
 	AuditTargetEnabled  AuditAction = "target.enabled"
 	AuditTargetDisabled AuditAction = "target.disabled"
+	AuditTargetRetired  AuditAction = "target.retired"
 	AuditPolicyCreated  AuditAction = "policy.created"
 	AuditPolicyUpdated  AuditAction = "policy.updated"
 	AuditPolicyRejected AuditAction = "policy.rejected"
@@ -259,6 +275,11 @@ type ListTargetsOptions struct {
 	Enabled *bool
 	// PolicyRef, when non-empty, keeps only targets under that policy.
 	PolicyRef string
+	// IncludeRetired also returns retired targets (docs/adr/0026); by
+	// default they are left out, so that everything that works on "the
+	// targets" (the scheduler, policy checks, the default list) never
+	// sees one.
+	IncludeRetired bool
 }
 
 // ListRunsOptions filters ListRuns. Runs are returned newest first.
@@ -307,11 +328,21 @@ type Registry interface {
 	// revision (t.Revision is set to the new value on return). FQDN is
 	// immutable and ignored; AdditionalNames is replaced. Returns
 	// ErrStaleRevision otherwise, and ErrConflict if another target has
-	// one of the names.
+	// one of the names, and ErrRetired if the target is retired.
 	UpdateTarget(ctx context.Context, t *Target, expectedRevision int64, ev *AuditEvent) error
 
+	// RetireTarget takes the target with id out of service for good
+	// (docs/adr/0026): it sets RetiredAt/RetiredBy, releases every name of
+	// the target, cancels its pending target-scoped ACME account request
+	// and bumps the revision, with ev, all in one transaction. Nothing is
+	// deleted. It returns ErrNotFound; ErrRetired if the target is
+	// already retired; ErrTargetEnabled unless it is disabled; ErrRunActive
+	// if a run is queued, starting or running. There is no way back.
+	RetireTarget(ctx context.Context, id, by, authority string, ev *AuditEvent) (*Target, error)
+
 	// CreateRun records a new queued run. Returns ErrRunActive if the
-	// target already has a queued, starting or running run.
+	// target already has a queued, starting or running run, and
+	// ErrRetired if the target is retired.
 	CreateRun(ctx context.Context, r *Run, ev *AuditEvent) error
 	GetRun(ctx context.Context, id string) (*Run, error)
 	ListRuns(ctx context.Context, opts ListRunsOptions) ([]*Run, error)

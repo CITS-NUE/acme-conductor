@@ -477,6 +477,9 @@ func (s *Scheduler) planBindingProvisioning(ctx context.Context, binding string,
 // Due decides whether target t under policy p is due for a run at now.
 // The second value explains the decision for logs and audit.
 func Due(t *registry.Target, p *registry.Policy, sum *registry.TargetRunSummary, now time.Time, backoff, maxBackoff time.Duration) (bool, string) {
+	if t.Retired() {
+		return false, "target retired"
+	}
 	if !t.Enabled || !p.Enabled {
 		return false, "target or policy disabled"
 	}
@@ -617,6 +620,9 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	}
 	log = log.With("fqdn", target.FQDN)
 	switch {
+	case target.Retired():
+		cancelled("target was retired before the run started")
+		return
 	case !target.Enabled:
 		cancelled("target was disabled before the run started")
 		return

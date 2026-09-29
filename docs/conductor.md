@@ -373,8 +373,10 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | 404 | `not_found` | 該当するポリシー，target，run，エンドポイントがない． |
 | 409 | `conflict` | 同じ FQDN に対する 2 つ目の target．既存の target をカバーしなくなるポリシー編集．キャンセルできない run のキャンセル． |
 | 409 | `stale_revision` | リクエストの `revision` が target の現在のリビジョンではない． |
-| 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）． |
+| 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）．退役の要求では，実行中の run があるので退役できない，の意味になる． |
 | 409 | `target_disabled` | 無効化された target に run が要求された． |
+| 409 | `target_enabled` | 有効な target を退役させようとした（退役の前に無効化しなければならない）． |
+| 409 | `target_retired` | 退役済みの target を変更しようとした（`PUT`，`enable`，`disable`，run の要求，target ごとのアカウントへの EAB の投入），または退役済みの target をもう一度退役させようとした．退役は元に戻せない（[退役](#target-の退役)）． |
 | 413 | `too_large` | 本文が 64 KiB を超えている． |
 | 415 | `unsupported_media_type` | `Content-Type: application/json` のない本文． |
 | 500 | `internal` | レジストリまたはその他の内部障害．詳細はログにのみ記録される． |
@@ -401,12 +403,13 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `POST /api/v1alpha1/policies` | ポリシーを作成 → `201` Policy，`Location`． |
 | `GET /api/v1alpha1/policies/{id}` | ポリシー 1 件． |
 | `PUT /api/v1alpha1/policies/{id}` | ポリシーを置き換え → `200`．その下のいずれかの target が満たさなくなる場合は拒否（`409`）． |
-| `GET /api/v1alpha1/targets[?enabled=&policyRef=]` | `{"items":[Target…]}`，古い順． |
+| `GET /api/v1alpha1/targets[?enabled=&policyRef=&retired=]` | `{"items":[Target…]}`，古い順．既定では退役済みの target を含めない．`retired=include` で含める（`retired=exclude` は既定と同じ．それ以外の値は `400`）． |
 | `POST /api/v1alpha1/targets` | target を作成 → `201` Target，`Location`．スケジューラを起こす． |
 | `GET /api/v1alpha1/targets/{id}` | target 1 件．証明書と最後の run の要約を含む． |
 | `PUT /api/v1alpha1/targets/{id}` | 指定した `revision` で変更可能なフィールドを更新 → `200`．スケジューラを起こす． |
 | `POST /api/v1alpha1/targets/{id}/enable` | `enabled: true` に設定 → `200` Target（変化があればリビジョンが上がる）． |
 | `POST /api/v1alpha1/targets/{id}/disable` | `enabled: false` に設定 → `200` Target．何も削除せず，実行中の run も止めない． |
+| `POST /api/v1alpha1/targets/{id}/retire` | target を退役させる（admin のみ．[退役](#target-の退役)）→ `200` Target（`retired: true`）．本文なし．無効化されていなければ `409` `target_enabled`，run が queued/starting/running なら `409` `run_active`，すでに退役済みなら `409` `target_retired`． |
 | `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | その target の run，新しい順． |
 | `POST /api/v1alpha1/targets/{id}/runs` | 今すぐ run を要求 → `202` Run，`Location`．本文 `{"revision": N}` は省略可． |
 | `GET /api/v1alpha1/runs[?targetId=&status=&limit=&before=]` | run の一覧，新しい順．`status` はコンマ区切りの一覧． |
@@ -533,6 +536,10 @@ Runner は名前の一致しない格納済みの証明書を再発行する．`
   "lastRun": { "id": "01JRUN…", "status": "succeeded", "requestedAt": "…", "finishedAt": "…" }
 }
 ```
+
+退役済みの target だけが，次の 3 つのフィールドを追加で持つ（それ以外の target では
+省略される）: `"retired": true`，`"retiredAt": "…"`，`"retiredBy": "…"`（`retiredByAuthority`
+も付く．audit の `actor`／`actorAuthority` と同じ組）．
 
 `certificate` は run が成功するまで `null` であり，最後に成功した `Result` が
 報告した内容そのものである．Store から読んだものでは決してない．`lastRun` は
@@ -673,6 +680,61 @@ Conductor を再起動した場合も，これで次の tick に収束する．�
 
 すべての遷移は，同じトランザクションで監査イベント（後述）を書く．
 
+### Target の退役
+
+テスト用など，もう要らなくなった target を片付けるための操作である．**purge ではない**:
+`Target`，`Run`，`AuditEvent` の行はどれも残り，履歴はそのまま読める
+（[ADR 0008](adr/0008-no-purge-in-mvp.md)，[ADR 0026](adr/0026-retire-targets.md)）．
+退役は，その target を恒久的に運用から外し，名前を解放する．
+
+`POST /api/v1alpha1/targets/{id}/retire`（admin のみ．無効化と同じ認可）は，次の
+前提をすべて満たすときだけ成功する．満たさなければ何も変えず `409` を返す．
+
+1. target が **無効** である（`target_enabled`）．
+2. target に **実行中の run** がない（queued/starting/running．`run_active`）．
+3. まだ **退役していない**（`target_retired`）．
+
+成功すると，1 つのトランザクションで次のことが起きる．
+
+- `retiredAt` と `retiredBy` を記録し，リビジョンを 1 つ進める．
+- target の名前（`fqdn` と各 `additionalNames`）をすべて解放する．以後，同じ名前を
+  別の（新しい）target が使える．
+- その target の **target ごとの ACME アカウント**（[ADR 0024](adr/0024-target-scoped-acme-accounts-and-san.md)）に
+  保留中（`provisioning`）の EAB 投入要求があれば `cancelled` にして，封入済みの
+  ペイロードを消す（行は消さない）．
+- 監査イベント `target.retired` を書く（要求を取り消したときは，要求ごとに
+  `acme_account.provisioning_cancelled` も）．
+
+退役した target は次のように扱われる．
+
+- `GET /targets/{id}` はこれまでどおり読める．`GET /targets` は既定で含めず，
+  `?retired=include` で含める（GUI は「退役済みも表示」）．その run，監査イベントは
+  これまでどおり読める．
+- 変更はすべて `409` `target_retired`: `PUT`，`enable`，`disable`，run の要求，
+  target ごとのアカウントへの EAB の投入．スキーマも退役済みの行の更新を拒む．
+- スケジューラは計画しない（既定の一覧に載らず，`Due` も偽を返す）．
+- ポリシーの target 数（GUI のポリシー詳細），ポリシーの更新時に「既存の target を
+  なお満たすか」を調べる対象からは，退役済みの target を除く．退役済みの target は
+  二度と run を持たず，証明書を発行しないので，ポリシーを厳しくしても害はない．
+  行は `policy_id` の外部キーを持ち続ける（ポリシーの削除はそもそもできない）．
+- 元に戻す API はない（unretire はない）．同じ FQDN をもう一度管理したいときは，
+  新しい target を作る．
+
+**Conductor の外は何も変わらない．** Certificate Store（Key Vault など）にある
+証明書，Runner のアカウント状態，CA 側のアカウントは，Conductor にそれらを操作する
+権限がないので，そのまま残る．保存済みの証明書は更新されなくなり，有効期限で切れる．
+Store のオブジェクト名は FQDN から決まるので，退役した target と同じ名前の新しい
+target は，同じ Key Vault 証明書の新しいバージョンを書く．これは許容している
+（古いバージョンは Key Vault に残る）．不要な証明書そのものを Store から消すのは，
+Store 側の運用（Key Vault の権限をもつ人）の仕事である．
+
+スキーマ（バージョン 6）: `targets` に `retired_at`，`retired_by`，
+`retired_by_authority` が加わり，`fqdn` の一意性は「退役していない target の間で」
+（部分ユニークインデックス）になる．`target_names` には退役していない target の名前
+だけが入る（退役で行を消す）．この移行は `targets` の作り直しを伴うため，
+その 1 つだけは外部キー検査を切り，コミット前に `PRAGMA foreign_key_check` を通してから
+検査を戻して実行する．
+
 ### 監査イベント
 
 ```json
@@ -690,6 +752,7 @@ Conductor がこれを保存するようになる前に記録されたイベン�
 
 アクション: `policy.created`，`policy.updated`，`policy.rejected`，
 `target.created`，`target.updated`，`target.enabled`，`target.disabled`，
+`target.retired`，
 `run.requested`，`run.started`，`run.succeeded`，`run.failed`，`run.cancelled`，
 `acme_account.provisioning_requested`，
 `acme_account.provisioning_attached`，`acme_account.activated`，
@@ -897,7 +960,9 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 ## GUI
 
 `/ui/` は同じ API の上に載る最小限のインターフェースである．target（一覧，作成，
-編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
+編集，有効化／無効化，退役，run の要求．一覧は退役済みを隠し，
+「退役済みも表示」で出せる．退役は無効な target の詳細ページで，FQDN を入力して
+確認する），ポリシー（一覧，作成，編集），run（ステータスで
 絞り込める一覧，詳細，キャンセル），監査ログ，そして `accountProvisioning` が設定されて
 いれば EAB プロビジョニングのページ（タブ「EAB」，"#/eab"．旧アドレス
 "#/acme-bindings" はここへ転送される）を扱う．このページに並ぶのは
@@ -920,6 +985,14 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 スタイルシート）で，フレームワークもビルド手順もない．表示するものはすべて
 DOM のメソッドで描画し，データからマークアップを組み立てることは決してなく，
 API の呼び出しは自身のオリジンに対してのみ行う．
+
+証明書，実行履歴，操作記録，発行ポリシーの一覧には，表の上に絞り込み欄がある．
+空白で区切った語をすべて含む行だけを残す（大文字小文字は区別しない）．対象は
+表に見えている文字列と，ID，追加のホスト名，エラーコードなどの生の値で，
+ブラウザに読み込み済みの行だけを調べる（実行履歴は最新 100 件，操作記録は
+最新 200 件．サーバーへの問い合わせは増えない）．入力は URL の `#` 以降の
+クエリ `q`（例: `#/runs?status=failed&q=acmefailure`）に履歴を増やさずに保存され，
+そのアドレスを開くと同じ絞り込みが再現される．
 
 `oidc` モードでは，ページは **パブリッククライアント**（`server.auth.oidc.clientId`）
 として認可コードフローと PKCE で操作者をサインインさせる．`/ui/config` を読み，
@@ -977,7 +1050,8 @@ provenance を添えて公開される（[ADR 0017](adr/0017-release-pipeline.md
 オンラインで `sqlite3 conductor.db ".backup out.db"` を使う．復元はプロセスを止めて
 ファイルを戻す．新しいバイナリは起動時にスキーマを前方に移行する（バージョンは
 `schema_migrations` に記録される．バージョン 2 で `actorAuthority` と
-`requestedByAuthority` の列が追加され，既存の行は空のまま残る）．古いバイナリは
+`requestedByAuthority` の列が追加され，既存の行は空のまま残る．バージョン 6 で
+target の退役が加わる）．古いバイナリは
 新しいスキーマで書かれたデータベースを拒否するため，デプロイのロールバックには
 対応するバックアップの復元も伴う．バックアップ時点で実行中だった run は，次の
 起動時に `failed`／「結果不明」として復旧される．

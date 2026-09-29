@@ -240,7 +240,62 @@ CREATE INDEX acme_accounts_run ON acme_accounts(run_id) WHERE run_id IS NOT NULL
 CREATE TRIGGER acme_accounts_no_delete BEFORE DELETE ON acme_accounts
   BEGIN SELECT RAISE(ABORT, 'acme_accounts cannot be deleted'); END;
 `,
+	// 6: retire targets (docs/adr/0026). A retired target keeps its row
+	// and history but is out of service for good and gives up its names:
+	// retired_at (NULL while in service), retired_by and its authority.
+	// targets.fqdn was NOT NULL UNIQUE, which would keep a retired
+	// target's FQDN from ever being registered again, and an inline
+	// UNIQUE cannot be dropped, so the table is rebuilt (SQLite's "Making
+	// Other Kinds Of Table Schema Changes" procedure; see
+	// foreignKeysOffMigrations: runs and target_names reference targets,
+	// and this migration must run with foreign keys off): fqdn becomes
+	// unique only among targets that are not retired. target_names keeps
+	// only the names of targets in service (a retire deletes the rows;
+	// the table has no delete trigger). A retired target's row cannot
+	// change any more (trigger), so retirement is irreversible in the
+	// schema itself.
+	`
+CREATE TABLE targets_v6 (
+  id                   TEXT PRIMARY KEY,
+  fqdn                 TEXT    NOT NULL,
+  enabled              INTEGER NOT NULL,
+  owner                TEXT    NOT NULL,
+  policy_id            TEXT    NOT NULL REFERENCES policies(id),
+  execution_binding    TEXT    NOT NULL,
+  dns_binding          TEXT    NOT NULL,
+  store_binding        TEXT    NOT NULL,
+  created_at           TEXT    NOT NULL,
+  updated_at           TEXT    NOT NULL,
+  revision             INTEGER NOT NULL,
+  additional_names     TEXT    NOT NULL DEFAULT '[]',
+  retired_at           TEXT,
+  retired_by           TEXT    NOT NULL DEFAULT '',
+  retired_by_authority TEXT    NOT NULL DEFAULT ''
+);
+INSERT INTO targets_v6 (id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names)
+  SELECT id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names FROM targets;
+DROP TABLE targets;
+ALTER TABLE targets_v6 RENAME TO targets;
+CREATE INDEX targets_policy ON targets(policy_id);
+CREATE UNIQUE INDEX targets_fqdn_in_service ON targets(fqdn) WHERE retired_at IS NULL;
+CREATE TRIGGER targets_no_delete BEFORE DELETE ON targets
+  BEGIN SELECT RAISE(ABORT, 'targets cannot be deleted'); END;
+CREATE TRIGGER targets_retired_is_final BEFORE UPDATE ON targets WHEN OLD.retired_at IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'a retired target cannot be changed'); END;
+`,
 }
+
+// foreignKeysOffMigrations are the migrations that rebuild a table other
+// tables reference. SQLite's procedure for that is: foreign keys off
+// (PRAGMA foreign_keys is a no-op inside a transaction, so it is set on the
+// connection before the transaction begins), create the new table, copy,
+// DROP the old one, RENAME the new one to the old name, recreate indexes and
+// triggers, PRAGMA foreign_key_check, commit, foreign keys back on. With
+// foreign keys on, the implicit DELETE FROM of DROP TABLE would fail on the
+// rows that still refer to the table. (RENAME of the new table does not touch the
+// references to the old name in runs and target_names: they name "targets",
+// and only references to the renamed table, "targets_v6", are rewritten.)
+var foreignKeysOffMigrations = map[int]bool{6: true}
 
 // SchemaVersion is the schema version this binary expects.
 var SchemaVersion = len(migrations)
@@ -257,16 +312,81 @@ func (d *DB) migrate(ctx context.Context) error {
 		return fmt.Errorf("%w: database is at version %d, binary supports %d", ErrSchemaTooNew, current, SchemaVersion)
 	}
 	for v := current + 1; v <= SchemaVersion; v++ {
-		err := d.tx(ctx, func(tx *sql.Tx) error {
-			if _, err := tx.ExecContext(ctx, migrations[v-1]); err != nil {
-				return err
-			}
-			_, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, v, fmtTime(time.Now()))
-			return err
-		})
+		var err error
+		if foreignKeysOffMigrations[v] {
+			err = d.applyWithoutForeignKeys(ctx, v)
+		} else {
+			err = d.tx(ctx, func(tx *sql.Tx) error { return applyMigration(ctx, tx, v) })
+		}
 		if err != nil {
 			return fmt.Errorf("apply migration %d: %w", v, err)
 		}
+	}
+	return nil
+}
+
+func applyMigration(ctx context.Context, tx *sql.Tx, v int) error {
+	if _, err := tx.ExecContext(ctx, migrations[v-1]); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, v, fmtTime(time.Now()))
+	return err
+}
+
+// applyWithoutForeignKeys applies migration v on one pinned connection with
+// foreign keys switched off, then checks them before the commit: any row
+// the migration left dangling rolls the whole migration back. Foreign keys
+// are switched back on whatever happens.
+func (d *DB) applyWithoutForeignKeys(ctx context.Context, v int) (err error) {
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("pin connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("switch foreign keys off: %w", err)
+	}
+	defer func() {
+		if _, ferr := conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`); ferr != nil && err == nil {
+			err = fmt.Errorf("switch foreign keys on: %w", ferr)
+		}
+	}()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	if err := applyMigration(ctx, tx, v); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("foreign key check: %w", err)
+	}
+	var violations []string
+	for rows.Next() {
+		var table, parent string
+		var rowid sql.NullInt64
+		var fkid int
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			rows.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("foreign key check: %w", err)
+		}
+		violations = append(violations, fmt.Sprintf("%s -> %s (rowid %d)", table, parent, rowid.Int64))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("foreign key check: %w", err)
+	}
+	if len(violations) > 0 {
+		_ = tx.Rollback()
+		return fmt.Errorf("foreign key check failed after the migration: %s", strings.Join(violations, "; "))
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
 }
@@ -548,13 +668,14 @@ func (d *DB) UpdatePolicy(ctx context.Context, p *registry.Policy, ev *registry.
 
 // ---- targets ----------------------------------------------------------
 
-const targetCols = `id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names`
+const targetCols = `id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names, retired_at, retired_by, retired_by_authority`
 
 func scanTarget(sc interface{ Scan(...any) error }) (*registry.Target, error) {
 	var t registry.Target
 	var enabled int
 	var created, updated, additional string
-	if err := sc.Scan(&t.ID, &t.FQDN, &enabled, &t.Owner, &t.PolicyRef, &t.ExecutionBinding, &t.DNSBinding, &t.StoreBinding, &created, &updated, &t.Revision, &additional); err != nil {
+	var retired sql.NullString
+	if err := sc.Scan(&t.ID, &t.FQDN, &enabled, &t.Owner, &t.PolicyRef, &t.ExecutionBinding, &t.DNSBinding, &t.StoreBinding, &created, &updated, &t.Revision, &additional, &retired, &t.RetiredBy, &t.RetiredByAuthority); err != nil {
 		return nil, err
 	}
 	t.Enabled = enabled != 0
@@ -569,6 +690,9 @@ func scanTarget(sc interface{ Scan(...any) error }) (*registry.Target, error) {
 		return nil, err
 	}
 	if t.UpdatedAt, err = parseTime(updated); err != nil {
+		return nil, err
+	}
+	if t.RetiredAt, err = parseOptTime(retired); err != nil {
 		return nil, err
 	}
 	return &t, nil
@@ -635,7 +759,7 @@ func (d *DB) CreateTarget(ctx context.Context, t *registry.Target, ev *registry.
 		ev.TargetID = t.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO targets (`+targetCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		_, err := tx.ExecContext(ctx, `INSERT INTO targets (id, fqdn, enabled, owner, policy_id, execution_binding, dns_binding, store_binding, created_at, updated_at, revision, additional_names) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			t.ID, t.FQDN, boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, fmtTime(t.CreatedAt), fmtTime(t.UpdatedAt), t.Revision, additional)
 		if err != nil {
 			switch {
@@ -669,6 +793,9 @@ func (d *DB) GetTarget(ctx context.Context, id string) (*registry.Target, error)
 func (d *DB) ListTargets(ctx context.Context, opts registry.ListTargetsOptions) ([]*registry.Target, error) {
 	q := `SELECT ` + targetCols + ` FROM targets WHERE 1=1`
 	var args []any
+	if !opts.IncludeRetired {
+		q += ` AND retired_at IS NULL`
+	}
 	if opts.Enabled != nil {
 		q += ` AND enabled = ?`
 		args = append(args, boolInt(*opts.Enabled))
@@ -706,7 +833,7 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 		ev.TargetID = t.ID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE targets SET enabled = ?, owner = ?, policy_id = ?, execution_binding = ?, dns_binding = ?, store_binding = ?, additional_names = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
+		res, err := tx.ExecContext(ctx, `UPDATE targets SET enabled = ?, owner = ?, policy_id = ?, execution_binding = ?, dns_binding = ?, store_binding = ?, additional_names = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ? AND retired_at IS NULL`,
 			boolInt(t.Enabled), t.Owner, t.PolicyRef, t.ExecutionBinding, t.DNSBinding, t.StoreBinding, additional, fmtTime(t.UpdatedAt), t.ID, expectedRevision)
 		if err != nil {
 			if isForeignKey(err) {
@@ -715,12 +842,16 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 			return fmt.Errorf("update target: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			var exists int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM targets WHERE id = ?`, t.ID).Scan(&exists); err != nil {
+			var retired sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, t.ID).Scan(&retired)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: target %s", registry.ErrNotFound, t.ID)
+			}
+			if err != nil {
 				return fmt.Errorf("update target: %w", err)
 			}
-			if exists == 0 {
-				return fmt.Errorf("%w: target %s", registry.ErrNotFound, t.ID)
+			if retired.Valid {
+				return fmt.Errorf("%w: target %s", registry.ErrRetired, t.ID)
 			}
 			return fmt.Errorf("%w: target %s is not at revision %d", registry.ErrStaleRevision, t.ID, expectedRevision)
 		}
@@ -740,6 +871,91 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 		t.Revision = expectedRevision + 1
 		return insertAudit(ctx, tx, ev)
 	})
+}
+
+// RetireTarget implements registry.Registry (docs/adr/0026). Every check
+// and every change is in one transaction: a run cannot be requested between
+// the check for an active run and the retirement, and a failure leaves
+// nothing half done.
+func (d *DB) RetireTarget(ctx context.Context, id, by, authority string, ev *registry.AuditEvent) (*registry.Target, error) {
+	now := time.Now().UTC()
+	if ev != nil {
+		ev.TargetID = id
+	}
+	err := d.tx(ctx, func(tx *sql.Tx) error {
+		var enabled int
+		var retired sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT enabled, retired_at FROM targets WHERE id = ?`, id).Scan(&enabled, &retired)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: target %s", registry.ErrNotFound, id)
+		}
+		if err != nil {
+			return fmt.Errorf("retire target: %w", err)
+		}
+		switch {
+		case retired.Valid:
+			return fmt.Errorf("%w: target %s", registry.ErrRetired, id)
+		case enabled != 0:
+			return fmt.Errorf("%w: target %s must be disabled before it is retired", registry.ErrTargetEnabled, id)
+		}
+		var active int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE target_id = ? AND status IN ('queued', 'starting', 'running')`, id).Scan(&active); err != nil {
+			return fmt.Errorf("retire target: %w", err)
+		}
+		if active > 0 {
+			return fmt.Errorf("%w: target %s", registry.ErrRunActive, id)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE targets SET retired_at = ?, retired_by = ?, retired_by_authority = ?, updated_at = ?, revision = revision + 1 WHERE id = ?`,
+			fmtTime(now), by, authority, fmtTime(now), id); err != nil {
+			return fmt.Errorf("retire target: %w", err)
+		}
+		// Release every name (the FQDN's row included).
+		if _, err := tx.ExecContext(ctx, `DELETE FROM target_names WHERE target_id = ?`, id); err != nil {
+			return fmt.Errorf("release target names: %w", err)
+		}
+		// A pending request for the target's own ACME account can no
+		// longer be carried by any run: withdraw it (rows are kept).
+		rows, err := tx.QueryContext(ctx, `SELECT binding, generation FROM acme_accounts WHERE scope = ? AND status = ? ORDER BY binding, generation`, id, string(registry.ACMEAccountProvisioning))
+		if err != nil {
+			return fmt.Errorf("find pending acme account requests: %w", err)
+		}
+		type pending struct {
+			binding    string
+			generation int64
+		}
+		var cancel []pending
+		for rows.Next() {
+			var p pending
+			if err := rows.Scan(&p.binding, &p.generation); err != nil {
+				rows.Close()
+				return err
+			}
+			cancel = append(cancel, p)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, p := range cancel {
+			if _, err := tx.ExecContext(ctx, `UPDATE acme_accounts SET status = ?, sealed_payload = NULL, run_id = NULL, updated_at = ? WHERE binding = ? AND scope = ? AND generation = ? AND status = ?`,
+				string(registry.ACMEAccountCancelled), fmtTime(now), p.binding, id, p.generation, string(registry.ACMEAccountProvisioning)); err != nil {
+				return fmt.Errorf("cancel acme account request: %w", err)
+			}
+			cev := &registry.AuditEvent{
+				Actor: by, ActorAuthority: authority, Action: registry.AuditACMEAccountProvisioningCancelled, TargetID: id,
+				Detail: fmt.Sprintf("acme account provisioning cancelled: %s generation=%d (target retired)", accountDetail(p.binding, id), p.generation),
+			}
+			if err := insertAudit(ctx, tx, cev); err != nil {
+				return err
+			}
+		}
+		return insertAudit(ctx, tx, ev)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return d.GetTarget(ctx, id)
 }
 
 // ---- runs -------------------------------------------------------------
@@ -786,6 +1002,10 @@ func (d *DB) CreateRun(ctx context.Context, r *registry.Run, ev *registry.AuditE
 		ev.TargetID = r.TargetID
 	}
 	return d.tx(ctx, func(tx *sql.Tx) error {
+		var retired sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, r.TargetID).Scan(&retired); err == nil && retired.Valid {
+			return fmt.Errorf("%w: target %s", registry.ErrRetired, r.TargetID)
+		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			r.ID, r.TargetID, r.TargetRevision, string(r.Status), r.RequestedBy, r.RequestedByAuthority, fmtTime(r.RequestedAt))
 		if err != nil {
@@ -1008,6 +1228,12 @@ func (d *DB) RequestACMEAccountProvisioning(ctx context.Context, a *registry.ACM
 	a.UpdatedAt = now
 	a.ActivatedAt = nil
 	return d.tx(ctx, func(tx *sql.Tx) error {
+		if a.Scope != "" {
+			var retired sql.NullString
+			if err := tx.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, a.Scope).Scan(&retired); err == nil && retired.Valid {
+				return fmt.Errorf("%w: target %s", registry.ErrRetired, a.Scope)
+			}
+		}
 		var maxGen sql.NullInt64
 		if err := tx.QueryRowContext(ctx, `SELECT MAX(generation) FROM acme_accounts WHERE binding = ? AND scope = ?`, a.Binding, a.Scope).Scan(&maxGen); err != nil {
 			return fmt.Errorf("read max generation: %w", err)

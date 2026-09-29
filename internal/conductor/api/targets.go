@@ -63,6 +63,13 @@ type TargetResource struct {
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
 	Revision         int64     `json:"revision"`
+	// Retired, RetiredAt and RetiredBy are present only on a retired
+	// target (docs/adr/0026): out of service for good, its names
+	// released. RetiredBy is the principal within RetiredByAuthority.
+	Retired            bool       `json:"retired,omitempty"`
+	RetiredAt          *time.Time `json:"retiredAt,omitempty"`
+	RetiredBy          string     `json:"retiredBy,omitempty"`
+	RetiredByAuthority string     `json:"retiredByAuthority,omitempty"`
 	// Certificate summarizes the last successful run, if any. It never
 	// contains certificate or key material.
 	Certificate *CertificateSummary `json:"certificate"`
@@ -99,6 +106,9 @@ func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetRes
 		ExecutionBinding: t.ExecutionBinding, DNSBinding: t.DNSBinding, StoreBinding: t.StoreBinding,
 		CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt, Revision: t.Revision,
 	}
+	if t.Retired() {
+		res.Retired, res.RetiredAt, res.RetiredBy, res.RetiredByAuthority = true, t.RetiredAt, t.RetiredBy, t.RetiredByAuthority
+	}
 	if ok := sum.LastSucceeded; ok != nil {
 		res.Certificate = &CertificateSummary{ExpiresAt: ok.ExpiresAt, FingerprintSha256: ok.FingerprintSha256, StoreObjectRef: ok.StoreObjectRef, LastSucceededAt: ok.FinishedAt, LastSucceededRun: ok.ID}
 	}
@@ -106,6 +116,12 @@ func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetRes
 		res.LastRun = &RunSummary{ID: last.ID, Status: last.Status, RequestedAt: last.RequestedAt, FinishedAt: last.FinishedAt, ErrorCode: last.ErrorCode}
 	}
 	return res, nil
+}
+
+// errRetired is the answer to any change of, or run request for, a retired
+// target (docs/adr/0026).
+func errRetired(t *registry.Target) *apiError {
+	return &apiError{status: http.StatusConflict, code: "target_retired", message: fmt.Sprintf("target %s is retired and cannot be changed", t.FQDN)}
 }
 
 func validateOwner(owner string) (string, error) {
@@ -219,7 +235,16 @@ func (s *Server) handleListTargets(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	list, err := s.reg.ListTargets(r.Context(), registry.ListTargetsOptions{Enabled: enabled, PolicyRef: policyRef})
+	includeRetired := false
+	switch v := r.URL.Query().Get("retired"); v {
+	case "", "exclude":
+	case "include":
+		includeRetired = true
+	default:
+		s.fail(w, r, badRequest("retired must be include or exclude"))
+		return
+	}
+	list, err := s.reg.ListTargets(r.Context(), registry.ListTargetsOptions{Enabled: enabled, PolicyRef: policyRef, IncludeRetired: includeRetired})
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -329,6 +354,10 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if t.Retired() {
+		s.fail(w, r, errRetired(t))
+		return
+	}
 	if t.Revision != in.Revision {
 		s.fail(w, r, fmt.Errorf("%w: target %s is at revision %d, not %d", registry.ErrStaleRevision, t.ID, t.Revision, in.Revision))
 		return
@@ -416,6 +445,10 @@ func (s *Server) handleSetTargetEnabled(enabled bool) http.HandlerFunc {
 			s.fail(w, r, err)
 			return
 		}
+		if t.Retired() {
+			s.fail(w, r, errRetired(t))
+			return
+		}
 		caller := PrincipalFrom(r.Context())
 		actor := caller.Name
 		if t.Enabled != enabled {
@@ -441,4 +474,41 @@ func (s *Server) handleSetTargetEnabled(enabled bool) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, res)
 	}
+}
+
+// handleRetireTarget retires a target (docs/adr/0026): out of service for
+// good, its names released, its rows and history kept. It is not a purge
+// (docs/adr/0008) and undoes nothing outside the Conductor: the stored
+// certificate, the Runner's account state and the CA account are left as
+// they are. The target must be disabled and have no active run; there is no
+// way back.
+func (s *Server) handleRetireTarget(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	caller := PrincipalFrom(r.Context())
+	actor := caller.Name
+	ev := &registry.AuditEvent{Actor: actor, ActorAuthority: caller.Authority, Action: registry.AuditTargetRetired}
+	// The FQDN for the audit detail; RetireTarget re-checks everything in
+	// its transaction.
+	t, err := s.reg.GetTarget(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ev.Detail = "target retired: " + targetDetail(t)
+	retired, err := s.reg.RetireTarget(r.Context(), id, actor, caller.Authority, ev)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.log.Info("target retired", "targetId", retired.ID, "fqdn", retired.FQDN, "actor", actor)
+	res, err := s.targetResource(r, retired)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }

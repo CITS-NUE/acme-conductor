@@ -92,6 +92,12 @@
     return statusBadge(enabled ? 'enabled' : 'disabled');
   }
 
+  // targetBadge is the state of a target: retired (docs/adr/0026) wins over
+  // enabled/disabled, which a retired target keeps only as history.
+  function targetBadge(t) {
+    return t.retired ? statusBadge('target-retired') : enabledBadge(t.enabled);
+  }
+
   function pad2(n) {
     return String(n).padStart(2, '0');
   }
@@ -107,11 +113,95 @@
     return utc + '（' + tr('common.localTime', { t: local }) + '）';
   }
 
+  // rowOf builds a table row from cells: a cell that already is a td/th is
+  // used as it is, anything else is wrapped in a td.
+  function rowOf(cells) {
+    return el('tr', null, ...cells.map((c) => (c instanceof HTMLTableCellElement ? c : el('td', null, c))));
+  }
+
+  function tableHead(headers) {
+    return el('thead', null, el('tr', null, ...headers.map((h) => el('th', { text: h }))));
+  }
+
   function table(headers, rows) {
     if (rows.length === 0) return el('p', { class: 'empty', text: tr('common.empty') });
-    const thead = el('thead', null, el('tr', null, ...headers.map((h) => el('th', { text: h }))));
-    const tbody = el('tbody', null, ...rows.map((cells) => el('tr', null, ...cells.map((c) => (c instanceof HTMLTableCellElement ? c : el('td', null, c))))));
-    return el('table', null, thead, tbody);
+    return el('table', null, tableHead(headers), el('tbody', null, ...rows.map(rowOf)));
+  }
+
+  // ---- list filter ----------------------------------------------------------
+  //
+  // A client-side text filter over the rows a list page has already loaded
+  // (no request is made). Its query lives in the hash query string as q, next
+  // to the page's own parameters, and is written with history.replaceState so
+  // that typing adds no history entries and fires no hashchange (the page is
+  // not re-rendered).
+
+  function hashParams() {
+    return new URLSearchParams(location.hash.split('?')[1] || '');
+  }
+
+  function hashWith(params) {
+    const path = location.hash.split('?')[0] || '#/targets';
+    const query = params.toString();
+    return path + (query ? '?' + query : '');
+  }
+
+  function replaceHashParam(name, value) {
+    const params = hashParams();
+    if (value) params.set(name, value);
+    else params.delete(name);
+    history.replaceState(null, '', location.pathname + location.search + hashWith(params));
+  }
+
+  // normalizeText folds case and full-width forms so that a query matches
+  // however it was typed.
+  function normalizeText(s) {
+    return String(s).normalize('NFKC').toLowerCase();
+  }
+
+  const FILTER_DELAY_MS = 120;
+
+  // filteredTable renders a list with a filter box. entries are
+  // { cells, extra }: the cells of the row and raw values that are not shown
+  // in full (ids, every additional name, error codes). A row is kept when
+  // every whitespace-separated term of the query is a substring of its
+  // visible cell text plus extra. Only the table body is rebuilt on input,
+  // so focus and caret stay in the box. controls are put before the box;
+  // limit, when given, adds the hint that only the loaded entries are covered.
+  function filteredTable({ headers, entries, controls, limit }) {
+    const rows = entries.map((e) => {
+      const trow = rowOf(e.cells);
+      const visible = Array.from(trow.cells).map((c) => c.textContent);
+      return { trow, text: normalizeText(visible.concat(e.extra || []).join(' ')) };
+    });
+    const tbody = el('tbody');
+    const tbl = el('table', null, tableHead(headers), tbody);
+    const empty = el('p', { class: 'empty' });
+    const count = el('span', { class: 'aside', 'aria-live': 'polite' });
+    const box = el('input', { type: 'search', class: 'filter', placeholder: tr('filter.placeholder'), 'aria-label': tr('filter.placeholder'), autocomplete: 'off', spellcheck: 'false', value: hashParams().get('q') || '' });
+    const apply = () => {
+      const terms = normalizeText(box.value).split(/\s+/).filter((t) => t);
+      const kept = rows.filter((r) => terms.every((t) => r.text.includes(t)));
+      tbody.replaceChildren(...kept.map((r) => r.trow));
+      count.textContent = tr('filter.count', { n: kept.length, m: rows.length });
+      tbl.hidden = kept.length === 0;
+      empty.hidden = kept.length !== 0;
+      empty.textContent = rows.length === 0 ? tr('common.empty') : tr('filter.noMatch');
+    };
+    let timer = null;
+    box.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        apply();
+        replaceHashParam('q', box.value.trim());
+      }, FILTER_DELAY_MS);
+    });
+    apply();
+    return el('div', { class: 'list' },
+      el('div', { class: 'toolbar' }, ...(controls || []), box, count, limit ? el('span', { class: 'aside', text: tr('filter.loadedOnly', { n: limit }) }) : null),
+      empty,
+      tbl,
+    );
   }
 
   function td(content, cls) {
@@ -354,20 +444,31 @@
 
   async function viewTargets() {
     setNav('targets');
-    const res = await api('GET', '/targets');
-    const rows = res.items.map((t) => [
-      el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: tr('targets.moreNames', { n: t.additionalNames.length }) }) : ''),
-      enabledBadge(t.enabled),
-      t.owner,
-      td(link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef), 'mono'),
-      t.executionBinding + ' / ' + t.dnsBinding + ' / ' + t.storeBinding,
-      t.certificate ? when(t.certificate.expiresAt) : '—',
-      t.lastRun ? el('span', null, statusBadge(t.lastRun.status), ' ', t.lastRun.errorCode ? el('span', { class: 'mono', text: t.lastRun.errorCode }) : '') : '—',
-    ]);
+    const showRetired = hashParams().get('retired') === '1';
+    const res = await api('GET', '/targets' + (showRetired ? '?retired=include' : ''));
+    const entries = res.items.map((t) => ({
+      cells: [
+        el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: tr('targets.moreNames', { n: t.additionalNames.length }) }) : ''),
+        targetBadge(t),
+        t.owner,
+        td(link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef), 'mono'),
+        t.executionBinding + ' / ' + t.dnsBinding + ' / ' + t.storeBinding,
+        t.certificate ? when(t.certificate.expiresAt) : '—',
+        t.lastRun ? el('span', null, statusBadge(t.lastRun.status), ' ', t.lastRun.errorCode ? el('span', { class: 'mono', text: t.lastRun.errorCode }) : '') : '—',
+      ],
+      extra: [t.id, t.fqdn].concat(t.additionalNames, [t.policyRef, t.lastRun ? t.lastRun.status : '', t.lastRun ? t.lastRun.errorCode || '' : '']),
+    }));
+    const retiredBox = checkbox(showRetired);
+    retiredBox.addEventListener('change', () => {
+      const params = hashParams();
+      if (retiredBox.checked) params.set('retired', '1');
+      else params.delete('retired');
+      location.hash = hashWith(params);
+    });
     show(
       el('h1', { text: tr('targets.title') }),
-      el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/targets/new', tr('targets.new'), 'button')),
-      table([tr('th.fqdn'), tr('th.state'), tr('th.owner'), tr('th.policy'), tr('th.bindings'), tr('th.certExpires'), tr('th.lastRun')], rows),
+      el('div', { class: 'toolbar' }, el('label', null, retiredBox, ' ' + tr('targets.showRetired')), el('span', { class: 'spacer' }), link('#/targets/new', tr('targets.new'), 'button')),
+      filteredTable({ headers: [tr('th.fqdn'), tr('th.state'), tr('th.owner'), tr('th.policy'), tr('th.bindings'), tr('th.certExpires'), tr('th.lastRun')], entries }),
     );
   }
 
@@ -389,12 +490,14 @@
       },
     }, label);
     const cert = t.certificate;
-    const account = await targetAccountSection(t);
+    // A retired target is history only: no actions, no edit form, no ACME
+    // account section.
+    const account = t.retired ? null : await targetAccountSection(t);
     show(
-      el('h1', null, el('span', { class: 'mono', text: t.fqdn }), ' ', enabledBadge(t.enabled)),
+      el('h1', null, el('span', { class: 'mono', text: t.fqdn }), ' ', targetBadge(t)),
       status,
-      nextStep(t, account),
-      el('div', { class: 'toolbar' },
+      t.retired ? notice('', tr('retired.banner', { at: when(t.retiredAt), by: t.retiredBy || '—' })) : nextStep(t, account),
+      t.retired ? '' : el('div', { class: 'toolbar' },
         act(tr('target.runNow'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/runs', 'primary', { revision: t.revision }),
         t.enabled ? act(tr('target.disable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : act(tr('target.enable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable'),
       ),
@@ -410,12 +513,49 @@
         [tr('target.createdUpdated'), when(t.createdAt) + ' / ' + when(t.updatedAt)],
         [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
         [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
-      ]),
+      ].concat(t.retired ? [[tr('target.retired'), when(t.retiredAt) + ' / ' + (t.retiredBy || '—')]] : [])),
       account ? account.node : '',
-      el('h2', { text: tr('common.edit') }),
-      await targetForm(t),
+      t.retired ? '' : el('h2', { text: tr('common.edit') }),
+      t.retired ? '' : await targetForm(t),
+      t.retired ? '' : retirePanel(t),
       el('h2', { text: tr('common.runs') }),
       runsTable(runs.items, false),
+    );
+  }
+
+  // retirePanel is the way out for a target that is not needed any more
+  // (docs/adr/0026): a disabled target is retired after its FQDN is typed
+  // in, since there is no way back. An enabled one only says to disable
+  // first.
+  function retirePanel(t) {
+    if (t.enabled) return el('div', null, el('h2', { text: tr('retire.title') }), el('p', { class: 'aside', text: tr('retire.needDisable') }));
+    const status = el('div');
+    const confirm = input('text', '', { placeholder: t.fqdn, autocomplete: 'off', spellcheck: 'false', 'aria-label': tr('retire.confirmLabel', { fqdn: t.fqdn }) });
+    const button = el('button', {
+      class: 'danger',
+      disabled: true,
+      onclick: async () => {
+        clear(status);
+        button.disabled = true;
+        try {
+          await api('POST', '/targets/' + encodeURIComponent(t.id) + '/retire');
+          flash = notice('ok', tr('retire.done'));
+          route();
+        } catch (err) {
+          status.append(notice('error', describe(err)));
+          button.disabled = confirm.value.trim().toLowerCase() !== t.fqdn;
+        }
+      },
+    }, tr('retire.button'));
+    confirm.addEventListener('input', () => { button.disabled = confirm.value.trim().toLowerCase() !== t.fqdn; });
+    return el('div', { class: 'panel retire' },
+      el('h2', { text: tr('retire.title') }),
+      el('p', { text: tr('retire.intro') }),
+      el('ul', null, ...['retire.b1', 'retire.b2', 'retire.b3', 'retire.b4'].map((k) => el('li', { text: tr(k) }))),
+      el('p', null, el('strong', { text: tr('retire.final') })),
+      status,
+      el('div', { class: 'field' }, el('label', { text: tr('retire.confirmLabel', { fqdn: t.fqdn }) }), confirm),
+      el('div', { class: 'actions' }, button),
     );
   }
 
@@ -514,20 +654,23 @@
   async function viewPolicies() {
     setNav('policies');
     const res = await api('GET', '/policies');
-    const rows = res.items.map((p) => [
-      td(link('#/policies/' + encodeURIComponent(p.id), p.id), 'mono'),
-      enabledBadge(p.enabled),
-      td(p.allowedDnsSuffixes.join(', '), 'mono'),
-      p.allowWildcard ? tr('common.yes') : tr('common.no'),
-      p.acmeBinding,
-      tr('common.days', { n: p.renewBeforeDays }),
-      p.keyType,
-      String(p.maxSANs),
-    ]);
+    const entries = res.items.map((p) => ({
+      cells: [
+        td(link('#/policies/' + encodeURIComponent(p.id), p.id), 'mono'),
+        enabledBadge(p.enabled),
+        td(p.allowedDnsSuffixes.join(', '), 'mono'),
+        p.allowWildcard ? tr('common.yes') : tr('common.no'),
+        p.acmeBinding,
+        tr('common.days', { n: p.renewBeforeDays }),
+        p.keyType,
+        String(p.maxSANs),
+      ],
+      extra: [p.id],
+    }));
     show(
       el('h1', { text: tr('policies.title') }),
       el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/policies/new', tr('policies.new'), 'button')),
-      table([tr('th.id'), tr('th.state'), tr('th.suffixes'), tr('th.wildcard'), tr('th.acmeBinding'), tr('th.renew'), tr('th.key'), tr('th.maxSans')], rows),
+      filteredTable({ headers: [tr('th.id'), tr('th.state'), tr('th.suffixes'), tr('th.wildcard'), tr('th.acmeBinding'), tr('th.renew'), tr('th.key'), tr('th.maxSans')], entries }),
     );
   }
 
@@ -606,10 +749,10 @@
 
   // Runs
 
-  function runsTable(items, withTarget) {
+  function runEntries(items, withTarget) {
     const headers = [tr('th.run'), tr('th.status'), tr('th.requested'), tr('th.finished'), tr('th.action'), tr('th.error'), tr('th.requestedBy')];
     if (withTarget) headers.splice(1, 0, tr('th.target'));
-    return table(headers, items.map((r) => {
+    const entries = items.map((r) => {
       const cells = [
         td(link('#/runs/' + encodeURIComponent(r.id), r.id), 'mono'),
         statusBadge(r.status),
@@ -620,21 +763,33 @@
         r.requestedBy,
       ];
       if (withTarget) cells.splice(1, 0, td(link('#/targets/' + encodeURIComponent(r.targetId), r.targetId), 'mono'));
-      return cells;
-    }));
+      return { cells, extra: [r.id, r.targetId, r.status, r.error ? r.error.code : '', r.requestedByAuthority || '', r.externalExecutionId || ''] };
+    });
+    return { headers, entries };
   }
+
+  function runsTable(items, withTarget) {
+    const { headers, entries } = runEntries(items, withTarget);
+    return table(headers, entries.map((e) => e.cells));
+  }
+
+  const RUNS_LIMIT = 100;
 
   async function viewRuns() {
     setNav('runs');
-    const filter = new URLSearchParams(location.hash.split('?')[1] || '');
-    const status = filter.get('status') || '';
-    const res = await api('GET', '/runs?limit=100' + (status ? '&status=' + encodeURIComponent(status) : ''));
+    const status = hashParams().get('status') || '';
+    const res = await api('GET', '/runs?limit=' + RUNS_LIMIT + (status ? '&status=' + encodeURIComponent(status) : ''));
     const sel = select(['', 'queued', 'starting', 'running', 'succeeded', 'failed', 'cancelled'], status, (v) => (v ? tr('status.' + v) : tr('common.all')));
-    sel.addEventListener('change', () => { location.hash = '#/runs' + (sel.value ? '?status=' + sel.value : ''); });
+    sel.addEventListener('change', () => {
+      const params = hashParams();
+      if (sel.value) params.set('status', sel.value);
+      else params.delete('status');
+      location.hash = hashWith(params);
+    });
+    const { headers, entries } = runEntries(res.items, true);
     show(
       el('h1', { text: tr('runs.title') }),
-      el('div', { class: 'toolbar' }, el('label', { text: tr('common.status') + ' ' }), sel),
-      runsTable(res.items, true),
+      filteredTable({ headers, entries, controls: [el('label', { text: tr('common.status') + ' ' }), sel], limit: RUNS_LIMIT }),
     );
   }
 
@@ -675,12 +830,13 @@
 
   // Audit
 
+  const AUDIT_LIMIT = 200;
+
   async function viewAudit() {
     setNav('audit');
-    const res = await api('GET', '/audit?limit=200');
-    show(
-      el('h1', { text: tr('audit.title') }),
-      table([tr('th.time'), tr('th.actor'), tr('th.authority'), tr('th.action'), tr('th.target'), tr('th.runShort'), tr('th.policy'), tr('th.detail')], res.items.map((e) => [
+    const res = await api('GET', '/audit?limit=' + AUDIT_LIMIT);
+    const entries = res.items.map((e) => ({
+      cells: [
         when(e.time),
         td(e.actor, 'mono'),
         e.actorAuthority ? td(e.actorAuthority, 'mono') : '—',
@@ -689,7 +845,12 @@
         e.runId ? td(link('#/runs/' + encodeURIComponent(e.runId), e.runId), 'mono') : '—',
         e.policyId ? td(link('#/policies/' + encodeURIComponent(e.policyId), e.policyId), 'mono') : '—',
         e.detail,
-      ])),
+      ],
+      extra: [e.id, e.time],
+    }));
+    show(
+      el('h1', { text: tr('audit.title') }),
+      filteredTable({ headers: [tr('th.time'), tr('th.actor'), tr('th.authority'), tr('th.action'), tr('th.target'), tr('th.runShort'), tr('th.policy'), tr('th.detail')], entries, limit: AUDIT_LIMIT }),
     );
   }
 
@@ -886,13 +1047,13 @@
   const routes = [
     [/^#\/targets\/new$/, () => viewNewTarget()],
     [/^#\/targets\/([A-Za-z0-9_-]+)$/, (m) => viewTarget(m[1])],
-    [/^#\/targets$/, () => viewTargets()],
+    [/^#\/targets(\?.*)?$/, () => viewTargets()],
     [/^#\/policies\/new$/, () => viewNewPolicy()],
     [/^#\/policies\/([A-Za-z0-9_-]+)$/, (m) => viewPolicy(m[1])],
-    [/^#\/policies$/, () => viewPolicies()],
+    [/^#\/policies(\?.*)?$/, () => viewPolicies()],
     [/^#\/runs\/([A-Za-z0-9_-]+)$/, (m) => viewRun(m[1])],
     [/^#\/runs(\?.*)?$/, () => viewRuns()],
-    [/^#\/audit$/, () => viewAudit()],
+    [/^#\/audit(\?.*)?$/, () => viewAudit()],
     [/^#\/eab$/, () => viewEAB()],
     // The page's former address, kept for bookmarks.
     [/^#\/acme-bindings$/, () => { location.hash = '#/eab'; }],
