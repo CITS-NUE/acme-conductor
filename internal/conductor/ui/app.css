@@ -85,7 +85,7 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 .notice.next strong { color: var(--fg); }
 .notice .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
 td .hint, dd .hint { color: var(--muted); font-size: 12px; }
-.status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.status { display: inline-block; white-space: nowrap; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
 .status.succeeded, .status.enabled { color: var(--ok); border-color: var(--ok); }
 .status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
