@@ -203,30 +203,125 @@ binding）は `runnerConfigJson` パラメータにそのまま書ける
 
 ## 新しい申請を追加する
 
-1. UPKI に ACME 利用情報作成申請を出し，EAB（Key ID と HMAC Key）を受け取る．
-   申請する名前は，これから作る target の `fqdn` と `additionalNames` そのもので
-   ある．
-2. 各名前の DNS-01 チャレンジが通ることを確かめる（委任しているなら
-   `dig +short CNAME _acme-challenge.<name>`）．
-3. target を作る．`fqdn` に利用管理者 FQDN（CN），`additionalNames` に残りの
-   dNSName を並べ，`policyRef` に UPKI のポリシーを指定する．
-   作った直後にスケジューラが最初の run を起こすが，まだアカウントがないので，
-   Runner を起動せずに上の要約の `AcmeFailure` で失敗する．これは想定通りで
-   ある．この失敗を残したくなければ，target を無効（「Enabled」を外す）で作り，
-   次の手順で EAB を投入してから有効にする．有効にした時点で run が起き，
-   保存された EAB を運ぶ．
-4. target の詳細ページの「ACME account」の節から EAB を投入する（Key ID と
-   HMAC Key を入力する．ブラウザの中で Runner の公開鍵に封じられ，暗号文だけが
-   Conductor に送られる）．投入と同時に，その target の run が 1 つ起こる．
-   手順 3 の失敗によるバックオフは待たない（投入より前の失敗だからである）．
-5. その run が ACME アカウントを登録し（`newAccount` に EAB を使う），続けて
-   証明書を発行する．run が成功し，target の「ACME account」に世代 1 が
-   `active` として表示されれば完了である．以後の更新は EAB を使わず，登録した
-   アカウントで行われる．
+UPKI の証明書を 1 つ（申請 1 つ = target 1 つ）追加するときの手順である．
+UPKI の登録担当者が，UPKI 側（TSV と審査），DNS（委任），Conductor（ポリシー，
+target，EAB）の作業をすべて 1 人で行うことを前提にする．Conductor を操作するのも
+登録担当者だけで，証明書の利用者は Conductor に触れない．利用者から受け取るのは
+名前と用途だけでよい．
 
-手順 4 で run を起こせなかった（target やポリシーが無効，実行中の run がある
-など）ときも EAB は記録され，ページの上部にその理由が出る．run に添付されて
-いない未着手の EAB は，次の tick でスケジューラが run を起こす理由になる．
+審査には日数がかかることがあるので，審査を待つ間に手順 4 を済ませてよい．
+Conductor の作業（手順 5 以降）は，EAB と委任の両方がそろってから行う．
+
+| # | 作業 | 場所 |
+|---|---|---|
+| 1 | 名前を決め，前提を確かめる | ― |
+| 2 | TSV を作る | [UPKI TSV 作成ツール](https://certs.nii.ac.jp/tsv-tool/) |
+| 3 | TSV をアップロードし，審査を経て EAB を受け取る | [UPKI 証明書発行支援システム（登録担当者）](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do) |
+| 4 | `_acme-challenge` の CNAME を設定する | 親ゾーンの DNS |
+| 5 | ポリシーを作る（初回，または条件が違うときだけ） | Conductor GUI |
+| 6 | target を作る | Conductor GUI |
+| 7 | EAB を投入し，発行を確かめる | Conductor GUI（target の詳細ページ） |
+
+### 1. 名前を決め，前提を確かめる
+
+- 利用管理者 FQDN（CN）を 1 つと，残りの dNSName（CN を含めて最大 8 個）を
+  決める．この集合が，そのまま UPKI の申請と target の `fqdn`／`additionalNames`
+  になる．後から名前を変えるには UPKI 側の手続きが要る（[名前を変える](#名前を変える)）．
+- ワイルドカードは使わない（`allowWildcard: false`）．
+- すべての名前が Runner の `authorization.allowedDnsSuffixes` のいずれかの下に
+  あることを確かめる．外れていると，run は Runner で `PolicyViolation`
+  （`fqdn is not under any allowed DNS suffix`）になる．Runner の設定は
+  デプロイ時に決まり，登録担当者は GUI から変えられない．足りなければ，
+  デプロイする者に Runner の設定の変更と再デプロイを頼む．
+  名前ごとの制限は DNS の委任と UPKI の登録がかけるので，サフィックスは
+  組織のドメイン（`example.ac.jp`）程度にまとめてよい．
+- 名前の数が Runner の `maxNames` とポリシーの `maxSANs` を超えないことを
+  確かめる（[設定例](#設定例)では両方 8）．
+
+### 2. TSV を作る
+
+[UPKI TSV 作成ツール](https://certs.nii.ac.jp/tsv-tool/) で，ACME 利用情報作成
+申請の TSV を作る．利用管理者 FQDN には手順 1 の CN を，dNSName には残りの名前を
+入れる．このとき選ぶ証明書プロファイルが，発行できる鍵の種別を決める．選んだ
+プロファイル（RSA かどうか，鍵長）を控えておき，手順 5 のポリシーの `keyType` に
+合わせる．
+
+### 3. TSV をアップロードし，EAB を受け取る
+
+[UPKI 証明書発行支援システムの登録担当者画面](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do)
+から TSV をアップロードする．審査が済むと EAB（Key ID と HMAC Key）が発行される．
+EAB は登録担当者の手元から出さない．利用者やほかの担当者に渡さず，チャットや
+チケットにも貼らない．Conductor のリポジトリにも Key Vault にも置かない
+（手順 7 でブラウザ内で暗号化して投入する）．
+
+### 4. `_acme-challenge` の CNAME を設定する
+
+各名前の `_acme-challenge.<name>` を，チャレンジ用ゾーンの中の名前へ CNAME で
+委任する（[`deploy/azure/README.md`](../deploy/azure/README.md#複数の-dns-ゾーン)）．
+Runner が書き込めるのはチャレンジ用ゾーンだけなので，委任のない名前では
+TXT を置けない．
+登録担当者には，親ゾーンに CNAME を書く権限を持たせておく（Azure DNS なら，
+親ゾーンの CNAME レコードの書き込み）．TXT を書く権限は要らない．
+
+```
+_acme-challenge.www.example.ac.jp.  IN CNAME  www.<チャレンジ用ゾーン>.
+```
+
+委任先の名前は，ほかの名前と重ならなければ何でもよい．チャレンジ用ゾーンの
+中にレコードを事前に作る必要はない（TXT は run のたびに Runner が作って消す）．
+設定したら，すべての名前について確かめる．
+
+```sh
+dig +short CNAME _acme-challenge.<name>   # チャレンジ用ゾーン内の名前が返ればよい
+```
+
+UPKI では所有確認に 20 回失敗すると翌日まで制限されるので，委任を確かめる前に
+手順 7 に進まない．利用管理者 FQDN そのものが外部のサービス（ホスティングなど）
+への CNAME でも，`_acme-challenge` は別の名前なので委任できる．
+
+### 5. ポリシーを作る
+
+UPKI 用のポリシーがまだないとき，または既存のものと条件（サフィックス，鍵種別）が
+違うときだけ作る．内容は [設定例のポリシー](#ポリシー) の通りで，`acmeBinding` に
+UPKI の binding を指定する．
+
+`keyType` は手順 2 で控えたプロファイルに合わせる．RSA のプロファイルに
+`rsa4096` を指定すると，チャレンジが通った後で CA に拒否され，run は
+`AcmeFailure` で失敗する（実例は [失敗の読み方](#失敗の読み方)）．
+既存のポリシーを流用するときも `keyType` を確かめる．ほかの CA 用に作った
+ポリシーを付けたままにしない．
+
+### 6. target を作る
+
+`fqdn` に利用管理者 FQDN（CN），`additionalNames` に残りの dNSName を並べ，
+`policyRef` に手順 5 のポリシーを指定する．**「Enabled」を外した無効の状態で
+作る．**
+
+有効のまま作ると，直後にスケジューラが最初の run を起こす．まだアカウントが
+ないので，run は Runner を起動せずに上の要約の `AcmeFailure` で失敗する．
+害はないが，失敗の記録が残る．
+
+### 7. EAB を投入し，発行を確かめる
+
+1. target の詳細ページの「ACME account」の節に，手順 3 の Key ID と HMAC Key を
+   入力して投入する．ブラウザの中で Runner の公開鍵に封じられ，暗号文だけが
+   Conductor に送られる．
+2. target を有効にする（「Enabled」を付けて保存する）．有効にした時点で run が
+   起き，保存された EAB を運ぶ．target を有効のまま作った場合は，EAB の投入と
+   同時に run が起こる．手順 6 の失敗によるバックオフは待たない（投入より前の
+   失敗だからである）．
+3. その run が ACME アカウントを登録し（`newAccount` に EAB を使う），続けて
+   証明書を発行する．run が `succeeded` になり，「ACME account」に世代 1 が
+   `active` と表示され，Store（Key Vault など）に証明書が入っていれば完了である．
+   以後の更新は EAB を使わず，登録したアカウントで行われる．
+
+run が失敗したら [失敗の読み方](#失敗の読み方) で切り分ける．アカウントの登録が
+済んでいれば（世代 1 が `active`），原因を直して GUI から run を起こし直すだけで
+よく，EAB を投入し直す必要はない．
+
+run を起こせなかった（target やポリシーが無効，実行中の run があるなど）ときも
+EAB は記録され，ページの上部にその理由が出る．run に添付されていない未着手の
+EAB は，次の tick でスケジューラが run を起こす理由になる．
 
 ## 名前を変える
 
@@ -275,7 +370,7 @@ target の `fqdn` は作成後に変えられない（Store のオブジェク�
 2. 旧 target を無効にする（`POST /targets/{id}/disable`）．旧い CN の証明書を
    更新し続けないためである．
 3. 新しい CN の target を作り，[新しい申請を追加する](#新しい申請を追加する)の
-   手順 3 から進める．
+   手順 4 から進める（新しい名前の委任を確かめてから）．
 4. 証明書の利用側（Key Vault の参照など）を，新しい target の Store の
    オブジェクトに切り替える．
 
@@ -293,16 +388,37 @@ UPKI 固有の失敗を，Conductor は専用の状態で扱わない．どれ�
 | 状況 | run に残るもの |
 |---|---|
 | target にアカウントがない（EAB 未投入） | `AcmeFailure`．要約は `acme binding "…" keeps one account per target and this target has none yet: provision one with an EAB`．Runner は起動しない． |
-| 登録されていない名前，CN が先頭にない，鍵種別がプロファイルと違う | CA がオーダーを拒否し，`AcmeFailure`（`lego exited with status <n>`）． |
+| 名前が Runner の `allowedDnsSuffixes` の下にない | `PolicyViolation`．要約は `runner authorization policy rejected the job: fqdn is not under any allowed DNS suffix`．lego は起動しない．Runner の設定を直して再デプロイする． |
+| 登録されていない名前，CN が先頭にない | CA がオーダーを拒否し，`AcmeFailure`（`lego exited with status <n>`）． |
+| 鍵種別がプロファイルと違う | 同上．チャレンジが通った後で拒否されるので，lego は数十秒動いてから失敗する． |
 | CA 側で停止されたアカウント | 同上． |
-| DNS-01 の所有確認に失敗（委任の漏れなど） | 同上． |
+| DNS-01 の所有確認に失敗（委任の漏れなど） | 同上．委任がなければ TXT を置けないので，lego は数秒で失敗する． |
 | EAB が無効（打ち間違い，すでに使われた） | EAB を運んだ run の `AcmeFailure`．その世代は `failed` になり，番号は再利用されない．新しい EAB を次の世代として投入し直す． |
 
 `lego` の失敗理由（CA の応答）は，いまのところ `Result.error.summary` にも
 info ログにも残らない．理由を run から読めるようにするのは
 [issue #38](https://github.com/CITS-NUE/acme-conductor/issues/38) で扱う．
 それまでは，上の表のどれに当たるかを，直前に行った操作（名前の編集，EAB の
-投入，DNS の変更）から切り分ける．
+投入，DNS の変更）と，次の手がかりから切り分ける．
+
+- **lego の所要時間**．Runner の info ログの `lego finished` に `durationMs` が
+  出る．数秒なら，チャレンジより前（委任の漏れで TXT を置けない，オーダーの
+  拒否）で失敗している．数十秒なら，TXT を置いてチャレンジまで進んだ後
+  （鍵種別の不一致など，検証や発行の段階）で失敗している．
+- **アカウントの世代**．EAB を運んだ run が失敗しても，世代が `active` に
+  なっていれば，アカウントの登録（EAB）は成功している．EAB を投入し直さず，
+  原因を直して run を起こし直す．
+- **チャレンジ用ゾーンの操作記録**．Azure DNS なら，チャレンジ用ゾーンの
+  アクティビティログに `TXT/write` があるかで，lego が TXT を置けたかが分かる．
+- **委任**．`dig +short CNAME _acme-challenge.<name>`．
+
+実例（2026-09 の導入時）: 次の 3 つが順に起きた．
+
+1. 名前が Runner の `allowedDnsSuffixes` の下になく，`PolicyViolation` になった．
+2. 委任がなく，lego が約 2 秒で失敗した．
+3. ポリシーの `keyType` が `rsa4096` のままで，lego が約 40 秒で失敗した．
+   TXT は置けていて，世代 1 は `active` になっていた．`rsa2048` にして run を
+   起こし直すと発行できた．
 
 ## binding 全体のアカウントで運用する場合
 
@@ -341,7 +457,7 @@ info ログにも残らない．理由を run から読めるようにするの�
 | 事項 | 現状 | 本書での扱い |
 |---|---|---|
 | ワイルドカードの可否 | 未確認 | `allowWildcard: false` |
-| 鍵種別 | EAB 発行時の証明書プロファイルで決まる（RSA が多い）．RSA の鍵長は未確認 | `keyType: rsa2048`．プロファイルに合わせる |
+| 鍵種別 | EAB 発行時の証明書プロファイルで決まる（RSA が多い）．RSA のプロファイルで `rsa4096` は拒否され，`rsa2048` で発行できた（2026-09，実運用で確認） | `keyType: rsa2048`．プロファイルに合わせる |
 | EAB の有効期限 | 未確認 | 期限がないことを前提にしない．受け取った EAB はそのまま投入する |
 | EAB の再利用 | 登録時に使う資格情報で，登録後の発行・更新では使わない．登録に使った EAB は再利用しない | 1 つの EAB は 1 つの世代の登録にだけ使う．certbot などからの移行でも，Conductor のアカウントには新しい EAB を受け取る |
 | CN を先頭に置く必要 | 必要 | Runner は `fqdn` を先頭の `--domains` に渡す |
