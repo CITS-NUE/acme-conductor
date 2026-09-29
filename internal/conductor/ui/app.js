@@ -16,8 +16,16 @@
   const TOKEN_KEY = 'acme-conductor.token';
   const PKCE_KEY = 'acme-conductor.pkce';
   const REDIRECT_URI = location.origin + '/ui/';
+  // The public guide (site/ on GitHub Pages). Links open in a new tab and
+  // carry no referrer, so the Conductor's URL never reaches the guide.
+  const GUIDE = 'https://cits-nue.github.io/acme-conductor/';
 
   const state = { config: null, token: null, bindings: null };
+
+  // Display strings live in i18n.js. Only what the page shows is translated:
+  // API values, error codes and status values keep their raw form.
+  const i18n = window.acmeConductorI18n;
+  const tr = (key, vars) => i18n.t(key, vars);
 
   // ---- DOM helpers ----------------------------------------------------------
 
@@ -69,22 +77,38 @@
     return el('a', { href, class: cls, text });
   }
 
+  function guideLink(page, text) {
+    return el('a', { href: GUIDE + page, target: '_blank', rel: 'noopener noreferrer', text });
+  }
+
+  // statusBadge keeps its CSS class from the raw value and shows a
+  // translated label, or the raw value when there is none.
   function statusBadge(value) {
-    return el('span', { class: 'status ' + String(value).toLowerCase(), text: value });
+    const key = 'status.' + value;
+    return el('span', { class: 'status ' + String(value).toLowerCase(), text: i18n.has(key) ? tr(key) : value });
   }
 
   function enabledBadge(enabled) {
     return statusBadge(enabled ? 'enabled' : 'disabled');
   }
 
+  function pad2(n) {
+    return String(n).padStart(2, '0');
+  }
+
+  // when shows UTC in ISO form; in Japanese it adds the browser's local time.
   function when(iso) {
     if (!iso) return '—';
     const d = new Date(iso);
-    return isNaN(d.getTime()) ? String(iso) : d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    if (isNaN(d.getTime())) return String(iso);
+    const utc = d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    if (i18n.lang() !== 'ja') return utc;
+    const local = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    return utc + '（' + tr('common.localTime', { t: local }) + '）';
   }
 
   function table(headers, rows) {
-    if (rows.length === 0) return el('p', { class: 'empty', text: 'Nothing here yet.' });
+    if (rows.length === 0) return el('p', { class: 'empty', text: tr('common.empty') });
     const thead = el('thead', null, el('tr', null, ...headers.map((h) => el('th', { text: h }))));
     const tbody = el('tbody', null, ...rows.map((cells) => el('tr', null, ...cells.map((c) => (c instanceof HTMLTableCellElement ? c : el('td', null, c))))));
     return el('table', null, thead, tbody);
@@ -100,17 +124,21 @@
     return dl;
   }
 
+  let fieldSeq = 0;
+
   function field(label, input, hint) {
-    const id = 'f-' + label.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const id = 'f-' + (++fieldSeq);
     input.id = id;
     const f = el('div', { class: 'field' }, el('label', { for: id, text: label }), input);
     if (hint) f.append(el('div', { class: 'hint', text: hint }));
     return f;
   }
 
-  function select(options, value) {
+  // select builds a dropdown; label, when given, maps a value to its
+  // displayed text (the value itself is what is sent).
+  function select(options, value, label) {
     const s = el('select');
-    for (const o of options) s.append(el('option', { value: o, selected: o === value, text: o }));
+    for (const o of options) s.append(el('option', { value: o, selected: o === value, text: label ? label(o) : o }));
     return s;
   }
 
@@ -142,6 +170,18 @@
       return err.code + ': ' + err.message + (extra ? ' (' + extra + ')' : '');
     }
     return err && err.message ? err.message : String(err);
+  }
+
+  // codeHint is a one-line plain explanation of an API error code, or null.
+  // The code itself is never translated.
+  function codeHint(code) {
+    const key = 'code.' + code;
+    return code && i18n.has(key) ? el('div', { class: 'hint', text: tr(key) }) : null;
+  }
+
+  // errorCell shows a run's error code and summary with the hint below.
+  function errorCell(e) {
+    return el('span', null, el('span', { class: 'mono', text: e.code }), ' ', e.summary, codeHint(e.code));
   }
 
   // ---- session --------------------------------------------------------------
@@ -183,7 +223,7 @@
 
   function storeToken(access) {
     const claims = decodeClaims(access);
-    const t = { access, exp: claims.exp, name: claims.preferred_username || claims.email || claims.sub || 'signed in' };
+    const t = { access, exp: claims.exp, name: claims.preferred_username || claims.email || claims.sub || tr('session.user') };
     sessionStorage.setItem(TOKEN_KEY, JSON.stringify(t));
     return t;
   }
@@ -220,11 +260,11 @@
     sessionStorage.removeItem(PKCE_KEY);
     let returnTo = '';
     try {
-      if (params.has('error')) throw new Error('the identity provider refused sign-in: ' + params.get('error'));
-      if (!raw) throw new Error('no sign-in was started in this tab');
+      if (params.has('error')) throw new Error(tr('signin.refused', { error: params.get('error') }));
+      if (!raw) throw new Error(tr('signin.notStarted'));
       const pkce = JSON.parse(raw);
       returnTo = pkce.returnTo || '';
-      if (params.get('state') !== pkce.state) throw new Error('the sign-in response does not match the request');
+      if (params.get('state') !== pkce.state) throw new Error(tr('signin.mismatch'));
       const auth = state.config.auth;
       const body = new URLSearchParams();
       body.set('grant_type', 'authorization_code');
@@ -234,11 +274,11 @@
       body.set('code_verifier', pkce.verifier);
       const res = await fetch(auth.tokenEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString(), credentials: 'omit' });
       const data = await res.json();
-      if (!res.ok || !data.access_token) throw new Error('the token request failed: ' + (data.error || res.status));
+      if (!res.ok || !data.access_token) throw new Error(tr('signin.tokenFailed', { error: data.error || res.status }));
       state.token = storeToken(data.access_token);
     } catch (err) {
       history.replaceState(null, '', REDIRECT_URI);
-      show(notice('error', 'Sign-in failed. ' + describe(err)), signInButton());
+      show(notice('error', tr('signin.failed', { detail: describe(err) })), signInButton());
       return true;
     }
     history.replaceState(null, '', REDIRECT_URI + returnTo);
@@ -248,22 +288,22 @@
   function signInButton() {
     const auth = state.config.auth;
     if (!auth.clientId) {
-      return el('div', { class: 'signin' }, el('p', { text: 'This deployment has no GUI client registered (server.auth.oidc.clientId). Use the API with a token obtained elsewhere.' }));
+      return el('div', { class: 'signin' }, el('p', { text: tr('signin.noClient') }));
     }
-    return el('div', { class: 'signin' }, el('p', { text: 'Sign in with ' + auth.issuer + ' to continue.' }), el('button', { class: 'primary', onclick: () => beginSignIn().catch((e) => show(notice('error', describe(e)))) }, 'Sign in'));
+    return el('div', { class: 'signin' }, el('p', { text: tr('signin.with', { issuer: auth.issuer }) }), el('button', { class: 'primary', onclick: () => beginSignIn().catch((e) => show(notice('error', describe(e)))) }, tr('session.signIn')));
   }
 
   function renderSession() {
     const s = document.getElementById('session');
     clear(s);
     if (state.config.auth.mode !== 'oidc') {
-      s.append(el('span', { text: 'localhost-dev (every local caller is an administrator)' }));
+      s.append(el('span', { text: tr('session.dev') }));
       return;
     }
     if (state.token) {
-      s.append(el('span', { class: 'mono', text: state.token.name }), el('button', { onclick: () => { clearToken(); route(); } }, 'Sign out'));
+      s.append(el('span', { class: 'mono', text: state.token.name }), el('button', { onclick: () => { clearToken(); route(); } }, tr('session.signOut')));
     } else {
-      s.append(el('span', { text: 'not signed in' }));
+      s.append(el('span', { text: tr('session.notSignedIn') }));
     }
   }
 
@@ -303,7 +343,7 @@
       await fn();
     } catch (err) {
       if (err instanceof ApiError && err.status === 401 && state.config.auth.mode === 'oidc') {
-        show(notice('error', 'Your session has ended (' + describe(err) + ').'), signInButton());
+        show(notice('error', tr('session.ended', { detail: describe(err) })), signInButton());
         return;
       }
       show(notice('error', describe(err)));
@@ -316,7 +356,7 @@
     setNav('targets');
     const res = await api('GET', '/targets');
     const rows = res.items.map((t) => [
-      el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: ' +' + t.additionalNames.length + ' names' }) : ''),
+      el('span', null, link('#/targets/' + encodeURIComponent(t.id), t.fqdn, 'mono'), t.additionalNames.length ? el('span', { class: 'aside', text: tr('targets.moreNames', { n: t.additionalNames.length }) }) : ''),
       enabledBadge(t.enabled),
       t.owner,
       td(link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef), 'mono'),
@@ -325,9 +365,9 @@
       t.lastRun ? el('span', null, statusBadge(t.lastRun.status), ' ', t.lastRun.errorCode ? el('span', { class: 'mono', text: t.lastRun.errorCode }) : '') : '—',
     ]);
     show(
-      el('h1', { text: 'Targets' }),
-      el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/targets/new', 'New target', 'button')),
-      table(['FQDN', 'State', 'Owner', 'Policy', 'Execution / DNS / Store', 'Certificate expires', 'Last run'], rows),
+      el('h1', { text: tr('targets.title') }),
+      el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/targets/new', tr('targets.new'), 'button')),
+      table([tr('th.fqdn'), tr('th.state'), tr('th.owner'), tr('th.policy'), tr('th.bindings'), tr('th.certExpires'), tr('th.lastRun')], rows),
     );
   }
 
@@ -349,32 +389,65 @@
       },
     }, label);
     const cert = t.certificate;
+    const account = await targetAccountSection(t);
     show(
       el('h1', null, el('span', { class: 'mono', text: t.fqdn }), ' ', enabledBadge(t.enabled)),
       status,
+      nextStep(t, account),
       el('div', { class: 'toolbar' },
-        act('Request run now', 'POST', '/targets/' + encodeURIComponent(t.id) + '/runs', 'primary', { revision: t.revision }),
-        t.enabled ? act('Disable', 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : act('Enable', 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable'),
+        act(tr('target.runNow'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/runs', 'primary', { revision: t.revision }),
+        t.enabled ? act(tr('target.disable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : act(tr('target.enable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable'),
       ),
       props([
-        ['Id', el('span', { class: 'mono', text: t.id })],
-        ['Additional names', t.additionalNames.length ? el('span', { class: 'mono', text: t.additionalNames.join(', ') }) : 'none (single-name certificate)'],
-        ['Owner', t.owner],
-        ['Policy', link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef, 'mono')],
-        ['Execution binding', t.executionBinding],
-        ['DNS binding', t.dnsBinding],
-        ['Store binding', t.storeBinding],
-        ['Revision', String(t.revision)],
-        ['Created / updated', when(t.createdAt) + ' / ' + when(t.updatedAt)],
-        ['Certificate', cert ? el('span', null, 'expires ' + when(cert.expiresAt) + ', stored as ', el('span', { class: 'mono', text: cert.storeObjectRef }), ', fingerprint ', el('span', { class: 'mono', text: cert.fingerprintSha256 })) : 'none recorded'],
-        ['Last successful run', cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
+        [tr('target.id'), el('span', { class: 'mono', text: t.id })],
+        [tr('target.additional'), t.additionalNames.length ? el('span', { class: 'mono', text: t.additionalNames.join(', ') }) : tr('target.singleName')],
+        [tr('target.owner'), t.owner],
+        [tr('target.policy'), link('#/policies/' + encodeURIComponent(t.policyRef), t.policyRef, 'mono')],
+        [tr('target.exec'), t.executionBinding],
+        [tr('target.dns'), t.dnsBinding],
+        [tr('target.store'), t.storeBinding],
+        [tr('target.revision'), String(t.revision)],
+        [tr('target.createdUpdated'), when(t.createdAt) + ' / ' + when(t.updatedAt)],
+        [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
+        [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
       ]),
-      (await targetAccountSection(t)) || '',
-      el('h2', { text: 'Edit' }),
+      account ? account.node : '',
+      el('h2', { text: tr('common.edit') }),
       await targetForm(t),
-      el('h2', { text: 'Runs' }),
+      el('h2', { text: tr('common.runs') }),
       runsTable(runs.items, false),
     );
+  }
+
+  // nextStep tells the operator what to do next, from state the page has
+  // already fetched: the target (with its last run and certificate) and,
+  // for a per-target binding, the target's ACME account.
+  function nextStep(t, account) {
+    const last = t.lastRun;
+    const runLink = last ? link('#/runs/' + encodeURIComponent(last.id), last.id, 'mono') : null;
+    const acct = account ? account.acct : null;
+    let kind = '';
+    let body;
+    if (acct && !acct.activeGeneration && !acct.pending) {
+      body = [tr('next.eab')];
+    } else if (!t.enabled) {
+      body = [tr(acct && acct.pending ? 'next.enableEab' : 'next.enable')];
+    } else if (last && ['queued', 'starting', 'running'].includes(last.status)) {
+      body = [tr('next.running'), runLink];
+    } else if (last && last.status === 'failed') {
+      kind = 'error';
+      body = [tr('next.failed', { code: last.errorCode || '—' }), runLink, ' ', tr('next.failedGuide'), guideLink('upki-guide.html#troubleshooting', tr('next.failedGuideLink')), codeHint(last.errorCode)];
+    } else if (acct && acct.pending) {
+      body = [tr('next.pendingEab')];
+    } else if (last && last.status === 'succeeded' && t.certificate) {
+      kind = 'ok';
+      body = [tr('next.done'), el('span', { class: 'mono', text: t.certificate.storeObjectRef }), tr('next.doneTail'), ' ', guideLink('certificate-usage.html', tr('next.usageLink'))];
+    } else if (!last) {
+      body = [tr('next.noRun')];
+    } else {
+      return null;
+    }
+    return el('div', { class: 'notice next ' + kind }, el('strong', { text: tr('next.title') }), ' ', ...body);
   }
 
   async function targetForm(t) {
@@ -417,23 +490,23 @@
       },
     },
     status,
-    field('FQDN', fqdn, isNew ? 'The certificate\'s primary name (its subject CN), ASCII, no trailing dot; a wildcard needs a policy that allows it.' : 'The primary name cannot change; create a new target to manage the certificate under another one.'),
-    field('Additional names', additional, 'Optional. One per line: the certificate\'s other names (subject alternative names). The policy\'s Max SANs bounds the total, the FQDN included. A change reissues the certificate at the next run.'),
-    field('Owner', owner, 'Who to contact about this certificate.'),
-    field('Policy', policy),
-    field('Execution binding', exec),
-    field('DNS binding', dns),
-    field('Store binding', store),
-    field('Enabled', enabled),
-    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, isNew ? 'Create target' : 'Save changes')),
+    field(tr('form.fqdn'), fqdn, isNew ? tr('form.fqdnHintNew') : tr('form.fqdnHintEdit')),
+    field(tr('form.additional'), additional, tr('form.additionalHint')),
+    field(tr('form.owner'), owner, tr('form.ownerHint')),
+    field(tr('form.policy'), policy, tr('form.policyHint')),
+    field(tr('form.exec'), exec, tr('form.execHint')),
+    field(tr('form.dns'), dns, tr('form.dnsHint')),
+    field(tr('form.store'), store, tr('form.storeHint')),
+    field(tr('form.enabled'), enabled, tr('form.enabledHint')),
+    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, isNew ? tr('form.createTarget') : tr('common.saveChanges'))),
     );
-    if (policies.length === 0) form.prepend(notice('error', 'Create a policy first.'));
+    if (policies.length === 0) form.prepend(notice('error', tr('form.needPolicy')));
     return form;
   }
 
   async function viewNewTarget() {
     setNav('targets');
-    show(el('h1', { text: 'New target' }), await targetForm(null));
+    show(el('h1', { text: tr('targets.newTitle') }), await targetForm(null));
   }
 
   // Policies
@@ -445,16 +518,16 @@
       td(link('#/policies/' + encodeURIComponent(p.id), p.id), 'mono'),
       enabledBadge(p.enabled),
       td(p.allowedDnsSuffixes.join(', '), 'mono'),
-      p.allowWildcard ? 'yes' : 'no',
+      p.allowWildcard ? tr('common.yes') : tr('common.no'),
       p.acmeBinding,
-      String(p.renewBeforeDays) + ' days',
+      tr('common.days', { n: p.renewBeforeDays }),
       p.keyType,
       String(p.maxSANs),
     ]);
     show(
-      el('h1', { text: 'Certificate policies' }),
-      el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/policies/new', 'New policy', 'button')),
-      table(['Id', 'State', 'Allowed suffixes', 'Wildcard', 'ACME binding', 'Renew before', 'Key', 'Max SANs'], rows),
+      el('h1', { text: tr('policies.title') }),
+      el('div', { class: 'toolbar' }, el('span', { class: 'spacer' }), link('#/policies/new', tr('policies.new'), 'button')),
+      table([tr('th.id'), tr('th.state'), tr('th.suffixes'), tr('th.wildcard'), tr('th.acmeBinding'), tr('th.renew'), tr('th.key'), tr('th.maxSans')], rows),
     );
   }
 
@@ -498,14 +571,14 @@
       },
     },
     status,
-    field('Allowed DNS suffixes', suffixes, 'One per line. A target FQDN must be the suffix itself or end in ".<suffix>" (label boundary).'),
-    field('Allow wildcard', wildcard),
-    field('ACME binding', acme),
-    field('Renew before (days)', renew),
-    field('Key type', keyType),
-    field('Max SANs', maxSANs, 'The most names one certificate may carry, the FQDN included. 1 means single-name certificates. Runners also cap this with their own authorization.maxNames.'),
-    field('Enabled', enabled),
-    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, isNew ? 'Create policy' : 'Save changes')),
+    field(tr('policy.suffixes'), suffixes, tr('policy.suffixesHint')),
+    field(tr('policy.wildcard'), wildcard),
+    field(tr('policy.acme'), acme, tr('policy.acmeHint')),
+    field(tr('policy.renew'), renew, tr('policy.renewHint')),
+    field(tr('policy.keyType'), keyType),
+    field(tr('policy.maxSans'), maxSANs, tr('policy.maxSansHint')),
+    field(tr('policy.enabled'), enabled),
+    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, isNew ? tr('policy.create') : tr('common.saveChanges'))),
     );
   }
 
@@ -515,27 +588,27 @@
     show(
       el('h1', null, el('span', { class: 'mono', text: p.id }), ' ', enabledBadge(p.enabled)),
       props([
-        ['Created / updated', when(p.createdAt) + ' / ' + when(p.updatedAt)],
-        ['Targets under this policy', String(targets.items.length)],
+        [tr('policy.createdUpdated'), when(p.createdAt) + ' / ' + when(p.updatedAt)],
+        [tr('policy.targetCount'), String(targets.items.length)],
       ]),
-      el('h2', { text: 'Edit' }),
-      notice('', 'A change is refused if any target under the policy would no longer satisfy it.'),
+      el('h2', { text: tr('common.edit') }),
+      notice('', tr('policy.changeNotice')),
       await policyForm(p),
-      el('h2', { text: 'Targets' }),
-      table(['FQDN', 'State', 'Owner'], targets.items.map((t) => [td(link('#/targets/' + encodeURIComponent(t.id), t.fqdn), 'mono'), enabledBadge(t.enabled), t.owner])),
+      el('h2', { text: tr('policy.targets') }),
+      table([tr('th.fqdn'), tr('th.state'), tr('th.owner')], targets.items.map((t) => [td(link('#/targets/' + encodeURIComponent(t.id), t.fqdn), 'mono'), enabledBadge(t.enabled), t.owner])),
     );
   }
 
   async function viewNewPolicy() {
     setNav('policies');
-    show(el('h1', { text: 'New policy' }), await policyForm(null));
+    show(el('h1', { text: tr('policies.newTitle') }), await policyForm(null));
   }
 
   // Runs
 
   function runsTable(items, withTarget) {
-    const headers = ['Run', 'Status', 'Requested', 'Finished', 'Action', 'Error', 'Requested by'];
-    if (withTarget) headers.splice(1, 0, 'Target');
+    const headers = [tr('th.run'), tr('th.status'), tr('th.requested'), tr('th.finished'), tr('th.action'), tr('th.error'), tr('th.requestedBy')];
+    if (withTarget) headers.splice(1, 0, tr('th.target'));
     return table(headers, items.map((r) => {
       const cells = [
         td(link('#/runs/' + encodeURIComponent(r.id), r.id), 'mono'),
@@ -543,7 +616,7 @@
         when(r.requestedAt),
         when(r.finishedAt),
         r.action || '—',
-        r.error ? el('span', null, el('span', { class: 'mono', text: r.error.code }), ' ', r.error.summary) : '—',
+        r.error ? errorCell(r.error) : '—',
         r.requestedBy,
       ];
       if (withTarget) cells.splice(1, 0, td(link('#/targets/' + encodeURIComponent(r.targetId), r.targetId), 'mono'));
@@ -556,11 +629,11 @@
     const filter = new URLSearchParams(location.hash.split('?')[1] || '');
     const status = filter.get('status') || '';
     const res = await api('GET', '/runs?limit=100' + (status ? '&status=' + encodeURIComponent(status) : ''));
-    const sel = select(['', 'queued', 'starting', 'running', 'succeeded', 'failed', 'cancelled'], status);
+    const sel = select(['', 'queued', 'starting', 'running', 'succeeded', 'failed', 'cancelled'], status, (v) => (v ? tr('status.' + v) : tr('common.all')));
     sel.addEventListener('change', () => { location.hash = '#/runs' + (sel.value ? '?status=' + sel.value : ''); });
     show(
-      el('h1', { text: 'Runs' }),
-      el('div', { class: 'toolbar' }, el('label', { text: 'Status ' }), sel),
+      el('h1', { text: tr('runs.title') }),
+      el('div', { class: 'toolbar' }, el('label', { text: tr('common.status') + ' ' }), sel),
       runsTable(res.items, true),
     );
   }
@@ -571,7 +644,7 @@
     const status = el('div');
     const cancellable = ['queued', 'starting', 'running'].includes(r.status);
     show(
-      el('h1', null, 'Run ', el('span', { class: 'mono', text: r.id }), ' ', statusBadge(r.status)),
+      el('h1', null, tr('run.title'), el('span', { class: 'mono', text: r.id }), ' ', statusBadge(r.status)),
       status,
       el('div', { class: 'toolbar' }, cancellable ? el('button', {
         class: 'danger',
@@ -584,18 +657,18 @@
             status.append(notice('error', describe(err)));
           }
         },
-      }, 'Cancel run') : null),
+      }, tr('run.cancel')) : null),
       props([
-        ['Target', link('#/targets/' + encodeURIComponent(r.targetId), r.targetId, 'mono')],
-        ['Target revision', String(r.targetRevision)],
-        ['Requested by', el('span', null, el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
-        ['Requested / started / finished', when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
-        ['Action', r.action],
-        ['Certificate expires', r.expiresAt ? when(r.expiresAt) : undefined],
-        ['Fingerprint', r.fingerprintSha256 ? el('span', { class: 'mono', text: r.fingerprintSha256 }) : undefined],
-        ['Store object', r.storeObjectRef ? el('span', { class: 'mono', text: r.storeObjectRef }) : undefined],
-        ['Error', r.error ? el('span', null, el('span', { class: 'mono', text: r.error.code }), ' ', r.error.summary) : undefined],
-        ['Execution', r.externalExecutionId ? el('span', { class: 'mono', text: r.externalExecutionId }) : undefined],
+        [tr('run.target'), link('#/targets/' + encodeURIComponent(r.targetId), r.targetId, 'mono')],
+        [tr('run.revision'), String(r.targetRevision)],
+        [tr('run.requestedBy'), el('span', null, el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
+        [tr('run.times'), when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
+        [tr('run.action'), r.action],
+        [tr('run.expires'), r.expiresAt ? when(r.expiresAt) : undefined],
+        [tr('run.fingerprint'), r.fingerprintSha256 ? el('span', { class: 'mono', text: r.fingerprintSha256 }) : undefined],
+        [tr('run.storeObject'), r.storeObjectRef ? el('span', { class: 'mono', text: r.storeObjectRef }) : undefined],
+        [tr('run.error'), r.error ? errorCell(r.error) : undefined],
+        [tr('run.execution'), r.externalExecutionId ? el('span', { class: 'mono', text: r.externalExecutionId }) : undefined],
       ]),
     );
   }
@@ -606,8 +679,8 @@
     setNav('audit');
     const res = await api('GET', '/audit?limit=200');
     show(
-      el('h1', { text: 'Audit log' }),
-      table(['Time', 'Actor', 'Authority', 'Action', 'Target', 'Run', 'Policy', 'Detail'], res.items.map((e) => [
+      el('h1', { text: tr('audit.title') }),
+      table([tr('th.time'), tr('th.actor'), tr('th.authority'), tr('th.action'), tr('th.target'), tr('th.runShort'), tr('th.policy'), tr('th.detail')], res.items.map((e) => [
         when(e.time),
         td(e.actor, 'mono'),
         e.actorAuthority ? td(e.actorAuthority, 'mono') : '—',
@@ -618,54 +691,6 @@
         e.detail,
       ])),
     );
-  }
-
-  // Migration (docs/migration.md): the target source flag and, in shadow
-  // mode, the latest comparison of the infrastructure list with the
-  // registry. Read-only: importing is done with `acme-conductor migrate`.
-
-  function reportTable(rep) {
-    const rows = [];
-    const push = (kind, e, note) => rows.push([statusBadge(kind), td(e.fqdn, 'mono'), e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), e.targetId), 'mono') : '—', note || '—']);
-    for (const e of rep.added) push('added', e, 'not in the registry: an import would create it');
-    for (const e of rep.changed) push('changed', e, (e.differences || []).map((d) => d.field + ': ' + d.registry + ' (expected ' + d.expected + ')').join('; '));
-    for (const e of rep.missing) push('missing', e, 'not in the list' + (e.enabled === false ? ' (disabled)' : ''));
-    for (const e of rep.rejected) push('rejected', e, e.reason);
-    for (const e of rep.unchanged) push('unchanged', e, '');
-    return table(['Category', 'FQDN', 'Target', 'Note'], rows);
-  }
-
-  async function viewMigration() {
-    setNav('migration');
-    const m = await api('GET', '/migration');
-    const src = m.source ? (m.source.kind === 'inline' ? 'inline list (' + m.source.count + ' entries)' : m.source.kind + ' ' + m.source.path + (m.source.parameter ? ' (param ' + m.source.parameter + ')' : '')) : '—';
-    const prof = m.profile ? m.profile.policyRef + ' / ' + m.profile.executionBinding + ' / ' + m.profile.dnsBinding + ' / ' + m.profile.storeBinding + ' / ' + m.profile.owner : '—';
-    const parts = [
-      el('h1', { text: 'Migration' }),
-      m.issuanceEnabled ? null : notice('ok', 'Issuance is disabled: the Conductor plans and starts no runs while the target source is "' + m.targetSource + '".'),
-      props([
-        ['Target source', statusBadge(m.targetSource)],
-        ['Issuance', m.issuanceEnabled ? 'enabled' : 'disabled'],
-        ['Configured list', src],
-        ['Import profile (policy / execution / dns / store / owner)', prof],
-      ]),
-    ];
-    const lc = m.lastComparison;
-    if (lc) {
-      parts.push(el('h2', { text: 'Shadow comparison' }));
-      if (lc.error) parts.push(notice('error', 'The latest comparison (' + when(lc.attemptedAt) + ') failed: ' + lc.error));
-      if (lc.report) {
-        const s = lc.report.summary;
-        parts.push(props([
-          ['Compared', when(lc.report.comparedAt)],
-          ['Source', lc.report.source],
-          ['Summary', 'added ' + s.added + ', changed ' + s.changed + ', missing ' + s.missing + ', unchanged ' + s.unchanged + ', rejected ' + s.rejected],
-        ]), reportTable(lc.report));
-      }
-    } else if (m.targetSource === 'shadow') {
-      parts.push(el('p', { class: 'empty', text: 'No comparison has been made yet.' }));
-    }
-    show(...parts);
   }
 
   // ---- ACME account provisioning (issue #42) --------------------------------
@@ -705,10 +730,10 @@
   function provisioningRunNotice(run) {
     if (!run) return null;
     if (run.started) {
-      return el('p', { class: 'notice' }, 'EAB recorded. Run ', link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), ' was started to register the account.');
+      return el('p', { class: 'notice' }, tr('eab.recorded'), link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), tr('eab.recordedStarted'));
     }
-    const parts = ['EAB recorded; no run was started: ' + run.reason + '.'];
-    if (run.runId) parts.push(' Run ', link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), '.');
+    const parts = [tr('eab.recordedNoRun', { reason: run.reason })];
+    if (run.runId) parts.push(tr('eab.runWord'), link('#/runs/' + encodeURIComponent(run.runId), run.runId, 'mono'), '.');
     return el('p', { class: 'notice' }, ...parts);
   }
 
@@ -737,10 +762,10 @@
       },
     },
     status,
-    el('p', { class: 'hint', text: 'Sealed in this browser to Runner key ' + keyInfo.keyId + (acct.scope ? ' for this target only' : '') + ' before it is sent; the Conductor never sees the key id or HMAC.' }),
-    field('EAB key id (kid)', kid),
-    field('EAB HMAC key', hmac, 'Never displayed once submitted.'),
-    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, 'Provision / replace EAB (generation ' + nextGeneration(acct) + ')')),
+    el('p', { class: 'hint', text: tr('eab.sealed', { keyId: keyInfo.keyId, scope: acct.scope ? tr('eab.sealedScope') : '' }) }),
+    field(tr('eab.kid'), kid),
+    field(tr('eab.hmac'), hmac, tr('eab.hmacHint')),
+    el('div', { class: 'actions' }, el('button', { class: 'primary', type: 'submit' }, tr('eab.submit', { n: nextGeneration(acct) }))),
     );
   }
 
@@ -749,10 +774,10 @@
   function accountDetails(acct, refresh) {
     const parts = [
       props([
-        ['Active generation', acct.activeGeneration || '—'],
-        ['Pending', acct.pending ? acct.pending.generation + ' (' + acct.pending.status + (acct.pending.runId ? ', attached to run ' + acct.pending.runId : '') + ')' : '—'],
+        [tr('eab.activeGen'), acct.activeGeneration || '—'],
+        [tr('eab.pending'), acct.pending ? tr('eab.pendingText', { gen: acct.pending.generation, status: acct.pending.status, attached: acct.pending.runId ? tr('eab.attached', { run: acct.pending.runId }) : '' }) : '—'],
       ]),
-      table(['Generation', 'Status', 'Key id', 'Requested by', 'Created', 'Activated'],
+      table([tr('th.generation'), tr('th.status'), tr('th.keyId'), tr('th.requestedBy'), tr('th.created'), tr('th.activated')],
         acct.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), g.requestedBy, when(g.createdAt), when(g.activatedAt)])),
     ];
     if (acct.pending && !acct.pending.runId) {
@@ -766,7 +791,7 @@
             parts.push(notice('error', describe(err)));
           }
         },
-      }, 'Cancel pending provisioning (generation ' + acct.pending.generation + ')')));
+      }, tr('eab.cancel', { n: acct.pending.generation }))));
     }
     return parts;
   }
@@ -774,15 +799,15 @@
   // accountForm is the provisioning form for acct, or why there is none.
   function accountForm(keyInfo, acct, eabRequired, x25519Ok, refresh) {
     if (!eabRequired) {
-      return [el('p', { class: 'hint', text: 'This binding is no longer listed in accountProvisioning.bindings: the pending generation is never sent to the Runner. Cancel it.' })];
+      return [el('p', { class: 'hint', text: tr('eab.dropped') })];
     }
     if (acct.pending) {
-      return [el('p', { class: 'hint', text: 'A generation is already pending; cancel it before provisioning a new one.' })];
+      return [el('p', { class: 'hint', text: tr('eab.alreadyPending') })];
     }
     if (!x25519Ok) {
-      return [notice('error', 'This browser has no WebCrypto X25519 support; account provisioning needs a browser that does.')];
+      return [notice('error', tr('eab.noX25519'))];
     }
-    return [el('h3', { text: 'Provision / replace EAB' }), provisioningForm(keyInfo, acct, refresh)];
+    return [el('h3', { text: tr('eab.formTitle') }), provisioningForm(keyInfo, acct, refresh)];
   }
 
   function acmeBindingPanel(keyInfo, b, targets, x25519Ok, refresh) {
@@ -790,8 +815,8 @@
     if (b.targetScoped) {
       const byId = new Map(targets.map((t) => [t.id, t]));
       parts.push(
-        el('p', { class: 'hint', text: 'This binding keeps one ACME account per target: provision each target\'s EAB from the target\'s page.' }),
-        table(['Target', 'Active generation', 'Pending'], b.targets.map((a) => {
+        el('p', { class: 'hint', text: tr('eab.perTarget') }),
+        table([tr('th.target'), tr('th.activeGeneration'), tr('th.pending')], b.targets.map((a) => {
           const t = byId.get(a.targetId);
           return [link('#/targets/' + encodeURIComponent(a.targetId), t ? t.fqdn : a.targetId, 'mono'), a.activeGeneration || '—', a.pending ? String(a.pending.generation) : '—'];
         })),
@@ -799,7 +824,7 @@
       // A binding-wide account left from before the binding became
       // target-scoped is still listed, to be seen and cancelled.
       if (b.generations.length) {
-        parts.push(el('h3', { text: 'Binding-wide account (not used)' }), ...accountDetails(bindingAccount(b), refresh));
+        parts.push(el('h3', { text: tr('eab.bindingWide') }), ...accountDetails(bindingAccount(b), refresh));
       }
       return el('div', { class: 'panel' }, ...parts);
     }
@@ -815,9 +840,9 @@
   async function viewEAB() {
     setNav('eab');
     const keyInfo = await provisioningKey();
-    const heading = el('h1', { text: 'External Account Binding' });
+    const heading = el('h1', { text: tr('eab.title') });
     if (!keyInfo) {
-      show(heading, notice('error', 'Account provisioning is not configured on this Conductor.'));
+      show(heading, notice('error', tr('eab.notConfigured')));
       return;
     }
     const [res, targets, x25519Ok] = await Promise.all([api('GET', '/acme-bindings'), api('GET', '/targets'), acmeConductorX25519Supported()]);
@@ -825,15 +850,16 @@
     const refresh = () => withErrors(() => viewEAB());
     show(
       heading,
-      el('p', { class: 'notice', text: 'EAB credentials are sealed in this browser and never displayed once submitted.' }),
+      el('p', { class: 'notice', text: tr('eab.notice') }),
       ...(items.length
         ? items.map((b) => acmeBindingPanel(keyInfo, b, targets.items, x25519Ok, refresh))
-        : [el('p', { class: 'hint', text: 'No ACME binding is listed in accountProvisioning.bindings.' })]),
+        : [el('p', { class: 'hint', text: tr('eab.noneListed') })]),
     );
   }
 
   // targetAccountSection is the target page's ACME account section when
-  // the target's binding keeps one account per target; null otherwise.
+  // the target's binding keeps one account per target, as { node, acct };
+  // null otherwise.
   async function targetAccountSection(t) {
     const keyInfo = await provisioningKey();
     if (!keyInfo) return null;
@@ -846,12 +872,13 @@
     ]);
     const acct = targetAccount(b.name, a);
     const refresh = () => route();
-    return el('div', null,
-      el('h2', { text: 'ACME account (' + b.name + ')' }),
-      el('p', { class: 'hint', text: 'This binding keeps one ACME account per target. Register the EAB issued for this target\'s names; the next run registers the account.' }),
+    const node = el('div', null,
+      el('h2', { text: tr('eab.targetAccount', { name: b.name }) }),
+      el('p', { class: 'hint' }, tr('eab.targetHint'), ' ', guideLink('upki-guide.html#step7', tr('eab.guideLink'))),
       ...accountDetails(acct, refresh),
       ...accountForm(keyInfo, acct, b.externalAccountBinding, x25519Ok, refresh),
     );
+    return { node, acct };
   }
 
   // ---- routing --------------------------------------------------------------
@@ -866,7 +893,6 @@
     [/^#\/runs\/([A-Za-z0-9_-]+)$/, (m) => viewRun(m[1])],
     [/^#\/runs(\?.*)?$/, () => viewRuns()],
     [/^#\/audit$/, () => viewAudit()],
-    [/^#\/migration$/, () => viewMigration()],
     [/^#\/eab$/, () => viewEAB()],
     // The page's former address, kept for bookmarks.
     [/^#\/acme-bindings$/, () => { location.hash = '#/eab'; }],
@@ -889,13 +915,38 @@
     location.hash = '#/targets';
   }
 
+  // applyStatic sets the language-dependent parts of index.html: <html lang>,
+  // the title, every [data-i18n] element and the language selector.
+  function applyStatic() {
+    document.documentElement.lang = i18n.lang();
+    document.title = tr('app.title');
+    for (const node of document.querySelectorAll('[data-i18n]')) node.textContent = tr(node.dataset.i18n);
+    const sel = document.getElementById('lang');
+    if (sel) {
+      sel.value = i18n.lang();
+      sel.setAttribute('aria-label', tr('lang.label'));
+    }
+  }
+
+  function initLanguage() {
+    applyStatic();
+    const sel = document.getElementById('lang');
+    if (!sel) return;
+    sel.addEventListener('change', () => {
+      i18n.setLang(sel.value);
+      applyStatic();
+      if (state.config) route();
+    });
+  }
+
   async function start() {
+    initLanguage();
     try {
       const res = await fetch('/ui/config', { headers: { Accept: 'application/json' }, credentials: 'omit' });
       if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => null));
       state.config = await res.json();
     } catch (err) {
-      show(notice('error', 'The interface configuration could not be loaded: ' + describe(err)));
+      show(notice('error', tr('config.failed', { detail: describe(err) })));
       return;
     }
     if (state.config.auth.mode === 'oidc') {

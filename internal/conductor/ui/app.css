@@ -47,6 +47,14 @@ a:hover { text-decoration: underline; }
 #nav { display: flex; gap: 16px; }
 #nav a { color: var(--muted); padding: 4px 0; border-bottom: 2px solid transparent; }
 #nav a.active { color: var(--fg); border-bottom-color: var(--accent); }
+.lang {
+  font: inherit;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
 .session { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); }
 main { flex: 1; padding: 16px; max-width: 1200px; width: 100%; margin: 0 auto; }
 .foot {
@@ -57,6 +65,7 @@ main { flex: 1; padding: 16px; max-width: 1200px; width: 100%; margin: 0 auto; }
   color: var(--muted);
   font-size: 12px;
 }
+.foot .links { display: flex; gap: 12px; flex-wrap: wrap; }
 h1 { font-size: 20px; margin: 0 0 12px; }
 h2 { font-size: 16px; margin: 20px 0 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
@@ -70,15 +79,17 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 .notice { padding: 10px 12px; border-radius: 6px; margin: 0 0 12px; border: 1px solid var(--line); background: var(--panel); }
 .notice.error { border-color: var(--bad); color: var(--bad); }
 .notice.ok { border-color: var(--ok); color: var(--ok); }
+.notice.next { border-color: var(--accent); }
+.notice.next.ok { border-color: var(--ok); }
+.notice.next.error { border-color: var(--bad); }
+.notice.next strong { color: var(--fg); }
+.notice .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+td .hint, dd .hint { color: var(--muted); font-size: 12px; }
 .status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
 .status.succeeded, .status.enabled { color: var(--ok); border-color: var(--ok); }
 .status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
 .status.cancelled { color: var(--muted); }
-.status.added, .status.registry { color: var(--ok); border-color: var(--ok); }
-.status.changed, .status.rejected, .status.missing { color: var(--warn); border-color: var(--warn); }
-.status.shadow, .status.iac { color: var(--warn); border-color: var(--warn); }
-.status.unchanged { color: var(--muted); }
 button, .button {
   font: inherit;
   padding: 5px 12px;
@@ -94,6 +105,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); max-width: 640px; }
 .field { display: grid; grid-template-columns: 180px 1fr; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
 .field label { color: var(--muted); }
+.field input[type=checkbox] { justify-self: start; }
 .field input[type=text], .field input[type=number], .field select, .field textarea {
   font: inherit;
   padding: 5px 8px;

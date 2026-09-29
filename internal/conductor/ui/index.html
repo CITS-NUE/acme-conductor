@@ -11,22 +11,32 @@
   <header class="topbar">
     <a class="brand" href="#/targets">ACME Conductor</a>
     <nav id="nav">
-      <a href="#/targets" data-nav="targets">Targets</a>
-      <a href="#/policies" data-nav="policies">Policies</a>
-      <a href="#/runs" data-nav="runs">Runs</a>
-      <a href="#/audit" data-nav="audit">Audit</a>
-      <a href="#/migration" data-nav="migration">Migration</a>
-      <a href="#/eab" data-nav="eab">EAB</a>
+      <a href="#/targets" data-nav="targets" data-i18n="nav.targets">Targets</a>
+      <a href="#/policies" data-nav="policies" data-i18n="nav.policies">Policies</a>
+      <a href="#/runs" data-nav="runs" data-i18n="nav.runs">Runs</a>
+      <a href="#/audit" data-nav="audit" data-i18n="nav.audit">Audit</a>
+      <a href="#/eab" data-nav="eab" data-i18n="nav.eab">EAB</a>
+      <a href="https://cits-nue.github.io/acme-conductor/upki-guide.html" target="_blank" rel="noopener noreferrer" data-i18n="nav.help">Help</a>
     </nav>
     <div id="session" class="session"></div>
+    <select id="lang" class="lang" aria-label="Language">
+      <option value="ja">日本語</option>
+      <option value="en">English</option>
+    </select>
   </header>
   <main id="main">
-    <noscript><p class="notice error">This interface needs JavaScript.</p></noscript>
+    <noscript><p class="notice error">This interface needs JavaScript. / この画面には JavaScript が必要です．</p></noscript>
   </main>
   <footer class="foot">
-    <span>The Conductor never holds a private key; nothing here can show one.</span>
-    <a href="/api/v1alpha1/bindings">API</a>
+    <span data-i18n="foot.text">The Conductor never holds a private key; nothing here can show one.</span>
+    <span class="links">
+      <a href="https://cits-nue.github.io/acme-conductor/upki-guide.html" target="_blank" rel="noopener noreferrer" data-i18n="foot.guide">Issuance guide</a>
+      <a href="https://cits-nue.github.io/acme-conductor/certificate-usage.html" target="_blank" rel="noopener noreferrer" data-i18n="foot.usage">Using certificates</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href="/api/v1alpha1/bindings">API</a>
+    </span>
   </footer>
+  <script src="i18n.js" defer></script>
   <script src="provision.js" defer></script>
   <script src="app.js" defer></script>
 </body>

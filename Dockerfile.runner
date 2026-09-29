@@ -91,6 +91,8 @@ ARG BUILD_DATE=unknown
 ARG LEGO_VERSION=4.35.2
 
 LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.url="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.documentation="https://cits-nue.github.io/acme-conductor/" \
       org.opencontainers.image.title="acme-runner" \
       org.opencontainers.image.description="ACME Runner one-shot data-plane job (validates a JobSpec, drives lego, stores the certificate)." \
       org.opencontainers.image.version="${VERSION}" \
