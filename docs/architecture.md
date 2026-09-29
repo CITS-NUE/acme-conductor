@@ -438,7 +438,6 @@ internal/
   conductor/scheduler/  期限到来の判断，target ごとの排他，run の実行
   conductor/sqlite/     Registry の SQLite 実装．マイグレーション付き
   conductor/fakerunner/ Conductor のテストで使う acme-runner のテストダブル．出荷するバイナリにはコンパイルされない
-  conductor/migration/  インフラ定義のホスト一覧からの移行: Bicep パラメータ/TargetList の読み取り，差分，冪等な取り込み，shadow 比較
   exchange/         自ら起動する Runner にジョブを差し出し，1 つの Runner だけが取るためのディスク上の受け渡しプロトコル (ADR 0014)
   fslock/           Runner のディスク上の store が共有するアドバイザリファイルロック
   keygen/           両バイナリ共通の keygen サブコマンド: ジョブ署名鍵と Result 署名鍵 (Ed25519) の生成 (ADR 0015)
@@ -589,14 +588,6 @@ Makefile            build / verify / image のターゲット
   [`docs/runner.md`](runner.md#accountprovisioning)，
   [`docs/conductor.md`](conductor.md#acme-アカウントプロビジョニング)，
   [ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md) を参照．
-- **cert-infra からの移行** — 既存の cert-infra リポジトリからの移行ツール:
-  ホスト一覧をその Bicep パラメータファイル（または TargetList 文書）から読み，
-  レジストリと比較し（`added`/`changed`/`missing`/`unchanged`/`rejected`），冪等に
-  取り込む（既定は dry-run．更新も削除も決して行わない）．`migration.targetSource`
-  フラグ（`iac`/`shadow`/`registry`）により切り替えまで Conductor は発行を行わず，
-  shadow モードでは比較を記録する．ロールバックはこのフラグである．
-  [`docs/migration.md`](migration.md) と
-  [ADR 0020](adr/0020-migration-from-cert-infra.md) を参照．
 
 ## 非目標
 

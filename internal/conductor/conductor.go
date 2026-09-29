@@ -29,7 +29,6 @@ import (
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launchers"
-	"github.com/CITS-NUE/acme-conductor/internal/conductor/migration"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/sqlite"
@@ -123,9 +122,6 @@ func Serve(ctx context.Context, opts Options) int {
 		log.Error("launchers could not be built", "error", err.Error())
 		return ExitConfig
 	}
-	if !cfg.IssuanceEnabled() {
-		log.Warn("issuance disabled: the conductor plans and starts no runs", "targetSource", cfg.Migration.TargetSource)
-	}
 	sched := scheduler.New(scheduler.Options{
 		Registry:             reg,
 		Launchers:            built,
@@ -134,7 +130,6 @@ func Serve(ctx context.Context, opts Options) int {
 		RetryBackoff:         time.Duration(cfg.Scheduler.RetryBackoffSeconds) * time.Second,
 		MaxRetryBackoff:      time.Duration(cfg.Scheduler.MaxRetryBackoffSeconds) * time.Second,
 		Logger:               log.With("component", "scheduler"),
-		IssuanceDisabled:     !cfg.IssuanceEnabled(),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
 	})
@@ -184,7 +179,6 @@ func Serve(ctx context.Context, opts Options) int {
 	for name := range cfg.ExecutionBindings {
 		names = append(names, name)
 	}
-	migOpts, shadow := buildMigration(cfg, reg, names, log)
 	handler := api.New(api.Options{
 		Registry:             reg,
 		Scheduler:            sched,
@@ -192,7 +186,6 @@ func Serve(ctx context.Context, opts Options) int {
 		Auth:                 auth,
 		Logger:               log.With("component", "api"),
 		UI:                   uiOpts,
-		Migration:            migOpts,
 		ProvisioningKey:      cfg.AccountProvisioning.Key(),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
@@ -227,14 +220,7 @@ func Serve(ctx context.Context, opts Options) int {
 		defer wg.Done()
 		_ = sched.Run(loopCtx)
 	}()
-	if shadow != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = shadow.Run(loopCtx)
-		}()
-	}
-	log.Info("conductor listening", "addr", ln.Addr().String(), "auth", cfg.Server.Auth.Mode, "tls", cfg.Server.TLS != nil, "behindTlsProxy", cfg.Server.BehindTLSProxy, "tickSeconds", cfg.Scheduler.TickSeconds, "maxConcurrentRuns", cfg.Scheduler.MaxConcurrentRuns, "targetSource", cfg.Migration.TargetSource)
+	log.Info("conductor listening", "addr", ln.Addr().String(), "auth", cfg.Server.Auth.Mode, "tls", cfg.Server.TLS != nil, "behindTlsProxy", cfg.Server.BehindTLSProxy, "tickSeconds", cfg.Scheduler.TickSeconds, "maxConcurrentRuns", cfg.Scheduler.MaxConcurrentRuns)
 	if opts.Listening != nil {
 		opts.Listening(ln.Addr())
 	}
@@ -263,33 +249,6 @@ func Serve(ctx context.Context, opts Options) int {
 	wg.Wait()
 	log.Info("conductor stopped")
 	return code
-}
-
-// buildMigration composes the migration tooling from the configuration:
-// the API's view of it, and the shadow comparison loop under target
-// source shadow (nil otherwise). Without a profile there is no migrator,
-// and the API says so.
-func buildMigration(cfg *config.Config, reg *sqlite.DB, executionNames []string, log *slog.Logger) (*api.MigrationOptions, *migration.Shadow) {
-	m := cfg.Migration
-	opts := &api.MigrationOptions{TargetSource: m.TargetSource, Source: m.Source}
-	if m.Profile == nil {
-		return opts, nil
-	}
-	opts.Migrator = &migration.Migrator{
-		Registry: reg, Profile: *m.Profile,
-		Bindings: migration.Bindings{Execution: executionNames, DNS: cfg.DNSBindings, Store: cfg.StoreBindings},
-	}
-	if m.TargetSource != config.TargetSourceShadow {
-		return opts, nil
-	}
-	shadow := &migration.Shadow{
-		Migrator: opts.Migrator, Source: *m.Source,
-		Interval: time.Duration(m.CompareIntervalSeconds) * time.Second,
-		Logger:   log.With("component", "migration"),
-	}
-	opts.Latest = shadow.Latest
-	log.Info("shadow comparison enabled", "source", m.Source.Describe(), "intervalSeconds", m.CompareIntervalSeconds)
-	return opts, shadow
 }
 
 // buildAuth builds the Authenticator for the configured mode and the

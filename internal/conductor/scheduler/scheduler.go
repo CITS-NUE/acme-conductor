@@ -63,12 +63,6 @@ type Options struct {
 	// (DefaultRecordRetry, DefaultRecordWindow).
 	RecordRetry  time.Duration
 	RecordWindow time.Duration
-	// IssuanceDisabled makes Plan and Dispatch do nothing: no run is
-	// recorded and no queued run is started, so the Conductor issues no
-	// certificate while another system (an infrastructure-defined job)
-	// still does (docs/migration.md, target source shadow or iac). Runs
-	// left in flight are still swept.
-	IssuanceDisabled bool
 	// ProvisioningBindings are the ACME bindings whose CA requires an
 	// External Account Binding (accountProvisioning.bindings). A run
 	// claims a pending account provisioning request only for one of
@@ -103,7 +97,6 @@ type Scheduler struct {
 
 	recordRetry  time.Duration
 	recordWindow time.Duration
-	disabled     bool
 	eabBindings  map[string]struct{}
 	targetScoped map[string]struct{}
 
@@ -157,7 +150,7 @@ func New(o Options) *Scheduler {
 	return &Scheduler{
 		reg: o.Registry, launchers: o.Launchers, tick: o.Tick, maxRuns: o.MaxConcurrentRuns,
 		backoff: o.RetryBackoff, maxBack: o.MaxRetryBackoff, log: o.Logger, now: o.Now,
-		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, disabled: o.IssuanceDisabled, eabBindings: eab, targetScoped: scoped,
+		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, eabBindings: eab, targetScoped: scoped,
 		wake: make(chan struct{}, 1), runsCtx: ctx, cancelRuns: cancel, inflight: map[string]context.CancelFunc{},
 	}
 }
@@ -302,11 +295,8 @@ func (s *Scheduler) sweep(ctx context.Context, summary, detailPrefix string) (in
 // Plan records a queued run for every enabled target that is due and has
 // no active run, and for every ACME account provisioning request no run
 // will otherwise carry (see planProvisioning). It returns the number of
-// runs created. It records nothing while issuance is disabled.
+// runs created.
 func (s *Scheduler) Plan(ctx context.Context) (int, error) {
-	if s.disabled {
-		return 0, nil
-	}
 	enabled := true
 	targets, err := s.reg.ListTargets(ctx, registry.ListTargetsOptions{Enabled: &enabled})
 	if err != nil {
@@ -544,13 +534,9 @@ func Backoff(n int, base, max time.Duration) time.Duration {
 }
 
 // Dispatch claims queued runs while capacity allows and executes each in
-// its own goroutine. It returns the number of runs started. It starts
-// nothing while issuance is disabled: a queued run stays queued.
+// its own goroutine. It returns the number of runs started.
 func (s *Scheduler) Dispatch(ctx context.Context) (int, error) {
 	started := 0
-	if s.disabled {
-		return 0, nil
-	}
 	for {
 		if ctx.Err() != nil || s.runsCtx.Err() != nil {
 			return started, nil

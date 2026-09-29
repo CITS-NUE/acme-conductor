@@ -61,7 +61,6 @@ AI に勝手に決めさせない**．案を出させ，人が確定する．
 - ACME の連絡先: <組織の窓口アドレス>
 - OIDC: Entra ID．アプリ登録 acme-conductor-api / acme-conductor-gui，ロール ACME.Admin / ACME.Viewer，principalClaim=oid
 - ingress: external=true，許可 CIDR=[]（わかれば学内の送信元）
-- migration: 初回は {}（registry）
 - その他: テンプレートの既定値のまま
 ```
 

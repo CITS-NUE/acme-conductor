@@ -112,7 +112,6 @@ az containerapp job show -n <existing-job> -g <rg> \
 | OIDC | issuer `https://login.microsoftonline.com/<tenant-id>/v2.0`，`oid`，`ACME.Admin` / `ACME.Viewer` | 手順 5 で作るアプリ登録の値 |
 | アプリ登録名 | `acme-conductor-api` / `acme-conductor-gui` | 環境ごとに分けるなら `-stg` などを付ける |
 | ingress | `ingressExternal: true`，`ingressAllowedCidrs: []` | 認証は OIDC が担う．CIDR は露出を絞るだけ |
-| `migration` | 初回は `{}`（= `registry`） | まず 1 target を Conductor 自身で発行して端から端まで確かめる |
 
 Key Vault 名が空いているかを確認する:
 
@@ -491,7 +490,7 @@ Conductor は証明書を Key Vault に **格納するところまで** しか�
 
 どちらもテンプレートの外の作業であり，利用側の管理者と行う．
 Runner の ID が持つのは証明書の書き込み権限だけで，誰に読ませるかは
-利用側の判断である（[`docs/migration.md`](../../docs/migration.md)）．
+利用側の判断である．
 
 **staging CA の証明書は，稼働中のサービスに決して付けない．** 信頼されない CA の
 証明書なので，クライアントはエラーになる．この節は，本番 CA で発行した後の作業である．

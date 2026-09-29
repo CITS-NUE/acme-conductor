@@ -416,16 +416,17 @@ Container Apps は，レジストリの更新を検知して自動で新しい�
 （`az containerapp job execution list`），そのようなディレクトリは手で削除
 すること．
 
-**`cert-infra` からの移行．** `migration` パラメータは Conductor 設定の
-`migration` セクションそのものである
-（[`docs/migration.md`](../../docs/migration.md)）．`targetSource` を `shadow`
-にし，`cert-infra` の `infra/main.bicepparam` の `targetDomains` を
-`source.fqdns` に貼り付けると，何も発行せず，その一覧を自身のレジストリと比較する
-Conductor がデプロイされる．一覧は `acme-conductor migrate import --apply`
-（または同じファイルから `--bicepparam`）で取り込む．Conductor に発行させるときは
-`registry` に切り替え，ロールバックするには `iac` に戻す．Conductor は
-`cert-infra` のデプロイに決して触れない．そのジョブを止めるのは操作者の作業で
-ある．
+**アップグレード時の注意．** 移行ツールの削除（[ADR 0025](../../docs/adr/0025-remove-migration-tooling.md)）に
+伴い，`main.bicep` から `migration` パラメータがなくなった．このバージョンを
+デプロイする前に，自分の `*.bicepparam` から `param migration = …` を削除する
+こと．残っていると Bicep のコンパイルが「パラメータ `migration` は宣言されて
+いない」で失敗する．Conductor の設定ファイルを直接管理している場合も，
+`migration` セクションを削除する．残っていると Conductor は
+`migration was removed (docs/adr/0025): delete the "migration" section` で
+起動しない（無視して発行を始めることはしない）．`targetSource` が `registry`
+だったデプロイは，セクションを消す以外に何も変わらない．`iac` や `shadow` の
+まま使っていたデプロイは，このバージョンでは常に Conductor が発行するように
+なる点に注意すること．
 
 ## 実デプロイで確認したことと，まだ確認していないこと
 

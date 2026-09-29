@@ -25,11 +25,12 @@
 | [0017](0017-release-pipeline.md) | リリースパイプライン: SBOM と provenance 付きの GHCR イメージとダイジェスト固定のベース |
 | [0018](0018-authority-qualified-principals.md) | 監査プリンシパルは権威 (issuer，`localhost-dev`，`scheduler`) で修飾する |
 | [0019](0019-provider-boundary.md) | プロバイダ境界: 公開コントラクト，合成層のレジストリ，単一モジュール，`deploy/azure` は残す |
-| [0020](0020-migration-from-cert-infra.md) | cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ |
+| [0020](0020-migration-from-cert-infra.md) | cert-infra からの移行: 一覧の取り込み，shadow 比較，target-source フラグ（[0025](0025-remove-migration-tooling.md) で廃止） |
 | [0021](0021-keyvault-pkcs12-content-type.md) | Key Vault store のコンテンツタイプ: パスワードなし PKCS #12 での取り込みを選べるようにする |
 | [0022](0022-encrypted-eab-provisioning-and-account-generations.md) | 暗号化された EAB プロビジョニングと ACME アカウントの世代 |
 | [0023](0023-separate-role-definitions-from-the-deployment.md) | カスタムロールの定義をデプロイから分け，再デプロイを常設の権限だけで行えるようにする |
 | [0024](0024-target-scoped-acme-accounts-and-san.md) | target 単位の ACME アカウントと SAN 証明書 |
+| [0025](0025-remove-migration-tooling.md) | 移行ツールを削除する |
 
 [`docs/architecture.md`](../architecture.md) と
 [`docs/threat-model.md`](../threat-model.md) も参照．

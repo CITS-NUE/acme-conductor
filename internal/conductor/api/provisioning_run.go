@@ -110,9 +110,6 @@ func (s *Server) provisioningCandidates(r *http.Request, binding string, t *regi
 // request is recorded either way and any later run of an eligible target
 // still carries it.
 func (s *Server) startProvisioningRun(r *http.Request, binding string, t *registry.Target, generation int64) ProvisioningRunResource {
-	if !s.issuanceEnabled() {
-		return ProvisioningRunResource{Reason: fmt.Sprintf("the conductor starts no run while migration.targetSource is %q", s.migration.TargetSource)}
-	}
 	cands, reason, err := s.provisioningCandidates(r, binding, t)
 	if err != nil {
 		s.log.Error("provisioning run candidates could not be listed", "binding", binding, "error", err.Error())
