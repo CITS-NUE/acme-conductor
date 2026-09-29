@@ -51,6 +51,8 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.url="https://github.com/CITS-NUE/acme-conductor" \
+      org.opencontainers.image.documentation="https://cits-nue.github.io/acme-conductor/" \
       org.opencontainers.image.title="acme-conductor" \
       org.opencontainers.image.description="ACME Conductor control plane (target registry, policy, audit, run scheduling)." \
       org.opencontainers.image.version="${VERSION}" \

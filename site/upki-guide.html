@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>証明書の発行手順 — ACME Conductor</title>
+<meta name="description" content="UPKI の登録担当者が，DNS・ACME・Azure に詳しくなくても，ACME Conductor で証明書を発行するまでの手順を最初から順に説明します．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="upki-guide.html" aria-current="page">証明書の発行手順</a>
+      <a href="certificate-usage.html">証明書の使い方</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>UPKI 証明書の発行手順<br>（登録担当者向け）</h1>
+    <p class="lead">
+      UPKI の登録担当者で，DNS・ACME・Azure にはあまり詳しくない方が，ACME Conductor を使って
+      証明書を発行するまでの手順を，最初から順に説明します．仕組みの詳しい説明や設定の書き方は，運用担当者向けの
+      <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/account-scoped-ca.md">アカウントごとに発行範囲が決まる CA の運用ガイド</a>にあります．
+      このページは，そこに書かれた手順を初めての方向けに言い換えたものです．
+    </p>
+  </section>
+
+  <h2 id="audience">この文書の対象と，終わったときの状態</h2>
+  <ul>
+    <li><strong>対象</strong>: UPKI 登録担当者として，サーバ証明書の申請を取りまとめている方．</li>
+    <li><strong>終わったときの状態</strong>: 申請した名前（ホスト名）の証明書が，Azure の Key Vault（証明書の保管場所）に入っています．その後は，期限が近づくと ACME Conductor が自動で更新するので，担当者が毎回申請し直す必要はありません．</li>
+    <li>発行された証明書を実際のサーバでどう使うかは，<a href="certificate-usage.html">発行された証明書の使い方（ケース別）</a>を読んでください．</li>
+    <li><strong>所要時間の目安</strong>: 作業そのものは，慣れれば 1 時間程度です．ただし UPKI の審査に数日かかることがあるので，全体では数日から 1 週間程度を見込んでください．</li>
+  </ul>
+  <p>ACME Conductor の画面には，画面上部のバーに <strong>日本語 / English</strong> の切り替えがあります．このページでは日本語表示の名前で説明します．</p>
+
+  <h2 id="flow">全体の流れ（1 画面で）</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>何をする</th><th>どこで</th><th>誰が</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><a href="#step1">ホスト名を決め，前提を確かめる</a></td><td>利用者との打ち合わせ</td><td>登録担当者</td></tr>
+        <tr><td>2</td><td><a href="#step2">申請用のファイル（TSV）を作る</a></td><td>UPKI TSV 作成ツール</td><td>登録担当者</td></tr>
+        <tr><td>3</td><td><a href="#step3">TSV を提出し，審査後に EAB を受け取る</a></td><td>UPKI 証明書発行支援システム</td><td>登録担当者</td></tr>
+        <tr><td>4</td><td><a href="#step4">DNS に CNAME を設定してもらう</a></td><td>DNS の管理画面</td><td>DNS の管理者（自分でなければ依頼）</td></tr>
+        <tr><td>5</td><td><a href="#step5">発行ポリシーを用意する</a>（初回か，条件が違うときだけ）</td><td>ACME Conductor の画面</td><td>登録担当者</td></tr>
+        <tr><td>6</td><td><a href="#step6">証明書（target）を無効の状態で追加する</a></td><td>ACME Conductor の画面</td><td>登録担当者</td></tr>
+        <tr><td>7</td><td><a href="#step7">EAB を登録し，発行できたか確かめる</a></td><td>ACME Conductor の画面</td><td>登録担当者</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>手順 3 の審査を待っている間に，手順 4 を進めておけます．手順 5 以降は，EAB を受け取り，DNS の設定を確認できてから行います．</p>
+
+  <h2 id="basics">はじめに知っておくこと</h2>
+  <ul>
+    <li><strong>証明書と秘密鍵</strong>: 証明書は「このサーバは本物です」という身分証明書のようなもので，秘密鍵はその持ち主だけが持つ鍵です．この 2 つは必ず組で使い，秘密鍵は他人に見せてはいけません．</li>
+    <li><strong>UPKI ACME と EAB</strong>: ACME は，証明書を自動で発行してもらうための決まりです．UPKI ACME では，最初に「この申請の担当はこの人」と結び付けるための合言葉を使い，これを <strong>EAB</strong>（Key ID と HMAC Key の 2 つの文字列）と呼びます．EAB は審査の後で UPKI から発行され，パスワードと同じくらい大切なものです．</li>
+    <li><strong>ACME Conductor が代わりにやること</strong>: 証明書の発行，期限が近づいたときの更新（証明書の有効期間は 89 日で，発行から約 59 日で自動更新に入ります），保管場所への保存です．担当者が更新のたびに操作する必要はありません．</li>
+    <li><strong>DNS の CNAME 委任（なぜ必要か）</strong>: 証明書を発行してもらうには，そのホスト名が自分たちのものだと証明する必要があります．そのために DNS に一時的な確認用の記録を置きます．ACME Conductor が組織の本番の DNS を直接書き換えないように，確認用の記録は専用の場所（チャレンジ用ゾーン）に置くことにします．そこで，本番の DNS には「確認用の記録は専用の場所を見てください」という案内（CNAME という種類の記録）を 1 回だけ書いておきます．これを <strong>委任</strong> と呼びます．</li>
+    <li><strong>Key Vault（証明書の保管場所）</strong>: Azure にある，証明書や鍵を安全にしまっておく金庫のようなサービスです．発行された証明書と秘密鍵はここに保存されます．ACME Conductor 自体は秘密鍵を持ちません．</li>
+  </ul>
+
+  <h2 id="prereq">事前に用意するもの</h2>
+  <ul class="checklist">
+    <li>☐ ACME Conductor の URL（以下 <code>&lt;Conductor の URL&gt;</code>）と，サインインできるアカウント．URL とアカウントは，デプロイ（構築・運用）を担当する方に確認します．</li>
+    <li>☐ UPKI 証明書発行支援システムの登録担当者画面にログインできること．</li>
+    <li>☐ 利用者から聞く情報．少なくとも次の 3 つです．
+      <ul>
+        <li>ホスト名（例: <code>www.example.ac.jp</code>）．メインの 1 つと，追加の名前（最大 7 個）．</li>
+        <li>用途（Web サイト，メールなど）．</li>
+        <li>どこで使うか（Azure のサービスか，サーバか，機器か）．<a href="certificate-usage.html">発行された証明書の使い方</a>の<a href="certificate-usage.html#where">「証明書をどこで使いますか？」</a>を見て，該当するケースを聞いておくと，後で慌てません．</li>
+      </ul>
+    </li>
+    <li>☐ DNS を変更できる人．自分でできない場合は，依頼先の担当者（<a href="#step4">手順 4</a> の依頼文の例を使います）．</li>
+    <li>☐ 発行できるドメインの範囲と，名前の数の上限．デプロイ担当者に，「許可するドメイン（例: <code>example.ac.jp</code>）」と「1 枚の証明書に入れられる名前の数」を聞いておきます．範囲の外の名前は発行できません（<a href="#step1">手順 1</a>）．</li>
+    <li>☐ チャレンジ用ゾーンの名前（以下 <code>&lt;チャレンジ用ゾーン&gt;</code>）．これもデプロイ担当者に確認します．</li>
+  </ul>
+
+  <h2 id="steps">手順</h2>
+
+  <h3 id="step1">手順 1. ホスト名を決め，前提を確かめる</h3>
+  <p><strong>目的</strong>: 申請する名前の一覧を確定します．後から変えると UPKI 側で手続きがやり直しになるので，最初に慎重に決めます．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li>利用者と相談して，メインのホスト名（UPKI の「利用管理者 FQDN」，証明書の CN になる名前）を 1 つ決めます．</li>
+    <li>追加のホスト名（UPKI では dNSName）を決めます．メインを含めて最大 8 個です．</li>
+    <li><code>*</code> を使う名前（ワイルドカード）は使いません．</li>
+    <li>すべての名前が，デプロイ担当者から聞いた「許可するドメイン」の下にあるか確認します．外れているときは，デプロイ担当者に設定の変更を頼みます（GUI からは変えられません）．</li>
+  </ol>
+  <p><strong>確認</strong>: 名前の一覧をメモに書き出し，数が上限以内で，すべて許可するドメインの下にあることを確かめます．</p>
+  <div class="callout warn">
+    <p><strong>よくある間違い</strong></p>
+    <ul>
+      <li>ホスト名が許可するドメインの外にあり，発行の段階で失敗する．</li>
+      <li>後から名前を足したくなる．足すこと自体はできますが UPKI 側の手続きが増えます（<a href="#rename">名前を変えるとき</a>）．</li>
+    </ul>
+  </div>
+
+  <h3 id="step2">手順 2. TSV を作る</h3>
+  <p><strong>目的</strong>: UPKI に出す申請用のファイル（TSV）を作ります．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li><a href="https://certs.nii.ac.jp/tsv-tool/">UPKI TSV 作成ツール</a>を開きます．</li>
+    <li>「ACME 利用情報作成申請」の TSV を作ります．利用管理者 FQDN に手順 1 のメインのホスト名を，dNSName に残りの名前を入れます．</li>
+    <li>証明書プロファイルを選びます．<strong>選んだプロファイル（RSA かどうか，鍵の長さ）をメモしておきます．</strong> 手順 5 で使います．</li>
+  </ol>
+  <p><strong>確認</strong>: 作成した TSV の名前の一覧が，手順 1 のメモと同じです．</p>
+  <div class="callout warn">
+    <p><strong>よくある間違い</strong>: プロファイルをメモし忘れ，手順 5 で鍵の種類を間違える（発行が失敗します）．</p>
+  </div>
+
+  <h3 id="step3">手順 3. TSV を提出し，EAB を受け取る</h3>
+  <p><strong>目的</strong>: 審査を通して EAB（Key ID と HMAC Key）を受け取ります．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li><a href="https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do">UPKI 証明書発行支援システムの登録担当者画面</a>にログインし，TSV をアップロードします．</li>
+    <li>審査を待ちます．数日かかることがあります．この間に手順 4 を進めます．</li>
+    <li>審査が済むと EAB（Key ID と HMAC Key）が発行されます．<strong>手元の安全な場所に，手順 7 まで一時的に控えてください．</strong></li>
+  </ol>
+  <p><strong>確認</strong>: Key ID と HMAC Key の 2 つの文字列が手元にあります．</p>
+  <div class="callout danger">
+    <p><strong>よくある間違い</strong></p>
+    <ul>
+      <li><strong>EAB は誰にも渡しません．利用者にも，他の担当者にも，チャットにもメールにもチケットにも貼りません．</strong> EAB を持つ人は，あなたの申請で証明書を発行できてしまいます．手順 7 で画面に入力するときだけ使います．</li>
+      <li>受け取った EAB を 2 回以上使おうとする．EAB は 1 回の登録にだけ使えます．</li>
+    </ul>
+  </div>
+
+  <h3 id="step4">手順 4. DNS に CNAME を設定してもらう</h3>
+  <p><strong>目的</strong>: 各ホスト名の「確認用の記録は専用の場所を見てください」という案内を，本番の DNS に書いてもらいます．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li>名前ごとに 1 つずつ，次の CNAME の記録が必要です．<code>&lt;ホスト名&gt;</code> に手順 1 の名前を，<code>&lt;チャレンジ用ゾーン&gt;</code> にデプロイ担当者から聞いた名前を入れます．
+<pre><code>_acme-challenge.&lt;ホスト名&gt;.  IN CNAME  &lt;ホスト名&gt;.&lt;チャレンジ用ゾーン&gt;.</code></pre>
+      例: <code>www.example.ac.jp</code> の場合
+<pre><code>_acme-challenge.www.example.ac.jp.  IN CNAME  www.&lt;チャレンジ用ゾーン&gt;.</code></pre>
+      右側の名前は，他の名前と重ならなければ何でも構いません．チャレンジ用ゾーンの中に，事前に何かを作る必要はありません．</li>
+    <li>DNS を自分で変更できないときは，DNS の管理者に次の依頼文を送ります．
+      <blockquote>
+        <p>件名: DNS への CNAME レコード追加のお願い（証明書の自動発行のため）</p>
+        <p>お疲れさまです．UPKI の証明書を自動発行する仕組みを使うため，次の CNAME レコードを追加してください．他のレコードの変更は不要です．</p>
+        <ul>
+          <li>種類: CNAME</li>
+          <li>名前: <code>_acme-challenge.&lt;ホスト名 1&gt;</code></li>
+          <li>値: <code>&lt;ホスト名 1&gt;.&lt;チャレンジ用ゾーン&gt;</code></li>
+        </ul>
+        <p>（名前ごとに 1 行ずつ）</p>
+        <ul>
+          <li><code>&lt;ホスト名 2&gt;</code> についても同様に，……</li>
+        </ul>
+        <p>追加の希望日: ○月○日まで（審査結果が出る前に済んでいると助かります）<br>追加後は，お知らせください．</p>
+      </blockquote>
+    </li>
+    <li>設定が済んだら，<strong>すべての名前について</strong> 確かめます（次の「確認」）．</li>
+  </ol>
+  <p><strong>確認</strong></p>
+  <ul>
+    <li>コマンドが使える場合（Mac のターミナルや Linux）:
+<pre><code>dig +short CNAME _acme-challenge.&lt;ホスト名&gt;</code></pre>
+      <code>&lt;ホスト名&gt;.&lt;チャレンジ用ゾーン&gt;.</code> のように，チャレンジ用ゾーンの中の名前が表示されれば成功です．何も表示されなければ，まだ設定されていません．</li>
+    <li>コマンドが使えない場合: DNS を調べる Web サービス（「DNS lookup」などで検索できます）に <code>_acme-challenge.&lt;ホスト名&gt;</code> を入れ，種類に CNAME を選んで調べます．結果がチャレンジ用ゾーンの名前ならば成功です．DNS の設定が世の中に広がるのに，数分から数時間かかることがあります．</li>
+  </ul>
+  <div class="callout warn">
+    <p><strong>よくある間違い</strong></p>
+    <ul>
+      <li>名前が複数あるのに，一部の名前の CNAME が抜けている．<strong>1 つでも抜けていると，その名前の確認が失敗します．</strong></li>
+      <li>確認しないまま手順 7 に進む．UPKI では所有確認に 20 回失敗すると，翌日まで処理が制限されます．失敗したときにやみくもに何度も試さないでください．</li>
+      <li><code>_acme-challenge.</code> を付け忘れる，ホスト名の末尾のドット（<code>.</code>）を間違える．</li>
+    </ul>
+  </div>
+
+  <h3 id="step5">手順 5. 発行ポリシーを用意する</h3>
+  <p><strong>目的</strong>: 「どのドメインまで，どんな鍵で，期限の何日前に更新するか」というルールを決めます．すでに UPKI 用のポリシーがあり，条件が合うときは，この手順は飛ばして手順 6 に進みます．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li>ブラウザで <code>&lt;Conductor の URL&gt;</code> を開き，サインインします．</li>
+    <li>メニューの「発行ポリシー」を開き，既存のポリシーを確認します．次の条件が合っていればそれを使います．合わなければ，新しいポリシーを作ります．
+      <ul>
+        <li>許可するドメイン: 手順 1 の名前がすべてその下にある．</li>
+        <li>鍵の種類: 手順 2 のプロファイルに合っている．RSA なら <code>rsa2048</code>．</li>
+        <li>ホスト名の最大数: 手順 1 の名前の数以上（UPKI は最大 8）．</li>
+        <li>期限の何日前に更新するか: 通常は <code>30</code>（約 59 日で更新に入ります）．</li>
+        <li>ワイルドカードは許可しない．</li>
+        <li>接続先（binding）: UPKI のもの（<code>upki</code> などの名前．デプロイ担当者に確認）．</li>
+      </ul>
+    </li>
+    <li>新しく作るときは，「発行ポリシーを追加」を押し，上の値を入れて「有効」にチェックを入れ，「発行ポリシーを追加」ボタンで保存します．</li>
+  </ol>
+  <p><strong>確認</strong>: ポリシーの一覧に表示されます．</p>
+  <div class="callout warn">
+    <p><strong>よくある間違い</strong></p>
+    <ul>
+      <li>鍵の種類をプロファイルと違うものにする．たとえば RSA のプロファイルで <code>rsa4096</code> を選ぶと，確認の後で UPKI に拒否され，発行が失敗します．</li>
+      <li>別の認証局用に作ったポリシーをそのまま使う．</li>
+    </ul>
+  </div>
+
+  <h3 id="step6">手順 6. 証明書（target）を無効の状態で追加する</h3>
+  <p><strong>目的</strong>: ACME Conductor に「この名前の証明書を管理してください」と登録します．まだ EAB を登録していないので，<strong>無効の状態で作ります．</strong></p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li>メニューの「証明書」を開き，「証明書を追加」を押します．</li>
+    <li>次のように入力します．
+      <ul>
+        <li>主たるホスト名（FQDN）: 手順 1 のメインのホスト名．作成後は変更できません．</li>
+        <li>追加のホスト名（SAN）: 残りの名前を 1 行に 1 つ．</li>
+        <li>発行ポリシー: 手順 5 のポリシー．</li>
+        <li>実行の接続先，DNS の接続先，保存先（store）: 他の証明書と同じ値でよいのが普通です．分からなければデプロイ担当者に聞いてください．保存先（Key Vault）の種類が，証明書の形式（PEM か PFX）を決めます．詳しくは<a href="certificate-usage.html#storage">使い方の文書</a>を見てください．</li>
+        <li>有効: <strong>チェックを外します．</strong></li>
+      </ul>
+    </li>
+    <li>画面下の「証明書を追加」ボタンを押します．</li>
+  </ol>
+  <p><strong>確認</strong>: 証明書の一覧に，無効の状態で表示されます．</p>
+  <div class="callout warn">
+    <p><strong>よくある間違い</strong>: 有効のまま作ってしまう．害はありませんが，アカウントがないため直後の実行が失敗し，失敗の記録が残ります．その場合も手順 7 に進んでかまいません．</p>
+  </div>
+
+  <h3 id="step7">手順 7. EAB を登録し，発行できたか確かめる</h3>
+  <p><strong>目的</strong>: EAB を登録して，証明書を実際に発行します．</p>
+  <p><strong>操作</strong></p>
+  <ol>
+    <li>手順 6 で作った証明書の詳細ページを開き，「ACME アカウント」の節を探します．</li>
+    <li>手順 3 の Key ID と HMAC Key を入力し，「EAB を登録（世代 1）」を押します．入力した内容はブラウザの中で暗号化されて送られ，登録後は画面に表示されません．</li>
+    <li>ページ上部の「有効にする」を押します．有効にした時点で自動的に発行が始まります．ページ上部の「次にやること」の案内にも，その時点ですべきことが表示されます．</li>
+    <li>「実行履歴」を開いて，実行（run）の状態を見ます．「実行中」から「成功」になれば完了です．数分かかることがあります．</li>
+  </ol>
+  <p><strong>確認</strong></p>
+  <ul>
+    <li>実行が「成功」になっている．</li>
+    <li>「ACME アカウント」の節に世代 1 が「使用中」と表示されている．</li>
+    <li>詳しい確認は次の<a href="#verify">発行できたか確かめる</a>を見てください．</li>
+  </ul>
+  <div class="callout danger">
+    <p><strong>よくある間違い</strong></p>
+    <ul>
+      <li><strong>EAB を貼るときに，チャットや文書にも貼ってしまう．</strong> 入力するのは，この 1 か所だけです．</li>
+      <li>失敗したからといって，何度も「今すぐ実行」を押す．UPKI の 20 回制限に近づきます．失敗したら，まず<a href="#troubleshooting">うまくいかないとき</a>で原因を確認します．</li>
+      <li>アカウントの登録が済んで（世代 1 が「使用中」），発行だけが失敗したのに，EAB をもう一度登録しようとする．その場合は EAB を再登録せず，原因を直してから「今すぐ実行」を 1 回押すだけです．</li>
+    </ul>
+  </div>
+
+  <h2 id="verify">発行できたか確かめる</h2>
+  <ol>
+    <li>「証明書」の一覧で，該当の証明書の「証明書の有効期限」の列に日付が入っています．有効期間は 89 日なので，今日から約 89 日後になっているはずです．</li>
+    <li>証明書の詳細ページの「証明書」の行に，保存先のオブジェクト名（<code>&lt;ホスト名を - でつないだもの&gt;-&lt;16 桁の英数字&gt;</code> の形）が表示されます．これが Key Vault の中での証明書の名前です．使い方の文書で必要になるので，利用者やサーバ管理者に伝える名前として控えておきます．</li>
+    <li>管理者の許可があれば，Azure ポータルの Key Vault で「証明書」を開き，その名前があることを確かめられます．</li>
+  </ol>
+  <p>証明書を実際に使うところ（Web サイトなど）へ反映する手順は，<a href="certificate-usage.html">発行された証明書の使い方（ケース別）</a>にあります．</p>
+
+  <h2 id="troubleshooting">うまくいかないとき</h2>
+  <p>画面の実行履歴に出る失敗の表示と，その意味です．どれも，画面には英語のエラーコードがそのまま表示されます．</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>画面に出る表示</th><th>意味</th><th>すること</th><th>誰に相談するか</th></tr></thead>
+      <tbody>
+        <tr><td><code>AcmeFailure</code>．要約に <code>keeps one account per target and this target has none yet</code></td><td>EAB がまだ登録されていない（手順 7 の前に実行された）</td><td>手順 7 の EAB の登録を行う．そのあとで実行が自動的に起きる</td><td>自分で対応できる</td></tr>
+        <tr><td><code>PolicyViolation</code>．要約に <code>fqdn is not under any allowed DNS suffix</code></td><td>名前が許可するドメインの外にある</td><td>名前を確認する．必要なら許可するドメインを増やしてもらう</td><td>デプロイ担当者</td></tr>
+        <tr><td><code>AcmeFailure</code>．数秒で終わった</td><td>DNS の CNAME が抜けているなど，確認用の記録を置けなかった可能性が高い</td><td>手順 4 の確認を全名前でやり直す</td><td>DNS の管理者</td></tr>
+        <tr><td><code>AcmeFailure</code>．数十秒かかって終わった</td><td>確認は通ったが，鍵の種類が UPKI のプロファイルと違う，または登録していない名前が入っている</td><td>手順 5 の鍵の種類を確認して直し，「今すぐ実行」を 1 回押す</td><td>UPKI の窓口（名前の場合），デプロイ担当者</td></tr>
+        <tr><td><code>AcmeFailure</code>．EAB を登録した直後の実行で失敗し，世代が「失敗」になった</td><td>EAB の入力ミス，または使用済みの EAB</td><td>新しい EAB を UPKI で受け取り，登録し直す（世代の番号は進みます）</td><td>UPKI の窓口</td></tr>
+        <tr><td>何も起きない（実行が始まらない）</td><td>証明書やポリシーが無効になっている，すでに別の実行が動いている</td><td>「有効」になっているかを確認する</td><td>デプロイ担当者</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><code>AcmeFailure</code> の理由の詳細（UPKI からの応答）は，今のところ画面には出ません．実行にかかった時間と，直前にやった操作から見当をつけます．詳しい切り分けは<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/account-scoped-ca.md#失敗の読み方">運用ガイドの「失敗の読み方」</a>にあります．</p>
+  <div class="callout danger">
+    <p>失敗した実行は，しばらく間隔を空けて自動で再試行されます．<strong>急いで何度も手動で実行しないでください．</strong> UPKI では所有確認に 20 回失敗すると，翌日まで処理が制限されます．</p>
+  </div>
+
+  <h2 id="operation">その後の運用</h2>
+  <ul>
+    <li><strong>自動更新</strong>: 発行から約 59 日で，ACME Conductor が自動的に更新します．担当者が通常やることはありません．更新のたびに Key Vault に新しい版が追加されます．</li>
+    <li><strong>担当者が見ること</strong>: 月に 1 回ほど，証明書の一覧の期限の列を見て，期限が近い（たとえば 30 日を切った）のに更新されていないものがないか確認します．実行が失敗し続けている証明書があれば，上の表で原因を調べます．更新が失敗し続けても，証明書が切れるまで 30 日の余裕があります．</li>
+    <li><strong>サーバ側の作業</strong>: 証明書が更新されても，使う側が新しい証明書を読み込まないと古いままです．自動で追従するかどうかは使い方によって違います．<a href="certificate-usage.html">発行された証明書の使い方</a>を見てください．</li>
+    <li><strong>担当者の異動</strong>: EAB を使うのは最初の登録だけなので，異動のときに EAB の引継ぎは要りません．Conductor にサインインできる人を変えたいときは，デプロイ担当者に頼みます．</li>
+  </ul>
+
+  <h3 id="rename">名前を変えるとき</h3>
+  <p>ホスト名を足す・減らす，またはメインのホスト名を変えるときは，UPKI 側の手続きと Conductor 側の操作の順序が決まっています．手順は<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/account-scoped-ca.md#名前を変える">運用ガイドの「名前を変える」</a>にあります．そのとおりに進めてください（特にメインのホスト名は，証明書の追加からやり直しになります）．</p>
+
+  <h2 id="glossary">用語集</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>用語</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td>ACME</td><td>証明書を自動で発行・更新するための決まり</td></tr>
+        <tr><td>UPKI ACME</td><td>UPKI が提供する ACME の窓口</td></tr>
+        <tr><td>EAB</td><td>UPKI ACME の登録に使う合言葉（Key ID と HMAC Key）．1 回の登録にだけ使う</td></tr>
+        <tr><td>CN</td><td>証明書に書かれるメインのホスト名（UPKI の利用管理者 FQDN）</td></tr>
+        <tr><td>SAN / dNSName</td><td>証明書に一緒に書かれる追加のホスト名</td></tr>
+        <tr><td>FQDN</td><td><code>www.example.ac.jp</code> のように，省略のないホスト名</td></tr>
+        <tr><td>DNS</td><td>ホスト名と住所（IP アドレス）を対応させる仕組み</td></tr>
+        <tr><td>CNAME</td><td>「この名前は，あちらの名前を見てください」という案内の DNS 記録</td></tr>
+        <tr><td>委任</td><td>確認用の記録を置く場所を，CNAME で別のゾーンに任せること</td></tr>
+        <tr><td>チャレンジ用ゾーン</td><td>確認用の記録を置く専用の DNS の場所</td></tr>
+        <tr><td>所有確認（DNS-01）</td><td>そのホスト名の持ち主であることを DNS で確かめる方法</td></tr>
+        <tr><td>証明書</td><td>サーバの身分証明書</td></tr>
+        <tr><td>秘密鍵</td><td>証明書とセットで使う，外に出してはいけない鍵</td></tr>
+        <tr><td>Key Vault</td><td>Azure の，証明書や鍵の保管サービス</td></tr>
+        <tr><td>target（証明書）</td><td>ACME Conductor が管理する証明書 1 枚の登録．UPKI の申請 1 つに当たる</td></tr>
+        <tr><td>run（実行）</td><td>発行や更新の 1 回の処理．実行履歴で見られる</td></tr>
+        <tr><td>世代</td><td>ACME アカウントの登録の番号．EAB を登録し直すたびに 1 つ進む</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="next">
+    <a class="back" href="index.html"><small>前へ</small>概要</a>
+    <a class="fwd" href="certificate-usage.html"><small>次へ</small>証明書の使い方</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>

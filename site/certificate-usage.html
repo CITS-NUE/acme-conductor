@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>証明書の使い方 — ACME Conductor</title>
+<meta name="description" content="発行された証明書を Azure のサービス，Linux・Windows のサーバ，手動運用の機器，他部署・業者で使う方法を，ケース別に説明します．">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="inner">
+    <a class="brand" href="index.html">ACME <span>Conductor</span></a>
+    <nav class="nav" aria-label="ページ">
+      <a href="index.html">概要</a>
+      <a href="upki-guide.html">証明書の発行手順</a>
+      <a href="certificate-usage.html" aria-current="page">証明書の使い方</a>
+      <a href="how-it-works.html">仕組み</a>
+      <a href="security.html">安全設計</a>
+      <a href="deploy.html">導入ガイド</a>
+      <a href="status.html">現状と制限</a>
+      <a href="https://github.com/CITS-NUE/acme-conductor">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>発行された証明書の使い方<br>（ケース別）</h1>
+    <p class="lead">
+      ACME Conductor で発行された証明書を，実際のサービスやサーバで使うための解説です．
+      まず「証明書をどこで使うか」を選び，該当するケースの節へ進んでください．
+    </p>
+  </section>
+
+  <p>読者は 2 種類を想定しています．</p>
+  <ul>
+    <li><strong>登録担当者（事務担当者）</strong>: 仕組みを理解し，サーバの管理者や業者に正しい依頼を出すために読みます．</li>
+    <li><strong>サーバの管理者</strong>: 自分のサーバに証明書を入れる具体的な手順を知るために読みます．</li>
+  </ul>
+  <p>証明書を発行するまでの手順は <a href="upki-guide.html">UPKI 証明書の発行手順（登録担当者向け）</a>にあります．設定や仕組みの詳細は <a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#certificate-store-azure-key-vault">Runner 運用ガイド</a>にあります．</p>
+
+  <h2 id="where">証明書をどこで使いますか？</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>証明書を使う場所</th><th>該当するケース</th></tr></thead>
+      <tbody>
+        <tr><td>Azure App Service，Application Gateway，Front Door，API Management</td><td><a href="#case-a">ケース A</a></td></tr>
+        <tr><td>Azure 上の仮想マシン，または Linux サーバ（nginx，Apache など）</td><td><a href="#case-b">ケース B</a></td></tr>
+        <tr><td>Windows Server（IIS など）</td><td><a href="#case-c">ケース C</a></td></tr>
+        <tr><td>手動でしか証明書を入れられない機器，ロードバランサ，外部のサービス</td><td><a href="#case-d">ケース D</a></td></tr>
+        <tr><td>他の部署や業者に証明書を渡す</td><td><a href="#case-e">ケース E</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>迷ったら，利用者に「そのホスト名のサイトは，どこで動いていますか」と聞きます．どのケースでも，秘密鍵の扱いには<a href="#private-key">秘密鍵の取り扱い</a>を守ります．</p>
+
+  <h2 id="basics">基本の知識</h2>
+
+  <h3 id="storage">どこに保存されるか</h3>
+  <p>発行された証明書と秘密鍵は，Azure の <strong>Key Vault</strong> に，<strong>証明書のオブジェクト</strong>として保存されます．</p>
+  <ul>
+    <li>オブジェクトの名前は，ホスト名から機械的に決まります．<code>.</code> と <code>_</code> は <code>-</code> に変わり，末尾に 16 桁の英数字（16 進数）が付きます．たとえば <code>wiki.example.ac.jp</code> は <code>wiki-example-ac-jp-&lt;16 桁の 16 進数&gt;</code> になります．</li>
+    <li>実際の名前は，ACME Conductor の証明書の詳細ページ（または実行履歴の実行の詳細）にある「保存先のオブジェクト名」で分かります．推測せず，画面の値をコピーして使ってください．</li>
+    <li>Key Vault の名前（<code>&lt;kv&gt;</code>）は，環境によって違います．デプロイ担当者に聞いてください．</li>
+  </ul>
+
+  <h3 id="versions">更新のたびに「新しい版」ができる</h3>
+  <p>証明書が更新されると，同じ名前の下に <strong>新しい版（バージョン）</strong> が追加されます．古い版は消えずに読み取れる状態で残ります．したがって，利用側は「名前だけで指定して，常に最新の版を使う」ようにしておけば，更新に自動で追従できます．バージョンを固定して指定すると，更新後も古い証明書を使い続けてしまいます．有効期間は 89 日で，発行から約 59 日で更新されます．</p>
+
+  <h3 id="pem-pfx">PEM と PFX（pkcs12）の違い</h3>
+  <p>Key Vault に保存される証明書には，2 つの形式があります．</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>形式</th><th>中身</th><th>向いている使い方</th></tr></thead>
+      <tbody>
+        <tr><td>PEM</td><td>証明書，中間証明書，秘密鍵を 1 つのテキストにしたもの</td><td>nginx や Apache など，自分でファイルを読むソフトウェア</td></tr>
+        <tr><td>PFX（PKCS #12）</td><td>同じものをまとめたバイナリのファイル（パスワードなし）</td><td>Azure の組み込みの連携（App Service など），Windows</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>どちらの形式で保存されるかは，証明書の登録時に選ぶ <strong>保存先（store）</strong> の設定で決まります．デプロイ担当者に「この証明書は PEM ですか，PFX ですか」と確認してください．Azure の App Service，Application Gateway，Front Door，API Management のような組み込みの連携は PFX を必要とし，Front Door と API Management はさらに RSA の鍵（<code>rsa2048</code> 以上）を必要とします．これは，<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#certificate-store-azure-key-vault">Runner 運用ガイド</a>に記載された内容です．形式の切り替えは，Runner 側で保存先の設定を変え，次の実行で証明書が再発行されることで反映されます．登録担当者が単独で切り替えることはできません．</p>
+
+  <h3 id="permissions">読み取りに必要な権限</h3>
+  <p>秘密鍵は Key Vault の「シークレット」として読み出されます．読み取るには，Key Vault に対する <code>secrets/get</code> の権限（Azure RBAC の組み込みロールでは <strong>Key Vault Secrets User</strong>）が必要です．この権限を持つ人やサービスは，秘密鍵を読めることになるので，本当に必要なものだけに付与します．付与の可否と手続きはデプロイ担当者・Key Vault の管理者に相談してください．</p>
+
+  <h2 id="case-a">ケース A: Azure の Web サービス</h2>
+  <p><strong>向いている場面</strong>: Azure の Web サービスで，独自ドメインの HTTPS を提供するとき．更新の追従を自動にできるので，最も手間がかかりません．</p>
+  <p><strong>必要な権限・準備</strong></p>
+  <ul>
+    <li>証明書が <strong>PFX（pkcs12）</strong> で保存されていること．Front Door と API Management は RSA の鍵も必要です．デプロイ担当者に確認します．</li>
+    <li>そのサービスが Key Vault から証明書を読めるように，Key Vault の <code>secrets/get</code>（Key Vault Secrets User）を与える．与える相手はサービスによって違います（Application Gateway と Front Door は割り当てたマネージド ID，App Service は既定では App Service のリソースプロバイダの ID）．ロール名やファイアウォールの設定など，細かい要件は各サービスの公式ドキュメントで確認してください．</li>
+  </ul>
+  <p><strong>手順の概要</strong></p>
+  <ol>
+    <li>Azure ポータルで，対象のサービスの TLS/SSL（証明書）の設定を開きます．</li>
+    <li>「Key Vault から証明書を追加（インポート）」を選び，Key Vault と証明書の名前を指定します．</li>
+    <li>証明書のバージョンは <strong>指定しない</strong>（「最新」を選ぶ，または版のない識別子を使う）．Application Gateway では，版のない識別子は <code>https://&lt;kv&gt;.vault.azure.net/secrets/&lt;証明書名&gt;</code> の形です．</li>
+    <li>ホスト名（カスタムドメイン）に証明書を割り当てます．</li>
+  </ol>
+  <p><strong>更新時の扱い</strong>: 版を指定しなければ，新しい版が自動で取り込まれます．反映まで時間がかかることがあります（サービスごとに，数時間から 1 日程度）．正確な間隔は，各サービスの公式ドキュメントで確認してください．</p>
+  <div class="callout warn">
+    <p><strong>注意</strong></p>
+    <ul>
+      <li>PEM の形式で保存されている場合，Application Gateway は受け付けません．形式の変更は，デプロイ担当者に頼みます．</li>
+      <li>名前（ホスト名）の DNS が，そのサービスを指していること．証明書とは別の作業です．</li>
+    </ul>
+  </div>
+
+  <h2 id="case-b">ケース B: Linux サーバ</h2>
+  <p><strong>向いている場面</strong>: Azure の仮想マシン，またはオンプレミスの Linux サーバで，自分で証明書ファイルを設定するとき．</p>
+  <p><strong>必要な権限・準備</strong></p>
+  <ul>
+    <li>証明書が PEM で保存されているのが最も簡単です（PFX でも変換できます）．</li>
+    <li>サーバに <strong>マネージド ID</strong>（Azure の仮想マシンなら，システム割り当て ID を有効にする．オンプレミスのサーバなら Azure Arc を使う）を持たせ，その ID に Key Vault の Key Vault Secrets User を付与します．人のアカウントで取得する場合は，その人に同じ権限が要ります．</li>
+    <li>Azure CLI（<code>az</code>）をサーバに入れておきます．</li>
+  </ul>
+  <p><strong>手順の概要</strong></p>
+  <ol>
+    <li>サインインします（マネージド ID の場合）．
+<pre><code>az login --identity</code></pre>
+    </li>
+    <li>証明書（秘密鍵つき）を取得します．PEM の場合:
+<pre><code>az keyvault secret download \
+  --vault-name &lt;kv&gt; --name &lt;証明書のオブジェクト名&gt; \
+  --file cert.pem --encoding utf-8</code></pre>
+      PFX（pkcs12）の場合は <code>--encoding base64</code> を付けます．できたファイルが PFX です．
+<pre><code>az keyvault secret download \
+  --vault-name &lt;kv&gt; --name &lt;証明書のオブジェクト名&gt; \
+  --file cert.pfx --encoding base64</code></pre>
+      ファイルに書かずに画面へ出すだけなら <code>az keyvault secret show ...</code> ですが，秘密鍵が画面に出るので，通常は使いません．
+    </li>
+    <li>PEM を，証明書チェーン（fullchain）と秘密鍵に分けます．
+<pre><code># 証明書と中間証明書（先頭が自分の証明書）
+sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' cert.pem &gt; fullchain.pem
+# 秘密鍵
+openssl pkey -in cert.pem -out privkey.pem</code></pre>
+      PFX しかない場合は，PEM に変換します（パスワードは空です）．
+<pre><code>openssl pkcs12 -in cert.pfx -passin pass: -nodes -out cert.pem</code></pre>
+      Key Vault が返す PFX は 3DES と SHA-1 の MAC の形式で，OpenSSL 3 系でも <code>-legacy</code> なしで読めます．
+    </li>
+    <li>ファイルを配置し，権限を絞ります．
+<pre><code>sudo install -m 644 fullchain.pem /etc/ssl/&lt;ホスト名&gt;/fullchain.pem
+sudo install -m 600 privkey.pem   /etc/ssl/&lt;ホスト名&gt;/privkey.pem
+rm -f cert.pem cert.pfx privkey.pem fullchain.pem   # 作業用のコピーは消す</code></pre>
+      秘密鍵は 600（所有者だけが読める）にし，Web サーバを動かすユーザ以外に読ませないようにします．
+    </li>
+    <li>nginx（<code>ssl_certificate</code> と <code>ssl_certificate_key</code>）や Apache（<code>SSLCertificateFile</code> と <code>SSLCertificateKeyFile</code>）に，このファイルを設定し，設定を再読み込みします（<code>sudo systemctl reload nginx</code> など）．</li>
+  </ol>
+  <p><strong>更新時の扱い</strong>: 証明書は約 59 日ごとに変わります．手動では続かないので，<strong>自動化します</strong>．上の手順 1 から 5 を 1 本のスクリプトにして，systemd タイマーか cron で毎日 1 回実行します．</p>
+<pre><code>#!/bin/sh
+# 概略．実際はエラー処理と，変更があったときだけ reload する処理を足す
+set -eu
+umask 077   # 秘密鍵を含む一時ファイルを他のユーザに読ませない
+az login --identity --output none
+az keyvault secret download --vault-name &lt;kv&gt; --name &lt;証明書のオブジェクト名&gt; \
+  --file /tmp/cert.pem --encoding utf-8
+# 分割，配置（600），一時ファイルの削除
+# 新しい証明書と前回の証明書が違うときだけ reload</code></pre>
+  <p>Azure や Azure Arc の仮想マシンでは，スクリプトを自作する代わりに，<strong>Key Vault の仮想マシン拡張機能</strong>（Linux 版と Windows 版があります）を使う方法もあります．Key Vault の証明書を仮想マシン上のファイルとして自動で更新する機能です．自動化の第一候補ですが，設定の細かい点は Microsoft の公式ドキュメントで確認してください．</p>
+  <div class="callout warn">
+    <p><strong>注意</strong></p>
+    <ul>
+      <li>スクリプトを動かす ID には，読み取りだけ（Key Vault Secrets User）を与えます．</li>
+      <li>更新の後に Web サーバを再読み込みしないと，古い証明書のままです．</li>
+    </ul>
+  </div>
+
+  <h2 id="case-c">ケース C: Windows Server</h2>
+  <p><strong>向いている場面</strong>: Windows Server の IIS などで HTTPS を提供するとき．</p>
+  <p><strong>必要な権限・準備</strong>: 証明書を PFX の形で取得できること．PFX（pkcs12）で保存されていれば，そのまま取得できます．PEM で保存されている場合は，取得した PEM を変換します．</p>
+<pre><code>openssl pkcs12 -export -in fullchain.pem -inkey privkey.pem -out cert.pfx</code></pre>
+  <p>（<a href="#case-b">ケース B</a> の手順 3 で PEM を分けてから行います．パスワードの入力を求められます．そのパスワードは，インポートのときに使います．）</p>
+  <p><strong>手順の概要</strong></p>
+  <ol>
+    <li>PFX を取得します（ケース B の <code>az keyvault secret download ... --encoding base64</code> を使えます）．</li>
+    <li>サーバ管理者が，証明書を「ローカルコンピューター」の「個人」ストア（<code>LocalMachine\My</code>）にインポートします．PowerShell の例:
+<pre><code>Import-PfxCertificate -FilePath .\cert.pfx `
+  -CertStoreLocation Cert:\LocalMachine\My</code></pre>
+      （パスワード付きの PFX のときは，<code>-Password</code> も指定します．）
+    </li>
+    <li>IIS マネージャーで，対象サイトの「バインド」を開き，HTTPS のバインドに，インポートした証明書を選びます．</li>
+    <li>作業用に置いた PFX ファイルは，インポート後にすぐ削除します．</li>
+  </ol>
+  <p><strong>更新時の扱い</strong>: 約 59 日ごとに，上の作業をやり直す必要があります．手動は忘れやすいので，自動化します．Azure（または Azure Arc）の仮想マシンなら，<strong>Key Vault の仮想マシン拡張機能（Windows 版）</strong> で，証明書を自動で <code>LocalMachine\My</code> に反映できます．ただし IIS のバインドが新しい証明書に切り替わるかは，設定によります．公式ドキュメントで確認してください．</p>
+  <div class="callout warn">
+    <p><strong>注意</strong>: 秘密鍵つきの PFX は，メールやチャットで送らないでください．</p>
+  </div>
+
+  <h2 id="case-d">ケース D: 手動でしか入れられない機器</h2>
+  <p><strong>向いている場面</strong>: ロードバランサ，VPN 装置，ネットワーク機器，外部のサービスなど，管理画面から証明書ファイルをアップロードする方式の機器．</p>
+  <p><strong>必要な権限・準備</strong>: Key Vault から証明書を取得する権限を持つ人が，ダウンロードします．PEM と PFX のどちらを受け付けるかは，機器のマニュアルで確認し，必要なら<a href="#case-b">ケース B</a>・<a href="#case-c">C</a> の方法で変換します．</p>
+  <p><strong>手順の概要</strong></p>
+  <ol>
+    <li>Key Vault から証明書をダウンロードする（ケース B の <code>az keyvault secret download</code>，または Azure ポータルの Key Vault の画面）．</li>
+    <li>機器の管理画面で，証明書（と，必要なら中間証明書と秘密鍵）をアップロードする．</li>
+    <li>ダウンロードしたファイルを，作業が終わったら削除する．</li>
+  </ol>
+  <p><strong>更新時の扱い</strong>: 更新のたびに，<strong>手動で同じ作業を繰り返す</strong> 必要があります．証明書は約 59 日で更新され，89 日で期限が切れます．次のどちらかをしておきます．</p>
+  <ul>
+    <li>更新の後に作業する日を，カレンダーに繰り返し予定として入れる（たとえば，発行から 60 日ごと）．</li>
+    <li>機器が API や自動化に対応しているなら，スクリプトで自動化する．</li>
+  </ul>
+  <div class="callout warn">
+    <p><strong>注意</strong>: 期限が切れるとサイトが「安全でない」と表示されます．担当者が異動しても続けられるように，作業手順書を残してください．</p>
+  </div>
+
+  <h2 id="case-e">ケース E: 他部署・業者に渡すとき</h2>
+  <p><strong>向いている場面</strong>: 運用を外部の業者や他部署に任せていて，その担当者が証明書をサーバに入れるとき．</p>
+  <p><strong>必要な権限・準備・手順の概要</strong></p>
+  <ul>
+    <li><strong>秘密鍵つきの証明書（PEM や PFX）をメールやチャットで送らない</strong>．一度送ると，誰に転送されたか分からなくなります．</li>
+    <li>推奨する方法は，<strong>相手に Key Vault の読み取り権限を与える</strong>ことです．相手は自分でダウンロードでき，更新の後にも最新の版を取得できます．権限の付与は Key Vault の管理者（デプロイ担当者）が行うので，依頼します．付与する権限は読み取りだけ（Key Vault Secrets User）で，対象は必要な Key Vault だけに絞ります．</li>
+    <li>どうしても Key Vault に入れられない相手には，組織が認めた安全な受け渡しの手段（暗号化された共有領域など）を使います．</li>
+    <li>依頼の前に，<strong>誰が承認するか</strong>を決めておきます．一般には，証明書の利用者（ホスト名の責任者）と Key Vault の管理者の承認が要ります．組織の規定を確認してください．</li>
+  </ul>
+  <p><strong>更新時の扱い</strong>: 相手は更新のたびに，上のケース B〜D のどれかで取得し直します．自動化してもらうのが理想です．更新の日の目安（約 59 日ごと）を伝えておきます．</p>
+  <div class="callout warn">
+    <p><strong>注意</strong>: 権限は，契約の終了や担当者の異動のときに，忘れずに削除します．</p>
+  </div>
+
+  <h2 id="private-key">秘密鍵の取り扱い</h2>
+  <div class="callout danger">
+    <ul>
+      <li>秘密鍵は，証明書と一緒に発行された <strong>1 つだけ</strong> です．誰かに知られると，その人があなたのサイトになりすませます．</li>
+      <li>メール，チャット，チケット，共有フォルダに置かない．</li>
+      <li>サーバに置くときは，所有者だけが読める権限（<code>chmod 600</code>）にする．</li>
+      <li>作業用にダウンロードしたファイルは，作業が終わったらすぐ削除する．</li>
+      <li>秘密鍵が漏れた，または漏れたかもしれないときは，すぐにデプロイ担当者と UPKI の窓口に連絡してください．新しい証明書の発行が必要です．</li>
+      <li>ACME Conductor 自体は，秘密鍵を保存も表示もしません．鍵は，Key Vault に直接書き込まれます．</li>
+    </ul>
+  </div>
+
+  <h2 id="verify-renewal">更新されたか確かめる</h2>
+  <p>更新は約 59 日ごとです．新しい証明書が実際に使われているかは，次の方法で確かめます．</p>
+  <ul>
+    <li>コマンド（Mac，Linux，Windows の WSL など）で，サーバが返している証明書の期限を見ます．
+<pre><code>openssl s_client -connect &lt;ホスト名&gt;:443 -servername &lt;ホスト名&gt; &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -dates</code></pre>
+      <code>notBefore</code> が最近の日付で，<code>notAfter</code> がその約 89 日後になっていれば，新しい証明書が使われています．</li>
+    <li>ブラウザ: アドレスバーの鍵のマークをクリックして「証明書」を開き，有効期間を見ます．</li>
+    <li>ACME Conductor の画面: 「証明書」の一覧の期限の列が更新されていれば，Key Vault の中の証明書は新しくなっています．ただし，サーバへの反映は別です．上の 2 つの方法で，サーバが返している証明書を見て確かめます．</li>
+  </ul>
+  <p>サーバに反映されていないときは，該当するケースの「更新時の扱い」（再読み込み，インポートのやり直しなど）を見直します．</p>
+
+  <div class="next">
+    <a class="back" href="upki-guide.html"><small>前へ</small>証明書の発行手順</a>
+    <a class="fwd" href="how-it-works.html"><small>次へ</small>仕組み: 1 枚の証明書が更新されるまで</a>
+  </div>
+</main>
+
+<footer>
+  <div class="inner">
+    ACME Conductor — Apache License 2.0．このサイトはリポジトリの <code>docs/</code> を読みやすくまとめたものです．正確な仕様は
+    <a href="https://github.com/CITS-NUE/acme-conductor/tree/main/docs">リポジトリの文書</a>が正です．
+  </div>
+</footer>
+</body>
+</html>

@@ -51,10 +51,11 @@ type UIAuthConfig struct {
 }
 
 // uiFiles maps the served paths to the embedded files and their types.
-// Only these three are served: there is no directory walk, so no path
+// Only these are served: there is no directory walk, so no path
 // under /ui/ can reach anything else.
 var uiFiles = map[string]struct{ name, contentType string }{
 	"":             {"index.html", "text/html; charset=utf-8"},
+	"i18n.js":      {"i18n.js", "text/javascript; charset=utf-8"},
 	"app.js":       {"app.js", "text/javascript; charset=utf-8"},
 	"provision.js": {"provision.js", "text/javascript; charset=utf-8"},
 	"app.css":      {"app.css", "text/css; charset=utf-8"},

@@ -1,6 +1,6 @@
 # 0020: cert-infra からの移行 — 一覧の取り込み，shadow 比較，target-source フラグ
 
-- ステータス: 採択
+- ステータス: 廃止（[0025](0025-remove-migration-tooling.md) により）
 - 日付: 2026-09-24
 
 ## 背景
@@ -75,6 +75,6 @@ Key Vault 上の名前はそれぞれのシステム固有のものである．�
 
 ## 関連文書
 
-- [`docs/migration.md`](../migration.md)
-- [`docs/conductor.md`](../conductor.md#migration)
+- `docs/migration.md`（削除済み．[0025](0025-remove-migration-tooling.md)）
+- `docs/conductor.md` の `migration` の節（削除済み．[0025](0025-remove-migration-tooling.md)）
 - [`docs/threat-model.md`](../threat-model.md)，T16

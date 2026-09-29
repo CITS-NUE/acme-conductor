@@ -19,11 +19,7 @@ REST API，スケジューラを備える．ランチャーは 2 種類ある．
 ベアラートークン，名前付きプリンシパル，admin と viewer のロール，TLS リスナー
 またはその前段のプラットフォーム ingress である．さらに Conductor 自身が配信する
 最小限の **GUI** を持つ（[認証](#認証)と [GUI](#gui) を参照）．`localhost-dev`
-モードは開発ホスト 1 台向けに残る．**移行ツール** も備える．既存のインフラ定義の
-ホスト一覧を読み，レジストリと比較して足りないものを取り込む `migrate` コマンドと
-API，および操作者が切り替えるまで Conductor に何も発行させない
-`migration.targetSource` フラグである（[`docs/migration.md`](migration.md) と
-[`migration`](#migration) を参照）．
+モードは開発ホスト 1 台向けに残る．
 
 ## 概要
 
@@ -52,15 +48,9 @@ Conductor は `JobSpec` を生成し `Result` を消費する．証明書につ�
 ```
 acme-conductor serve [--config FILE] [--log-level LEVEL]
 acme-conductor keygen --private FILE --public FILE
-acme-conductor migrate (list|diff|import) [flags]
 acme-conductor --version
 acme-conductor --help
 ```
-
-`migrate` は Bicep のパラメータファイルまたは TargetList 文書からホスト一覧を読み，
-稼働中の Conductor のレジストリと API 経由で比較し，レジストリにない名前を取り込む
-（`--apply` を指定しない限り dry-run）．
-[`docs/migration.md`](migration.md#コマンドライン) に説明がある．
 
 `keygen` は[ジョブ署名](#jobsigning)用の Ed25519 鍵ペアを生成する．秘密鍵は
 `--private` に書き込まれ（`0600` で作成．既存のファイルを上書きすることは決して
@@ -116,7 +106,6 @@ Runner の `jobSigning.publicKeys` に貼り付けるために出力される．
 | `dnsBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
 | `storeBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
 | `jobSigning` | object | 省略可．`azure-container-apps-job` バインディングがある場合は必須．後述． |
-| `migration` | object | 省略可．インフラで定義されたホスト一覧からの移行: `targetSource` フラグ，一覧，取り込みプロファイル．[`migration`](#migration) を参照．省略時は `targetSource: registry` で一覧なし． |
 
 ### `server`
 
@@ -263,22 +252,6 @@ name>` である．Conductor の ID に必要なのは，Job リソースに対�
 [`deploy/examples/conductor-config.aca.example.json`](../deploy/examples/conductor-config.aca.example.json)
 を参照．
 
-### `migration`
-
-既存のインフラで定義されたホスト一覧からの移行
-（[`docs/migration.md`](migration.md)）．このセクション全体が省略可であり，
-その構成要素は次の通り:
-
-| フィールド | 型 | 既定値 | 備考 |
-|---|---|---|---|
-| `targetSource` | string | `registry` | 誰が発行するか．`registry`: スケジューラがレジストリの target について run を計画し開始する．`shadow`: 計画も開始もせず，設定された一覧を `compareIntervalSeconds` ごとにレジストリと比較する．`iac`: 計画も開始もせず，それだけである．`shadow` と `iac` のもとでは `POST /targets/{id}/runs` は `409 issuance_disabled` を返す．レジストリは編集可能なまま． |
-| `source` | object | — | 一覧の読み込み元: `bicepParamFile`（クリーンな絶対パス．`parameter` を併用可，既定は `targetDomains`），`jsonFile`（TargetList 文書，クリーンな絶対パス），`fqdns`（インラインの一覧，最大 10000 個の名前）のうちちょうど 1 つ．`shadow` では必須．それ以外では `GET /migration/diff` および `fqdns` なしの取り込みの既定の一覧となる．`profile` が必要． |
-| `profile` | object | — | 取り込まれる各 target を FQDN 以外に何で構成するか: `policyRef`（識別子．プロファイルが使われる時点でそのポリシーが存在しなければならない），`executionBinding`・`dnsBinding`・`storeBinding`（それぞれこの設定が登録するバインディング），`owner`（印字可能，最大 128 バイト）．`source` がある場合に必須で，差分や取り込みを行うには必ず必要． |
-| `compareIntervalSeconds` | int | `300` | shadow 比較を実行する間隔．`10`–`86400`． |
-
-一覧が寄与するのは FQDN だけであり，それ以外は何も寄与しない．target が名前以外に
-必要とするものはすべて，プロファイル，すなわち管理者が決める．
-
 ### `jobSigning`
 
 | フィールド | 型 | 既定値 | 備考 |
@@ -402,9 +375,6 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | 409 | `stale_revision` | リクエストの `revision` が target の現在のリビジョンではない． |
 | 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）． |
 | 409 | `target_disabled` | 無効化された target に run が要求された． |
-| 409 | `issuance_disabled` | `migration.targetSource` が `shadow` または `iac` の間に run が要求された（[`docs/migration.md`](migration.md)）． |
-| 409 | `migration_unconfigured` | 移行の差分または取り込みが要求されたが，`migration.profile` が設定されていない，またはそれが指すポリシーが存在しない． |
-| 409 | `source_unreadable` | 設定された `migration.source` を読めなかった（ファイルがない，形式が不正，ホスト名でない名前がある）． |
 | 413 | `too_large` | 本文が 64 KiB を超えている． |
 | 415 | `unsupported_media_type` | `Content-Type: application/json` のない本文． |
 | 500 | `internal` | レジストリまたはその他の内部障害．詳細はログにのみ記録される． |
@@ -443,10 +413,6 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /api/v1alpha1/runs/{id}` | run 1 件． |
 | `POST /api/v1alpha1/runs/{id}/cancel` | キャンセル: 待機中の run は即座にキャンセルされる（`200`）．starting/running の run には停止が要求される（`202`．結果は Runner の報告時に記録される）． |
 | `GET /api/v1alpha1/audit[?targetId=&runId=&policyId=&limit=&before=]` | 監査イベント，新しい順． |
-| `GET /api/v1alpha1/migration` | 移行の状態: `targetSource`，`issuanceEnabled`，設定されたソースとプロファイル，および `shadow` では最新の比較結果． |
-| `GET /api/v1alpha1/migration/diff` | 設定された一覧をレジストリと比較 → レポート． |
-| `POST /api/v1alpha1/migration/diff` | `{"fqdns": […]}` をレジストリと比較 → レポート． |
-| `POST /api/v1alpha1/migration/import` | 一覧を取り込む: `{"fqdns": […], "dryRun": true}`，どちらも省略可（`dryRun` の既定は `true`．`fqdns` がなければ設定された一覧）→ 取り込み結果．レジストリにない名前についてのみ target を作成し，更新も削除も決して行わない．何かを作成したときはスケジューラを起こす．[`docs/migration.md`](migration.md#api) を参照． |
 
 ページングする一覧（`runs`，`audit`）は `limit`（`1`–`1000`，既定 `100`）と
 `before=<id>`（その id より前にソートされる項目を返す．id は作成時刻順にソート
@@ -662,7 +628,7 @@ run を 1 つ起こす**（issue #59）．証明書の期限も，直前の失�
   あれば次の候補に移る．
 
 run を起こせなかったとき（target やポリシーが無効，binding を使う target が
-ない，`migration.targetSource` が `registry` でない，すべての候補に実行中の
+ない，すべての候補に実行中の
 run がある）も要求は記録され，レスポンスの `run.started` は `false`，
 `run.reason` にその理由が入る（候補の実行中の run があれば `run.runId` も）．
 いずれの場合も，スケジューラは **run に添付されていない未着手の要求そのもの**を
@@ -724,15 +690,15 @@ Conductor がこれを保存するようになる前に記録されたイベン�
 
 アクション: `policy.created`，`policy.updated`，`policy.rejected`，
 `target.created`，`target.updated`，`target.enabled`，`target.disabled`，
-`target.imported`（移行の取り込みで作成された target．由来の一覧を伴う），
 `run.requested`，`run.started`，`run.succeeded`，`run.failed`，`run.cancelled`，
-`migration.compared`（結果が前回と異なる shadow 比較．actor と authority は
-ともに `migration`，すなわち Conductor 自身の比較ループであり，`scheduler` が
-それ自身の authority であるのと同じ），`acme_account.provisioning_requested`，
+`acme_account.provisioning_requested`，
 `acme_account.provisioning_attached`，`acme_account.activated`，
 `acme_account.provisioning_failed`，`acme_account.provisioning_cancelled`，
 `acme_account.retired`（[ACME アカウントプロビジョニング](#acme-アカウントプロビジョニング)を参照．
 `detail` は binding，generation，keyId，runId のみで EAB の値を一切含まない）．
+削除された移行ツール（[ADR 0025](adr/0025-remove-migration-tooling.md)）が記録した
+`target.imported` と `migration.compared` は，既存のデータベースに残っていても
+そのままの文字列で表示される．
 `detail` は Conductor が検証済みの値から
 組み立てる短い文（最大 512 バイト）であり，Runner の出力を含むことは決してない．
 イベントは，それが記述する変更と同じトランザクションで書き込まれ，更新も削除も
@@ -932,9 +898,7 @@ curl -s -H "Authorization: Bearer $token" https://conductor.example.ac.jp/api/v1
 
 `/ui/` は同じ API の上に載る最小限のインターフェースである．target（一覧，作成，
 編集，有効化／無効化，run の要求），ポリシー（一覧，作成，編集），run（ステータスで
-絞り込める一覧，詳細，キャンセル），監査ログ，移行の状態（target source，設定された
-ソース，shadow モードでの直近の比較．読み取り専用で，取り込みは
-`acme-conductor migrate` で行う），そして `accountProvisioning` が設定されて
+絞り込める一覧，詳細，キャンセル），監査ログ，そして `accountProvisioning` が設定されて
 いれば EAB プロビジョニングのページ（タブ「EAB」，"#/eab"．旧アドレス
 "#/acme-bindings" はここへ転送される）を扱う．このページに並ぶのは
 `accountProvisioning.bindings` に挙がった binding と，リストから外れたが
@@ -1104,10 +1068,6 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
   する．数百の target と 1 人の操作者には十分だが，多忙なマルチテナント API には
   向かない．マルチレプリカは非目標であり，所有権ロックにより同じデータベース上の
   第 2 のプロセスはサポートされる形ではなく起動時エラーになる．
-- **移行が移すのは名前であり，証明書やアカウントではない．** 取り込まれた target は，
-  `targetSource` が `registry` になった時点で Conductor 自身のオブジェクト名の下で
-  新たに発行される．利用側の参照先の付け替えは操作者が行い，shadow 比較が比べるのは
-  一覧であって Store 内の証明書ではない（[`docs/migration.md`](migration.md)）．
 - **ポリシーの変更はバージョン管理も push もされない．** ポリシーの更新は各 target の
   次の run で適用される（[Policy](#policy) を参照）．`acmeBinding` の変更は現在の
   証明書の再発行を強制せず，run にポリシーのリビジョンはなく，各 `JobSpec` 内の
