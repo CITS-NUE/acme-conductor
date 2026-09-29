@@ -203,21 +203,24 @@ binding）は `runnerConfigJson` パラメータにそのまま書ける
 
 ## 新しい申請を追加する
 
-UPKI の証明書を 1 つ（申請 1 つ = target 1 つ）追加するときの作業者の手順である．
-作業は UPKI 側（TSV と審査），DNS（委任），Conductor（ポリシー，target，EAB）の
-3 か所にまたがる．審査と DNS の変更には日数がかかることがあるので，手順 3 と
-手順 4 は並行してよい．Conductor 側の作業（手順 5 以降）は，EAB と委任の両方が
-そろってから行う．
+UPKI の証明書を 1 つ（申請 1 つ = target 1 つ）追加するときの手順である．
+UPKI の登録担当者が，UPKI 側（TSV と審査），DNS（委任），Conductor（ポリシー，
+target，EAB）の作業をすべて 1 人で行うことを前提にする．Conductor を操作するのも
+登録担当者だけで，証明書の利用者は Conductor に触れない．利用者から受け取るのは
+名前と用途だけでよい．
 
-| # | 作業 | 場所 | 担当の例 |
-|---|---|---|---|
-| 1 | 名前を決め，前提を確かめる | ― | 作業者 |
-| 2 | TSV を作る | [UPKI TSV 作成ツール](https://certs.nii.ac.jp/tsv-tool/) | 作業者 |
-| 3 | TSV をアップロードし，審査を経て EAB を受け取る | [UPKI 証明書発行支援システム（登録担当者）](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do) | 登録担当者 |
-| 4 | `_acme-challenge` の CNAME を設定する | 親ゾーンの DNS | DNS 管理者 |
-| 5 | ポリシーを作る（初回，または条件が違うときだけ） | Conductor GUI | 作業者 |
-| 6 | target を作る | Conductor GUI | 作業者 |
-| 7 | EAB を投入し，発行を確かめる | Conductor GUI（target の詳細ページ） | 作業者 |
+審査には日数がかかることがあるので，審査を待つ間に手順 4 を済ませてよい．
+Conductor の作業（手順 5 以降）は，EAB と委任の両方がそろってから行う．
+
+| # | 作業 | 場所 |
+|---|---|---|
+| 1 | 名前を決め，前提を確かめる | ― |
+| 2 | TSV を作る | [UPKI TSV 作成ツール](https://certs.nii.ac.jp/tsv-tool/) |
+| 3 | TSV をアップロードし，審査を経て EAB を受け取る | [UPKI 証明書発行支援システム（登録担当者）](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do) |
+| 4 | `_acme-challenge` の CNAME を設定する | 親ゾーンの DNS |
+| 5 | ポリシーを作る（初回，または条件が違うときだけ） | Conductor GUI |
+| 6 | target を作る | Conductor GUI |
+| 7 | EAB を投入し，発行を確かめる | Conductor GUI（target の詳細ページ） |
 
 ### 1. 名前を決め，前提を確かめる
 
@@ -228,7 +231,8 @@ UPKI の証明書を 1 つ（申請 1 つ = target 1 つ）追加するときの
 - すべての名前が Runner の `authorization.allowedDnsSuffixes` のいずれかの下に
   あることを確かめる．外れていると，run は Runner で `PolicyViolation`
   （`fqdn is not under any allowed DNS suffix`）になる．Runner の設定は
-  デプロイ時に決まるので，足りなければ先に Runner の設定を直して再デプロイする．
+  デプロイ時に決まり，登録担当者は GUI から変えられない．足りなければ，
+  デプロイする者に Runner の設定の変更と再デプロイを頼む．
   名前ごとの制限は DNS の委任と UPKI の登録がかけるので，サフィックスは
   組織のドメイン（`example.ac.jp`）程度にまとめてよい．
 - 名前の数が Runner の `maxNames` とポリシーの `maxSANs` を超えないことを
@@ -244,11 +248,11 @@ UPKI の証明書を 1 つ（申請 1 つ = target 1 つ）追加するときの
 
 ### 3. TSV をアップロードし，EAB を受け取る
 
-登録担当者が [UPKI 証明書発行支援システムの登録担当者画面](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do)
+[UPKI 証明書発行支援システムの登録担当者画面](https://scia.secomtrust.net/upki-odcert/lra/SSLLogin.do)
 から TSV をアップロードする．審査が済むと EAB（Key ID と HMAC Key）が発行される．
-受け取った EAB は手順 7 まで安全に保管し，チャットやチケットに平文で貼らない．
-EAB は Conductor のリポジトリにも Key Vault にも置かない（手順 7 でブラウザ内で
-暗号化して投入する）．
+EAB は登録担当者の手元から出さない．利用者やほかの担当者に渡さず，チャットや
+チケットにも貼らない．Conductor のリポジトリにも Key Vault にも置かない
+（手順 7 でブラウザ内で暗号化して投入する）．
 
 ### 4. `_acme-challenge` の CNAME を設定する
 
@@ -256,6 +260,8 @@ EAB は Conductor のリポジトリにも Key Vault にも置かない（手順
 委任する（[`deploy/azure/README.md`](../deploy/azure/README.md#複数の-dns-ゾーン)）．
 Runner が書き込めるのはチャレンジ用ゾーンだけなので，委任のない名前では
 TXT を置けない．
+登録担当者には，親ゾーンに CNAME を書く権限を持たせておく（Azure DNS なら，
+親ゾーンの CNAME レコードの書き込み）．TXT を書く権限は要らない．
 
 ```
 _acme-challenge.www.example.ac.jp.  IN CNAME  www.<チャレンジ用ゾーン>.
