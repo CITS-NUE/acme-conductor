@@ -375,6 +375,30 @@ DNS-01 チャレンジを通せてしまう．Runner に書かせるのはチャ
 （[ID](#id) を参照）．`oidc` モードではループバックのピアは信頼されないため，
 レプリカへの `az containerapp exec` はもはや管理者セッションではない．
 
+**カスタムドメイン（任意）．** `conductorCustomDomain` を与えると，Conductor を
+その名前でも公開し，Container Apps のマネージド証明書（無償，自動更新）で
+TLS を終端する．DNS レコードはテンプレートの外で先に作る（ゾーンは多くの場合
+別の管理者のものであり，テンプレートはゾーンへの書き込み権限を要求しない）．
+
+1. ゾーンに 2 つのレコードを作る．値は既存のデプロイの出力
+   `conductorPlatformFqdn` と `customDomainVerificationId` にある．
+
+   | 名前 | 種類 | 値 |
+   |---|---|---|
+   | `<name>` | CNAME | `conductorPlatformFqdn`（アプリの FQDN） |
+   | `asuid.<name>` | TXT | `customDomainVerificationId`（環境の検証 ID） |
+
+2. `conductorCustomDomainCertificateIssued = false` でデプロイする．名前が
+   未バインドでアプリに追加され，CNAME で検証するマネージド証明書が発行される
+   （数分〜数十分）．ゾーンに CAA があるなら DigiCert を許可しておく．
+3. `conductorCustomDomainCertificateIssued = true` にして再デプロイする．名前が
+   証明書にバインドされる（SNI）．以後はずっと `true` のままにする．
+4. GUI の公開クライアントに `https://<name>/ui/`（出力 `conductorGuiRedirectUri`）を
+   リダイレクト URI として追加する．プラットフォームの FQDN もそのまま使える．
+
+2 段階なのは，マネージド証明書がアプリに追加済みの名前にしか発行されず，
+バインドには証明書が要るためである．
+
 **バックアップ．** レジストリは `conductor-state` 共有上の `conductor.db` で
 ある．共有のスナップショットを取るか，アプリをゼロにスケールした状態で
 ファイルをコピーする．`runner-state` 共有は ACME アカウント鍵（証明書の鍵では

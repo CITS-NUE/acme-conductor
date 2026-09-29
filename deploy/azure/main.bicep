@@ -156,6 +156,12 @@ param ingressExternal bool = true
 @description('CIDR ranges allowed to reach the ingress; empty allows every source. Authentication does not depend on this list, it only narrows the exposure.')
 param ingressAllowedCidrs array = []
 
+@description('Custom domain for the Conductor (e.g. acme.example.ac.jp), served with a free managed certificate; empty keeps only the app\'s platform FQDN. Its CNAME and asuid TXT records are created beforehand, outside this template (see README, custom domain).')
+param conductorCustomDomain string = ''
+
+@description('false on the first deployment with conductorCustomDomain: the domain is added unbound and the managed certificate is issued. true afterwards: the domain is bound to that certificate (see README, custom domain).')
+param conductorCustomDomainCertificateIssued bool = false
+
 @description('Scheduler settings copied into the Conductor configuration.')
 param schedulerTickSeconds int = 60
 param schedulerMaxConcurrentRuns int = 2
@@ -177,6 +183,14 @@ var conductorAppName = '${namePrefix}-conductor'
 var shareConductorState = 'conductor-state'
 var shareRunnerState = 'runner-state'
 var shareExchange = 'exchange'
+
+// --- custom domain for the Conductor (optional) ------------------------------
+
+// The DNS records are not written here: the zone usually belongs to
+// someone else, and the name's CNAME (to the app's platform FQDN) and asuid
+// TXT (the environment's verification ID) are set once, beforehand.
+var customDomainEnabled = !empty(conductorCustomDomain)
+var conductorCertificateName = '${conductorAppName}-cert'
 
 // --- encrypted EAB provisioning (optional) -----------------------------------
 
@@ -718,6 +732,23 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
         transport: 'http'
         allowInsecure: false
         ipSecurityRestrictions: ingressRestrictions
+        // A managed certificate is issued only for a name already on an
+        // app, so the domain is first added unbound; the next deployment
+        // (conductorCustomDomainCertificateIssued) binds it.
+        customDomains: !customDomainEnabled
+          ? []
+          : [
+              conductorCustomDomainCertificateIssued
+                ? {
+                    name: conductorCustomDomain
+                    bindingType: 'SniEnabled'
+                    certificateId: resourceId('Microsoft.App/managedEnvironments/managedCertificates', environment.name, conductorCertificateName)
+                  }
+                : {
+                    name: conductorCustomDomain
+                    bindingType: 'Disabled'
+                  }
+            ]
       }
       secrets: [
         {
@@ -770,6 +801,24 @@ resource conductorApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// --- custom domain: the managed certificate ---------------------------------
+
+// Issued (CNAME validation) on the first deployment, after the domain is on
+// the app. Once issued it is only referenced: the platform renews it.
+resource conductorCertificate 'Microsoft.App/managedEnvironments/managedCertificates@2024-03-01' = if (customDomainEnabled && !conductorCustomDomainCertificateIssued) {
+  parent: environment
+  name: conductorCertificateName
+  location: location
+  tags: tags
+  properties: {
+    subjectName: conductorCustomDomain
+    domainControlValidation: 'CNAME'
+  }
+  dependsOn: [
+    conductorApp
+  ]
+}
+
 // --- grants ------------------------------------------------------------------
 
 // Conductor identity -> observe and stop executions of this Job only
@@ -808,6 +857,8 @@ module runnerKeyVault 'modules/keyvault-role-assignment.bicep' = {
 
 // --- outputs -----------------------------------------------------------------
 
+var conductorHost = customDomainEnabled ? conductorCustomDomain : conductorApp.properties.configuration.ingress.fqdn
+
 output environmentName string = environment.name
 output runnerJobName string = runnerJob.name
 output conductorAppName string = conductorApp.name
@@ -815,8 +866,11 @@ output conductorIdentityClientId string = conductorIdentity.properties.clientId
 output runnerIdentityClientId string = runnerIdentity.properties.clientId
 output storageAccountName string = storage.name
 @description('Where the API and the GUI answer.')
-output conductorUrl string = 'https://${conductorApp.properties.configuration.ingress.fqdn}'
+output conductorUrl string = 'https://${conductorHost}'
 @description('The redirect URI to register on the GUI\'s public client (SPA platform).')
-output conductorGuiRedirectUri string = 'https://${conductorApp.properties.configuration.ingress.fqdn}/ui/'
+output conductorGuiRedirectUri string = 'https://${conductorHost}/ui/'
+@description('Values for a custom domain\'s DNS records: the CNAME target and the asuid TXT.')
+output conductorPlatformFqdn string = conductorApp.properties.configuration.ingress.fqdn
+output customDomainVerificationId string = environment.properties.customDomainConfiguration.customDomainVerificationId
 @description('The Conductor configuration as deployed, for review.')
 output conductorConfig object = conductorConfig
