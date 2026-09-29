@@ -347,7 +347,8 @@ Job では失敗する．未設定なら `DefaultAzureCredential` の経路に�
 エンドポイントのコンテナごとのトークンであり，他のすべてのパススルー値と
 同様に Runner のログから秘匿される．
 
-Job は固定コマンド `reconcile --exchange /exchange` で **スケジュール実行**
+Job は固定コマンド `reconcile --exchange /exchange`（`--log-level` だけは
+デプロイのパラメタ `runnerLogLevel`）で **スケジュール実行**
 （毎分）され，Conductor から開始されることは決してない
 （[ADR 0014](adr/0014-azure-container-apps-job-launcher.md)）．各実行は
 差し出されたジョブを最大 1 つ取るか即座に終了し，Conductor のために
@@ -876,6 +877,21 @@ docker run --rm \
 `lego` の終了後，1 行の要約（`exitCode`，`durationMs`，`timedOut`，
 `cancelled`）が info/error レベルで記録される．**`lego` の生の出力が
 `Result` に達することは決してない**．上記の固定テンプレートだけが達する．
+
+`lego` が 0 以外で終了したときは，秘匿処理済みの stderr の末尾（最大 20 行，
+各行は上の 8 KiB で切り詰め済み）を 1 件の **warn** レコード
+（`"msg":"lego failed; last stderr lines"`，`exitCode`，`lines`）として
+あわせて記録する．debug を有効にしていない運用でも，失敗の理由（ゾーンが
+見つからない，CA が拒否した，など）を Runner のログから読めるようにする
+ためである．出力先は Runner のログだけで，`Result` と Conductor の run
+レコードには入らない．既定のレベルで残るログなので，これらの行には上の
+秘匿に加えて，資格情報の形をした値のマスクをかける．名前が `hmac`，
+`password`，`secret`，`token`，`sig`，`key`，`credential` などで終わる
+`name=value` と JSON の `"name":"value"` の値，`Authorization:` 以降，
+`Bearer`／`Basic` の後の値，JWT／JWS 形（`eyJ…`），`AKIA…`，`ghp_…`，
+`github_pat_…` を `[REDACTED]` に置き換える．これは `Result` のシークレット
+マーカーと同じ種類のヒューリスティックであり，シークレット検出器ではない．
+成功した run では何も追加されない．
 
 この秘匿は **値ベースかつヒューリスティック** である．Runner 自身が解決した
 特定のシークレット値と既知の PEM マーカーをマスクするのであって，任意の，

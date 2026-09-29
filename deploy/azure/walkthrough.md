@@ -474,10 +474,22 @@ ContainerAppConsoleLogs_CL
 | order by TimeGenerated asc'
 ```
 
-run が `AcmeFailure lego exited with status 1` で失敗した場合，lego 自身のメッセージは
-今のところ debug ログにしか出ず，Azure のテンプレートでは debug を有効にできない
-（[#38](https://github.com/CITS-NUE/acme-conductor/issues/38)）．まず上の `dig` で
-委任を確かめ，次に Runner のログで `fqdn` が意図した名前かを確かめる．失敗した
+run が `AcmeFailure lego exited with status 1` で失敗した場合，Runner は lego の
+stderr の末尾（秘匿処理済み）を warn レベルの `lego failed; last stderr lines` として
+記録する．まずこれを読む．
+
+```sh
+az monitor log-analytics query -w "$WS" -t P1D -o table --analytics-query '
+ContainerAppConsoleLogs_CL
+| where ContainerName_s == "runner" and Log_s has "lego failed; last stderr lines"
+| project TimeGenerated, Log_s
+| order by TimeGenerated desc'
+```
+
+それでも足りなければ，パラメタ `runnerLogLevel = 'debug'` で再デプロイすると，
+lego の出力がすべての行について記録される．調べ終えたら `info` に戻す．委任の
+欠落が疑われるときは上の `dig` で確かめ，Runner のログで `fqdn` が意図した名前かも
+確かめる．失敗した
 target は GUI で無効化しておく．有効なままだと再試行が続き，CA のレート制限を消費する．
 
 ## 11. 利用側への組み込み
@@ -647,5 +659,5 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | run が `PolicyViolation`（`fqdn is not under any allowed DNS suffix`）で失敗する | target の名前が Runner の `authorization.allowedDnsSuffixes` の下にない | Runner 設定の `allowedDnsSuffixes` に加えて再デプロイする |
-| run が `AcmeFailure lego exited with status 1` で失敗し，理由がログにない（`lego finished` の `durationMs` が数秒） | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない（lego の出力は debug のみ．#38） | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
+| run が `AcmeFailure lego exited with status 1` で失敗する（`lego finished` の `durationMs` が数秒） | 多くは target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない．Runner のログの `lego failed; last stderr lines` に lego のメッセージが出る | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10）．理由が読み取れなければ `runnerLogLevel = 'debug'` で再デプロイする |
 | EAB を要求する CA（UPKI など）で，run が `AcmeFailure lego exited with status 1` で失敗する（`durationMs` が数十秒．チャレンジ用ゾーンに `TXT/write` の記録がある） | ポリシーの `keyType` が，EAB を発行した証明書プロファイルの鍵種別と合わない（例: RSA のプロファイルに `rsa4096`） | ポリシーの `keyType` をプロファイルに合わせ（UPKI の RSA なら `rsa2048`），run を起こし直す．EAB の投入し直しは不要（[運用ガイド](../../docs/account-scoped-ca.md#失敗の読み方)） |
