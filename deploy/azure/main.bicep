@@ -661,6 +661,11 @@ var conductorConfigBase = {
   }
   acmeBindings: acmeBindings
   dnsBindings: dnsBindings
+  // Every DNS binding writes in the one challenge zone the Runner may
+  // write (dnsZoneName). The Conductor only compares public DNS against it
+  // to show each target's _acme-challenge delegation (issue #66); the
+  // Runner never receives it and writes where its own configuration says.
+  dnsChallengeZones: toObject(dnsBindings, b => b, b => dnsZoneName)
   storeBindings: storeBindings
 }
 

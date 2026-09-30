@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/CITS-NUE/acme-conductor/internal/policy"
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 )
@@ -133,6 +134,14 @@ type Config struct {
 	ACMEBindings  []string `json:"acmeBindings"`
 	DNSBindings   []string `json:"dnsBindings"`
 	StoreBindings []string `json:"storeBindings"`
+	// DNSChallengeZones maps a DNS binding name to the zone its Runner
+	// writes challenge records in (the zone each _acme-challenge record
+	// is delegated into by CNAME). The Conductor only compares public DNS
+	// against it to show whether a target's names are delegated (issue
+	// #66); it is never sent to a Runner, which decides where it writes
+	// from its own configuration. A binding without an entry is checked
+	// for the presence of a CNAME only.
+	DNSChallengeZones map[string]string `json:"dnsChallengeZones,omitempty"`
 	// JobSigning, when present, makes every launcher hand the Runner a
 	// signed envelope instead of a bare JobSpec. It is required when an
 	// execution binding sends jobs over a transport the Conductor does
@@ -510,6 +519,16 @@ func (c *Config) Validate() error {
 		if err := validateNames(field, names); err != nil {
 			return err
 		}
+	}
+	for name, zone := range c.DNSChallengeZones {
+		if !c.HasDNSBinding(name) {
+			return invalid("dnsChallengeZones: %q is not one of dnsBindings", name)
+		}
+		z, err := policy.NormalizeSuffix(zone)
+		if err != nil {
+			return invalid("dnsChallengeZones.%s: %v", name, err)
+		}
+		c.DNSChallengeZones[name] = z
 	}
 	if c.JobSigning != nil {
 		if err := c.JobSigning.validate(); err != nil {

@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/dnsdelegation"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
 	"github.com/CITS-NUE/acme-conductor/pkg/launcher"
@@ -76,6 +77,11 @@ type Options struct {
 	// docs/adr/0024): a run of a target under one of them claims and uses
 	// only that target's account, never the binding's own.
 	TargetScopedBindings []string
+	// DNSDelegation, when set, checks each run's target for its
+	// _acme-challenge delegation (issue #66) alongside the launch. The
+	// result is only logged as a warning: a run is never held back by it,
+	// since a wrong answer from DNS must not stop a renewal.
+	DNSDelegation *dnsdelegation.Checker
 }
 
 // Defaults for Options.RecordRetry and Options.RecordWindow.
@@ -99,6 +105,7 @@ type Scheduler struct {
 	recordWindow time.Duration
 	eabBindings  map[string]struct{}
 	targetScoped map[string]struct{}
+	dnsCheck     *dnsdelegation.Checker
 
 	wake chan struct{}
 
@@ -150,7 +157,7 @@ func New(o Options) *Scheduler {
 	return &Scheduler{
 		reg: o.Registry, launchers: o.Launchers, tick: o.Tick, maxRuns: o.MaxConcurrentRuns,
 		backoff: o.RetryBackoff, maxBack: o.MaxRetryBackoff, log: o.Logger, now: o.Now,
-		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, eabBindings: eab, targetScoped: scoped,
+		recordRetry: o.RecordRetry, recordWindow: o.RecordWindow, eabBindings: eab, targetScoped: scoped, dnsCheck: o.DNSDelegation,
 		wake: make(chan struct{}, 1), runsCtx: ctx, cancelRuns: cancel, inflight: map[string]context.CancelFunc{},
 	}
 }
@@ -730,6 +737,9 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		cancelled("run was cancelled before the runner started")
 		return
 	}
+	if s.dnsCheck != nil {
+		go s.warnDelegation(log, target)
+	}
 	exec, err := l.Start(runCtx, spec)
 	if err != nil {
 		release()
@@ -805,6 +815,25 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 // AccountProvisioning.Status). runID is the run that claimed generation
 // of the account (binding, scope), or "" if this run carried no
 // provisioning payload.
+// warnDelegation logs a warning when a name of target is not delegated
+// into its DNS binding's challenge zone. It runs beside the launch and
+// never affects the run.
+func (s *Scheduler) warnDelegation(log *slog.Logger, target *registry.Target) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	names := append([]string{target.FQDN}, target.AdditionalNames...)
+	rep := s.dnsCheck.Check(ctx, target.DNSBinding, names, false)
+	for _, n := range rep.Names {
+		switch n.Status {
+		case dnsdelegation.StatusMissing, dnsdelegation.StatusMismatch:
+			log.Warn("challenge record is not delegated into the dns binding's challenge zone; the run is likely to fail with DnsFailure",
+				"name", n.Name, "recordName", n.RecordName, "status", string(n.Status), "cnameTarget", n.Target, "dnsBinding", rep.DNSBinding, "challengeZone", rep.ChallengeZone)
+		case dnsdelegation.StatusError:
+			log.Info("challenge record delegation could not be checked", "name", n.Name, "recordName", n.RecordName, "dnsBinding", rep.DNSBinding)
+		}
+	}
+}
+
 func (s *Scheduler) finishProvisioning(ctx context.Context, log *slog.Logger, binding, scope string, generation int64, runID string, res *v1alpha1.Result, waitErr error) {
 	if runID == "" {
 		if res != nil && res.AccountProvisioning != nil {

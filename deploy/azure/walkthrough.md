@@ -446,6 +446,10 @@ GUI（`<conductorUrl>/ui/`）に `ACME.Admin` でサインインし，次の順�
    dig +short CNAME _acme-challenge.<target fqdn>   # チャレンジ用ゾーン内の名前が返ればよい
    ```
 
+   登録した後は，GUI の target の詳細ページの「DNS の委任（_acme-challenge）」の節でも，
+   すべての名前について同じことを確かめられる（`dnsChallengeZones` はテンプレートが
+   `dnsZoneName` から入れる）．
+
 API で行う場合は [`docs/conductor.md`](../../docs/conductor.md#rest-api) を参照．
 既存の証明書基盤と同じホストを扱う場合は，その定期実行の時間帯を避ける．
 

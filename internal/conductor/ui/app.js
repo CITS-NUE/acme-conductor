@@ -548,6 +548,7 @@
         [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
         [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
       ].concat(t.retired ? [[tr('target.retired'), when(t.retiredAt) + ' / ' + (t.retiredBy || '—')]] : [])),
+      t.retired ? '' : delegationSection(t),
       account ? account.node : '',
       t.retired ? '' : el('h2', { text: tr('common.edit') }),
       t.retired ? '' : await targetForm(t),
@@ -555,6 +556,63 @@
       el('h2', { text: tr('common.runs') }),
       runsTable(runs.items, false, dir),
     );
+  }
+
+  // delegationSection shows, from public DNS, whether every name's
+  // _acme-challenge record is delegated by CNAME into the challenge zone of
+  // the target's DNS binding (issue #66). It loads on its own so a slow DNS
+  // answer never holds up the page; "Check again" skips the Conductor's
+  // short cache (DNS resolvers may still answer from theirs).
+  function delegationSection(t) {
+    const body = el('div', null, el('p', { class: 'aside', text: tr('dns.checking') }));
+    const load = async (refresh) => {
+      try {
+        const r = await api('GET', '/targets/' + encodeURIComponent(t.id) + '/dns-delegation' + (refresh ? '?refresh=true' : ''));
+        clear(body);
+        body.append(...delegationReport(r));
+      } catch (err) {
+        clear(body);
+        body.append(notice('error', describe(err)));
+      }
+    };
+    const again = el('button', {
+      onclick: async () => {
+        again.disabled = true;
+        clear(body);
+        body.append(el('p', { class: 'aside', text: tr('dns.checking') }));
+        await load(true);
+        again.disabled = false;
+      },
+    }, tr('dns.recheck'));
+    load(false);
+    return el('div', null,
+      el('h2', { text: tr('dns.title') }),
+      el('p', { class: 'hint' }, tr('dns.hint'), ' ', guideLink('upki-guide.html#step4', tr('dns.guideLink'))),
+      body,
+      el('div', { class: 'toolbar' }, again),
+    );
+  }
+
+  function delegationReport(r) {
+    const out = [];
+    out.push(r.challengeZone
+      ? el('p', { class: 'aside' }, tr('dns.zone'), el('span', { class: 'mono', text: r.challengeZone }), ' (' + tr('dns.binding', { name: r.dnsBinding }) + ')')
+      : el('p', { class: 'aside', text: tr('dns.noZone', { name: r.dnsBinding }) }));
+    out.push(table([tr('dns.name'), tr('dns.record'), tr('common.status'), tr('dns.target')], r.names.map((n) => [
+      td(n.name, 'mono'),
+      td(n.recordName, 'mono'),
+      td(statusBadge('dns-' + n.status)),
+      td(n.target || '—', 'mono'),
+    ])));
+    const todo = r.names.filter((n) => (n.status === 'missing' || n.status === 'mismatch') && n.expected);
+    if (todo.length) {
+      out.push(el('p', { text: tr('dns.request') }));
+      out.push(el('pre', { class: 'mono', text: todo.map((n) => n.recordName + '.  IN CNAME  ' + n.expected + '.').join('\n') }));
+    } else if (r.names.some((n) => n.status === 'missing')) {
+      out.push(el('p', { text: tr('dns.requestNoZone') }));
+    }
+    out.push(el('p', { class: 'aside', text: tr('dns.checkedAt', { t: when(r.checkedAt) }) + ' ' + tr('dns.cacheNote') }));
+    return out;
   }
 
   // retirePanel is the way out for a target that is not needed any more

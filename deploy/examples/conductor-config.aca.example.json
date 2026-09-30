@@ -70,6 +70,9 @@
   "dnsBindings": [
     "azure-dns-staging"
   ],
+  "dnsChallengeZones": {
+    "azure-dns-staging": "example.ac.jp"
+  },
   "storeBindings": [
     "keyvault-staging"
   ]

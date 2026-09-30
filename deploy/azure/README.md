@@ -341,8 +341,12 @@ Container Apps はコンテナの `IDENTITY_ENDPOINT` と `IDENTITY_HEADER` 変�
 ゾーン 1 つのままである．テンプレートもロール割り当ても変わらない．
 
 SAN の名前の **1 つ 1 つ** に委任が要る．1 つでも欠けていれば，その名前の
-チャレンジが通らずに run が `AcmeFailure` になる．証明書に名前を足す前に，
-それぞれ確かめる（[walkthrough の手順 10](walkthrough.md)）．
+チャレンジが通らずに run が `DnsFailure` になる．証明書に名前を足す前に，
+それぞれ確かめる（[walkthrough の手順 10](walkthrough.md)）．GUI の target の
+詳細ページも，公開 DNS を引いて各名前の委任の状態を示す．テンプレートは
+Conductor の設定の `dnsChallengeZones` に，すべての DNS バインディングについて
+`dnsZoneName` を入れる．Conductor はこれを確認に使うだけで，Runner には渡さない
+（[ADR 0027](../../docs/adr/0027-dns-delegation-check.md)）．
 
 ```sh
 dig +short CNAME _acme-challenge.<name>   # チャレンジ用ゾーン内の名前が返ればよい

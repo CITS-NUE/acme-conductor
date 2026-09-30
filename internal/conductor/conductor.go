@@ -28,6 +28,7 @@ import (
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/config"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/dnsdelegation"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/launchers"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/oidc"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/scheduler"
@@ -122,6 +123,9 @@ func Serve(ctx context.Context, opts Options) int {
 		log.Error("launchers could not be built", "error", err.Error())
 		return ExitConfig
 	}
+	// Public DNS only, no credentials (issue #66); shared by the API and
+	// the scheduler so they reuse one cache.
+	delegation := dnsdelegation.New(dnsdelegation.Options{Zones: cfg.DNSChallengeZones})
 	sched := scheduler.New(scheduler.Options{
 		Registry:             reg,
 		Launchers:            built,
@@ -132,6 +136,7 @@ func Serve(ctx context.Context, opts Options) int {
 		Logger:               log.With("component", "scheduler"),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
+		DNSDelegation:        delegation,
 	})
 	if n, err := sched.Recover(ctx); err != nil {
 		log.Error("in-flight runs could not be recovered", "error", err.Error())
@@ -189,6 +194,7 @@ func Serve(ctx context.Context, opts Options) int {
 		ProvisioningKey:      cfg.AccountProvisioning.Key(),
 		ProvisioningBindings: cfg.AccountProvisioning.EABBindings(),
 		TargetScopedBindings: cfg.AccountProvisioning.TargetScoped(),
+		DNSDelegation:        delegation,
 	})
 	srv := &http.Server{
 		Handler:           handler,
