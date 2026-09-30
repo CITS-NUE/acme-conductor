@@ -162,6 +162,8 @@ func (s *Server) routes() {
 	api("POST "+Prefix+"/targets/{id}/retire", s.handleRetireTarget)
 	api("GET "+Prefix+"/targets/{id}/runs", s.handleListTargetRuns)
 	api("GET "+Prefix+"/targets/{id}/dns-delegation", s.handleTargetDNSDelegation)
+	api("GET "+Prefix+"/targets/{id}/consumers", s.handleGetTargetConsumers)
+	api("PUT "+Prefix+"/targets/{id}/consumers", s.handlePutTargetConsumers)
 	api("POST "+Prefix+"/targets/{id}/runs", s.handleRequestRun)
 	api("GET "+Prefix+"/runs", s.handleListRuns)
 	api("GET "+Prefix+"/runs/{id}", s.handleGetRun)
@@ -271,6 +273,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusNotFound, "not_found", err.Error(), nil)
 	case errors.Is(err, registry.ErrStaleRevision):
 		writeError(w, http.StatusConflict, "stale_revision", err.Error(), nil)
+	case errors.Is(err, registry.ErrStaleConsumers):
+		writeError(w, http.StatusConflict, "stale_version", err.Error(), nil)
 	case errors.Is(err, registry.ErrRunActive):
 		writeError(w, http.StatusConflict, "run_active", err.Error(), nil)
 	case errors.Is(err, registry.ErrRetired):

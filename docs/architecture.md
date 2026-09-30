@@ -607,6 +607,24 @@ Makefile            build / verify / image のターゲット
 - 任意のスクリプトや発行後フック．
 - 利用者が指定するコンテナイメージ．
 - 動的なプラグインダウンロード．
+- 利用側の ID への権限付与．証明書を使うサービス（Application Gateway，VM
+  など）に Certificate Store の読み取り権限（Key Vault なら
+  `Key Vault Secrets User`）を付けるのは，Store の管理者の仕事である．
+  Conductor は target ごとに利用側の台帳（[`docs/conductor.md`](conductor.md#利用側の台帳)）を
+  持つが，それは人が読むための自由記述であり，そこから何も付与しない．
+  理由は次の 3 つである．
+  1. 付与するには，Conductor か Runner に「読み取りのロールを任意の
+     プリンシパルに付ける」権限が要る．条件（ABAC）で絞っても，攻撃者は
+     テナント内に自分で作れるプリンシパルを指定できる．すると Conductor の
+     admin（あるいはジョブ署名鍵）が，実質的に「すべての証明書の秘密鍵の
+     読み取り」に昇格する．これはセキュリティ原則 1 と 5，
+     [ADR 0005](adr/0005-conductor-never-touches-secrets.md) の前提を崩す．
+  2. プリンシパルの ID を API で受け取ることは，セキュリティ原則 6（API の
+     入力でリソース ID や資格情報を指定しない）に反する．
+  3. 権限付与の形は Store ごとにまったく違う（Key Vault の RBAC，AWS の IAM
+     ポリシー，ファイルの権限など）．provider の境界
+     （[ADR 0019](adr/0019-provider-boundary.md)）で抽象化しても，中身がほぼ
+     Store 固有になる．
 
 ## 関連文書
 

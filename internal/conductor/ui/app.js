@@ -508,7 +508,7 @@
 
   async function viewTarget(id) {
     setNav('targets');
-    const [t, runs, dir] = await Promise.all([api('GET', '/targets/' + encodeURIComponent(id)), api('GET', '/targets/' + encodeURIComponent(id) + '/runs?limit=50'), directory()]);
+    const [t, runs, dir, consumers] = await Promise.all([api('GET', '/targets/' + encodeURIComponent(id)), api('GET', '/targets/' + encodeURIComponent(id) + '/runs?limit=50'), directory(), api('GET', '/targets/' + encodeURIComponent(id) + '/consumers')]);
     const status = el('div');
     const refresh = () => route();
     const act = (label, method, path, cls, body) => el('button', {
@@ -548,13 +548,79 @@
         [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
         [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
       ].concat(t.retired ? [[tr('target.retired'), when(t.retiredAt) + ' / ' + (t.retiredBy || '—')]] : [])),
+      consumersSection(t, consumers),
       t.retired ? '' : delegationSection(t),
       account ? account.node : '',
       t.retired ? '' : el('h2', { text: tr('common.edit') }),
       t.retired ? '' : await targetForm(t),
-      t.retired ? '' : retirePanel(t),
+      t.retired ? '' : retirePanel(t, consumers),
       el('h2', { text: tr('common.runs') }),
       runsTable(runs.items, false, dir),
+    );
+  }
+
+  // consumersSection is the target's consumer ledger (issue #74): who uses
+  // its certificate and whom to contact. It is free text for people and
+  // grants nothing; giving a consumer read access to the store is the store
+  // administrator's job. A retired target's ledger is shown read-only.
+  function consumersSection(t, c) {
+    const status = el('div');
+    const body = el('div');
+    const view = () => {
+      clear(body);
+      body.append(c.items.length
+        ? table([tr('consumers.service'), tr('consumers.contact'), tr('consumers.note')], c.items.map((e) => [e.service, e.contact, e.note || '—']))
+        : el('p', { class: 'aside', text: tr('consumers.none') }));
+      if (c.updatedAt) body.append(el('p', { class: 'aside', text: tr('consumers.updated', { t: when(c.updatedAt), by: c.updatedBy || '—' }) }));
+      if (!t.retired) body.append(el('div', { class: 'toolbar' }, el('button', { onclick: edit }, tr('common.edit'))));
+    };
+    const edit = () => {
+      clear(body);
+      clear(status);
+      const rows = el('tbody');
+      const addRow = (e) => {
+        const tr_ = el('tr', null,
+          el('td', null, input('text', e.service, { 'aria-label': tr('consumers.service'), maxlength: '256' })),
+          el('td', null, input('text', e.contact, { 'aria-label': tr('consumers.contact'), maxlength: '256' })),
+          el('td', null, input('text', e.note, { 'aria-label': tr('consumers.note'), maxlength: '512' })),
+          el('td', null, el('button', { onclick: () => tr_.remove() }, tr('consumers.remove'))));
+        rows.append(tr_);
+      };
+      (c.items.length ? c.items : [{ service: '', contact: '', note: '' }]).forEach(addRow);
+      const save = el('button', {
+        class: 'primary',
+        onclick: async () => {
+          clear(status);
+          const items = [...rows.children].map((r) => {
+            const v = [...r.querySelectorAll('input')].map((i) => i.value.trim());
+            return { service: v[0], contact: v[1], note: v[2] };
+          }).filter((e) => e.service || e.contact || e.note);
+          save.disabled = true;
+          try {
+            await api('PUT', '/targets/' + encodeURIComponent(t.id) + '/consumers', { version: c.version, items });
+            // Re-render the page: the retire panel lists the consumers too.
+            flash = notice('ok', tr('consumers.saved'));
+            route();
+          } catch (err) {
+            status.append(notice('error', err instanceof ApiError && err.code === 'stale_version' ? tr('consumers.stale') : describe(err)));
+            save.disabled = false;
+          }
+        },
+      }, tr('common.saveChanges'));
+      body.append(
+        el('table', { class: 'consumers-edit' }, tableHead([tr('consumers.service'), tr('consumers.contact'), tr('consumers.note'), '']), rows),
+        el('div', { class: 'toolbar' },
+          el('button', { onclick: () => addRow({ service: '', contact: '', note: '' }) }, tr('consumers.add')),
+          save,
+          el('button', { onclick: () => { clear(status); view(); } }, tr('consumers.cancel'))),
+      );
+    };
+    view();
+    return el('div', null,
+      el('h2', { text: tr('consumers.title') }),
+      el('p', { class: 'hint' }, tr('consumers.hint'), ' ', guideLink('certificate-usage.html#permissions', tr('consumers.guideLink'))),
+      status,
+      body,
     );
   }
 
@@ -619,8 +685,13 @@
   // (docs/adr/0026): a disabled target is retired after its FQDN is typed
   // in, since there is no way back. An enabled one only says to disable
   // first.
-  function retirePanel(t) {
+  function retirePanel(t, consumers) {
     if (t.enabled) return el('div', null, el('h2', { text: tr('retire.title') }), el('p', { class: 'aside', text: tr('retire.needDisable') }));
+    const users = consumers.items.length
+      ? el('div', { class: 'notice' },
+        el('p', { text: tr('consumers.retireNotice', { n: consumers.items.length }) }),
+        el('ul', null, ...consumers.items.map((c) => el('li', { text: c.service + '（' + c.contact + '）' }))))
+      : el('p', { class: 'aside', text: tr('consumers.retireNone') });
     const status = el('div');
     const confirm = input('text', '', { placeholder: t.fqdn, autocomplete: 'off', spellcheck: 'false', 'aria-label': tr('retire.confirmLabel', { fqdn: t.fqdn }) });
     const button = el('button', {
@@ -644,6 +715,7 @@
       el('h2', { text: tr('retire.title') }),
       el('p', { text: tr('retire.intro') }),
       el('ul', null, ...['retire.b1', 'retire.b2', 'retire.b3', 'retire.b4'].map((k) => el('li', { text: tr(k) }))),
+      users,
       el('p', null, el('strong', { text: tr('retire.final') })),
       status,
       el('div', { class: 'field' }, el('label', { text: tr('retire.confirmLabel', { fqdn: t.fqdn }) }), confirm),

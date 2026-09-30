@@ -85,7 +85,8 @@
   <p>どちらの形式で保存されるかは，証明書の登録時に選ぶ <strong>保存先（store）</strong> の設定で決まります．デプロイ担当者に「この証明書は PEM ですか，PFX ですか」と確認してください．Azure の App Service，Application Gateway，Front Door，API Management のような組み込みの連携は PFX を必要とし，Front Door と API Management はさらに RSA の鍵（<code>rsa2048</code> 以上）を必要とします．これは，<a href="https://github.com/CITS-NUE/acme-conductor/blob/main/docs/runner.md#certificate-store-azure-key-vault">Runner 運用ガイド</a>に記載された内容です．形式の切り替えは，Runner 側で保存先の設定を変え，次の実行で証明書が再発行されることで反映されます．登録担当者が単独で切り替えることはできません．</p>
 
   <h3 id="permissions">読み取りに必要な権限</h3>
-  <p>秘密鍵は Key Vault の「シークレット」として読み出されます．読み取るには，Key Vault に対する <code>secrets/get</code> の権限（Azure RBAC の組み込みロールでは <strong>Key Vault Secrets User</strong>）が必要です．この権限を持つ人やサービスは，秘密鍵を読めることになるので，本当に必要なものだけに付与します．付与の可否と手続きはデプロイ担当者・Key Vault の管理者に相談してください．</p>
+  <p>秘密鍵は Key Vault の「シークレット」として読み出されます．読み取るには，Key Vault に対する <code>secrets/get</code> の権限（Azure RBAC の組み込みロールでは <strong>Key Vault Secrets User</strong>）が必要です．この権限を持つ人やサービスは，秘密鍵を読めることになるので，本当に必要なものだけに付与します．付与の可否と手続きはデプロイ担当者・Key Vault の管理者に相談してください．ACME Conductor は，この権限を付けることも外すこともしません．</p>
+  <p>権限をもらったら，ACME Conductor の証明書の詳細ページの「利用側」に，使っているサービスと連絡先を登録しておきます．証明書を変えるときや退役させるときに，誰に知らせ，どの権限を外すかが分かるようにするためです．</p>
 
   <h2 id="case-a">ケース A: Azure の Web サービス</h2>
   <p><strong>向いている場面</strong>: Azure の Web サービスで，独自ドメインの HTTPS を提供するとき．更新の追従を自動にできるので，最も手間がかかりません．</p>

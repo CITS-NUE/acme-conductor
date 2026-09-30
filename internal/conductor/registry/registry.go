@@ -40,6 +40,10 @@ var (
 	ErrPolicyNameTaken = errors.New("policy name is taken")
 	// ErrTargetEnabled: a target must be disabled before it is retired.
 	ErrTargetEnabled = errors.New("target is enabled")
+	// ErrStaleConsumers: a consumer ledger update named a version that is
+	// no longer current (optimistic locking, separate from the target's
+	// revision).
+	ErrStaleConsumers = errors.New("stale consumer ledger version")
 )
 
 // Policy is a CertificatePolicy: the rules a Target is issued under.
@@ -93,6 +97,31 @@ type Target struct {
 
 // Retired reports whether the target is retired.
 func (t *Target) Retired() bool { return t.RetiredAt != nil }
+
+// Consumer is one entry of a target's consumer ledger (issue #74): a
+// service that uses the target's certificate and whom to contact about
+// it. It is free text for people. Neither the Conductor nor a Runner
+// interprets it, it is never part of a JobSpec, and it grants nothing:
+// giving a consumer read access to the Certificate Store is the store
+// administrator's job (docs/architecture.md, non-goals).
+type Consumer struct {
+	Service string
+	Contact string
+	Note    string
+}
+
+// Consumers is a target's consumer ledger. It has its own Version for
+// optimistic locking so that editing it never changes the target's
+// Revision (which would cancel a queued run). Version 0 means the ledger
+// was never written.
+type Consumers struct {
+	TargetID           string
+	Version            int64
+	Items              []Consumer
+	UpdatedAt          *time.Time
+	UpdatedBy          string
+	UpdatedByAuthority string
+}
 
 // RunStatus is the lifecycle state of a Run.
 type RunStatus string
@@ -178,6 +207,10 @@ const (
 	AuditACMEAccountProvisioningFailed    AuditAction = "acme_account.provisioning_failed"
 	AuditACMEAccountProvisioningCancelled AuditAction = "acme_account.provisioning_cancelled"
 	AuditACMEAccountRetired               AuditAction = "acme_account.retired"
+
+	// AuditTargetConsumersUpdated records a change of a target's consumer
+	// ledger (issue #74); its detail carries counts only, never the entries.
+	AuditTargetConsumersUpdated AuditAction = "target.consumers_updated"
 )
 
 // MaxAuditDetailLength bounds the free-text detail of an audit event.
@@ -345,6 +378,16 @@ type Registry interface {
 	// already retired; ErrTargetEnabled unless it is disabled; ErrRunActive
 	// if a run is queued, starting or running. There is no way back.
 	RetireTarget(ctx context.Context, id, by, authority string, ev *AuditEvent) (*Target, error)
+	// GetTargetConsumers returns the consumer ledger of target id (Version
+	// 0 and no items when it was never written); ErrNotFound for an
+	// unknown target.
+	GetTargetConsumers(ctx context.Context, id string) (*Consumers, error)
+	// SetTargetConsumers replaces the ledger of c.TargetID if its version
+	// is still expectedVersion, and sets c.Version and c.UpdatedAt on
+	// return. It does not change the target's revision. ErrNotFound for
+	// an unknown target, ErrRetired for a retired one (its ledger is
+	// history, like the rest of it), ErrStaleConsumers otherwise.
+	SetTargetConsumers(ctx context.Context, c *Consumers, expectedVersion int64, ev *AuditEvent) error
 
 	// CreateRun records a new queued run. Returns ErrRunActive if the
 	// target already has a queued, starting or running run, and
