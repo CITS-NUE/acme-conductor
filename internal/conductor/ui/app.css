@@ -90,6 +90,9 @@ td .hint, dd .hint { color: var(--muted); font-size: 12px; }
 .status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
 .status.cancelled, .status.target-retired { color: var(--muted); }
+.status.dns-ok, .status.dns-present { color: var(--ok); border-color: var(--ok); }
+.status.dns-missing, .status.dns-mismatch { color: var(--bad); border-color: var(--bad); }
+.status.dns-error { color: var(--warn); border-color: var(--warn); }
 button, .button {
   font: inherit;
   padding: 5px 12px;

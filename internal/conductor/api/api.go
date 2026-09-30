@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/dnsdelegation"
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 	"github.com/CITS-NUE/acme-conductor/internal/strictjson"
 	"github.com/CITS-NUE/acme-conductor/pkg/api/v1alpha1"
@@ -89,6 +90,9 @@ type Options struct {
 	// account per target (accountProvisioning.targetScopedBindings): they
 	// are provisioned per target, never as a whole.
 	TargetScopedBindings []string
+	// DNSDelegation checks a target's _acme-challenge delegation from
+	// public DNS (issue #66); nil checks the presence of a CNAME only.
+	DNSDelegation *dnsdelegation.Checker
 }
 
 // Server is the API handler.
@@ -106,6 +110,7 @@ type Server struct {
 	provisioning *ecdh.PublicKey
 	eabBindings  []string
 	targetScoped []string
+	dnsCheck     *dnsdelegation.Checker
 }
 
 // New builds the handler.
@@ -122,7 +127,7 @@ func New(o Options) *Server {
 	if o.Scheduler == nil {
 		o.Scheduler = noScheduler{}
 	}
-	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), provisioning: o.ProvisioningKey}
+	s := &Server{reg: o.Registry, sched: o.Scheduler, bind: o.Bindings, auth: o.Auth, log: o.Logger, now: o.Now, ready: o.Ready, ui: o.UI, mux: http.NewServeMux(), provisioning: o.ProvisioningKey, dnsCheck: dnsChecker(o)}
 	if o.ProvisioningKey != nil {
 		s.eabBindings = o.ProvisioningBindings
 		s.targetScoped = o.TargetScopedBindings
@@ -156,6 +161,7 @@ func (s *Server) routes() {
 	api("POST "+Prefix+"/targets/{id}/disable", s.handleSetTargetEnabled(false))
 	api("POST "+Prefix+"/targets/{id}/retire", s.handleRetireTarget)
 	api("GET "+Prefix+"/targets/{id}/runs", s.handleListTargetRuns)
+	api("GET "+Prefix+"/targets/{id}/dns-delegation", s.handleTargetDNSDelegation)
 	api("POST "+Prefix+"/targets/{id}/runs", s.handleRequestRun)
 	api("GET "+Prefix+"/runs", s.handleListRuns)
 	api("GET "+Prefix+"/runs/{id}", s.handleGetRun)

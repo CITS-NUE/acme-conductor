@@ -104,6 +104,7 @@ Runner の `jobSigning.publicKeys` に貼り付けるために出力される．
 | `executionBindings` | map | 1 つ以上．キーはバインディング名（`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`，63 文字以下）． |
 | `acmeBindings` | []string | ポリシーが選択できるバインディング名．空でなく，重複しないこと． |
 | `dnsBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
+| `dnsChallengeZones` | map | 省略可．DNS バインディング名から，その Runner がチャレンジ用レコードを書くゾーン（各 `_acme-challenge` の CNAME の委任先）への対応．キーは `dnsBindings` のいずれか，値はワイルドカードでない DNS 名．Conductor は公開 DNS をこれと比べて委任の状態を示すだけで（[DNS の委任の確認](#dns-の委任の確認)），Runner には決して渡さない．エントリのないバインディングは CNAME の有無だけを確かめる．[ADR 0027](adr/0027-dns-delegation-check.md) |
 | `storeBindings` | []string | target が選択できるバインディング名．空でなく，重複しないこと． |
 | `jobSigning` | object | 省略可．`azure-container-apps-job` バインディングがある場合は必須．後述． |
 
@@ -412,6 +413,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `POST /api/v1alpha1/targets/{id}/disable` | `enabled: false` に設定 → `200` Target．何も削除せず，実行中の run も止めない． |
 | `POST /api/v1alpha1/targets/{id}/retire` | target を退役させる（admin のみ．[退役](#target-の退役)）→ `200` Target（`retired: true`）．本文なし．無効化されていなければ `409` `target_enabled`，run が queued/starting/running なら `409` `run_active`，すでに退役済みなら `409` `target_retired`． |
 | `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | その target の run，新しい順． |
+| `GET /api/v1alpha1/targets/{id}/dns-delegation[?refresh=true]` | 各名前の `_acme-challenge` の委任の状態（[DNS の委任の確認](#dns-の委任の確認)）．公開 DNS を引くだけなので viewer も呼べる．`refresh=true` は Conductor のキャッシュ（5 分）を使わない． |
 | `POST /api/v1alpha1/targets/{id}/runs` | 今すぐ run を要求 → `202` Run，`Location`．本文 `{"revision": N}` は省略可． |
 | `GET /api/v1alpha1/runs[?targetId=&status=&limit=&before=]` | run の一覧，新しい順．`status` はコンマ区切りの一覧． |
 | `GET /api/v1alpha1/runs/{id}` | run 1 件． |
@@ -688,6 +690,46 @@ Conductor を再起動した場合も，これで次の tick に収束する．�
    ままで次の機会にまた claim される．
 
 すべての遷移は，同じトランザクションで監査イベント（後述）を書く．
+
+### DNS の委任の確認
+
+`GET /targets/{id}/dns-delegation` は，target の各名前（`fqdn` と
+`additionalNames`．ワイルドカードは `*.` を除いた名前）について，公開 DNS で
+`_acme-challenge.<名前>` の CNAME をたどり（最大 8 段），次の文書を返す
+（[ADR 0027](adr/0027-dns-delegation-check.md)）．
+
+```json
+{
+  "dnsBinding": "azure-dns-staging",
+  "challengeZone": "cert.example.ac.jp",
+  "status": "missing",
+  "names": [
+    {"name": "www.example.ac.jp", "recordName": "_acme-challenge.www.example.ac.jp", "status": "ok", "target": "www.example.ac.jp.cert.example.ac.jp"},
+    {"name": "mail.example.ac.jp", "recordName": "_acme-challenge.mail.example.ac.jp", "status": "missing", "expected": "mail.example.ac.jp.cert.example.ac.jp"}
+  ],
+  "checkedAt": "2026-09-30T00:00:00Z"
+}
+```
+
+| `status` | 意味 |
+|---|---|
+| `ok` | CNAME をたどった先がチャレンジ用ゾーンの中にある．名前自体がそのゾーンの中にある場合（委任が要らない）も `ok`． |
+| `present` | CNAME はあるが，そのバインディングに `dnsChallengeZones` がないので行き先を確かめていない． |
+| `missing` | CNAME がない． |
+| `mismatch` | CNAME がチャレンジ用ゾーンの外を指している． |
+| `error` | 問い合わせに失敗した（タイムアウト，SERVFAIL，たどる段数の超過）． |
+
+文書全体の `status` は，名前のうち最も悪いもの（`missing`，`mismatch`，`error`，
+`present`，`ok` の順）である．`expected` はチャレンジ用ゾーンが設定されている
+ときの CNAME の値の例（`<名前>.<チャレンジ用ゾーン>`）で，DNS の担当者にそのまま
+渡せる．リゾルバはシステムのものなので，CNAME を追加した直後はそのネガティブ
+キャッシュのためにしばらく `missing` と見えることがある．
+
+スケジューラも run を起こすたびに同じ確認を（起動と並行して）行い，`missing`
+または `mismatch` の名前があれば warn の
+`challenge record is not delegated into the dns binding's challenge zone` を
+記録する．run は止めない．委任が欠けていれば，その run は Runner で
+`DnsFailure` になる．
 
 ### Target の退役
 
@@ -1017,6 +1059,12 @@ code verifier とともに `token_endpoint` で交換し，アクセストーク
 と `Referrer-Policy: no-referrer` を付けて配信される．`localhost-dev` モードでは，
 ループバック上の同一オリジンの呼び出し元であるため，同じページがサインインなしで動く．
 
+target の詳細ページには「DNS の委任（_acme-challenge）」の節があり，各名前の
+委任の状態（[DNS の委任の確認](#dns-の委任の確認)）と，欠けているまたは誤って
+いる名前について DNS の担当者に依頼するレコード
+（`_acme-challenge.<名前>.  IN CNAME  <名前>.<チャレンジ用ゾーン>.`）を示す．
+「再確認」はキャッシュを使わずに引き直す．
+
 GUI が表示するのは API が返すものだけである．秘密鍵，証明書本体，資格情報は決して
 表示されない．Conductor がそれらを持っていないからである．
 
@@ -1086,6 +1134,11 @@ stderr（Runner 自身が既に秘匿処理を施した構造化ログ）を 1 �
   これを復号できない（[ADR 0022](adr/0022-encrypted-eab-provisioning-and-account-generations.md)）．
   侵害された Conductor が偽の公開鍵を提示して投入前の EAB を横取りする残存
   リスクは，`keyId` を帯外で比較する運用手順に依存する（[制限事項](#制限事項)）．
+- Conductor が外部に問い合わせるのは，ランチャーとプロバイダの OIDC を除けば，
+  公開 DNS だけである（[DNS の委任の確認](#dns-の委任の確認)）．資格情報を使わず，
+  読むのは登録済みの target から決まる `_acme-challenge.<名前>` の CNAME だけで，
+  何も書き込まない．比較に使う `dnsChallengeZones` は `JobSpec` に載らず，Runner の
+  書き込み先に影響しない（[ADR 0027](adr/0027-dns-delegation-check.md)）．
 - API の入力で指定できるのは管理者が登録した binding の名前だけである．コマンド，
   イメージ，パス，環境変数，リソース ID，資格情報のためのフィールドはなく，未知の
   フィールドは拒否されるため，どれも紛れ込ませることはできない．

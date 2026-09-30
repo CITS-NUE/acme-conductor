@@ -107,6 +107,15 @@ func TestReadRejects(t *testing.T) {
 		"concurrency-big": func(s string) string {
 			return strings.Replace(s, `"database"`, `"scheduler": {"maxConcurrentRuns": 1000}, "database"`, 1)
 		},
+		"challenge-zone-unknown-binding": func(s string) string {
+			return strings.Replace(s, `"storeBindings"`, `"dnsChallengeZones": {"other": "cert.example.ac.jp"}, "storeBindings"`, 1)
+		},
+		"challenge-zone-invalid": func(s string) string {
+			return strings.Replace(s, `"storeBindings"`, `"dnsChallengeZones": {"azure-dns-staging": "not a zone"}, "storeBindings"`, 1)
+		},
+		"challenge-zone-wildcard": func(s string) string {
+			return strings.Replace(s, `"storeBindings"`, `"dnsChallengeZones": {"azure-dns-staging": "*.cert.example.ac.jp"}, "storeBindings"`, 1)
+		},
 		"backoff-order": func(s string) string {
 			return strings.Replace(s, `"database"`, `"scheduler": {"retryBackoffSeconds": 600, "maxRetryBackoffSeconds": 300}, "database"`, 1)
 		},
@@ -529,5 +538,15 @@ func TestAccountProvisioningConfiguration(t *testing.T) {
 				t.Fatalf("err = %v, want ErrInvalid", err)
 			}
 		})
+	}
+}
+
+func TestReadNormalizesChallengeZones(t *testing.T) {
+	c, err := Read(strings.NewReader(strings.Replace(minimal, `"storeBindings"`, `"dnsChallengeZones": {"azure-dns-staging": "Cert.Example.AC.JP."}, "storeBindings"`, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.DNSChallengeZones["azure-dns-staging"]; got != "cert.example.ac.jp" {
+		t.Fatalf("zone = %q", got)
 	}
 }
