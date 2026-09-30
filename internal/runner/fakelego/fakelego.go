@@ -31,7 +31,8 @@ import (
 // binding's non-secret env map in test configurations.
 const (
 	// EnvMode selects the behaviour: ok (default), fail, hang, wrongdomain,
-	// nokey, garbage, missingoutput, longline (1 MiB output lines, then ok).
+	// nokey, garbage, missingoutput, longline (1 MiB output lines, then ok),
+	// dnsoutsidezone and dnspropagation (lego's DNS-01 failure messages).
 	EnvMode = "FAKE_LEGO_MODE"
 	// EnvDays sets the certificate validity in days (default 90).
 	EnvDays = "FAKE_LEGO_DAYS"
@@ -154,6 +155,16 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "-----BEGIN EC PRIVATE KEY-----")
 		fmt.Fprintln(stderr, "ZmFrZS1sZWFrZWQta2V5")
 		fmt.Fprintln(stderr, "-----END EC PRIVATE KEY-----")
+		return 1
+	case "dnsoutsidezone":
+		// What lego v4 prints when the challenge record name is outside the
+		// DNS provider's zone (no _acme-challenge CNAME delegation).
+		d := domains[0]
+		fmt.Fprintf(stderr, "2026/01/01 00:00:00 Could not obtain certificates:\n\terror: one or more domains had a problem:\n[%s] [%s] acme: error presenting token: azuredns: _acme-challenge.%s. is not a subdomain of challenge.example.ac.jp.\n", d, d, d)
+		return 1
+	case "dnspropagation":
+		d := domains[0]
+		fmt.Fprintf(stderr, "2026/01/01 00:00:00 Could not obtain certificates:\n\terror: one or more domains had a problem:\n[%s] propagation: time limit exceeded: last error: NS ns1.example.ac.jp.:53 did not return the expected TXT record [fqdn: _acme-challenge.%s., value: abc]: \n", d, d)
 		return 1
 	case "hang":
 		fmt.Fprintln(stdout, "fake lego: hanging")

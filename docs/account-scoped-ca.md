@@ -398,8 +398,9 @@ target を作る（手順 3），の順になる．旧 target を退役させる
 
 ## 失敗の読み方
 
-UPKI 固有の失敗を，Conductor は専用の状態で扱わない．どれも `AcmeFailure`
-として run に残り，既存のバックオフで再試行される．
+UPKI 固有の失敗を，Conductor は専用の状態で扱わない．DNS-01 の失敗は
+`DnsFailure`，それ以外は `AcmeFailure` として run に残り，既存のバックオフで
+再試行される．
 
 | 状況 | run に残るもの |
 |---|---|
@@ -408,14 +409,15 @@ UPKI 固有の失敗を，Conductor は専用の状態で扱わない．どれ�
 | 登録されていない名前，CN が先頭にない | CA がオーダーを拒否し，`AcmeFailure`（`lego exited with status <n>`）． |
 | 鍵種別がプロファイルと違う | 同上．チャレンジが通った後で拒否されるので，lego は数十秒動いてから失敗する． |
 | CA 側で停止されたアカウント | 同上． |
-| DNS-01 の所有確認に失敗（委任の漏れなど） | 同上．委任がなければ TXT を置けないので，lego は数秒で失敗する． |
+| DNS-01 の所有確認に失敗（委任の漏れなど） | `DnsFailure`．要約が理由を示す（委任の漏れなら `the challenge record is outside the zone of dns binding "…"; check the _acme-challenge CNAME delegation`）．委任がなければ TXT を置けないので，lego は数秒で失敗する． |
 | EAB が無効（打ち間違い，すでに使われた） | EAB を運んだ run の `AcmeFailure`．その世代は `failed` になり，番号は再利用されない．新しい EAB を次の世代として投入し直す． |
 
-`lego` の失敗理由（CA の応答）は，いまのところ `Result.error.summary` にも
-info ログにも残らない．理由を run から読めるようにするのは
-[issue #38](https://github.com/CITS-NUE/acme-conductor/issues/38) で扱う．
-それまでは，上の表のどれに当たるかを，直前に行った操作（名前の編集，EAB の
-投入，DNS の変更）と，次の手がかりから切り分ける．
+`AcmeFailure` の run の `Result.error.summary` には，CA の応答は入らない
+（[脅威モデル](threat-model.md) の T6）．CA の応答を含む lego のメッセージは，
+Runner のログに warn の `lego failed; last stderr lines` として残る
+（[`docs/runner.md`](runner.md#ログと秘匿)）．まずこれを読む．そのうえで，上の表の
+どれに当たるかを，直前に行った操作（名前の編集，EAB の投入，DNS の変更）と，
+次の手がかりから切り分ける．
 
 - **lego の所要時間**．Runner の info ログの `lego finished` に `durationMs` が
   出る．数秒なら，チャレンジより前（委任の漏れで TXT を置けない，オーダーの

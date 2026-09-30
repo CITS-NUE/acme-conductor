@@ -155,6 +155,25 @@ func fail(code v1alpha1.ErrorCode, summary string, err error) *failure {
 	return &failure{code: code, summary: summary, err: err}
 }
 
+// legoFailure maps a non-zero lego exit to an error code and summary. What
+// lego's stderr was recognized as (lego.Failure) only selects one of these
+// fixed templates; no text of lego's reaches the Result (threat model T6).
+func legoFailure(res *lego.Outcome, dnsBinding string) (v1alpha1.ErrorCode, string) {
+	switch res.Failure {
+	case lego.FailureDNSOutsideZone:
+		return v1alpha1.ErrorCodeDNSFailure, fmt.Sprintf("the challenge record is outside the zone of dns binding %q; check the _acme-challenge CNAME delegation", dnsBinding)
+	case lego.FailureDNSZoneNotFound:
+		return v1alpha1.ErrorCodeDNSFailure, fmt.Sprintf("dns binding %q could not find the DNS zone of the challenge record", dnsBinding)
+	case lego.FailureDNSPresent:
+		return v1alpha1.ErrorCodeDNSFailure, fmt.Sprintf("dns binding %q could not create the challenge TXT record", dnsBinding)
+	case lego.FailureDNSPropagation:
+		return v1alpha1.ErrorCodeDNSFailure, "the challenge TXT record did not propagate before the lego timeout"
+	case lego.FailureCADNS:
+		return v1alpha1.ErrorCodeDNSFailure, "the CA could not resolve the challenge record"
+	}
+	return v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("lego exited with status %d", res.ExitCode)
+}
+
 // outcome is what a successful reconcile knows about the stored certificate.
 type outcome struct {
 	action      v1alpha1.ResultAction
@@ -623,7 +642,8 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	case res.TimedOut:
 		return nil, failAP(v1alpha1.ErrorCodeTimeout, fmt.Sprintf("lego did not finish within %d seconds", cfg.Lego.TimeoutSeconds), nil)
 	case res.ExitCode != 0:
-		return nil, failAP(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("lego exited with status %d", res.ExitCode), nil)
+		code, summary := legoFailure(res, spec.DNS.Binding)
+		return nil, failAP(code, summary, nil)
 	}
 
 	certPEM, keyPEM, issuerPEM, err := lego.ReadOutputs(work, spec.Target.FQDN)

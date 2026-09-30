@@ -182,6 +182,10 @@ type Outcome struct {
 	TimedOut  bool
 	Cancelled bool
 	Duration  time.Duration
+	// Failure is what a non-zero exit is recognized as from lego's stderr
+	// (the first line that matches a known pattern). It is FailureUnknown
+	// for a successful run and for a failure no pattern matched.
+	Failure Failure
 }
 
 // DefaultGracePeriod is how long Run waits after SIGTERM (and after the
@@ -240,6 +244,7 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	// One sink per stream: PEM suppression is stateful.
 	stdout := newLineSink(logger, "stdout", NewRedactor(secrets), 0)
 	stderr := newLineSink(logger, "stderr", NewRedactor(secrets), failureTailLines)
+	stderr.classify = true
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -287,6 +292,7 @@ func (e *Executor) Run(ctx context.Context, inv *Invocation) (*Outcome, error) {
 	// read from the Runner's own log. It goes to the log only, never to
 	// the Result.
 	if out.ExitCode != 0 {
+		out.Failure = stderr.Failure()
 		if tail := stderr.Tail(); len(tail) > 0 {
 			logger.Warn("lego failed; last stderr lines", "exitCode", out.ExitCode, "lines", tail)
 		}
@@ -306,7 +312,8 @@ const failureTailLines = 20
 // lineSink is an io.Writer that splits a stream into lines, redacts them
 // and logs them. os/exec writes to it from its own goroutine, so no
 // locking is needed beyond what Write's caller provides. With a non-zero
-// tailCap it also keeps the last tailCap redacted lines for Tail.
+// tailCap it also keeps the last tailCap redacted lines for Tail, and with
+// classify it records the first known failure pattern for Failure.
 type lineSink struct {
 	logger    *slog.Logger
 	stream    string
@@ -315,6 +322,8 @@ type lineSink struct {
 	truncated bool
 	tail      []string
 	tailCap   int
+	classify  bool
+	failure   Failure
 	mu        sync.Mutex
 }
 
@@ -360,6 +369,9 @@ func (s *lineSink) emit() {
 	out, keep := s.redact.Line(line)
 	if keep {
 		s.logger.Debug("lego output", "stream", s.stream, "line", out, "truncated", s.truncated)
+		if s.classify && s.failure == FailureUnknown {
+			s.failure = classifyLine(out)
+		}
 		if s.tailCap > 0 {
 			if len(s.tail) == s.tailCap {
 				s.tail = append(s.tail[:0], s.tail[1:]...)
@@ -408,6 +420,14 @@ func (s *lineSink) Tail() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.tail...)
+}
+
+// Failure returns the classification of the first line that matched a
+// known failure pattern, or FailureUnknown.
+func (s *lineSink) Failure() Failure {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failure
 }
 
 // Flush logs a trailing line without a newline.
