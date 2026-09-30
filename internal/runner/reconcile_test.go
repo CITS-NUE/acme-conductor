@@ -452,6 +452,8 @@ func TestReconcileFailures(t *testing.T) {
 		legoRan  bool
 	}{
 		{name: "lego fails", mode: "fail", code: v1alpha1.ErrorCodeACMEFailure, summary: "lego exited with status 1", legoRan: true},
+		{name: "lego challenge record outside the dns zone", mode: "dnsoutsidezone", code: v1alpha1.ErrorCodeDNSFailure, summary: "outside the zone of dns binding \"fake-dns\"; check the _acme-challenge CNAME delegation", legoRan: true},
+		{name: "lego propagation timeout", mode: "dnspropagation", code: v1alpha1.ErrorCodeDNSFailure, summary: "did not propagate", legoRan: true},
 		{name: "lego writes no output", mode: "missingoutput", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},
 		{name: "lego writes wrong domain", mode: "wrongdomain", code: v1alpha1.ErrorCodeACMEFailure, summary: "subject alternative names differ from the target's names", legoRan: true},
 		{name: "lego writes no key", mode: "nokey", code: v1alpha1.ErrorCodeACMEFailure, summary: "produced no usable certificate", legoRan: true},

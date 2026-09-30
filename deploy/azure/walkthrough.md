@@ -477,7 +477,10 @@ ContainerAppConsoleLogs_CL
 | order by TimeGenerated asc'
 ```
 
-run が `AcmeFailure lego exited with status 1` で失敗した場合，Runner は lego の
+委任の漏れなど，lego の DNS-01 の既知の失敗は `DnsFailure` として run に残り，要約で
+理由が分かる（例：`the challenge record is outside the zone of dns binding "…"; check
+the _acme-challenge CNAME delegation`）．run が `AcmeFailure lego exited with status 1`
+で失敗した場合は，Runner は lego の
 stderr の末尾（秘匿処理済み）を warn レベルの `lego failed; last stderr lines` として
 記録する．まずこれを読む．
 
@@ -681,5 +684,6 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
 | 再デプロイ後，Conductor の新しいリビジョンが `Activating` のまま進まず，レプリカが `registry could not be opened ... unable to open database file (14)` で再起動を繰り返す．旧リビジョンは動き続ける | 旧レプリカが SMB 上のレジストリを開いたままで，新しいレプリカが開けない（#51） | （`deploy/azure` で）`./switch-revision.sh <RG> <namePrefix>` で旧リビジョンを deactivate する（「再デプロイ」） |
 | run が `PolicyViolation`（`fqdn is not under any allowed DNS suffix`）で失敗する | target の名前が Runner の `authorization.allowedDnsSuffixes` の下にない | Runner 設定の `allowedDnsSuffixes` に加えて再デプロイする |
-| run が `AcmeFailure lego exited with status 1` で失敗する（`lego finished` の `durationMs` が数秒） | 多くは target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない．Runner のログの `lego failed; last stderr lines` に lego のメッセージが出る | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10）．理由が読み取れなければ `runnerLogLevel = 'debug'` で再デプロイする |
+| run が `DnsFailure`（`the challenge record is outside the zone of dns binding "…"; check the _acme-challenge CNAME delegation`）で失敗する | target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10） |
+| run が `AcmeFailure lego exited with status 1` で失敗する | lego の失敗のうち，DNS の既知の失敗に当たらないもの．Runner のログの `lego failed; last stderr lines` に lego のメッセージが出る | メッセージに従う．理由が読み取れなければ `runnerLogLevel = 'debug'` で再デプロイする |
 | EAB を要求する CA（UPKI など）で，run が `AcmeFailure lego exited with status 1` で失敗する（`durationMs` が数十秒．チャレンジ用ゾーンに `TXT/write` の記録がある） | ポリシーの `keyType` が，EAB を発行した証明書プロファイルの鍵種別と合わない（例: RSA のプロファイルに `rsa4096`） | ポリシーの `keyType` をプロファイルに合わせ（UPKI の RSA なら `rsa2048`），run を起こし直す．EAB の投入し直しは不要（[運用ガイド](../../docs/account-scoped-ca.md#失敗の読み方)） |

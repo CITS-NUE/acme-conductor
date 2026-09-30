@@ -840,7 +840,12 @@ docker run --rm \
 | `InvalidJobSpec` | プロビジョニング run（`account.provisioning` あり）で，その世代がすでに登録済み（リプレイ）． | `acme account generation <g> of binding "<b>" is already provisioned` |
 | `InvalidJobSpec` | プロビジョニング payload が来たが，この Runner に `accountProvisioning` が設定されていない． | `this runner has no account provisioning key` |
 | `InvalidJobSpec` | プロビジョニング payload が Runner の鍵で開けなかった（未知の `keyId`，AAD 不一致，AEAD 認証失敗，不正な平文）． | `account provisioning payload could not be opened` |
-| `AcmeFailure` | `lego` が非ゼロのステータスで終了した． | `lego exited with status <n>` |
+| `DnsFailure` | `lego` が非ゼロで終了し，stderr に，チャレンジ用レコードの名前（CNAME を辿った後）が DNS バインディングのゾーンの外にあるという失敗が出た．多くは `_acme-challenge` の CNAME 委任の漏れ． | `the challenge record is outside the zone of dns binding "<name>"; check the _acme-challenge CNAME delegation` |
+| `DnsFailure` | 同じく，DNS プロバイダがチャレンジ用レコードのゾーンを見つけられなかった． | `dns binding "<name>" could not find the DNS zone of the challenge record` |
+| `DnsFailure` | 同じく，DNS プロバイダがそれ以外の理由（権限，API のエラー）で TXT レコードを作れなかった． | `dns binding "<name>" could not create the challenge TXT record` |
+| `DnsFailure` | 同じく，TXT レコードが `lego` の伝播待ちの時間内に権威サーバーに現れなかった． | `the challenge TXT record did not propagate before the lego timeout` |
+| `DnsFailure` | 同じく，CA が検証の際に DNS の問題（ACME のエラー型 `dns`）を返した． | `the CA could not resolve the challenge record` |
+| `AcmeFailure` | `lego` が非ゼロのステータスで終了し，上のどれにも当たらなかった． | `lego exited with status <n>` |
 | `AcmeFailure` | `lego` が `0` で終了したが，読める証明書／鍵ファイルを書かなかった． | `lego exited successfully but produced no usable certificate` |
 | `AcmeFailure` | `lego` が書いた証明書をパースできなかった． | `lego produced an unreadable certificate` |
 | `AcmeFailure` | 発行された証明書の SAN の集合が target の名前（FQDN と追加名）と一致しない． | `issued certificate's subject alternative names differ from the target's names` |
@@ -892,6 +897,18 @@ docker run --rm \
 `github_pat_…` を `[REDACTED]` に置き換える．これは `Result` のシークレット
 マーカーと同じ種類のヒューリスティックであり，シークレット検出器ではない．
 成功した run では何も追加されない．
+
+同じ stderr の行から，既知の DNS-01 の失敗を見分けてエラーコードを選ぶ
+（上の表の `DnsFailure` の行）．見るのは，同梱する `lego` のリリース
+（`Dockerfile.runner` の `LEGO_VERSION`）が出す決まった文言だけである．
+たとえば `acme: error presenting token:`，`is not a subdomain of`，
+`could not find zone`，`propagation: time limit exceeded`，
+`urn:ietf:params:acme:error:dns` である．最初に当てはまった行で決まる．
+`Result` に入るのは，選んだコードと Runner が持つ固定テンプレートの要約だけで，
+`lego` の文言は入らない．どれにも当たらなければ，これまでどおり
+`AcmeFailure` になる．`lego` を更新して文言が変わると，見分けられずに
+`AcmeFailure` に戻る（安全側）．更新のときは
+`internal/runner/lego/classify_test.go` の行を新しいリリースの文言に合わせる．
 
 この秘匿は **値ベースかつヒューリスティック** である．Runner 自身が解決した
 特定のシークレット値と既知の PEM マーカーをマスクするのであって，任意の，
