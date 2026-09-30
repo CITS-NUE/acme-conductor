@@ -390,6 +390,9 @@ InvalidTemplateDeployment: Authorization failed for template resource '<guid>' o
 
 出力のうち，`conductorUrl` と `conductorGuiRedirectUri` は次の手順で使う．
 
+初回のデプロイでは旧リビジョンがないので，次の「再デプロイ」で述べる
+リビジョンの切り替えは要らない．
+
 ## 9. デプロイ後の確認
 
 ```sh
@@ -618,7 +621,25 @@ echo | openssl s_client -connect <fqdn>:443 -servername <fqdn> 2>/dev/null \
 
 パラメタや Runner 設定，イメージのダイジェストを変えたら，手順 7 の環境変数を
 設定して手順 8-3 のコマンドを再実行する．内容が同じなら何度実行しても結果は
-変わらない．8-1 と 8-2 は繰り返さない（ロール定義を変えるリリースのときだけ 8-1 を
+変わらない．
+
+Conductor のリビジョンが新しくなるデプロイ（イメージや Conductor の設定を変えた
+とき）では，続けてリビジョンの切り替えを確かめる．新しいリビジョンが SQLite の
+レジストリを開けずに ready にならず，旧リビジョンも止まらないまま更新が止まることが
+ある（[#51](https://github.com/CITS-NUE/acme-conductor/issues/51)．v0.7.0 → v0.8.0 と
+v0.8.1 → v0.9.0 で staging と prod の両方に起きた）．
+
+```sh
+./switch-revision.sh rg-acme-staging acme-stg
+```
+
+止まっていなければ何もせずに終わる．止まっていれば旧リビジョンを deactivate し，
+新しいリビジョンが `Healthy` になるまで待つ（最大 15 分．途中で `Unhealthy` と
+出てもよい）．その間の 40 秒〜2 分ほど，Conductor（API と GUI，スケジューラ）は
+止まる．Runner には影響しない．詳しくは [README](README.md#デプロイ後の運用) の
+「リビジョンの切り替え」．
+
+8-1 と 8-2 は繰り返さない（ロール定義を変えるリリースのときだけ 8-1 を
 先に再実行する）ので，PIM の有効化は要らない．#37 より前のテンプレートで，
 ABAC 条件付きの権限の場合は，毎回 `--validation-level Template` が要る．
 
@@ -658,6 +679,7 @@ az ad app delete --id <oidcAudience>; az ad app delete --id <oidcClientId>
 | GUI の EAB のページに，ある binding が出ない／API が `409 eab_not_required` | その binding が `accountProvisioningBindings` に挙がっていない | CA が EAB を要求するなら `accountProvisioningBindings` に加えて再デプロイする．要求しない CA（Let's Encrypt など）なら投入は不要 |
 | 本番 CA のバインディングが Runner に拒否される（想定） | `allowProductionCA: true` がない | バインディングに追加する（手順 11-1） |
 | 利用側（Application Gateway など）が証明書を読めない（想定） | 利用側の ID に `Key Vault Secrets User` がない，形式（PEM／EC）を受け付けない，ネットワークで届かない | 手順 11-2，11-3 |
+| 再デプロイ後，Conductor の新しいリビジョンが `Activating` のまま進まず，レプリカが `registry could not be opened ... unable to open database file (14)` で再起動を繰り返す．旧リビジョンは動き続ける | 旧レプリカが SMB 上のレジストリを開いたままで，新しいレプリカが開けない（#51） | （`deploy/azure` で）`./switch-revision.sh <RG> <namePrefix>` で旧リビジョンを deactivate する（「再デプロイ」） |
 | run が `PolicyViolation`（`fqdn is not under any allowed DNS suffix`）で失敗する | target の名前が Runner の `authorization.allowedDnsSuffixes` の下にない | Runner 設定の `allowedDnsSuffixes` に加えて再デプロイする |
 | run が `AcmeFailure lego exited with status 1` で失敗する（`lego finished` の `durationMs` が数秒） | 多くは target の `_acme-challenge` がチャレンジ用ゾーンに委任されていない．Runner のログの `lego failed; last stderr lines` に lego のメッセージが出る | 委任済みの名前を使うか，親ゾーンに CNAME を追加する（手順 10）．理由が読み取れなければ `runnerLogLevel = 'debug'` で再デプロイする |
 | EAB を要求する CA（UPKI など）で，run が `AcmeFailure lego exited with status 1` で失敗する（`durationMs` が数十秒．チャレンジ用ゾーンに `TXT/write` の記録がある） | ポリシーの `keyType` が，EAB を発行した証明書プロファイルの鍵種別と合わない（例: RSA のプロファイルに `rsa4096`） | ポリシーの `keyType` をプロファイルに合わせ（UPKI の RSA なら `rsa2048`），run を起こし直す．EAB の投入し直しは不要（[運用ガイド](../../docs/account-scoped-ca.md#失敗の読み方)） |
