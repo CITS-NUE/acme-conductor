@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/dnsdelegation"
@@ -111,6 +112,11 @@ type Server struct {
 	eabBindings  []string
 	targetScoped []string
 	dnsCheck     *dnsdelegation.Checker
+
+	// names caches the display name last recorded per principal, so the
+	// registry is written only when a provider asserts a new one.
+	namesMu sync.Mutex
+	names   map[principalKeyName]string
 }
 
 // New builds the handler.
@@ -169,6 +175,7 @@ func (s *Server) routes() {
 	api("GET "+Prefix+"/runs/{id}", s.handleGetRun)
 	api("POST "+Prefix+"/runs/{id}/cancel", s.handleCancelRun)
 	api("GET "+Prefix+"/audit", s.handleListAudit)
+	api("GET "+Prefix+"/principals", s.handleListPrincipals)
 	api("GET "+Prefix+"/account-provisioning/key", s.handleProvisioningKey)
 	api("GET "+Prefix+"/acme-bindings", s.handleListACMEBindings)
 	api("GET "+Prefix+"/acme-bindings/{binding}", s.handleGetACMEBinding)
@@ -219,6 +226,7 @@ func (s *Server) authenticated(h http.HandlerFunc) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden", fmt.Sprintf("role %q may only read", p.Role), nil)
 			return
 		}
+		s.recordDisplayName(r.Context(), p)
 		h(w, r.WithContext(withPrincipal(r.Context(), p)))
 	})
 }

@@ -594,6 +594,10 @@ func (bearerFake) Authenticate(r *http.Request) (Principal, error) {
 	switch r.Header.Get("Authorization") {
 	case "Bearer admin":
 		return Principal{Name: "alice@example.ac.jp", Authority: "https://idp.example/v2.0", Role: RoleAdmin}, nil
+	case "Bearer named":
+		return Principal{Name: "oid-alice", Authority: "https://idp.example/v2.0", Role: RoleViewer, DisplayName: "Alice Example"}, nil
+	case "Bearer renamed":
+		return Principal{Name: "oid-alice", Authority: "https://idp.example/v2.0", Role: RoleViewer, DisplayName: "Alice Renamed"}, nil
 	case "Bearer viewer":
 		return Principal{Name: "bob@example.ac.jp", Role: RoleViewer}, nil
 	case "Bearer norole":

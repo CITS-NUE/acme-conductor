@@ -268,9 +268,13 @@ func buildAuth(ctx context.Context, cfg *config.Config, port int, log *slog.Logg
 		return api.LocalhostDev{Port: fmt.Sprint(port)}, &api.UIOptions{AuthMode: config.AuthLocalhostDev}, nil
 	case config.AuthOIDC:
 		o := cfg.Server.Auth.OIDC
+		displayNameClaim := o.DisplayNameClaim
+		if displayNameClaim == config.NoOIDCDisplayNameClaim {
+			displayNameClaim = ""
+		}
 		a, err := oidc.New(oidc.Config{
 			Issuer: o.Issuer, Audience: o.Audience,
-			PrincipalClaim: o.PrincipalClaim, RolesClaim: o.RolesClaim,
+			PrincipalClaim: o.PrincipalClaim, RolesClaim: o.RolesClaim, DisplayNameClaim: displayNameClaim,
 			AdminValues: o.Roles.Admin, ViewerValues: o.Roles.Viewer,
 			ClockSkew: time.Duration(o.ClockSkewSeconds) * time.Second,
 			KeyCache:  time.Duration(o.KeyCacheSeconds) * time.Second,

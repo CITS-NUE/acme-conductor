@@ -236,6 +236,22 @@ type AuditEvent struct {
 	Detail         string
 }
 
+// MaxPrincipalDisplayNameLength bounds a principal's display name, in
+// bytes.
+const MaxPrincipalDisplayNameLength = 256
+
+// PrincipalName is the display name an identity provider last asserted
+// for a principal (Authority, Name). It is a label for people reading
+// the GUI, never an identity: audit events and runs name the principal by
+// its stable identifier, and the display name may change, be shared or
+// be reassigned. Only the latest value is kept.
+type PrincipalName struct {
+	Authority   string
+	Name        string
+	DisplayName string
+	UpdatedAt   time.Time
+}
+
 // ACMEAccountStatus is the lifecycle state of one ACME account generation
 // (issue #42, encrypted EAB provisioning).
 type ACMEAccountStatus string
@@ -407,6 +423,14 @@ type Registry interface {
 
 	AppendAudit(ctx context.Context, ev *AuditEvent) error
 	ListAudit(ctx context.Context, opts ListAuditOptions) ([]*AuditEvent, error)
+
+	// SetPrincipalName records the display name last asserted for
+	// (p.Authority, p.Name), replacing any earlier one, and sets
+	// p.UpdatedAt. It is not audited: the display name is a label, not
+	// state the audit log describes.
+	SetPrincipalName(ctx context.Context, p *PrincipalName) error
+	// ListPrincipalNames returns every recorded display name.
+	ListPrincipalNames(ctx context.Context) ([]*PrincipalName, error)
 
 	// An ACME account is addressed by (binding, scope): scope is "" for
 	// the binding's own account and a target id for an account scoped to

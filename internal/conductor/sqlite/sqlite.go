@@ -313,6 +313,18 @@ CREATE TRIGGER target_consumers_retired_update BEFORE UPDATE ON target_consumers
   WHEN (SELECT retired_at FROM targets WHERE id = NEW.target_id) IS NOT NULL
   BEGIN SELECT RAISE(ABORT, 'a retired target cannot be changed'); END;
 `,
+	// 9: display names of principals, as the identity provider last
+	// asserted them. A label for the GUI only; audit events and runs keep
+	// naming principals by their stable identifier.
+	`
+CREATE TABLE principal_names (
+  authority    TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (authority, name)
+);
+`,
 }
 
 // foreignKeysOffMigrations are the migrations that rebuild a table other
@@ -571,6 +583,48 @@ func (d *DB) ListAudit(ctx context.Context, opts registry.ListAuditOptions) ([]*
 		}
 		ev.Action = registry.AuditAction(action)
 		out = append(out, &ev)
+	}
+	return out, rows.Err()
+}
+
+// ---- principal names ----------------------------------------------------
+
+// SetPrincipalName implements registry.Registry.
+func (d *DB) SetPrincipalName(ctx context.Context, p *registry.PrincipalName) error {
+	if p.Authority == "" || p.Name == "" || p.DisplayName == "" {
+		return errors.New("set principal name: authority, name and display name are required")
+	}
+	if len(p.DisplayName) > registry.MaxPrincipalDisplayNameLength {
+		return errors.New("set principal name: display name is too long")
+	}
+	p.UpdatedAt = time.Now()
+	_, err := d.db.ExecContext(ctx, `INSERT INTO principal_names (authority, name, display_name, updated_at) VALUES (?, ?, ?, ?)
+  ON CONFLICT (authority, name) DO UPDATE SET display_name = excluded.display_name, updated_at = excluded.updated_at`,
+		p.Authority, p.Name, p.DisplayName, fmtTime(p.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("set principal name: %w", err)
+	}
+	return nil
+}
+
+// ListPrincipalNames implements registry.Registry.
+func (d *DB) ListPrincipalNames(ctx context.Context) ([]*registry.PrincipalName, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT authority, name, display_name, updated_at FROM principal_names ORDER BY authority, name`)
+	if err != nil {
+		return nil, fmt.Errorf("list principal names: %w", err)
+	}
+	defer rows.Close()
+	var out []*registry.PrincipalName
+	for rows.Next() {
+		var p registry.PrincipalName
+		var ts string
+		if err := rows.Scan(&p.Authority, &p.Name, &p.DisplayName, &ts); err != nil {
+			return nil, fmt.Errorf("scan principal name: %w", err)
+		}
+		if p.UpdatedAt, err = parseTime(ts); err != nil {
+			return nil, err
+		}
+		out = append(out, &p)
 	}
 	return out, rows.Err()
 }

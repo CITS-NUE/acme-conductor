@@ -297,6 +297,13 @@ func TestOIDCModeAppliesDefaults(t *testing.T) {
 	if o.PrincipalClaim != "sub" {
 		t.Fatalf("the default principal claim must be a stable identifier, got %q", o.PrincipalClaim)
 	}
+	if o.DisplayNameClaim != "name" {
+		t.Fatalf("display name claim default: %q", o.DisplayNameClaim)
+	}
+	c, err = Read(strings.NewReader(strings.Replace(withOIDC(minimal), `"roles"`, `"displayNameClaim": "-", "roles"`, 1)))
+	if err != nil || c.Server.Auth.OIDC.DisplayNameClaim != NoOIDCDisplayNameClaim {
+		t.Fatalf("displayNameClaim \"-\": %v", err)
+	}
 	if strings.Join(o.Scopes, " ") != "openid profile api://acme-conductor/.default" {
 		t.Fatalf("scopes not kept as given: %v", o.Scopes)
 	}
@@ -378,6 +385,9 @@ func TestOIDCModeRejects(t *testing.T) {
 		"role-with-space":   func(s string) string { return strings.Replace(s, `ACME.Viewer`, `ACME Viewer`, 1) },
 		"bad-claim-name": func(s string) string {
 			return strings.Replace(s, `"roles"`, `"principalClaim": "9x", "roles"`, 1)
+		},
+		"bad-display-name-claim": func(s string) string {
+			return strings.Replace(s, `"roles"`, `"displayNameClaim": "a b", "roles"`, 1)
 		},
 		"skew-too-large": func(s string) string {
 			return strings.Replace(s, `"roles"`, `"clockSkewSeconds": 301, "roles"`, 1)

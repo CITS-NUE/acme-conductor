@@ -20,7 +20,7 @@
   // carry no referrer, so the Conductor's URL never reaches the guide.
   const GUIDE = 'https://cits-nue.github.io/acme-conductor/';
 
-  const state = { config: null, token: null, bindings: null };
+  const state = { config: null, token: null, bindings: null, people: new Map() };
 
   // Display strings live in i18n.js. Only what the page shows is translated:
   // API values, error codes and status values keep their raw form.
@@ -123,9 +123,15 @@
     return el('thead', null, el('tr', null, ...headers.map((h) => el('th', { text: h }))));
   }
 
+  // scroller wraps a table so that a table wider than the page scrolls
+  // inside its own box instead of widening the whole page.
+  function scroller(tbl) {
+    return el('div', { class: 'table-scroll' }, tbl);
+  }
+
   function table(headers, rows) {
     if (rows.length === 0) return el('p', { class: 'empty', text: tr('common.empty') });
-    return el('table', null, tableHead(headers), el('tbody', null, ...rows.map(rowOf)));
+    return scroller(el('table', null, tableHead(headers), el('tbody', null, ...rows.map(rowOf))));
   }
 
   // ---- list filter ----------------------------------------------------------
@@ -200,7 +206,7 @@
     return el('div', { class: 'list' },
       el('div', { class: 'toolbar' }, ...(controls || []), box, count, limit ? el('span', { class: 'aside', text: tr('filter.loadedOnly', { n: limit }) }) : null),
       empty,
-      tbl,
+      scroller(tbl),
     );
   }
 
@@ -269,6 +275,41 @@
       // the filter.
       policyOfTarget: (id) => (tById.has(id) ? (pById.has(tById.get(id).policyRef) ? policyLabel(pById.get(tById.get(id).policyRef)) : tById.get(id).policyRef) : ''),
     };
+  }
+
+  // ---- principals -------------------------------------------------------------
+  //
+  // Audit events and runs name a principal by its stable identifier (an
+  // Entra ID oid, say) within its authority. The Conductor also keeps the
+  // display name the identity provider last asserted for each principal;
+  // who() shows that in place of the identifier, which stays in the
+  // tooltip. A principal with no display name (localhost-dev, the
+  // scheduler, someone not seen since) is shown by its identifier.
+
+  async function loadPrincipals() {
+    try {
+      const res = await api('GET', '/principals');
+      state.people = new Map(res.items.map((p) => [p.authority + '\n' + p.name, p.displayName]));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) throw err;
+      // A label only: the page still works with identifiers.
+    }
+  }
+
+  function displayName(name, authority) {
+    return state.people.get((authority || '') + '\n' + name) || '';
+  }
+
+  function who(name, authority) {
+    if (!name) return '—';
+    const label = displayName(name, authority);
+    const id = authority ? name + ' @ ' + authority : name;
+    return label ? el('span', { title: id, text: label }) : el('span', { class: 'mono', title: id, text: name });
+  }
+
+  // whoText is who() as plain text, for sentences.
+  function whoText(name, authority) {
+    return name ? displayName(name, authority) || name : '—';
   }
 
   async function policyList() {
@@ -346,7 +387,7 @@
 
   function storeToken(access) {
     const claims = decodeClaims(access);
-    const t = { access, exp: claims.exp, name: claims.preferred_username || claims.email || claims.sub || tr('session.user') };
+    const t = { access, exp: claims.exp, name: claims.name || claims.preferred_username || claims.email || claims.sub || tr('session.user') };
     sessionStorage.setItem(TOKEN_KEY, JSON.stringify(t));
     return t;
   }
@@ -530,7 +571,7 @@
     show(
       el('h1', null, el('span', { class: 'mono', text: t.fqdn }), ' ', targetBadge(t)),
       status,
-      t.retired ? notice('', tr('retired.banner', { at: when(t.retiredAt), by: t.retiredBy || '—' })) : nextStep(t, account),
+      t.retired ? notice('', tr('retired.banner', { at: when(t.retiredAt), by: whoText(t.retiredBy, t.retiredByAuthority) })) : nextStep(t, account),
       t.retired ? '' : el('div', { class: 'toolbar' },
         act(tr('target.runNow'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/runs', 'primary', { revision: t.revision }),
         t.enabled ? act(tr('target.disable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : act(tr('target.enable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable'),
@@ -547,7 +588,7 @@
         [tr('target.createdUpdated'), when(t.createdAt) + ' / ' + when(t.updatedAt)],
         [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
         [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
-      ].concat(t.retired ? [[tr('target.retired'), when(t.retiredAt) + ' / ' + (t.retiredBy || '—')]] : [])),
+      ].concat(t.retired ? [[tr('target.retired'), el('span', null, when(t.retiredAt) + ' / ', who(t.retiredBy, t.retiredByAuthority))]] : [])),
       consumersSection(t, consumers),
       t.retired ? '' : delegationSection(t),
       account ? account.node : '',
@@ -571,7 +612,7 @@
       body.append(c.items.length
         ? table([tr('consumers.service'), tr('consumers.contact'), tr('consumers.note')], c.items.map((e) => [e.service, e.contact, e.note || '—']))
         : el('p', { class: 'aside', text: tr('consumers.none') }));
-      if (c.updatedAt) body.append(el('p', { class: 'aside', text: tr('consumers.updated', { t: when(c.updatedAt), by: c.updatedBy || '—' }) }));
+      if (c.updatedAt) body.append(el('p', { class: 'aside', text: tr('consumers.updated', { t: when(c.updatedAt), by: whoText(c.updatedBy, c.updatedByAuthority) }) }));
       if (!t.retired) body.append(el('div', { class: 'toolbar' }, el('button', { onclick: edit }, tr('common.edit'))));
     };
     const edit = () => {
@@ -926,14 +967,14 @@
       const cells = [
         td(link('#/runs/' + encodeURIComponent(r.id), r.id), 'mono'),
         statusBadge(r.status),
-        when(r.requestedAt),
-        when(r.finishedAt),
+        td(when(r.requestedAt), 'nowrap'),
+        td(when(r.finishedAt), 'nowrap'),
         r.action || '—',
         r.error ? errorCell(r.error) : '—',
-        r.requestedBy,
+        who(r.requestedBy, r.requestedByAuthority),
       ];
       if (withTarget) cells.splice(1, 0, td(link('#/targets/' + encodeURIComponent(r.targetId), dir.target(r.targetId)), 'mono'));
-      return { cells, extra: [r.id, r.targetId, dir.target(r.targetId), dir.policyOfTarget(r.targetId), r.status, r.error ? r.error.code : '', r.requestedByAuthority || '', r.externalExecutionId || ''] };
+      return { cells, extra: [r.id, r.targetId, dir.target(r.targetId), dir.policyOfTarget(r.targetId), r.status, r.error ? r.error.code : '', r.requestedBy, r.requestedByAuthority || '', r.externalExecutionId || ''] };
     });
     return { headers, entries };
   }
@@ -986,7 +1027,7 @@
       props([
         [tr('run.target'), link('#/targets/' + encodeURIComponent(r.targetId), dir.target(r.targetId), 'mono')],
         [tr('run.revision'), String(r.targetRevision)],
-        [tr('run.requestedBy'), el('span', null, el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
+        [tr('run.requestedBy'), el('span', null, displayName(r.requestedBy, r.requestedByAuthority) ? displayName(r.requestedBy, r.requestedByAuthority) + ' — ' : '', el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
         [tr('run.times'), when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
         [tr('run.action'), r.action],
         [tr('run.expires'), r.expiresAt ? when(r.expiresAt) : undefined],
@@ -1007,16 +1048,16 @@
     const [res, dir] = await Promise.all([api('GET', '/audit?limit=' + AUDIT_LIMIT), directory()]);
     const entries = res.items.map((e) => ({
       cells: [
-        when(e.time),
-        td(e.actor, 'mono'),
-        e.actorAuthority ? td(e.actorAuthority, 'mono') : '—',
+        td(when(e.time), 'nowrap'),
+        who(e.actor, e.actorAuthority),
+        e.actorAuthority ? td(e.actorAuthority, 'mono authority') : '—',
         td(e.action, 'mono'),
         e.targetId ? td(link('#/targets/' + encodeURIComponent(e.targetId), dir.target(e.targetId)), 'mono') : '—',
         e.runId ? td(link('#/runs/' + encodeURIComponent(e.runId), e.runId), 'mono') : '—',
         e.policyId ? link('#/policies/' + encodeURIComponent(e.policyId), dir.policy(e.policyId)) : '—',
-        e.detail,
+        td(e.detail, 'detail'),
       ],
-      extra: [e.id, e.time, e.targetId || '', e.policyId || '', e.targetId ? dir.policyOfTarget(e.targetId) : ''],
+      extra: [e.id, e.time, e.actor, e.targetId || '', e.policyId || '', e.targetId ? dir.policyOfTarget(e.targetId) : ''],
     }));
     show(
       el('h1', { text: tr('audit.title') }),
@@ -1109,7 +1150,7 @@
         [tr('eab.pending'), acct.pending ? tr('eab.pendingText', { gen: acct.pending.generation, status: acct.pending.status, attached: acct.pending.runId ? tr('eab.attached', { run: acct.pending.runId }) : '' }) : '—'],
       ]),
       table([tr('th.generation'), tr('th.status'), tr('th.keyId'), tr('th.requestedBy'), tr('th.created'), tr('th.activated')],
-        acct.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), g.requestedBy, when(g.createdAt), when(g.activatedAt)])),
+        acct.generations.map((g) => [g.generation, statusBadge(g.status), td(g.keyId, 'mono'), who(g.requestedBy, g.requestedByAuthority), when(g.createdAt), when(g.activatedAt)])),
     ];
     if (acct.pending && !acct.pending.runId) {
       parts.push(el('div', { class: 'actions' }, el('button', {
@@ -1239,7 +1280,10 @@
     for (const [re, fn] of routes) {
       const m = re.exec(hash);
       if (m) {
-        withErrors(() => fn(m));
+        withErrors(async () => {
+          await loadPrincipals();
+          await fn(m);
+        });
         return;
       }
     }

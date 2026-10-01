@@ -96,7 +96,13 @@ const (
 // other providers are configured explicitly.
 const (
 	DefaultOIDCPrincipalClaim = "sub"
-	DefaultOIDCRolesClaim     = "roles"
+	// DefaultOIDCDisplayNameClaim is read as the caller's display name,
+	// which the GUI shows in place of the principal; it is never recorded
+	// as an identity.
+	DefaultOIDCDisplayNameClaim = "name"
+	// NoOIDCDisplayNameClaim as displayNameClaim reads no display name.
+	NoOIDCDisplayNameClaim = "-"
+	DefaultOIDCRolesClaim  = "roles"
 )
 
 // Execution binding types.
@@ -398,6 +404,11 @@ type OIDC struct {
 	// and the requestedBy of runs (default sub; oid for Entra ID). It
 	// identifies the subject; it is not a display name.
 	PrincipalClaim string `json:"principalClaim,omitempty"`
+	// DisplayNameClaim names the claim the GUI shows in place of the
+	// principal (default name). It is a label only: the Conductor keeps
+	// the value last asserted for each principal and never records it as
+	// the actor. "-" reads none.
+	DisplayNameClaim string `json:"displayNameClaim,omitempty"`
 	// RolesClaim names the claim (a string or an array of strings) whose
 	// values are matched against Roles (default roles).
 	RolesClaim string `json:"rolesClaim,omitempty"`
@@ -683,7 +694,14 @@ func (o *OIDC) validate() error {
 	if o.RolesClaim == "" {
 		o.RolesClaim = DefaultOIDCRolesClaim
 	}
-	for name, v := range map[string]string{"principalClaim": o.PrincipalClaim, "rolesClaim": o.RolesClaim} {
+	if o.DisplayNameClaim == "" {
+		o.DisplayNameClaim = DefaultOIDCDisplayNameClaim
+	}
+	claims := map[string]string{"principalClaim": o.PrincipalClaim, "rolesClaim": o.RolesClaim}
+	if o.DisplayNameClaim != NoOIDCDisplayNameClaim {
+		claims["displayNameClaim"] = o.DisplayNameClaim
+	}
+	for name, v := range claims {
 		if !claimNameRe.MatchString(v) {
 			return invalid("server.auth.oidc.%s must match %s", name, claimNameRe)
 		}
