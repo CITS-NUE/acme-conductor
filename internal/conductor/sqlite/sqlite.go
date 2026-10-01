@@ -290,6 +290,29 @@ CREATE TRIGGER targets_retired_is_final BEFORE UPDATE ON targets WHEN OLD.retire
 ALTER TABLE policies ADD COLUMN name TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX policies_name ON policies(name COLLATE NOCASE) WHERE name <> '';
 `,
+	// 8: consumer ledger of a target (issue #74): who uses its certificate,
+	// as free text for people (items is a JSON list). A row exists once the
+	// ledger was first written; version is its own optimistic-locking
+	// counter, independent of targets.revision. A retired target's ledger
+	// cannot change any more, as the rest of the target (trigger).
+	`
+CREATE TABLE target_consumers (
+  target_id            TEXT    NOT NULL PRIMARY KEY REFERENCES targets(id),
+  version              INTEGER NOT NULL CHECK (version >= 1),
+  items                TEXT    NOT NULL,
+  updated_at           TEXT    NOT NULL,
+  updated_by           TEXT    NOT NULL,
+  updated_by_authority TEXT    NOT NULL
+);
+CREATE TRIGGER target_consumers_no_delete BEFORE DELETE ON target_consumers
+  BEGIN SELECT RAISE(ABORT, 'target_consumers cannot be deleted'); END;
+CREATE TRIGGER target_consumers_retired_insert BEFORE INSERT ON target_consumers
+  WHEN (SELECT retired_at FROM targets WHERE id = NEW.target_id) IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'a retired target cannot be changed'); END;
+CREATE TRIGGER target_consumers_retired_update BEFORE UPDATE ON target_consumers
+  WHEN (SELECT retired_at FROM targets WHERE id = NEW.target_id) IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'a retired target cannot be changed'); END;
+`,
 }
 
 // foreignKeysOffMigrations are the migrations that rebuild a table other
@@ -911,6 +934,97 @@ func (d *DB) UpdateTarget(ctx context.Context, t *registry.Target, expectedRevis
 			return err
 		}
 		t.Revision = expectedRevision + 1
+		return insertAudit(ctx, tx, ev)
+	})
+}
+
+// consumerJSON is the stored form of one ledger entry.
+type consumerJSON struct {
+	Service string `json:"service"`
+	Contact string `json:"contact"`
+	Note    string `json:"note,omitempty"`
+}
+
+// GetTargetConsumers implements registry.Registry.
+func (d *DB) GetTargetConsumers(ctx context.Context, id string) (*registry.Consumers, error) {
+	var retired sql.NullString
+	if err := d.db.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, id).Scan(&retired); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: target %s", registry.ErrNotFound, id)
+		}
+		return nil, fmt.Errorf("get target consumers: %w", err)
+	}
+	c := &registry.Consumers{TargetID: id, Items: []registry.Consumer{}}
+	var items, updated string
+	err := d.db.QueryRowContext(ctx, `SELECT version, items, updated_at, updated_by, updated_by_authority FROM target_consumers WHERE target_id = ?`, id).
+		Scan(&c.Version, &items, &updated, &c.UpdatedBy, &c.UpdatedByAuthority)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get target consumers: %w", err)
+	}
+	var stored []consumerJSON
+	if err := json.Unmarshal([]byte(items), &stored); err != nil {
+		return nil, fmt.Errorf("corrupt consumer ledger of target %s: %w", id, err)
+	}
+	for _, e := range stored {
+		c.Items = append(c.Items, registry.Consumer{Service: e.Service, Contact: e.Contact, Note: e.Note})
+	}
+	t, err := parseTime(updated)
+	if err != nil {
+		return nil, err
+	}
+	c.UpdatedAt = &t
+	return c, nil
+}
+
+// SetTargetConsumers implements registry.Registry. The target's row and
+// revision are not touched.
+func (d *DB) SetTargetConsumers(ctx context.Context, c *registry.Consumers, expectedVersion int64, ev *registry.AuditEvent) error {
+	stored := make([]consumerJSON, 0, len(c.Items))
+	for _, e := range c.Items {
+		stored = append(stored, consumerJSON{Service: e.Service, Contact: e.Contact, Note: e.Note})
+	}
+	items, err := json.Marshal(stored)
+	if err != nil {
+		return fmt.Errorf("encode consumer ledger: %w", err)
+	}
+	now := time.Now().UTC()
+	if ev != nil {
+		ev.TargetID = c.TargetID
+	}
+	return d.tx(ctx, func(tx *sql.Tx) error {
+		var retired sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, c.TargetID).Scan(&retired); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: target %s", registry.ErrNotFound, c.TargetID)
+			}
+			return fmt.Errorf("set target consumers: %w", err)
+		}
+		if retired.Valid {
+			return fmt.Errorf("%w: target %s", registry.ErrRetired, c.TargetID)
+		}
+		var current int64
+		err := tx.QueryRowContext(ctx, `SELECT version FROM target_consumers WHERE target_id = ?`, c.TargetID).Scan(&current)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("set target consumers: %w", err)
+		}
+		if current != expectedVersion {
+			return fmt.Errorf("%w: target %s consumers are at version %d, not %d", registry.ErrStaleConsumers, c.TargetID, current, expectedVersion)
+		}
+		if current == 0 {
+			_, err = tx.ExecContext(ctx, `INSERT INTO target_consumers (target_id, version, items, updated_at, updated_by, updated_by_authority) VALUES (?, 1, ?, ?, ?, ?)`,
+				c.TargetID, string(items), fmtTime(now), c.UpdatedBy, c.UpdatedByAuthority)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE target_consumers SET version = version + 1, items = ?, updated_at = ?, updated_by = ?, updated_by_authority = ? WHERE target_id = ? AND version = ?`,
+				string(items), fmtTime(now), c.UpdatedBy, c.UpdatedByAuthority, c.TargetID, current)
+		}
+		if err != nil {
+			return fmt.Errorf("set target consumers: %w", err)
+		}
+		c.Version = current + 1
+		c.UpdatedAt = &now
 		return insertAudit(ctx, tx, ev)
 	})
 }

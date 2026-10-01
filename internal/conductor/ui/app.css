@@ -143,3 +143,4 @@ dl.props dd { margin: 0; }
   .topbar { flex-wrap: wrap; gap: 12px; }
   .session { margin-left: 0; }
 }
+.consumers-edit input { width: 100%; box-sizing: border-box; }

@@ -413,6 +413,8 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `POST /api/v1alpha1/targets/{id}/disable` | `enabled: false` に設定 → `200` Target．何も削除せず，実行中の run も止めない． |
 | `POST /api/v1alpha1/targets/{id}/retire` | target を退役させる（admin のみ．[退役](#target-の退役)）→ `200` Target（`retired: true`）．本文なし．無効化されていなければ `409` `target_enabled`，run が queued/starting/running なら `409` `run_active`，すでに退役済みなら `409` `target_retired`． |
 | `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | その target の run，新しい順． |
+| `GET /api/v1alpha1/targets/{id}/consumers` | target の利用側の台帳（[利用側の台帳](#利用側の台帳)）．退役済みの target でも読める． |
+| `PUT /api/v1alpha1/targets/{id}/consumers` | 台帳を丸ごと置き換える（admin のみ）→ `200`．本文 `{"version": N, "items": [...]}`．`version` が最新でなければ `409` `stale_version`，退役済みなら `409` `target_retired`．target の `revision` は変えない． |
 | `GET /api/v1alpha1/targets/{id}/dns-delegation[?refresh=true]` | 各名前の `_acme-challenge` の委任の状態（[DNS の委任の確認](#dns-の委任の確認)）．公開 DNS を引くだけなので viewer も呼べる．`refresh=true` は Conductor のキャッシュ（5 分）を使わない． |
 | `POST /api/v1alpha1/targets/{id}/runs` | 今すぐ run を要求 → `202` Run，`Location`．本文 `{"revision": N}` は省略可． |
 | `GET /api/v1alpha1/runs[?targetId=&status=&limit=&before=]` | run の一覧，新しい順．`status` はコンマ区切りの一覧． |
@@ -691,6 +693,44 @@ Conductor を再起動した場合も，これで次の tick に収束する．�
 
 すべての遷移は，同じトランザクションで監査イベント（後述）を書く．
 
+### 利用側の台帳
+
+target ごとに，その証明書を使っているサービスと連絡先を記録する台帳を持つ
+（[#74](https://github.com/CITS-NUE/acme-conductor/issues/74)）．証明書を変えるときや
+退役させるとき（[退役](#target-の退役)）に，誰に知らせ，どの権限を外すかを
+残すためのものである．
+
+```json
+{
+  "targetId": "01JABCDEFGHJKMNPQRSTVWXYZ1",
+  "version": 3,
+  "items": [
+    {"service": "Application Gateway agw-web-prod（学外向け）", "contact": "情報基盤課 ネットワーク係 net-admin@example.ac.jp", "note": "2026-10-01 から参照"},
+    {"service": "オンプレ web01（学内向け）", "contact": "○○研究室 山田 内線 1234", "note": "SP sp-onprem-web で毎週取得"}
+  ],
+  "updatedAt": "2026-10-01T02:15:00Z",
+  "updatedBy": "3f2a…",
+  "updatedByAuthority": "https://login.microsoftonline.com/…/v2.0"
+}
+```
+
+- `service` と `contact` は必須，`note` は任意．どれも前後の空白を除いた 1 行の
+  印字可能な UTF-8 で，`service` と `contact` は 256 バイトまで，`note` は
+  512 バイトまで．1 つの target に 20 件まで．
+- 人が読むための自由記述であり，Conductor も Runner も解釈しない．`JobSpec` にも
+  載らない．プリンシパルやリソースの ID の欄はなく，台帳から何かの権限が付く
+  こともない（[アーキテクチャの非目標](architecture.md#非目標)）．
+- `version` は台帳専用の楽観ロックの番号で，最初の書き込みの前は `0` である．
+  台帳の編集は target の `revision` を変えない．`revision` が上がると待機中の
+  run が開始されずにキャンセルされる（[Run のライフサイクル](#run-のライフサイクルとスケジューリング)）
+  ので，それを避けるためである．
+- 変更は監査イベント `target.consumers_updated` に残る．`detail` は件数と
+  版だけ（例: `consumers updated: 0 -> 2 entries (version 1)`）で，名前や連絡先は
+  追記専用の監査ログに複製しない．
+- 閲覧は viewer にも許す（`owner` と同じ扱い）．編集は admin だけである．
+- 退役済みの target の台帳は，target の他の部分と同じく変更できない
+  （レジストリとスキーマのトリガが拒否する）．
+
 ### DNS の委任の確認
 
 `GET /targets/{id}/dns-delegation` は，target の各名前（`fqdn` と
@@ -803,7 +843,7 @@ Conductor がこれを保存するようになる前に記録されたイベン�
 
 アクション: `policy.created`，`policy.updated`，`policy.rejected`，
 `target.created`，`target.updated`，`target.enabled`，`target.disabled`，
-`target.retired`，
+`target.retired`，`target.consumers_updated`（件数だけ．[利用側の台帳](#利用側の台帳)），
 `run.requested`，`run.started`，`run.succeeded`，`run.failed`，`run.cancelled`，
 `acme_account.provisioning_requested`，
 `acme_account.provisioning_attached`，`acme_account.activated`，
@@ -1059,7 +1099,11 @@ code verifier とともに `token_endpoint` で交換し，アクセストーク
 と `Referrer-Policy: no-referrer` を付けて配信される．`localhost-dev` モードでは，
 ループバック上の同一オリジンの呼び出し元であるため，同じページがサインインなしで動く．
 
-target の詳細ページには「DNS の委任（_acme-challenge）」の節があり，各名前の
+target の詳細ページには「利用側」の節があり，[利用側の台帳](#利用側の台帳)を
+表示し，編集できる（行の追加と削除）．退役の確認欄にもこの台帳を並べ，利用側の
+参照先の変更と読み取り権限の削除を保存先の管理者に依頼するよう促す．
+
+target の詳細ページには「DNS の委任（_acme-challenge）」の節もあり，各名前の
 委任の状態（[DNS の委任の確認](#dns-の委任の確認)）と，欠けているまたは誤って
 いる名前について DNS の担当者に依頼するレコード
 （`_acme-challenge.<名前>.  IN CNAME  <名前>.<チャレンジ用ゾーン>.`）を示す．
