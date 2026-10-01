@@ -75,7 +75,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -109,7 +109,7 @@ jobs:
       # definition. Both live in the registry next to the image index.
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.${{ matrix.component }}
@@ -128,7 +128,7 @@ jobs:
       # registry under the image digest and verifiable with `gh
       # attestation verify`.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
