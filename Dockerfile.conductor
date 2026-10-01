@@ -14,7 +14,13 @@
 # Base images are pinned by digest: the tag says what the
 # digest is expected to be, the digest is what is built from. Dependabot
 # (.github/dependabot.yml) proposes updates to both together.
-FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS builder
+FROM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
+
+# Build with the Go of the pinned image, never a toolchain the go.mod
+# toolchain line would otherwise make the go command download: the digest
+# above is what decides the compiler. go version records it in the log.
+ENV GOTOOLCHAIN=local
+RUN go version
 
 WORKDIR /src
 
@@ -51,8 +57,6 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.source="https://github.com/CITS-NUE/acme-conductor" \
-      org.opencontainers.image.url="https://github.com/CITS-NUE/acme-conductor" \
-      org.opencontainers.image.documentation="https://cits-nue.github.io/acme-conductor/" \
       org.opencontainers.image.title="acme-conductor" \
       org.opencontainers.image.description="ACME Conductor control plane (target registry, policy, audit, run scheduling)." \
       org.opencontainers.image.version="${VERSION}" \
