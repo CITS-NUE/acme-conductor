@@ -13,6 +13,9 @@
 // claim, which should be a stable identifier of the subject (sub, or oid
 // for Entra ID), not a display name, qualified by the issuer as its
 // authority: a subject is unique only within the issuer that asserted it.
+// A second configured claim (name by default) supplies a display name the
+// GUI shows in place of the identifier; it is optional and never decides
+// who the caller is.
 //
 // Verification is deliberately narrow: RS256, PS256 and ES256 only (no
 // "none", no HMAC), one issuer, one audience, key ids required, a key
@@ -37,6 +40,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/api"
+	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
 )
 
 // MaxPrincipalLength bounds the principal name taken from a token.
@@ -51,11 +55,14 @@ type Config struct {
 	Issuer         string
 	Audience       string
 	PrincipalClaim string
-	RolesClaim     string
-	AdminValues    []string
-	ViewerValues   []string
-	ClockSkew      time.Duration
-	KeyCache       time.Duration
+	// DisplayNameClaim names the claim read as the caller's display name;
+	// empty reads none.
+	DisplayNameClaim string
+	RolesClaim       string
+	AdminValues      []string
+	ViewerValues     []string
+	ClockSkew        time.Duration
+	KeyCache         time.Duration
 }
 
 // Options are the injectable dependencies.
@@ -131,7 +138,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (api.Principal, error) {
 	if !ok {
 		return api.Principal{}, fmt.Errorf("%w: the token carries no role this API grants", api.ErrForbidden)
 	}
-	return api.Principal{Name: name, Authority: a.cfg.Issuer, Role: role}, nil
+	return api.Principal{Name: name, Authority: a.cfg.Issuer, Role: role, DisplayName: a.displayName(claims)}, nil
 }
 
 // bearerToken extracts the token of an "Authorization: Bearer" header.
@@ -236,6 +243,25 @@ func (a *Authenticator) principal(claims map[string]any) (string, error) {
 		}
 	}
 	return v, nil
+}
+
+// displayName reads the configured display name claim. It is a label
+// only, so a missing or unusable value is no display name rather than a
+// refusal.
+func (a *Authenticator) displayName(claims map[string]any) string {
+	if a.cfg.DisplayNameClaim == "" {
+		return ""
+	}
+	v, ok := claims[a.cfg.DisplayNameClaim].(string)
+	if !ok || v == "" || len(v) > registry.MaxPrincipalDisplayNameLength || !utf8.ValidString(v) || strings.TrimSpace(v) != v {
+		return ""
+	}
+	for _, r := range v {
+		if r == unicode.ReplacementChar || !unicode.IsPrint(r) {
+			return ""
+		}
+	}
+	return v
 }
 
 // role maps the configured roles claim to an API role: admin wins over

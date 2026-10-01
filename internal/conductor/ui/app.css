@@ -56,7 +56,7 @@ a:hover { text-decoration: underline; }
   color: var(--fg);
 }
 .session { margin-left: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); }
-main { flex: 1; padding: 16px; max-width: 1200px; width: 100%; margin: 0 auto; }
+main { flex: 1; padding: 16px; max-width: 1200px; width: 100%; min-width: 0; margin: 0 auto; }
 .foot {
   display: flex;
   justify-content: space-between;
@@ -71,6 +71,12 @@ h2 { font-size: 16px; margin: 20px 0 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 .toolbar .spacer { flex: 1; }
 table { border-collapse: collapse; width: 100%; }
+/* A wide table scrolls inside this box; the page itself never scrolls
+   sideways, so the header and footer stay the width of the window. */
+.table-scroll { overflow-x: auto; max-width: 100%; }
+td.nowrap { white-space: nowrap; }
+td.detail { min-width: 320px; overflow-wrap: anywhere; }
+td.authority { min-width: 160px; max-width: 220px; overflow-wrap: anywhere; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
 td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }

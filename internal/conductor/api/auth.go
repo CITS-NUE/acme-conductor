@@ -19,11 +19,14 @@ import (
 // requestedBy and requestedByAuthority of runs, so that a record stays
 // unambiguous when the deployment's identity provider changes: a
 // subject is unique only within its authority. Role decides what the
-// caller may do.
+// caller may do. DisplayName, when the authenticator has one, is the
+// human-readable name the provider asserted for the caller; it is shown
+// in the GUI in place of Name but never recorded as an identity.
 type Principal struct {
-	Name      string
-	Authority string
-	Role      Role
+	Name        string
+	Authority   string
+	Role        Role
+	DisplayName string
 }
 
 // Role is what a principal may do. There are two: an admin may call

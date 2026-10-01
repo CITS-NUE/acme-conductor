@@ -128,6 +128,7 @@ Runner の `jobSigning.publicKeys` に貼り付けるために出力される．
 | `clientId` | string | — | GUI がサインインに使う公開クライアント（Entra ID: リダイレクト URI `https://<host>/ui/` を持つシングルページアプリケーションの登録）．これがないと GUI はサインインできない．API は他所で取得したトークンを引き続き受け付ける． |
 | `scopes` | []string | —（`clientId` がある場合は必須） | GUI がサインイン時に要求するもの．クライアントが要求するスコープとプロバイダが書き込む audience は別の識別子なので，`audience` からは導出しない．Entra ID: `openid`，`profile`，および `<application ID URI>/.default`（例: `api://<api-client-id>/.default`）．相異なる値 16 個以下．`clientId` がある場合のみ． |
 | `principalClaim` | string | `sub` | その値が監査のアクターおよび `requestedBy` として記録されるクレーム．表示名ではなくサブジェクトの **安定した識別子** であること（`preferred_username`，`email`，`name` はユーザーの改名で変わる）．Entra ID: `oid` を設定する（Entra ID の `sub` はクライアントごとに異なるペアワイズ値）．印字可能文字の文字列で 256 バイト以下でなければならない． |
+| `displayNameClaim` | string | `name` | GUI が操作者の欄などで識別子の代わりに表示する表示名のクレーム（[ADR 0028](adr/0028-principal-display-names.md)）．**ラベルにすぎない**: アクターとして記録されることはなく，値が無い・使えないトークンも拒否されない．Conductor はプリンシパルごとに最後に主張された値だけを `principal_names` に保持する．Entra ID: `name`（`profile` スコープが必要）．`-` で読まない． |
 | `rolesClaim` | string | `roles` | その値（文字列または文字列の配列）が `roles` と照合されるクレーム． |
 | `roles.admin` | []string | —（必須，空でない） | **admin** ロールを与える値: すべてのエンドポイント． |
 | `roles.viewer` | []string | — | **viewer** ロールを与える値: `GET` のみ．1 つの値はどちらか一方の一覧にしか現れてはならない．両方の値を持つトークンは admin．どちらの一覧も最大 32 個． |
@@ -421,6 +422,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `GET /api/v1alpha1/runs/{id}` | run 1 件． |
 | `POST /api/v1alpha1/runs/{id}/cancel` | キャンセル: 待機中の run は即座にキャンセルされる（`200`）．starting/running の run には停止が要求される（`202`．結果は Runner の報告時に記録される）． |
 | `GET /api/v1alpha1/audit[?targetId=&runId=&policyId=&limit=&before=]` | 監査イベント，新しい順． |
+| `GET /api/v1alpha1/principals` | プリンシパルの表示名の一覧 `{"items":[{"authority","name","displayName","updatedAt"}]}`（[ADR 0028](adr/0028-principal-display-names.md)）．認証されたリクエストのトークンが表示名を持てば，それが記録される．viewer も呼べる． |
 
 ページングする一覧（`runs`，`audit`）は `limit`（`1`–`1000`，既定 `100`）と
 `before=<id>`（その id より前にソートされる項目を返す．id は作成時刻順にソート

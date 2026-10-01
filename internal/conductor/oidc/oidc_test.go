@@ -377,7 +377,7 @@ func TestEntraV2TokenShape(t *testing.T) {
 	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 	auth, err := New(Config{
 		Issuer: is.URL(), Audience: apiClientID,
-		PrincipalClaim: "oid", RolesClaim: "roles",
+		PrincipalClaim: "oid", RolesClaim: "roles", DisplayNameClaim: "name",
 		AdminValues: []string{"ACME.Admin"}, ViewerValues: []string{"ACME.Viewer"},
 		ClockSkew: time.Minute, KeyCache: time.Hour,
 	}, &Options{HTTPClient: is.Srv.Client(), Now: func() time.Time { return now }})
@@ -403,7 +403,7 @@ func TestEntraV2TokenShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Entra v2 token: %v", err)
 	}
-	if p.Name != oid || p.Role != api.RoleAdmin {
+	if p.Name != oid || p.Role != api.RoleAdmin || p.DisplayName != "Alice Example" {
 		t.Fatalf("principal %+v", p)
 	}
 	// A v1-shaped token (aud is the application ID URI) is not for this
@@ -421,6 +421,19 @@ func TestEntraV2TokenShape(t *testing.T) {
 	delete(c, "oid")
 	if _, err := auth.Authenticate(req(is.Token(c))); err == nil || !strings.Contains(err.Error(), "oid") {
 		t.Fatalf("token without oid: %v", err)
+	}
+	// The display name is a label: a missing or unusable one is no
+	// display name, never a refusal, and never the principal.
+	for _, v := range []any{nil, "", " Alice", "Alice\nAdmin", 7, strings.Repeat("a", 257)} {
+		c = entra()
+		if v == nil {
+			delete(c, "name")
+		} else {
+			c["name"] = v
+		}
+		if p, err := auth.Authenticate(req(is.Token(c))); err != nil || p.Name != oid || p.DisplayName != "" {
+			t.Fatalf("name %q: %+v, %v", v, p, err)
+		}
 	}
 	// preferred_username is not consulted for the principal.
 	c = entra()
