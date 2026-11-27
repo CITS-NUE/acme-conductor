@@ -325,6 +325,13 @@ CREATE TABLE principal_names (
   PRIMARY KEY (authority, name)
 );
 `,
+	// 10: revocation runs (docs/adr/0029). Every earlier run is a
+	// reconcile; the reason and fingerprint are set on revoke runs only.
+	`
+ALTER TABLE runs ADD COLUMN operation TEXT NOT NULL DEFAULT 'reconcile' CHECK (operation IN ('reconcile', 'revoke'));
+ALTER TABLE runs ADD COLUMN revocation_reason INTEGER;
+ALTER TABLE runs ADD COLUMN revocation_fingerprint_sha256 TEXT NOT NULL DEFAULT '';
+`,
 }
 
 // foreignKeysOffMigrations are the migrations that rebuild a table other
@@ -1170,15 +1177,18 @@ func (d *DB) RetireTarget(ctx context.Context, id, by, authority string, ev *reg
 
 // ---- runs -------------------------------------------------------------
 
-const runCols = `id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at, started_at, finished_at, action, expires_at, fingerprint_sha256, store_object_ref, error_code, error_summary, external_execution_id`
+const runCols = `id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at, started_at, finished_at, action, expires_at, fingerprint_sha256, store_object_ref, error_code, error_summary, external_execution_id, operation, revocation_reason, revocation_fingerprint_sha256`
 
 func scanRun(sc interface{ Scan(...any) error }) (*registry.Run, error) {
 	var r registry.Run
-	var status, requested, action, code string
+	var status, requested, action, code, operation string
 	var started, finished, expires sql.NullString
-	if err := sc.Scan(&r.ID, &r.TargetID, &r.TargetRevision, &status, &r.RequestedBy, &r.RequestedByAuthority, &requested, &started, &finished, &action, &expires, &r.FingerprintSha256, &r.StoreObjectRef, &code, &r.ErrorSummary, &r.ExternalExecutionID); err != nil {
+	var reason sql.NullInt64
+	if err := sc.Scan(&r.ID, &r.TargetID, &r.TargetRevision, &status, &r.RequestedBy, &r.RequestedByAuthority, &requested, &started, &finished, &action, &expires, &r.FingerprintSha256, &r.StoreObjectRef, &code, &r.ErrorSummary, &r.ExternalExecutionID, &operation, &reason, &r.RevocationFingerprint); err != nil {
 		return nil, err
 	}
+	r.Operation = v1alpha1.Operation(operation)
+	r.RevocationReason = int(reason.Int64)
 	r.Status = registry.RunStatus(status)
 	r.Action = v1alpha1.ResultAction(action)
 	r.ErrorCode = v1alpha1.ErrorCode(code)
@@ -1207,6 +1217,13 @@ func (d *DB) CreateRun(ctx context.Context, r *registry.Run, ev *registry.AuditE
 		r.RequestedAt = time.Now().UTC()
 	}
 	r.Status = registry.RunQueued
+	if r.Operation == "" {
+		r.Operation = v1alpha1.OperationReconcile
+	}
+	var reason sql.NullInt64
+	if r.IsRevoke() {
+		reason = sql.NullInt64{Int64: int64(r.RevocationReason), Valid: true}
+	}
 	if ev != nil {
 		ev.RunID = r.ID
 		ev.TargetID = r.TargetID
@@ -1216,8 +1233,8 @@ func (d *DB) CreateRun(ctx context.Context, r *registry.Run, ev *registry.AuditE
 		if err := tx.QueryRowContext(ctx, `SELECT retired_at FROM targets WHERE id = ?`, r.TargetID).Scan(&retired); err == nil && retired.Valid {
 			return fmt.Errorf("%w: target %s", registry.ErrRetired, r.TargetID)
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			r.ID, r.TargetID, r.TargetRevision, string(r.Status), r.RequestedBy, r.RequestedByAuthority, fmtTime(r.RequestedAt))
+		_, err := tx.ExecContext(ctx, `INSERT INTO runs (id, target_id, target_revision, status, requested_by, requested_by_authority, requested_at, operation, revocation_reason, revocation_fingerprint_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, r.TargetID, r.TargetRevision, string(r.Status), r.RequestedBy, r.RequestedByAuthority, fmtTime(r.RequestedAt), string(r.Operation), reason, r.RevocationFingerprint)
 		if err != nil {
 			switch {
 			case isUnique(err):

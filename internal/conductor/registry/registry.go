@@ -169,6 +169,13 @@ type Run struct {
 	RequestedAt          time.Time
 	StartedAt            *time.Time
 	FinishedAt           *time.Time
+	// Operation is what the run asks the Runner to do: reconcile (every
+	// run before schema version 10) or revoke (docs/adr/0029).
+	Operation v1alpha1.Operation
+	// RevocationReason and RevocationFingerprint are set on a revoke run:
+	// the CRLReason and the certificate (the target's last one) to revoke.
+	RevocationReason      int
+	RevocationFingerprint string
 	// The following mirror the Result once one is known.
 	Action            v1alpha1.ResultAction
 	ExpiresAt         *time.Time
@@ -180,6 +187,9 @@ type Run struct {
 	// platform (a process id for the local launcher).
 	ExternalExecutionID string
 }
+
+// IsRevoke reports whether r is a revocation run.
+func (r *Run) IsRevoke() bool { return r.Operation == v1alpha1.OperationRevoke }
 
 // AuditAction names what an AuditEvent records.
 type AuditAction string

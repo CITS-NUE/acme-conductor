@@ -166,6 +166,7 @@ func (s *Server) routes() {
 	api("POST "+Prefix+"/targets/{id}/enable", s.handleSetTargetEnabled(true))
 	api("POST "+Prefix+"/targets/{id}/disable", s.handleSetTargetEnabled(false))
 	api("POST "+Prefix+"/targets/{id}/retire", s.handleRetireTarget)
+	api("POST "+Prefix+"/targets/{id}/revoke-certificate", s.handleRevokeCertificate)
 	api("GET "+Prefix+"/targets/{id}/runs", s.handleListTargetRuns)
 	api("GET "+Prefix+"/targets/{id}/dns-delegation", s.handleTargetDNSDelegation)
 	api("GET "+Prefix+"/targets/{id}/consumers", s.handleGetTargetConsumers)

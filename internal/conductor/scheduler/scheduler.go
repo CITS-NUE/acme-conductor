@@ -630,7 +630,12 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	case target.Retired():
 		cancelled("target was retired before the run started")
 		return
-	case !target.Enabled:
+	// A revocation is for a disabled target only (docs/adr/0029): one
+	// enabled in between would go on using the certificate.
+	case run.IsRevoke() && target.Enabled:
+		cancelled("target was enabled before the revocation started")
+		return
+	case !target.Enabled && !run.IsRevoke():
 		cancelled("target was disabled before the run started")
 		return
 	case target.Revision != run.TargetRevision:
@@ -642,7 +647,8 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		failed(v1alpha1.ErrorCodeInternal, "target policy could not be loaded")
 		return
 	}
-	if !policy.Enabled {
+	// A disabled policy stops issuing, not revoking.
+	if !policy.Enabled && !run.IsRevoke() {
 		cancelled("policy was disabled before the run started")
 		return
 	}
@@ -679,7 +685,9 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 	}
 	var acct *registry.ACMEAccount
 	var sealedJSON string
-	if _, ok := s.eabBindings[policy.ACMEBinding]; ok {
+	// A revocation never registers an account: it uses the one that holds
+	// the certificate, so a pending provisioning is left for a later run.
+	if _, ok := s.eabBindings[policy.ACMEBinding]; ok && !run.IsRevoke() {
 		acct, sealedJSON, err = s.reg.ClaimACMEAccountProvisioning(ctx, policy.ACMEBinding, scope, run.ID)
 		if err != nil {
 			failed(v1alpha1.ErrorCodeInternal, "acme account provisioning could not be claimed")
@@ -710,6 +718,9 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		switch {
 		case active > 0:
 			account = &v1alpha1.ACMEAccountRef{Scope: scope, Generation: active}
+		case scope != "" && run.IsRevoke():
+			failed(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q keeps one account per target and this target has none to revoke with: request the revocation from the CA by other means", policy.ACMEBinding))
+			return
 		case scope != "":
 			failed(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q keeps one account per target and this target has none yet: provision one with an EAB", policy.ACMEBinding))
 			return
@@ -737,7 +748,8 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		cancelled("run was cancelled before the runner started")
 		return
 	}
-	if s.dnsCheck != nil {
+	// A revocation involves no challenge.
+	if s.dnsCheck != nil && !run.IsRevoke() {
 		go s.warnDelegation(log, target)
 	}
 	exec, err := l.Start(runCtx, spec)
@@ -969,6 +981,13 @@ func BuildJobSpec(run *registry.Run, t *registry.Target, p *registry.Policy, acc
 		ACME:  v1alpha1.ACMERef{Binding: p.ACMEBinding, Account: account},
 		DNS:   v1alpha1.DNSRef{Binding: t.DNSBinding},
 		Store: v1alpha1.StoreRef{Binding: t.StoreBinding},
+	}
+	// A reconcile carries no operation, so a Runner that predates
+	// revocation keeps accepting it; one that predates it rejects a
+	// revocation instead of reading it as an issuance.
+	if run.IsRevoke() {
+		spec.Operation = v1alpha1.OperationRevoke
+		spec.Revocation = &v1alpha1.RevocationSpec{Reason: run.RevocationReason, FingerprintSha256: run.RevocationFingerprint}
 	}
 	// A single-name job carries neither field, so a Runner that predates
 	// multi-name certificates keeps accepting it.
