@@ -302,6 +302,11 @@ type ACMEBinding struct {
 	// AllowProductionCA must be set explicitly to use a directory that is
 	// not recognized as staging/test/local (see IsNonProductionDirectory).
 	AllowProductionCA bool `json:"allowProductionCA,omitempty"`
+	// AllowRevocation must be set explicitly for this Runner to carry out a
+	// revocation job (operation "revoke") through this binding: revoking is
+	// irreversible at the CA, so a Conductor alone can never cause it
+	// (docs/adr/0029).
+	AllowRevocation bool `json:"allowRevocation,omitempty"`
 }
 
 // EAB names the environment variables that carry the EAB key ID and HMAC.

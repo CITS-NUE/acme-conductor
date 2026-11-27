@@ -93,7 +93,7 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, mon
 td .hint, dd .hint { color: var(--muted); font-size: 12px; }
 .status { display: inline-block; white-space: nowrap; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
 .status.succeeded, .status.enabled { color: var(--ok); border-color: var(--ok); }
-.status.failed, .status.disabled { color: var(--bad); border-color: var(--bad); }
+.status.failed, .status.disabled, .status.revoked { color: var(--bad); border-color: var(--bad); }
 .status.running, .status.starting, .status.queued { color: var(--warn); border-color: var(--warn); }
 .status.cancelled, .status.target-retired { color: var(--muted); }
 .status.dns-ok, .status.dns-present { color: var(--ok); border-color: var(--ok); }

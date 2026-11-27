@@ -133,13 +133,21 @@ func Build(p Params) (*Invocation, error) {
 		inv.Env = append(inv.Env, name+"="+v)
 		inv.secrets = append(inv.secrets, v)
 	}
-	// EAB material travels through lego's own environment variables, never
-	// through argv, so it is not visible in a process listing. Exactly one
-	// of three things happens: an explicit override (a decrypted
-	// provisioning payload) wins outright; DisableEAB suppresses the
-	// binding's own EAB even if it configures one (a generation-scoped
-	// account reusing an already-registered account); otherwise the
-	// binding's env-named EAB, if any, is used as before.
+	if err := inv.addEAB(p); err != nil {
+		return nil, err
+	}
+	inv.Argv = append(inv.Argv, "run")
+	return inv, nil
+}
+
+// addEAB wires the External Account Binding into inv. EAB material travels
+// through lego's own environment variables, never through argv, so it is
+// not visible in a process listing. Exactly one of three things happens: an
+// explicit override (a decrypted provisioning payload) wins outright;
+// DisableEAB suppresses the binding's own EAB even if it configures one (a
+// generation-scoped account reusing an already-registered account);
+// otherwise the binding's env-named EAB, if any, is used as before.
+func (inv *Invocation) addEAB(p Params) error {
 	switch {
 	case p.EAB != nil:
 		inv.Argv = append(inv.Argv, "--eab")
@@ -151,13 +159,54 @@ func Build(p Params) (*Invocation, error) {
 		kid, ok1 := p.LookupEnv(p.ACME.EAB.KIDEnv)
 		hmac, ok2 := p.LookupEnv(p.ACME.EAB.HMACEnv)
 		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("%w: EAB credentials", ErrMissingEnv)
+			return fmt.Errorf("%w: EAB credentials", ErrMissingEnv)
 		}
 		inv.Argv = append(inv.Argv, "--eab")
 		inv.Env = append(inv.Env, "LEGO_EAB_KID="+kid, "LEGO_EAB_HMAC="+hmac)
 		inv.secrets = append(inv.secrets, kid, hmac)
 	}
-	inv.Argv = append(inv.Argv, "run")
+	return nil
+}
+
+// BuildRevoke constructs the lego invocation that revokes the certificate
+// lego finds at OutputFiles(p.WorkDir, p.FQDN) (the caller puts it there)
+// with the CRLReason reason, through the account in p.WorkDir
+// (docs/adr/0029). It shares the ACME arguments and the EAB handling with
+// Build, so lego sets up its client exactly as it does for the run that
+// renews the certificate; it gets no DNS arguments and no DNS environment,
+// since revokeCert involves no challenge. --keep stops lego from moving the
+// files to its archive folder: the work directory is discarded anyway.
+func BuildRevoke(p Params, reason int) (*Invocation, error) {
+	if p.LookupEnv == nil {
+		p.LookupEnv = func(string) (string, bool) { return "", false }
+	}
+	if !filepath.IsAbs(p.Binary) || !filepath.IsAbs(p.WorkDir) {
+		return nil, errors.New("binary and work directory must be absolute")
+	}
+	if !p.KeyType.Valid() {
+		return nil, fmt.Errorf("unsupported key type %q", p.KeyType)
+	}
+	if !v1alpha1.ValidRevocationReason(reason) {
+		return nil, fmt.Errorf("unsupported revocation reason %d", reason)
+	}
+	inv := &Invocation{Dir: p.WorkDir}
+	inv.Argv = []string{
+		p.Binary,
+		"--email", p.ACME.Email,
+		"--server", p.ACME.DirectoryURL,
+		"--domains", p.FQDN,
+		"--key-type", string(p.KeyType),
+		"--path", p.WorkDir,
+	}
+	inv.Env = []string{
+		"HOME=" + p.WorkDir,
+		"TMPDIR=" + p.WorkDir,
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+	}
+	if err := inv.addEAB(p); err != nil {
+		return nil, err
+	}
+	inv.Argv = append(inv.Argv, "revoke", "--reason", strconv.Itoa(reason), "--keep")
 	return inv, nil
 }
 

@@ -574,7 +574,9 @@
       t.retired ? notice('', tr('retired.banner', { at: when(t.retiredAt), by: whoText(t.retiredBy, t.retiredByAuthority) })) : nextStep(t, account),
       t.retired ? '' : el('div', { class: 'toolbar' },
         act(tr('target.runNow'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/runs', 'primary', { revision: t.revision }),
-        t.enabled ? act(tr('target.disable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : act(tr('target.enable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable'),
+        // A target whose certificate was revoked is not enabled again
+        // (docs/adr/0029).
+        t.enabled ? act(tr('target.disable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/disable', 'danger') : (cert && cert.revoked ? '' : act(tr('target.enable'), 'POST', '/targets/' + encodeURIComponent(t.id) + '/enable')),
       ),
       props([
         [tr('target.id'), el('span', { class: 'mono', text: t.id })],
@@ -586,7 +588,7 @@
         [tr('target.store'), t.storeBinding],
         [tr('target.revision'), String(t.revision)],
         [tr('target.createdUpdated'), when(t.createdAt) + ' / ' + when(t.updatedAt)],
-        [tr('target.certificate'), cert ? el('span', null, tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
+        [tr('target.certificate'), cert ? el('span', null, cert.revoked ? statusBadge('revoked') : '', cert.revoked ? ' ' : '', tr('target.certExpires') + when(cert.expiresAt) + tr('target.certStored'), el('span', { class: 'mono', text: cert.storeObjectRef }), tr('target.certFingerprint'), el('span', { class: 'mono', text: cert.fingerprintSha256 })) : tr('target.certNone')],
         [tr('target.lastSuccess'), cert ? link('#/runs/' + encodeURIComponent(cert.lastSucceededRunId), cert.lastSucceededRunId, 'mono') : '—'],
       ].concat(t.retired ? [[tr('target.retired'), el('span', null, when(t.retiredAt) + ' / ', who(t.retiredBy, t.retiredByAuthority))]] : [])),
       consumersSection(t, consumers),
@@ -594,6 +596,7 @@
       account ? account.node : '',
       t.retired ? '' : el('h2', { text: tr('common.edit') }),
       t.retired ? '' : await targetForm(t),
+      t.retired ? accountStopNotice() : revokePanel(t, account, runs.items),
       t.retired ? '' : retirePanel(t, consumers),
       el('h2', { text: tr('common.runs') }),
       runsTable(runs.items, false, dir),
@@ -722,6 +725,73 @@
     return out;
   }
 
+  // UPKI_TSV_TOOL is NII's tool that writes the TSV files UPKI's
+  // registration officers upload (revocation, ACME account stop).
+  const UPKI_TSV_TOOL = 'https://certs.nii.ac.jp/tsv-tool/';
+
+  function externalLink(href, text) {
+    return el('a', { href, target: '_blank', rel: 'noopener noreferrer', text });
+  }
+
+  // accountStopNotice says what is left at the CA once a target is out of
+  // service: with UPKI, the target's own ACME account is stopped by the
+  // registration officer (a TSV), which the Conductor cannot do.
+  function accountStopNotice() {
+    return el('div', { class: 'notice' },
+      el('strong', { text: tr('stop.title') }), ' ', tr('stop.body'), ' ',
+      externalLink(UPKI_TSV_TOOL, tr('stop.tsvTool')), ' · ',
+      guideLink('upki-guide.html#retire', tr('stop.guideLink')));
+  }
+
+  // revokePanel revokes the certificate of a disabled target through its
+  // ACME account (docs/adr/0029), the step before retiring it. The FQDN is
+  // typed in, since a revocation cannot be undone.
+  function revokePanel(t, account, runs) {
+    const cert = t.certificate;
+    const head = el('h2', { text: tr('revoke.title') });
+    if (t.enabled) return el('div', null, head, el('p', { class: 'aside', text: tr('revoke.needDisable') }));
+    if (!cert) return el('div', null, head, el('p', { class: 'aside', text: tr('revoke.noCert') }));
+    if (cert.revoked) {
+      return el('div', null, head,
+        notice('ok', tr('revoke.revoked', { t: when(cert.lastSucceededAt) })),
+        account ? accountStopNotice() : '');
+    }
+    if (cert.expiresAt && new Date(cert.expiresAt) <= new Date()) return el('div', null, head, el('p', { class: 'aside', text: tr('revoke.expired') }));
+    const active = runs.find((r) => ['queued', 'starting', 'running'].includes(r.status));
+    if (active) return el('div', null, head, el('p', { class: 'aside' }, tr('revoke.active'), ' ', link('#/runs/' + encodeURIComponent(active.id), active.id, 'mono')));
+    const status = el('div');
+    const reason = select(['5', '0', '1', '3', '4'], '5', (v) => tr('revoke.reason' + v));
+    const confirm = input('text', '', { placeholder: t.fqdn, autocomplete: 'off', spellcheck: 'false', 'aria-label': tr('retire.confirmLabel', { fqdn: t.fqdn }) });
+    const button = el('button', {
+      class: 'danger',
+      disabled: true,
+      onclick: async () => {
+        clear(status);
+        button.disabled = true;
+        try {
+          await api('POST', '/targets/' + encodeURIComponent(t.id) + '/revoke-certificate', { revision: t.revision, reason: Number(reason.value) });
+          flash = notice('ok', tr('revoke.requested'));
+          route();
+        } catch (err) {
+          status.append(notice('error', describe(err)));
+          button.disabled = confirm.value.trim().toLowerCase() !== t.fqdn;
+        }
+      },
+    }, tr('revoke.button'));
+    confirm.addEventListener('input', () => { button.disabled = confirm.value.trim().toLowerCase() !== t.fqdn; });
+    return el('div', { class: 'panel retire' },
+      head,
+      el('p', { text: tr('revoke.intro') }),
+      el('ul', null, ...['revoke.b1', 'revoke.b2', 'revoke.b3', 'revoke.b4'].map((k) => el('li', { text: tr(k) }))),
+      el('p', { class: 'hint' }, tr('revoke.fallback'), ' ', guideLink('upki-guide.html#retire', tr('stop.guideLink'))),
+      el('p', null, el('strong', { text: tr('retire.final') })),
+      status,
+      el('div', { class: 'field' }, el('label', { text: tr('revoke.reason') }), reason),
+      el('div', { class: 'field' }, el('label', { text: tr('retire.confirmLabel', { fqdn: t.fqdn }) }), confirm),
+      el('div', { class: 'actions' }, button),
+    );
+  }
+
   // retirePanel is the way out for a target that is not needed any more
   // (docs/adr/0026): a disabled target is retired after its FQDN is typed
   // in, since there is no way back. An enabled one only says to disable
@@ -773,7 +843,16 @@
     const acct = account ? account.acct : null;
     let kind = '';
     let body;
-    if (acct && !acct.activeGeneration && !acct.pending) {
+    const revoking = last && last.operation === 'revoke';
+    if (!t.enabled && t.certificate && t.certificate.revoked) {
+      kind = 'ok';
+      body = [tr('next.revoked')];
+    } else if (!t.enabled && revoking && ['queued', 'starting', 'running'].includes(last.status)) {
+      body = [tr('next.revoking'), runLink];
+    } else if (!t.enabled && revoking && last.status === 'failed') {
+      kind = 'error';
+      body = [tr('next.revokeFailed', { code: last.errorCode || '—' }), runLink, ' ', guideLink('upki-guide.html#retire', tr('stop.guideLink'))];
+    } else if (acct && !acct.activeGeneration && !acct.pending) {
       body = [tr('next.eab')];
     } else if (!t.enabled) {
       body = [tr(acct && acct.pending ? 'next.enableEab' : 'next.enable')];
@@ -969,7 +1048,7 @@
         statusBadge(r.status),
         td(when(r.requestedAt), 'nowrap'),
         td(when(r.finishedAt), 'nowrap'),
-        r.action || '—',
+        r.action || (r.operation === 'revoke' ? tr('run.opRevoke') : '—'),
         r.error ? errorCell(r.error) : '—',
         who(r.requestedBy, r.requestedByAuthority),
       ];
@@ -1029,6 +1108,7 @@
         [tr('run.revision'), String(r.targetRevision)],
         [tr('run.requestedBy'), el('span', null, displayName(r.requestedBy, r.requestedByAuthority) ? displayName(r.requestedBy, r.requestedByAuthority) + ' — ' : '', el('span', { class: 'mono', text: r.requestedBy }), r.requestedByAuthority ? ' @ ' : '', r.requestedByAuthority ? el('span', { class: 'mono', text: r.requestedByAuthority }) : '')],
         [tr('run.times'), when(r.requestedAt) + ' / ' + when(r.startedAt) + ' / ' + when(r.finishedAt)],
+        [tr('run.operation'), r.operation === 'revoke' ? tr('run.revocation', { reason: tr('revoke.reason' + r.revocation.reason) }) : undefined],
         [tr('run.action'), r.action],
         [tr('run.expires'), r.expiresAt ? when(r.expiresAt) : undefined],
         [tr('run.fingerprint'), r.fingerprintSha256 ? el('span', { class: 'mono', text: r.fingerprintSha256 }) : undefined],

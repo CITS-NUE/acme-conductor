@@ -19,16 +19,20 @@ type RunResource struct {
 	// RequestedByAuthority is the namespace RequestedBy is unique in: an
 	// OIDC issuer URL, "localhost-dev" or "scheduler"; "" on runs
 	// recorded before the Conductor stored it.
-	RequestedByAuthority string                `json:"requestedByAuthority"`
-	RequestedAt          time.Time             `json:"requestedAt"`
-	StartedAt            *time.Time            `json:"startedAt"`
-	FinishedAt           *time.Time            `json:"finishedAt"`
-	Action               v1alpha1.ResultAction `json:"action,omitempty"`
-	ExpiresAt            *time.Time            `json:"expiresAt,omitempty"`
-	FingerprintSha256    string                `json:"fingerprintSha256,omitempty"`
-	StoreObjectRef       string                `json:"storeObjectRef,omitempty"`
-	Error                *v1alpha1.ResultError `json:"error"`
-	ExternalExecutionID  string                `json:"externalExecutionId,omitempty"`
+	RequestedByAuthority string    `json:"requestedByAuthority"`
+	RequestedAt          time.Time `json:"requestedAt"`
+	// Operation is "revoke" on a revocation run (docs/adr/0029) and
+	// omitted on a reconcile.
+	Operation           v1alpha1.Operation       `json:"operation,omitempty"`
+	Revocation          *v1alpha1.RevocationSpec `json:"revocation,omitempty"`
+	StartedAt           *time.Time               `json:"startedAt"`
+	FinishedAt          *time.Time               `json:"finishedAt"`
+	Action              v1alpha1.ResultAction    `json:"action,omitempty"`
+	ExpiresAt           *time.Time               `json:"expiresAt,omitempty"`
+	FingerprintSha256   string                   `json:"fingerprintSha256,omitempty"`
+	StoreObjectRef      string                   `json:"storeObjectRef,omitempty"`
+	Error               *v1alpha1.ResultError    `json:"error"`
+	ExternalExecutionID string                   `json:"externalExecutionId,omitempty"`
 }
 
 func runResource(r *registry.Run) RunResource {
@@ -37,6 +41,10 @@ func runResource(r *registry.Run) RunResource {
 		RequestedBy: r.RequestedBy, RequestedByAuthority: r.RequestedByAuthority, RequestedAt: r.RequestedAt, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
 		Action: r.Action, ExpiresAt: r.ExpiresAt, FingerprintSha256: r.FingerprintSha256, StoreObjectRef: r.StoreObjectRef,
 		ExternalExecutionID: r.ExternalExecutionID,
+	}
+	if r.IsRevoke() {
+		res.Operation = r.Operation
+		res.Revocation = &v1alpha1.RevocationSpec{Reason: r.RevocationReason, FingerprintSha256: r.RevocationFingerprint}
 	}
 	if r.ErrorCode != "" {
 		res.Error = &v1alpha1.ResultError{Code: r.ErrorCode, Summary: r.ErrorSummary}

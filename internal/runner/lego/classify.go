@@ -28,6 +28,10 @@ const (
 	// FailureCADNS: the CA reported a DNS problem (ACME error type dns)
 	// while validating the challenge.
 	FailureCADNS
+	// FailureAlreadyRevoked: the CA answered revokeCert with
+	// alreadyRevoked; the revocation the run asked for is already in
+	// effect (docs/adr/0029).
+	FailureAlreadyRevoked
 )
 
 // The markers below are the messages of the lego release the Runner image
@@ -44,6 +48,8 @@ const (
 	markerPropagation = "propagation: time limit exceeded"
 	// RFC 8555 section 6.7.
 	markerCADNS = "urn:ietf:params:acme:error:dns"
+	// RFC 8555 section 7.6.
+	markerAlreadyRevoked = "urn:ietf:params:acme:error:alreadyRevoked"
 )
 
 // classifyLine returns what one redacted stderr line says about the
@@ -63,6 +69,8 @@ func classifyLine(line string) Failure {
 		return FailureDNSPropagation
 	case strings.Contains(line, markerCADNS):
 		return FailureCADNS
+	case strings.Contains(line, markerAlreadyRevoked):
+		return FailureAlreadyRevoked
 	}
 	return FailureUnknown
 }

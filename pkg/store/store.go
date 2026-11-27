@@ -60,6 +60,10 @@ type Info struct {
 	// again, since it never reads a stored private key back. A store with
 	// a single form leaves it false.
 	Stale bool
+	// Certificate is the DER encoding of the stored leaf certificate (its
+	// public part only, never a key). The Runner needs it to revoke the
+	// certificate (docs/adr/0029); InfoOf fills it in.
+	Certificate []byte
 }
 
 // Store is the adapter interface implemented per binding type.
@@ -198,6 +202,7 @@ func InfoOf(c *x509.Certificate) *Info {
 		NotAfter:          c.NotAfter.UTC(),
 		DNSNames:          append([]string(nil), c.DNSNames...),
 		KeyType:           KeyTypeOf(c),
+		Certificate:       append([]byte(nil), c.Raw...),
 	}
 }
 

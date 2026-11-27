@@ -259,6 +259,15 @@ Conductor が生成し，Runner がちょうど 1 回消費する．
 [`docs/runner.md`](runner.md#acme-アカウントの世代とプロビジョニング) と
 [`docs/conductor.md`](conductor.md#acme-アカウントプロビジョニング) を参照．
 
+`operation`（任意）は Runner にさせることを選ぶ．省略は `"reconcile"`（発行・更新）．
+`"revoke"` は Store にある証明書を target のアカウントで失効させるジョブで，
+`revocation: { "reason": 0|1|3|4|5, "fingerprintSha256": "…" }` を必ず持ち，
+`acme.account.provisioning` を持てない．Runner は ACME バインディングの
+`allowRevocation` が真で，Store の証明書の指紋が一致するときだけ失効させ，成功した
+`Result` の `action` は `revoked` になる（[ADR 0029](adr/0029-revoke-certificate-before-retiring.md)，
+[`docs/runner.md`](runner.md#証明書の失効)）．このフィールドを知らない Runner は
+厳格なデコードでジョブごと拒否する．
+
 ### 検証と認可
 
 `pkg/api/v1alpha1/validate.go` と `internal/policy` は意図的に 2 つの異なる問いを

@@ -163,6 +163,7 @@ acme-runner --help
 | `email` | string | 1 つのメールボックスアドレス（空白・引用符・スラッシュを含まず，`@` はちょうど 1 つで，先頭・末尾が `@` でない）． |
 | `eab` | object，任意 | `{ "kidEnv": "...", "hmacEnv": "..." }` — 実行時に EAB のキー ID と HMAC を運ぶ環境変数の **名前**（決して値ではない）．`kidEnv` と `hmacEnv` は有効な環境変数名で，互いに異なっていなければならない． |
 | `allowProductionCA` | bool，既定 `false` | ステージング／テスト／ローカルと認識されないディレクトリを使うには明示的に設定しなければならない（後述）． |
+| `allowRevocation` | bool，既定 `false` | このバインディングで失効ジョブ（`operation: "revoke"`）を実行するには明示的に設定しなければならない．なければ `PolicyViolation`（[証明書の失効](#証明書の失効)）． |
 
 ディレクトリは，そのホストがループバック・プライベート・リンクローカルの
 IP リテラルであるか，ホストのラベル（`.` と `-` で分割）のいずれかが
@@ -466,6 +467,28 @@ Runner 自身の環境でそれを export する — さらに `/store` をル�
   原理的には，`lego` が起動されたが生成された証明書のフィンガープリントが
   格納済みのものと変わらなかった場合（実際には `lego` は発行のたびに新しい
   鍵を生成するのでこれは起きないが，Runner はそれを前提にしない）．
+
+### 証明書の失効
+
+`JobSpec.operation` が `"revoke"` のジョブ（[ADR 0029](adr/0029-revoke-certificate-before-retiring.md)）は，
+証明書を発行せず，Store にある証明書を CA で失効させる．認可（ステップ 4）と
+バインディングの解決，アカウント状態の場所の決定までは reconcile と同じで，
+そこから先が次のように変わる．
+
+1. ACME バインディングが `allowRevocation: true` でなければ `PolicyViolation`．
+   Conductor だけでは失効を起こせない．
+2. Store から今の証明書を読む．なければ `StoreFailure`．その SHA-256 指紋が
+   `revocation.fingerprintSha256` と一致しなければ，何もせず `InvalidJobSpec`．
+3. アカウント状態を作業ディレクトリに写す．世代を指定したジョブでは，その世代が
+   登録済みでなければ `AcmeFailure`（失効ジョブはプロビジョニングを伴わない）．
+4. 証明書の公開部分を `certificates/<FQDN>.crt` に置き，
+   `lego --email … --server … --domains <FQDN> --key-type … --path <work> [--eab] revoke --reason N --keep`
+   を実行する．EAB の扱いは reconcile と同じ（世代を指定したジョブでは EAB なし）．
+   DNS の引数と環境変数は渡さない．終わったらアカウント状態を公開し直す．
+5. 成功すれば `action: "revoked"` と，失効させた証明書の `expiresAt`，
+   `fingerprintSha256`，`storeObjectRef` を返す．CA が `alreadyRevoked` を返したときも
+   成功として扱う．それ以外の失敗は `AcmeFailure`
+   （「lego could not revoke the certificate (exit status N)」）．Store は変えない．
 
 ### ACME アカウントの世代とプロビジョニング
 
@@ -803,7 +826,7 @@ docker run --rm \
 
 `Result`（`CertificateReconcileResult`）は常に 1 行の JSON として stdout に
 表示され，`--result` が指定されていればそのパスにアトミックに書き出される．
-成功時は `action`（`issued`/`renewed`/`noop`），`expiresAt`，
+成功時は `action`（`issued`/`renewed`/`noop`，失効ジョブでは `revoked`），`expiresAt`，
 `fingerprintSha256`，`storeObjectRef` を持つ．失敗時は
 `error: { code, summary }` を持ち，それ以外では `error` は `null` である．
 フィールドの全一覧は

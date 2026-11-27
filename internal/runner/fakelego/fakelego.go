@@ -13,8 +13,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +63,16 @@ const (
 	// opened provisioning payload actually reached lego, without the fake
 	// ever logging or returning the value itself.
 	EnvExpectEABKID = "FAKE_LEGO_EXPECT_EAB_KID"
+	// RevokeModeFile is the name of a file a test plants in a registered
+	// account's directory of the Runner state (beside account.json) to steer
+	// the revoke command, which gets no DNS binding environment: ok (the
+	// default), fail, alreadyrevoked.
+	RevokeModeFile = "fake-revoke-mode"
+	// RevokedSuffix: on a successful revoke the fake writes
+	// "<lower-case hex SHA-256 of the DER certificate>" + RevokedSuffix,
+	// holding the reason, beside account.json, so that it reaches the
+	// published account state, where tests find it.
+	RevokedSuffix = ".fake-revoked"
 	// EnvPlantFile, when set, makes the fake create an empty regular file
 	// at this path just before it exits. Tests point it at a Runner state
 	// path (for example a generation's accounts.d) to make the Runner's
@@ -76,6 +89,17 @@ type Record struct {
 	Argv []string `json:"argv"`
 	Env  []string `json:"env"`
 	Dir  string   `json:"dir"`
+}
+
+// Invoked reports whether a test binary was started as lego: by the
+// ACME_RUNNER_FAKE_LEGO marker in the DNS binding's environment (a run), or,
+// for a revocation, which gets no DNS environment, by lego's revoke command
+// line. A test binary's own arguments never look like either.
+func Invoked(args []string, getenv func(string) string) bool {
+	if getenv("ACME_RUNNER_FAKE_LEGO") == "1" {
+		return true
+	}
+	return slices.Contains(args, "revoke") && slices.Contains(args, "--server")
 }
 
 // Main runs the fake with the given arguments and environment and returns
@@ -102,6 +126,9 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	domain := ""
 	if len(domains) > 0 {
 		domain = domains[0]
+	}
+	if _, ok := flags["revoke"]; ok {
+		return revoke(flags, domain, stdout, stderr)
 	}
 	if path == "" || domain == "" || flags["server"] == "" || flags["email"] == "" || flags["dns"] == "" {
 		fmt.Fprintln(stderr, "fake lego: missing required flags")
@@ -262,6 +289,62 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	return 0
 }
 
+// revoke imitates "lego ... revoke --reason N --keep": it needs a registered
+// account (and, when --eab is given, the EAB environment, as lego's client
+// setup does), reads the certificate lego would read for domain, and
+// records the revocation (see RevokeModeFile and RevokedSuffix).
+func revoke(flags map[string]string, domain string, stdout, stderr io.Writer) int {
+	path := flags["path"]
+	if path == "" || domain == "" || flags["server"] == "" || flags["email"] == "" || flags["reason"] == "" {
+		fmt.Fprintln(stderr, "fake lego: missing required flags")
+		return 2
+	}
+	if _, dns := flags["dns"]; dns {
+		fmt.Fprintln(stderr, "fake lego: revoke must not be given --dns")
+		return 2
+	}
+	accountDir := filepath.Join(path, "accounts", hostOf(flags["server"]), flags["email"])
+	if _, err := os.Stat(filepath.Join(accountDir, "account.json")); err != nil {
+		fmt.Fprintf(stderr, "Account %s is not registered. Use 'run' to register a new account.\n", flags["email"])
+		return 1
+	}
+	if _, eab := flags["eab"]; eab && (os.Getenv("LEGO_EAB_KID") == "" || os.Getenv("LEGO_EAB_HMAC") == "") {
+		fmt.Fprintln(stderr, "fake lego: --eab given but LEGO_EAB_KID/LEGO_EAB_HMAC are empty")
+		return 1
+	}
+	fmt.Fprintf(stdout, "Trying to revoke certificate for domain %s\n", domain)
+	data, err := os.ReadFile(filepath.Join(path, "certificates", strings.NewReplacer(":", "-", "*", "_").Replace(domain)+".crt"))
+	if err != nil {
+		fmt.Fprintf(stderr, "Error while revoking the certificate for domain %s\n\t%v\n", domain, err)
+		return 1
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		fmt.Fprintf(stderr, "Error while revoking the certificate for domain %s\n\tno certificate\n", domain)
+		return 1
+	}
+	mode := "ok"
+	if m, err := os.ReadFile(filepath.Join(accountDir, RevokeModeFile)); err == nil {
+		mode = strings.TrimSpace(string(m))
+	}
+	revokeCert := "https://" + hostOf(flags["server"]) + "/revokeCert"
+	switch mode {
+	case "fail":
+		fmt.Fprintf(stderr, "Error while revoking the certificate for domain %s\n\tacme: error: 403 :: POST :: %s :: urn:ietf:params:acme:error:unauthorized :: not authorized\n", domain, revokeCert)
+		return 1
+	case "alreadyrevoked":
+		fmt.Fprintf(stderr, "Error while revoking the certificate for domain %s\n\tacme: error: 400 :: POST :: %s :: urn:ietf:params:acme:error:alreadyRevoked :: Certificate already revoked\n", domain, revokeCert)
+		return 1
+	}
+	sum := sha256.Sum256(block.Bytes)
+	if err := os.WriteFile(filepath.Join(accountDir, hex.EncodeToString(sum[:])+RevokedSuffix), []byte(flags["reason"]), 0o600); err != nil {
+		fmt.Fprintln(stderr, "fake lego:", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "Certificate was revoked.")
+	return 0
+}
+
 // parseFlags handles the "--flag value" and bare-command forms the Runner
 // uses. Boolean flags (--accept-tos, --eab) and commands map to "".
 func parseFlags(args []string) map[string]string {
@@ -273,7 +356,7 @@ func parseFlags(args []string) map[string]string {
 			continue
 		}
 		name := strings.TrimPrefix(a, "--")
-		if name == "accept-tos" || name == "eab" {
+		if name == "accept-tos" || name == "eab" || name == "keep" {
 			out[name] = "true"
 			continue
 		}

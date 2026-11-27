@@ -21,6 +21,62 @@ type JobSpec struct {
 	ACME       ACMERef    `json:"acme"`
 	DNS        DNSRef     `json:"dns"`
 	Store      StoreRef   `json:"store"`
+	// Operation is what the Runner is asked to do. Absent means
+	// OperationReconcile, the issue-or-renew run every Runner understands;
+	// a Runner that predates the field rejects a document carrying it
+	// (strict decoding), so it never mistakes a revocation for an issuance.
+	Operation Operation `json:"operation,omitempty"`
+	// Revocation is present iff Operation is OperationRevoke.
+	Revocation *RevocationSpec `json:"revocation,omitempty"`
+}
+
+// Operation names what a job asks the Runner to do.
+type Operation string
+
+// Operations. The empty value means OperationReconcile.
+const (
+	OperationReconcile Operation = "reconcile"
+	OperationRevoke    Operation = "revoke"
+)
+
+// OperationOf returns the job's operation, mapping absent to
+// OperationReconcile.
+func (s *JobSpec) OperationOf() Operation {
+	if s.Operation == "" {
+		return OperationReconcile
+	}
+	return s.Operation
+}
+
+// RevocationSpec asks the Runner to revoke the certificate it holds in the
+// store for the target, through the target's ACME account (docs/adr/0029).
+type RevocationSpec struct {
+	// Reason is the RFC 5280 CRLReason sent with revokeCert; one of
+	// RevocationReasons.
+	Reason int `json:"reason"`
+	// FingerprintSha256 is the lower-case hex SHA-256 of the DER
+	// certificate to revoke. The Runner revokes only if the certificate in
+	// the store is exactly this one.
+	FingerprintSha256 string `json:"fingerprintSha256"`
+}
+
+// RevocationReasons are the RFC 5280 CRLReason codes a revocation may carry:
+// those UPKI's revocation request also offers (unspecified, keyCompromise,
+// affiliationChanged, superseded, cessationOfOperation).
+var RevocationReasons = []int{0, 1, 3, 4, 5}
+
+// RevocationReasonCessationOfOperation is the reason for a certificate whose
+// server has been taken out of service, the default.
+const RevocationReasonCessationOfOperation = 5
+
+// ValidRevocationReason reports whether r is one of RevocationReasons.
+func ValidRevocationReason(r int) bool {
+	for _, v := range RevocationReasons {
+		if r == v {
+			return true
+		}
+	}
+	return false
 }
 
 // TargetRef identifies the target the run is for. Revision is the target's
@@ -219,6 +275,10 @@ const (
 	ActionIssued  ResultAction = "issued"
 	ActionRenewed ResultAction = "renewed"
 	ActionNoop    ResultAction = "noop"
+	// ActionRevoked is the outcome of a revocation run (docs/adr/0029): the
+	// certificate the Result describes was revoked and is still in the
+	// store.
+	ActionRevoked ResultAction = "revoked"
 	ActionFailed  ResultAction = "failed"
 )
 

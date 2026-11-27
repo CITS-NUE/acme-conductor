@@ -85,6 +85,9 @@ type CertificateSummary struct {
 	StoreObjectRef    string     `json:"storeObjectRef"`
 	LastSucceededAt   *time.Time `json:"lastSucceededAt"`
 	LastSucceededRun  string     `json:"lastSucceededRunId"`
+	// Revoked says the last succeeded run revoked this certificate
+	// (docs/adr/0029); it is still in the store.
+	Revoked bool `json:"revoked,omitempty"`
 }
 
 // RunSummary is the short form of a run embedded in a target.
@@ -94,6 +97,8 @@ type RunSummary struct {
 	RequestedAt time.Time          `json:"requestedAt"`
 	FinishedAt  *time.Time         `json:"finishedAt"`
 	ErrorCode   v1alpha1.ErrorCode `json:"errorCode,omitempty"`
+	// Operation is "revoke" for a revocation run, omitted otherwise.
+	Operation v1alpha1.Operation `json:"operation,omitempty"`
 }
 
 func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetResource, error) {
@@ -110,10 +115,13 @@ func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetRes
 		res.Retired, res.RetiredAt, res.RetiredBy, res.RetiredByAuthority = true, t.RetiredAt, t.RetiredBy, t.RetiredByAuthority
 	}
 	if ok := sum.LastSucceeded; ok != nil {
-		res.Certificate = &CertificateSummary{ExpiresAt: ok.ExpiresAt, FingerprintSha256: ok.FingerprintSha256, StoreObjectRef: ok.StoreObjectRef, LastSucceededAt: ok.FinishedAt, LastSucceededRun: ok.ID}
+		res.Certificate = &CertificateSummary{ExpiresAt: ok.ExpiresAt, FingerprintSha256: ok.FingerprintSha256, StoreObjectRef: ok.StoreObjectRef, LastSucceededAt: ok.FinishedAt, LastSucceededRun: ok.ID, Revoked: certificateRevoked(sum)}
 	}
 	if last := sum.LastRun; last != nil {
 		res.LastRun = &RunSummary{ID: last.ID, Status: last.Status, RequestedAt: last.RequestedAt, FinishedAt: last.FinishedAt, ErrorCode: last.ErrorCode}
+		if last.IsRevoke() {
+			res.LastRun.Operation = last.Operation
+		}
 	}
 	return res, nil
 }
@@ -398,6 +406,12 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		changed = append(changed, "storeBinding")
 	}
 	if in.Enabled != nil {
+		if *in.Enabled && !t.Enabled {
+			if err := s.checkEnable(r, t); err != nil {
+				s.fail(w, r, err)
+				return
+			}
+		}
 		t.Enabled = *in.Enabled
 		changed = append(changed, "enabled")
 	}
@@ -448,6 +462,12 @@ func (s *Server) handleSetTargetEnabled(enabled bool) http.HandlerFunc {
 		if t.Retired() {
 			s.fail(w, r, errRetired(t))
 			return
+		}
+		if enabled && !t.Enabled {
+			if err := s.checkEnable(r, t); err != nil {
+				s.fail(w, r, err)
+				return
+			}
 		}
 		caller := PrincipalFrom(r.Context())
 		actor := caller.Name

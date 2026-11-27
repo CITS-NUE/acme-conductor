@@ -102,8 +102,50 @@
     "store": {
       "$ref": "#/$defs/bindingRef",
       "description": "Administrator-registered certificate store binding."
+    },
+    "operation": {
+      "enum": ["reconcile", "revoke"],
+      "description": "What the Runner is asked to do. Absent means \"reconcile\" (issue or renew). \"revoke\" revokes the certificate in the store through the target's ACME account and requires revocation (docs/adr/0029)."
+    },
+    "revocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "fingerprintSha256"],
+      "properties": {
+        "reason": {
+          "enum": [0, 1, 3, 4, 5],
+          "description": "RFC 5280 CRLReason sent with revokeCert: 0 unspecified, 1 keyCompromise, 3 affiliationChanged, 4 superseded, 5 cessationOfOperation."
+        },
+        "fingerprintSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lower-case hex SHA-256 of the DER certificate to revoke. The Runner revokes only if the certificate in the store is exactly this one."
+        }
+      },
+      "description": "Present iff operation is \"revoke\"."
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "operation": { "const": "revoke" } },
+        "required": ["operation"]
+      },
+      "then": {
+        "required": ["revocation"],
+        "properties": {
+          "acme": {
+            "properties": {
+              "account": { "properties": { "provisioning": false } }
+            }
+          }
+        }
+      },
+      "else": {
+        "not": { "required": ["revocation"] }
+      }
+    }
+  ],
   "$defs": {
     "identifier": {
       "type": "string",
