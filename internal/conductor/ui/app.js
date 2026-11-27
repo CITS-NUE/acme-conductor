@@ -102,15 +102,27 @@
     return String(n).padStart(2, '0');
   }
 
-  // when shows UTC in ISO form; in Japanese it adds the browser's local time.
+  // zoneLabel names the browser's time zone for the times when shows: JST for
+  // Asia/Tokyo (Intl would say "GMT+9"), otherwise Intl's short name.
+  const zoneLabel = (function () {
+    try {
+      if (Intl.DateTimeFormat().resolvedOptions().timeZone === 'Asia/Tokyo') return 'JST';
+      const part = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(new Date()).find((p) => p.type === 'timeZoneName');
+      if (part) return part.value;
+    } catch (e) {
+      // fall through
+    }
+    return '';
+  })();
+
+  // when shows a time in the browser's local time zone, labelled with it
+  // (2026-11-27 12:02:20 JST). The API and the logs stay in UTC.
   function when(iso) {
     if (!iso) return '—';
     const d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso);
-    const utc = d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
-    if (i18n.lang() !== 'ja') return utc;
-    const local = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-    return utc + '（' + tr('common.localTime', { t: local }) + '）';
+    const local = d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+    return zoneLabel ? local + ' ' + zoneLabel : local;
   }
 
   // rowOf builds a table row from cells: a cell that already is a td/th is

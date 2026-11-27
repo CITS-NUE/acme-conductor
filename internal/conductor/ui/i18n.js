@@ -33,7 +33,6 @@
     'common.edit': 'Edit',
     'common.runs': 'Runs',
     'common.saveChanges': 'Save changes',
-    'common.localTime': 'local {t}',
 
     'status.enabled': 'enabled',
     'status.disabled': 'disabled',
@@ -337,7 +336,6 @@
     'common.edit': '編集',
     'common.runs': '実行履歴',
     'common.saveChanges': '変更を保存',
-    'common.localTime': 'ローカル時刻 {t}',
 
     'status.enabled': '有効',
     'status.disabled': '無効',
