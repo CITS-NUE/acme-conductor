@@ -200,7 +200,7 @@
     'revoke.button': 'Revoke',
     'revoke.requested': 'The revocation was requested. Its run is listed below.',
     'stop.title': 'At the CA:',
-    'stop.body': 'with UPKI, the target\'s ACME account stays registered until the registration officer submits an ACME account stop request (a TSV). Revoke the certificate first: after the account is stopped, it can only be revoked with a TSV.',
+    'stop.body': 'if this certificate was issued through UPKI ACME with an account of its own, that account stays registered until the registration officer submits an ACME account stop request (a TSV). Revoke the certificate first: after the account is stopped, it can only be revoked with a TSV.',
     'stop.tsvTool': 'UPKI TSV tool',
     'stop.guideLink': 'revoking and stopping (Japanese)',
 
@@ -504,7 +504,7 @@
     'revoke.button': '失効させる',
     'revoke.requested': '失効を依頼しました．run は下の一覧にあります．',
     'stop.title': '認証局側の手続き:',
-    'stop.body': 'UPKI では，この証明書の ACME アカウントは，登録担当者が ACME アカウントの停止申請（TSV）を出すまで登録されたままです．先に証明書を失効させてください．アカウントを停止した後は，TSV でしか失効させられません．',
+    'stop.body': 'UPKI ACME で，この証明書専用の ACME アカウントを使って発行していた場合，そのアカウントは，登録担当者が ACME アカウントの停止申請（TSV）を出すまで登録されたままです．先に証明書を失効させてください．アカウントを停止した後は，TSV でしか失効させられません．',
     'stop.tsvTool': 'UPKI の TSV 作成ツール',
     'stop.guideLink': '失効と停止の手順',
 

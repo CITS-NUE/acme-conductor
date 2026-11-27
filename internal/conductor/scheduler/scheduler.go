@@ -800,6 +800,17 @@ func (s *Scheduler) execute(runCtx context.Context, run *registry.Run) {
 		}
 		return
 	}
+	// A succeeded Result must be the outcome of the operation this run
+	// asked for: a revocation of exactly the requested certificate, or a
+	// reconcile that revoked nothing (docs/adr/0029).
+	if res.Status == v1alpha1.StatusSucceeded {
+		revoked := res.Action == v1alpha1.ActionRevoked
+		if revoked != run.IsRevoke() || (revoked && res.FingerprintSha256 != run.RevocationFingerprint) {
+			log.Error("runner reported a result that does not match the run's operation", "operation", string(run.Operation), "action", string(res.Action), "fingerprintSha256", res.FingerprintSha256)
+			failed(v1alpha1.ErrorCodeInternal, "runner reported a result that does not match the run's operation")
+			return
+		}
+	}
 	// The Result has passed the contract's own validation (the launcher
 	// decodes it strictly), so its fields are safe to record as-is.
 	run.Action = res.Action

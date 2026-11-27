@@ -406,6 +406,12 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		changed = append(changed, "storeBinding")
 	}
 	if in.Enabled != nil {
+		if *in.Enabled && !t.Enabled {
+			if err := s.checkEnable(r, t); err != nil {
+				s.fail(w, r, err)
+				return
+			}
+		}
 		t.Enabled = *in.Enabled
 		changed = append(changed, "enabled")
 	}
@@ -458,15 +464,8 @@ func (s *Server) handleSetTargetEnabled(enabled bool) http.HandlerFunc {
 			return
 		}
 		if enabled && !t.Enabled {
-			// The store still holds the revoked certificate, which the
-			// Runner would take as current (docs/adr/0029).
-			sum, err := s.reg.RunSummary(r.Context(), t.ID)
-			if err != nil {
+			if err := s.checkEnable(r, t); err != nil {
 				s.fail(w, r, err)
-				return
-			}
-			if certificateRevoked(sum) {
-				writeError(w, http.StatusConflict, "certificate_revoked", "the target's certificate was revoked; retire the target and create a new one to manage the name again", nil)
 				return
 			}
 		}

@@ -72,16 +72,18 @@ func revokeStored(ctx context.Context, opts Options, log *slog.Logger, cfg *conf
 	if err := loadAccounts(ctx, env.accountRoot, work); err != nil {
 		return nil, classifyCtx(ctx, fail(v1alpha1.ErrorCodeInternal, "ACME account state could not be read", err))
 	}
-	// A generation must already be registered, as for a renewal; lego is
-	// then given no EAB. The legacy account uses the binding's EAB, if any.
-	disableEAB := false
-	if env.account != nil {
-		if !accountRegistered(work) {
-			err := fmt.Errorf("acme account generation %d of binding %q has no registered account on this runner", env.account.Generation, spec.ACME.Binding)
-			return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme account generation %d of binding %q is not provisioned on this runner", env.account.Generation, spec.ACME.Binding), err)
+	// The account must already be registered, as for a renewal: lego
+	// would otherwise generate (and the persist below publish) a fresh
+	// account key before finding that it is not. A generation is then used
+	// without an EAB; the legacy account uses the binding's EAB, if any.
+	if !accountRegistered(work) {
+		if env.account == nil {
+			return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme binding %q has no registered account on this runner", spec.ACME.Binding), nil)
 		}
-		disableEAB = true
+		err := fmt.Errorf("acme account generation %d of binding %q has no registered account on this runner", env.account.Generation, spec.ACME.Binding)
+		return nil, fail(v1alpha1.ErrorCodeACMEFailure, fmt.Sprintf("acme account generation %d of binding %q is not provisioned on this runner", env.account.Generation, spec.ACME.Binding), err)
 	}
+	disableEAB := env.account != nil
 	certPath, _, _ := lego.OutputFiles(work, spec.Target.FQDN)
 	if err := os.MkdirAll(filepath.Dir(certPath), 0o700); err != nil {
 		return nil, fail(v1alpha1.ErrorCodeInternal, "work directory could not be prepared", err)

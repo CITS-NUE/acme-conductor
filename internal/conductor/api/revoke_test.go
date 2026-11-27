@@ -99,3 +99,47 @@ func TestRevokeCertificateExpired(t *testing.T) {
 		t.Fatalf("expired: %d %s", r.status, r.raw)
 	}
 }
+
+// Every way of enabling is refused while the certificate is being revoked
+// or once it is.
+func TestEnableRefusedForRevokedCertificate(t *testing.T) {
+	e := newEnv(t)
+	pid := e.createPolicy()
+	tid := e.createTarget(pid, "wiki.example.ac.jp")
+	path := Prefix + "/targets/" + tid
+	e.reconciled(tid, 60*24*time.Hour)
+	e.do("POST", path+"/disable", nil, nil)
+	if r := e.do("POST", path+"/revoke-certificate", nil, nil); r.status != 202 {
+		t.Fatalf("revoke: %d %s", r.status, r.raw)
+	}
+	rev := e.do("GET", path, nil, nil).body["revision"]
+	for _, c := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{"POST", path + "/enable", nil},
+		{"PUT", path, map[string]any{"revision": rev, "enabled": true}},
+	} {
+		if r := e.do(c.method, c.path, c.body, nil); r.status != 409 || r.errCode() != "run_active" {
+			t.Fatalf("%s while revoking: %d %s", c.method, r.status, r.raw)
+		}
+	}
+	e.finishRevocation()
+	for _, c := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{"POST", path + "/enable", nil},
+		{"PUT", path, map[string]any{"revision": rev, "enabled": true}},
+	} {
+		if r := e.do(c.method, c.path, c.body, nil); r.status != 409 || r.errCode() != "certificate_revoked" {
+			t.Fatalf("%s revoked: %d %s", c.method, r.status, r.raw)
+		}
+	}
+	// Other edits of a disabled, revoked target still work.
+	if r := e.do("PUT", path, map[string]any{"revision": rev, "owner": "other"}, nil); r.status != 200 {
+		t.Fatalf("edit owner: %d %s", r.status, r.raw)
+	}
+}

@@ -1375,7 +1375,9 @@ func (d *DB) RunSummary(ctx context.Context, targetID string) (*registry.TargetR
 		s.LastSucceeded = ok[0]
 		since = ok[0].ID
 	}
-	err = d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE target_id = ? AND id > ? AND status IN (?, ?)`, targetID, since, string(registry.RunFailed), string(registry.RunCancelled)).Scan(&s.ConsecutiveFailures)
+	// Only reconcile runs count toward the renewal backoff: a failed
+	// revocation says nothing about issuing.
+	err = d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE target_id = ? AND id > ? AND status IN (?, ?) AND operation = 'reconcile'`, targetID, since, string(registry.RunFailed), string(registry.RunCancelled)).Scan(&s.ConsecutiveFailures)
 	if err != nil {
 		return nil, fmt.Errorf("count failures: %w", err)
 	}

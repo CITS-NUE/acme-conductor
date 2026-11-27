@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/CITS-NUE/acme-conductor/internal/conductor/registry"
@@ -21,6 +22,24 @@ type RevokeCertificateInput struct {
 // one its last succeeded run left in the store) was revoked by that run.
 func certificateRevoked(sum *registry.TargetRunSummary) bool {
 	return sum.LastSucceeded != nil && sum.LastSucceeded.Action == v1alpha1.ActionRevoked
+}
+
+// checkEnable refuses to enable a target whose certificate was revoked, or
+// is being revoked: the store still holds that certificate, which the Runner
+// would take as current (docs/adr/0029). It applies to every way of
+// enabling a target (POST .../enable and PUT with enabled: true).
+func (s *Server) checkEnable(r *http.Request, t *registry.Target) error {
+	sum, err := s.reg.RunSummary(r.Context(), t.ID)
+	if err != nil {
+		return err
+	}
+	if certificateRevoked(sum) {
+		return &apiError{status: http.StatusConflict, code: "certificate_revoked", message: "the target's certificate was revoked; retire the target and create a new one to manage the name again"}
+	}
+	if last := sum.LastRun; last != nil && last.IsRevoke() && slices.Contains(registry.ActiveRunStatuses, last.Status) {
+		return &apiError{status: http.StatusConflict, code: "run_active", message: "the target's certificate is being revoked"}
+	}
+	return nil
 }
 
 // handleRevokeCertificate requests a revocation run (docs/adr/0029): the

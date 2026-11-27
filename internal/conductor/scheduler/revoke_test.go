@@ -114,3 +114,43 @@ func TestRevocationWithoutAccountFails(t *testing.T) {
 		t.Fatalf("run = %+v", got)
 	}
 }
+
+// A succeeded Result that is not the outcome of the run's operation is not
+// recorded as such.
+func TestResultMustMatchOperation(t *testing.T) {
+	f := setupScoped(t)
+	issueScoped(t, f)
+	r := f.requestRevocation(t)
+	f.fake.respond = func(_ context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+		res := okResult(f.clock(), spec, v1alpha1.ActionRevoked, 60)
+		res.FingerprintSha256 = strings.Repeat("f", 64) // not the one asked for
+		return res, nil
+	}
+	if _, err := f.s.Dispatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Drain(context.Background())
+	if got := f.lastRun(t); got.ID != r.ID || got.Status != registry.RunFailed || got.ErrorCode != v1alpha1.ErrorCodeInternal {
+		t.Fatalf("revoke with another fingerprint: %+v", got)
+	}
+
+	// A reconcile that reports a revocation.
+	f.target.Enabled = true
+	if err := f.reg.UpdateTarget(context.Background(), f.target, f.target.Revision, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.respond = func(_ context.Context, spec *v1alpha1.JobSpec) (*v1alpha1.Result, error) {
+		return okResult(f.clock(), spec, v1alpha1.ActionRevoked, 60), nil
+	}
+	rr := &registry.Run{TargetID: f.target.ID, TargetRevision: f.target.Revision, RequestedBy: "operator"}
+	if err := f.reg.CreateRun(context.Background(), rr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.Dispatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Drain(context.Background())
+	if got := f.lastRun(t); got.ID != rr.ID || got.Status != registry.RunFailed || got.Action == v1alpha1.ActionRevoked {
+		t.Fatalf("reconcile reporting revoked: %+v", got)
+	}
+}
