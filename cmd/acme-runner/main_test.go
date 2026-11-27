@@ -12,7 +12,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("ACME_RUNNER_FAKE_LEGO") == "1" {
+	if fakelego.Invoked(os.Args[1:], os.Getenv) {
 		os.Exit(fakelego.Main(os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 	}
 	os.Exit(m.Run())

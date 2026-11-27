@@ -35,7 +35,7 @@
     },
     "action": {
       "type": "string",
-      "enum": ["issued", "renewed", "noop", "failed"]
+      "enum": ["issued", "renewed", "noop", "revoked", "failed"]
     },
     "expiresAt": {
       "type": "string",
@@ -86,7 +86,7 @@
       "then": {
         "properties": {
           "error": { "type": "null" },
-          "action": { "enum": ["issued", "renewed", "noop"] }
+          "action": { "enum": ["issued", "renewed", "noop", "revoked"] }
         },
         "required": ["expiresAt", "fingerprintSha256", "storeObjectRef"]
       }

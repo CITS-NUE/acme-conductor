@@ -808,3 +808,70 @@ func fakeInvocation(t *testing.T, mode string, extra map[string]string) *Invocat
 	}
 	return inv
 }
+
+// TestBuildRevoke_Golden: a revocation gets the ACME arguments of a run, no
+// DNS arguments or environment (no DNS secret reaches lego), and the
+// revoke command with its reason after it.
+func TestBuildRevoke_Golden(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		t.Fatalf("a revocation without EAB must not look up %s", name)
+		return "", false
+	}
+	p := baseParams(lookup)
+	p.AdditionalNames = []string{"www.example.ac.jp"}
+	p.DisableEAB = true
+	inv, err := BuildRevoke(p, 5)
+	if err != nil {
+		t.Fatalf("BuildRevoke: %v", err)
+	}
+	want := []string{
+		"/usr/local/bin/lego",
+		"--email", "certs@example.ac.jp",
+		"--server", "https://acme-staging-v02.api.letsencrypt.org/directory",
+		"--domains", "wiki.example.ac.jp",
+		"--key-type", "ec256",
+		"--path", "/work/run-1",
+		"revoke", "--reason", "5", "--keep",
+	}
+	if !reflect.DeepEqual(inv.Argv, want) {
+		t.Errorf("argv =\n%v\nwant\n%v", inv.Argv, want)
+	}
+	wantEnv := []string{"HOME=/work/run-1", "TMPDIR=/work/run-1", "PATH=/usr/local/bin:/usr/bin:/bin"}
+	if !reflect.DeepEqual(inv.Env, wantEnv) {
+		t.Errorf("env = %v, want %v", inv.Env, wantEnv)
+	}
+}
+
+// TestBuildRevoke_BindingEAB: the legacy account uses the binding's EAB
+// exactly as a run does, through the environment.
+func TestBuildRevoke_BindingEAB(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case "KID_ENV":
+			return "kid-value", true
+		case "HMAC_ENV":
+			return "hmac-value", true
+		}
+		return "", false
+	}
+	p := baseParams(lookup)
+	p.ACME.EAB = &config.EAB{KIDEnv: "KID_ENV", HMACEnv: "HMAC_ENV"}
+	inv, err := BuildRevoke(p, 0)
+	if err != nil {
+		t.Fatalf("BuildRevoke: %v", err)
+	}
+	if !slices.Contains(inv.Argv, "--eab") || slices.Index(inv.Argv, "--eab") > slices.Index(inv.Argv, "revoke") {
+		t.Errorf("argv = %v, want --eab before revoke", inv.Argv)
+	}
+	if !slices.Contains(inv.Env, "LEGO_EAB_KID=kid-value") || !slices.Contains(inv.Secrets(), "hmac-value") {
+		t.Errorf("env = %v, secrets = %v: EAB not wired", inv.Env, inv.Secrets())
+	}
+}
+
+func TestBuildRevoke_RejectsReason(t *testing.T) {
+	for _, r := range []int{-1, 2, 6, 7, 11} {
+		if _, err := BuildRevoke(baseParams(nil), r); err == nil {
+			t.Errorf("BuildRevoke(reason %d): expected error", r)
+		}
+	}
+}

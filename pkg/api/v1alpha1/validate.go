@@ -202,6 +202,29 @@ func (s *JobSpec) Validate() error {
 	if err := policy.CheckCount(len(names), maxSANs); err != nil {
 		return invalidErr("target.additionalNames", "inconsistent with embedded policy snapshot", err)
 	}
+	switch s.Operation {
+	case "", OperationReconcile:
+		if s.Revocation != nil {
+			return invalid("revocation", "only allowed when operation is \"revoke\"")
+		}
+	case OperationRevoke:
+		if s.Revocation == nil {
+			return invalid("revocation", "required when operation is \"revoke\"")
+		}
+		if !ValidRevocationReason(s.Revocation.Reason) {
+			return invalid("revocation.reason", fmt.Sprintf("must be one of %v", RevocationReasons))
+		}
+		if !fingerprintRe.MatchString(s.Revocation.FingerprintSha256) {
+			return invalid("revocation.fingerprintSha256", "must be 64 lower-case hex characters")
+		}
+		// A revocation never registers an account: it must be done by
+		// the account that already holds the certificate.
+		if s.ACME.Account != nil && s.ACME.Account.Provisioning != nil {
+			return invalid("acme.account.provisioning", "not allowed when operation is \"revoke\"")
+		}
+	default:
+		return invalid("operation", fmt.Sprintf("must be %q or %q", OperationReconcile, OperationRevoke))
+	}
 	return nil
 }
 
@@ -386,9 +409,9 @@ func (r *Result) Validate() error {
 		return invalid("status", "must be \"succeeded\" or \"failed\"")
 	}
 	switch r.Action {
-	case ActionIssued, ActionRenewed, ActionNoop, ActionFailed:
+	case ActionIssued, ActionRenewed, ActionNoop, ActionRevoked, ActionFailed:
 	default:
-		return invalid("action", "must be one of issued, renewed, noop, failed")
+		return invalid("action", "must be one of issued, renewed, noop, revoked, failed")
 	}
 	if r.ExpiresAt != nil && r.ExpiresAt.IsZero() {
 		return invalid("expiresAt", "must be a valid timestamp")

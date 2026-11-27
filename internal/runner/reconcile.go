@@ -460,6 +460,9 @@ func reconcile(ctx context.Context, opts Options, log *slog.Logger, cfg *config.
 	}
 	object := st.ObjectName(spec.Target.FQDN)
 	log = log.With("storeObjectRef", object, "storeType", st.Type())
+	if spec.OperationOf() == v1alpha1.OperationRevoke {
+		return revokeStored(ctx, opts, log, cfg, spec, revokeEnv{acme: acme, account: account, accountRoot: accountRoot, store: st, object: object})
+	}
 
 	now := opts.Now().UTC()
 	current, err := st.Current(ctx, object)
