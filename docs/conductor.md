@@ -368,6 +368,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 
 | HTTP | `code` | 発生条件 |
 |---|---|---|
+| 400 | `invalid_reason` | 失効理由が 0，1，3，4，5 のいずれでもない． |
 | 400 | `invalid_request` | 不正な本文，フィールド検証の失敗，未知のフィールド，未登録のバインディング名，不正な FQDN/サフィックス，不正なクエリパラメータ． |
 | 400 | `policy_violation` | target の FQDN が，指定したポリシーで許可されていない（ラベル境界でのサフィックス照合，ワイルドカード規則）．`policy.rejected` として監査される． |
 | 401 | `unauthenticated` | `oidc` モード: ベアラートークンがない，または検証に通らない（署名，issuer，audience，期限，未知の鍵）．`WWW-Authenticate: Bearer realm="acme-conductor"` を伴う． |
@@ -378,7 +379,10 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | 409 | `stale_revision` | リクエストの `revision` が target の現在のリビジョンではない． |
 | 409 | `run_active` | その target について run がすでに queued/starting/running である（`details.activeRunId`，`details.status`）．退役の要求では，実行中の run があるので退役できない，の意味になる． |
 | 409 | `target_disabled` | 無効化された target に run が要求された． |
-| 409 | `target_enabled` | 有効な target を退役させようとした（退役の前に無効化しなければならない）． |
+| 409 | `target_enabled` | 有効な target を退役させようとした，またはその証明書を失効させようとした（どちらも先に無効化しなければならない）． |
+| 409 | `no_certificate` | 失効させる証明書がない（成功した run がまだない）． |
+| 409 | `certificate_revoked` | 証明書はすでに失効している．失効の要求のほか，失効済みの証明書を持つ target を有効にしようとしたときも返る（[証明書の失効](#証明書の失効)）． |
+| 409 | `certificate_expired` | 証明書の有効期限が切れているので，失効させるものがない． |
 | 409 | `target_retired` | 退役済みの target を変更しようとした（`PUT`，`enable`，`disable`，run の要求，target ごとのアカウントへの EAB の投入），または退役済みの target をもう一度退役させようとした．退役は元に戻せない（[退役](#target-の退役)）． |
 | 413 | `too_large` | 本文が 64 KiB を超えている． |
 | 415 | `unsupported_media_type` | `Content-Type: application/json` のない本文． |
@@ -412,6 +416,7 @@ ULID である（1 つのプロセス内で単調増加なので，作成順に�
 | `PUT /api/v1alpha1/targets/{id}` | 指定した `revision` で変更可能なフィールドを更新 → `200`．スケジューラを起こす． |
 | `POST /api/v1alpha1/targets/{id}/enable` | `enabled: true` に設定 → `200` Target（変化があればリビジョンが上がる）． |
 | `POST /api/v1alpha1/targets/{id}/disable` | `enabled: false` に設定 → `200` Target．何も削除せず，実行中の run も止めない． |
+| `POST /api/v1alpha1/targets/{id}/revoke-certificate` | target の今の証明書を失効させる run を作る（admin のみ．[証明書の失効](#証明書の失効)）→ `202` Run（`operation: "revoke"`）．本文 `{"revision": N, "reason": 5}`（どちらも省略可．`reason` の既定は 5）． |
 | `POST /api/v1alpha1/targets/{id}/retire` | target を退役させる（admin のみ．[退役](#target-の退役)）→ `200` Target（`retired: true`）．本文なし．無効化されていなければ `409` `target_enabled`，run が queued/starting/running なら `409` `run_active`，すでに退役済みなら `409` `target_retired`． |
 | `GET /api/v1alpha1/targets/{id}/runs[?status=&limit=&before=]` | その target の run，新しい順． |
 | `GET /api/v1alpha1/targets/{id}/consumers` | target の利用側の台帳（[利用側の台帳](#利用側の台帳)）．退役済みの target でも読める． |
@@ -560,6 +565,43 @@ Runner は名前の一致しない格納済みの証明書を再発行する．`
 報告した内容そのものである．Store から読んだものでは決してない．`lastRun` は
 run が存在するまで `null` であり，run が失敗した場合は `errorCode` を持つ．
 
+### 証明書の失効
+
+ホストを閉じたなど，証明書を使わなくなった target は，退役させる前に証明書を CA で
+失効させる（[ADR 0029](adr/0029-revoke-certificate-before-retiring.md)）．ACME で
+発行した証明書は ACME のクライアントから失効させるのが UPKI の手順であり，ACME
+アカウントの鍵は Runner にしかないので，失効も Runner が行う．
+
+`POST /api/v1alpha1/targets/{id}/revoke-certificate`（admin のみ）は，次の前提を
+すべて満たすときだけ失効 run を作る．満たさなければ何も変えず `409` を返す．
+
+1. 退役していない（`target_retired`）．
+2. target が **無効** である（`target_enabled`）．
+3. 実行中の run がない（`run_active`）．
+4. 最後に成功した run の証明書がある（`no_certificate`）．それが失効済みでなく
+   （`certificate_revoked`），期限が切れていない（`certificate_expired`）．
+
+失効 run は `operation: "revoke"` と `revocation: {reason, fingerprintSha256}` を持ち，
+指紋は Conductor がその証明書のものを入れる．スケジューラは失効 run に限り，無効な
+target（と無効なポリシー）でも実行する．EAB 投入要求は取らず，target のアクティブな
+アカウントの世代を使う（target ごとのアカウントを持つバインディングで，アクティブな
+世代がなければ `AcmeFailure` で失敗する）．DNS の委任の確認はしない．失効 run は
+計画では作らず，失敗しても再試行しない．開始前に target が有効にされていれば
+キャンセルする．
+
+Runner が成功を報告すると（`action: "revoked"`），その run が target の最後に成功した
+run になり，`certificate.revoked: true` と表示される．Store の証明書は残る．
+**失効済みの証明書を持つ target は有効にできない**（`409 certificate_revoked`）．
+Runner は Store に残る失効済みの証明書を「まだ有効」と判断するからである．同じ名前を
+もう一度管理するときは，退役させて新しい target を作る．監査には `run.requested`
+（詳細に指紋と理由）と，run の結果のイベントが残る．
+
+CA 側の ACME アカウントの停止（UPKI では登録担当者の停止申請）は Conductor の外の
+手続きであり，失効の後に行う．アカウントを停止した後は Runner から失効させられない．
+
+スキーマ（バージョン 10）: `runs` に `operation`（`reconcile`／`revoke`），
+`revocation_reason`，`revocation_fingerprint_sha256` が加わる．既存の行は `reconcile`．
+
 ### Run
 
 ```json
@@ -573,7 +615,9 @@ run が存在するまで `null` であり，run が失敗した場合は `error
 ```
 
 `status` は `queued`，`starting`，`running`，`succeeded`，`failed`，`cancelled` の
-いずれかである．`action`，`expiresAt`，`fingerprintSha256`，`storeObjectRef`，
+いずれかである．失効 run（[証明書の失効](#証明書の失効)）は `"operation": "revoke"` と
+`"revocation": {"reason": 5, "fingerprintSha256": "…"}` を持ち，成功すると `action` は
+`revoked` になる．reconcile の run はどちらも持たない．`action`，`expiresAt`，`fingerprintSha256`，`storeObjectRef`，
 `error` は Runner の `Result`
 （[コントラクト](architecture.md#certificatereconcileresult-result)）を写したもので，
 `error` は失敗またはキャンセル時に `{ "code", "summary" }` となる．`requestedBy` は

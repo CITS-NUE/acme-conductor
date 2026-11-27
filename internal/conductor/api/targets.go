@@ -97,6 +97,8 @@ type RunSummary struct {
 	RequestedAt time.Time          `json:"requestedAt"`
 	FinishedAt  *time.Time         `json:"finishedAt"`
 	ErrorCode   v1alpha1.ErrorCode `json:"errorCode,omitempty"`
+	// Operation is "revoke" for a revocation run, omitted otherwise.
+	Operation v1alpha1.Operation `json:"operation,omitempty"`
 }
 
 func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetResource, error) {
@@ -117,6 +119,9 @@ func (s *Server) targetResource(r *http.Request, t *registry.Target) (*TargetRes
 	}
 	if last := sum.LastRun; last != nil {
 		res.LastRun = &RunSummary{ID: last.ID, Status: last.Status, RequestedAt: last.RequestedAt, FinishedAt: last.FinishedAt, ErrorCode: last.ErrorCode}
+		if last.IsRevoke() {
+			res.LastRun.Operation = last.Operation
+		}
 	}
 	return res, nil
 }

@@ -114,7 +114,8 @@ run では，`eab` が書いてあっても使われない
     "upki": {
       "directoryURL": "https://<UPKI ACME の directory URL>",
       "email": "pki-admin@example.ac.jp",
-      "allowProductionCA": true
+      "allowProductionCA": true,
+      "allowRevocation": true
     }
   },
   "accountProvisioning": {
@@ -128,6 +129,10 @@ run では，`eab` が書いてあっても使われない
 - `directoryURL` — UPKI の案内にある ACME の directory URL．ホスト名に
   `staging` や `test` などのラベルを含まない本番の CA なので，
   `allowProductionCA: true` が要る．
+- `allowRevocation: true` — 使わなくなった証明書を，退役の前に Runner から失効
+  させるため（UPKI が ACME の証明書に求める手順．[`docs/upki-guide.md`](upki-guide.md#使わなくなった証明書を片付ける失効退役停止)，
+  [ADR 0029](adr/0029-revoke-certificate-before-retiring.md)）．省くと失効の run は
+  `PolicyViolation` で失敗し，失効は登録担当者への TSV の申請だけになる．
 - `maxNames: 8` — UPKI の上限（CN を含めて 8 個）に合わせる．既定の `1` の
   ままでは，`additionalNames` を持つジョブを Runner が `PolicyViolation` で
   拒否する．これは CA の制約の写しではなく Runner 自身の上限なので，他の CA の
